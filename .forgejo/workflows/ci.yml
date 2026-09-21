@@ -1,0 +1,41 @@
+# Authority/check-name convention: scarcity-router docs/release-engineering.md.
+# Independently written A0 gate; no publication or private credentials.
+name: ci
+
+"on":
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174 # v5.4.0
+        with:
+          version: "0.9.30"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Install locked tooling
+        run: uv sync --locked
+      - name: Repository gate
+        run: make check
+      - name: Built-package gate
+        run: make package-check
+      - name: Dependency vulnerability audit
+        run: make audit

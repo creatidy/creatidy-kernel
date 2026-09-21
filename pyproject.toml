@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "creatidy-kernel"
+version = "0.0.1.dev0"
+description = "Local-first, provider-neutral engineering Program control-plane foundation"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = []
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Source = "https://forgejo.creatidy.com/Creatidy/creatidy-kernel"
+Issues = "https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues"
+Mirror = "https://github.com/creatidy/creatidy-kernel"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.31,<2",
+    "detect-secrets>=1.5,<2",
+    "import-linter>=2.3,<3",
+    "pip-audit>=2.9,<3",
+    "pytest>=8.4,<10",
+    "pyyaml>=6,<7",
+    "ruff>=0.12,<1",
+    "types-pyyaml>=6,<7",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/creatidy_kernel"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src", "/tests", "/tools", "/examples", "/docs", "/.forgejo",
+    "/pyproject.toml", "/uv.lock", "/Makefile", "/README.md", "/LICENSE",
+    "/CONTRIBUTING.md", "/SECURITY.md", "/AGENTS.md", "/.gitignore",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["S101"] # Assertions are the pytest assertion interface.
+"tests/test_boundaries.py" = ["S603"] # Fixed argv, never workload input.
+"tools/*.py" = ["S603", "S607"] # Developer tools execute explicit uv/git argv, without a shell.
+
+[tool.basedpyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.12"
+include = ["src", "tests", "tools", "examples"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-config --strict-markers"
+
+[tool.importlinter]
+root_package = "creatidy_kernel"
+
+[[tool.importlinter.contracts]]
+name = "Adapters depend inward; core and ports never depend on adapters"
+type = "layers"
+containers = ["creatidy_kernel"]
+layers = ["adapters", "ports", "core"]
+exhaustive = true

@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Canonical issues and feature requests
+    url: https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues
+    about: Development happens on Forgejo. This repository is a public mirror.
