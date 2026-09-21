@@ -1,5 +1,7 @@
 # Authority/check-name convention: scarcity-router docs/release-engineering.md.
-# Independently written A0 gate; no publication or private credentials.
+# Independently written A0 gate; no publication or configured private secrets.
+# Forgejo ignores GitHub's permissions key. Automatic-token scope depends on the
+# event; checkout cleanup is not token containment. See the delivery contract.
 name: ci
 
 "on":
@@ -7,9 +9,6 @@ name: ci
     branches: [develop]
   push:
     branches: [develop]
-
-permissions:
-  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}

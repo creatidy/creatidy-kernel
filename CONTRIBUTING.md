@@ -21,8 +21,10 @@ git diff --check
 ```
 
 `make package-check` runs `uv run --locked python tools/check_package.py`, building wheel/sdist and
-testing a clean wheel installation. `make audit` runs the dependency vulnerability check and requires
-public advisory/package-index access. The ordinary tests/example do not contact models or services.
+testing a clean wheel installation. The builder and its dependencies are in the development lock;
+project installation and package checks use that environment without a second isolated resolution.
+`make audit` runs `uv run --locked python tools/audit_dependencies.py` and requires public
+advisory/package-index access. The ordinary tests/example do not contact models or services.
 Format intentional edits with `uv run --locked ruff format .`; do not weaken checks to make them pass.
 
 Use core-owned immutable values and protocols. Adapters depend inward; core must not depend on

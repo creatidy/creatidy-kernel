@@ -14,7 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory:
     work = Path(directory)
     dist = work / "dist"
-    subprocess.run(["uv", "build", "--no-sources", "--out-dir", str(dist)], cwd=ROOT, check=True)
+    build = ["uv", "build", "--no-sources", "--no-build-isolation", "--python", sys.executable]
+    subprocess.run([*build, "--out-dir", str(dist)], cwd=ROOT, check=True)
     wheels = list(dist.glob("*.whl"))
     sdists = list(dist.glob("*.tar.gz"))
     if len(wheels) != 1 or len(sdists) != 1:
@@ -34,9 +35,7 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
             raise SystemExit("Unexpected non-package content in wheel")
         package_bytes = {name: archive.read(name) for name in names if name.startswith("creatidy_kernel/")}
     rebuilt = work / "rebuilt"
-    subprocess.run(
-        ["uv", "build", str(sdists[0]), "--wheel", "--no-sources", "--out-dir", str(rebuilt)], cwd=work, check=True
-    )
+    subprocess.run([*build, str(sdists[0]), "--wheel", "--out-dir", str(rebuilt)], cwd=work, check=True)
     rebuilt_wheel = next(rebuilt.glob("*.whl"))
     with zipfile.ZipFile(rebuilt_wheel) as archive:
         rebuilt_bytes = {name: archive.read(name) for name in archive.namelist() if name.startswith("creatidy_kernel/")}

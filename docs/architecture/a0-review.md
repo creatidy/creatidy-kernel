@@ -1,7 +1,15 @@
 # A0 Adversarial Challenge
 
-This checklist evaluates the target, not an implemented engine. Independent review results and
-executed validation are recorded in the completion report. A0's code is only the allocation boundary.
+This checklist evaluates the target, not an implemented engine. A0's code is only the allocation
+boundary. An independent fresh read-only review of snapshot `b85d7c2` found no P0/P1 core or
+architecture blocker, but identified two P2 tooling issues: the builder dependency closure was outside
+the audited lock, and a GitHub permissions field was incorrectly treated as Forgejo enforcement.
+Both were addressed before finalization: locked builder/bootstrap/package execution and corrected
+event-specific CI assurances. Scarcity Router was also removed as a prerequisite for the first useful
+slice. The read-only follow-up closed both findings and found no new blocker within that correction
+scope; it reran the repository tests, offline package check and locked dependency export. The final
+completion report records the published revision and CI outcome. Deployed runner/token containment
+and branch protection are not certified by a passing source test or CI run.
 
 | Challenge | Answer and scope consequence |
 | --- | --- |

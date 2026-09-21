@@ -17,23 +17,41 @@ stable check name and pinned-action discipline, not its full distribution pipeli
 
 `.forgejo/workflows/ci.yml` is `ci`, job/status context `check`, on PRs targeting `develop` and pushes
 to `develop`. It uses pinned checkout/setup-uv actions, pinned uv, locked Python tooling and
-`persist-credentials: false`. It calls `make check`, `make package-check` and `make audit`; it has no
-provider credentials, publication, deployment, or duplicate test list. No GitHub development CI or
+`persist-credentials: false`. It calls `make check`, `make package-check` and `make audit`; it references
+no configured provider/private secrets and performs no publication or deployment. No duplicate test
+list, GitHub development CI or
 release workflow is included in A0.
+
+Forgejo [ignores GitHub's `permissions` key](https://forgejo.org/docs/v16.0/user/actions/github-actions/#known-list-of-differences).
+It is intentionally omitted rather than tested as an enforced read-only guarantee. Automatic job-token
+scope is event/version dependent: documented fork-PR restrictions do not imply read-only push or
+same-repository jobs. Push validation runs maintainer-controlled source. Checkout cleanup prevents
+persisted Git credentials but does not prove token denial to subprocesses. The source tests check
+triggers, pins and absence of configured secret references, not deployed credential containment.
 
 The local gate checks formatting, lint/security rules, strict basedpyright, inward imports, synthetic
 unit/boundary tests, license/metadata and documentation-link hygiene, plus detect-secrets without
 remote credential verification. The scanner selects Git-visible tracked/untracked source files and
 does not walk ignored local state. Package validation builds wheel/sdist, compares rebuilt package
 contents, validates license/runtime-dependency metadata and smoke-installs outside the source tree.
-Dependency auditing contacts public advisory infrastructure; no runtime telemetry is introduced.
+Hatchling and its dependency closure are in `uv.lock` and the audit export. uv's per-project no-build-
+isolation setting installs that locked builder before building the editable project; both package
+builds also explicitly use the same interpreter/environment without isolated resolution. Dependency
+auditing contacts public advisory infrastructure; no runtime telemetry is introduced.
 
 ## External Activation
 
 Repository files are not proof of external settings or a live green run. At initial audit both public
 repositories already existed and were empty. The configured Forgejo MCP identity could read Kernel
 but could not administer it; do not claim metadata/protections were changed from a failed API call.
-The completion report records actual publication and activation outcomes.
+The completion report records the final source revision. The initial snapshot
+`b85d7c2d829a40f3747a3ed28235a657be9c267d` was published via normal Git transport to canonical
+`develop` and `a0/foundation`; Forgejo selected `develop` as default. Its
+[CI run](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/actions/runs/1) passed. Identical GitHub
+heads arrived automatically without a direct GitHub source push, demonstrating mirror propagation,
+not an administrative inspection of the mirroring mechanism or credential scope. GitHub defaults to
+`develop`, identifies Forgejo in its description/homepage, has normal issues/wiki/projects disabled,
+and has private vulnerability reporting enabled. No `main` or release tags were created.
 
 Required operator configuration, without storing credentials in Git:
 
@@ -41,7 +59,10 @@ Required operator configuration, without storing credentials in Git:
    required `check`, no force push and no history rewriting. `main` remains human-controlled.
 2. A Forgejo `ubuntu-latest` runner must be ephemeral/unprivileged per job, with no host/Docker socket,
    no private-network access and no provider/deployment/publishing secrets. Public contribution code
-   is hostile; a read-only workflow token alone does not make a privileged runner safe.
+   is hostile. Verify event-specific automatic-token scope and isolation on the deployed Forgejo/
+   runner, including filesystem/env/context exposure, before accepting untrusted contributions. A
+   passing run or `persist-credentials: false` does not establish those controls. Administrative access
+   was unavailable in A0, so branch protection and runner/token containment remain unverified.
 3. Use Forgejo's existing one-way push-mirror facility to the approved GitHub repository. Configure
    the destination-scoped credential outside this repository; mirror canonical branches and authorized
    tags, not issues or a second development workflow. Do not build a new mirroring service. Current

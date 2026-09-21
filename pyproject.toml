@@ -26,6 +26,8 @@ Mirror = "https://github.com/creatidy/creatidy-kernel"
 dev = [
     "basedpyright>=1.31,<2",
     "detect-secrets>=1.5,<2",
+    "editables>=0.3,<1", # Hatchling's PEP 660 editable-build dependency.
+    "hatchling==1.27.0",
     "import-linter>=2.3,<3",
     "pip-audit>=2.9,<3",
     "pytest>=8.4,<10",
@@ -33,6 +35,10 @@ dev = [
     "ruff>=0.12,<1",
     "types-pyyaml>=6,<7",
 ]
+
+[tool.uv]
+# Install the locked builder first, then build this project in that environment.
+no-build-isolation-package = ["creatidy-kernel"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/creatidy_kernel"]

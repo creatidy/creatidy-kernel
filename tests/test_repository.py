@@ -14,6 +14,8 @@ def test_license_and_runtime_dependency_contract() -> None:
     assert config["project"]["license"] == "Apache-2.0"
     assert config["project"]["license-files"] == ["LICENSE"]
     assert config["project"]["dependencies"] == []
+    assert set(config["build-system"]["requires"]) <= set(config["dependency-groups"]["dev"])
+    assert config["tool"]["uv"]["no-build-isolation-package"] == ["creatidy-kernel"]
     license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
     assert "Version 2.0, January 2004" in license_text
     assert "END OF TERMS AND CONDITIONS" in license_text
@@ -31,13 +33,14 @@ def test_local_document_links_resolve() -> None:
             assert (path.parent / target.split("#")[0]).exists(), f"{path.relative_to(ROOT)}: {target}"
 
 
-def test_ci_is_canonical_read_only_and_actions_are_pinned() -> None:
+def test_ci_is_canonical_with_pinned_actions_and_no_configured_secrets() -> None:
     workflow_text = (ROOT / ".forgejo" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     workflow = cast(dict[str, object], yaml.safe_load(workflow_text))
     events = cast(dict[str, object], workflow["on"])
     assert set(events) == {"push", "pull_request"}
     assert all(cast(dict[str, object], event)["branches"] == ["develop"] for event in events.values())
-    assert workflow["permissions"] == {"contents": "read"}
+    # Forgejo ignores GitHub's permissions key; YAML cannot prove token isolation.
+    assert "permissions" not in workflow
     jobs = cast(dict[str, object], workflow["jobs"])
     assert set(jobs) == {"check"}
     job = cast(dict[str, object], jobs["check"])
@@ -46,6 +49,6 @@ def test_ci_is_canonical_read_only_and_actions_are_pinned() -> None:
         if "uses" in step:
             assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", step["uses"])
     assert "persist-credentials: false" in workflow_text
-    assert "secrets." not in workflow_text
+    assert not re.search(r"\bsecrets\s*[.\[]", yaml.safe_dump(workflow))
     assert "make check" in workflow_text and "make package-check" in workflow_text
     assert not list((ROOT / ".github" / "workflows").glob("*"))

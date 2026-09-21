@@ -12,6 +12,10 @@ revision, impact, a minimal synthetic reproduction and suggested mitigation wher
 SLA or supported production release is claimed for A0.
 
 Dependency installation and CI fetch public tooling; ordinary tests make no model/provider calls.
-PR jobs must be isolated and unprivileged, with no deployment, model, publishing or owner credentials.
+PR jobs must be isolated and unprivileged, with no configured deployment, model, publishing or owner
+secrets. Forgejo's automatic repository token is separate: its scope depends on the event and deployed
+version, and a GitHub-style `permissions` declaration does not restrict it. Checkout credential cleanup
+is not token containment. Runner/token settings require administrative verification before untrusted
+contributions; A0's local tests do not certify that infrastructure boundary.
 A Git worktree, path instruction, or MCP root is not a hostile-code sandbox. Never give a worker
 control-plane storage, owner API authority or a container daemon socket.

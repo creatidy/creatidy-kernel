@@ -13,10 +13,9 @@ flowchart LR
     K3 --> K4[K4 Verification and bounded remediation]
     K4 --> K5[K5 Forgejo adapter]
     K4 --> K6[K6 Existing harness adapter]
-    K4 --> K7[K7 Scarcity Router adapter]
-    K5 --> K8[K8 CLI reference slice and recovery proof]
-    K6 --> K8
-    K7 --> K8
+    K5 --> K7[K7 CLI slice and recovery proof]
+    K6 --> K7
+    K7 -. optional reference extension .-> K8[K8 Scarcity Router adapter]
 ```
 
 | Node | Owner and bounded delivery | Acceptance / stop condition |
@@ -27,8 +26,8 @@ flowchart LR
 | K4 | Kernel: Candidate/Evidence/AcceptedResult, independent verification, findings/convergence and local outcome observations | Exact subjects, fresh reviewer context and identity, no form-only acceptance; synthetic two-WorkUnit flow covers A-F before live adapters. Finite time/resource budgets, pause versus HumanGate separation, unknown usage preserved. |
 | K5 | Kernel: minimal Forgejo adapter for repository/change/check observations and authorized branch/push/PR effects | Shared fake/Forgejo contract suite with synthetic local forge; explicit domain receipts, pagination/absence semantics, duplicate/uncertain operation handling. No automatic merge in this slice. |
 | K6 | Kernel: one existing coding harness adapter, initially Codex app-server | Version-pin and capability-negotiate start/observe/interrupt/retrieve/reconcile; verify observed identity and cold review. Missing recovery/attestation produces explicit unavailable/unknown. Native SDK/protocol only. |
-| K7 | Kernel: ScarcityRouterAllocator over public recommendation API | Producer-shaped redacted fixtures, schema/version errors, `selected=null`, actual configured runtime compatibility, preserved rationale/provenance; no shadow routing. No reservation claimed where unsupported. FixedAllocator remains sufficient for offline execution. |
-| K8 | Kernel: one CLI over the application layer, disposable repository reference scenario, restart/recovery and package proof | Program -> READY WorkUnit -> allocation -> isolated runtime -> candidate -> independent verification -> accepted result -> next WorkUnit. Export outcome/evidence manifest, record consumption and owner interruptions. Offline suite mandatory; live provider use explicitly opt-in with a finite owner budget. |
+| K7 | Kernel: one CLI over the application layer, disposable repository reference scenario, restart/recovery and package proof | Program -> READY WorkUnit -> FixedAllocator -> isolated runtime -> candidate -> independent verification -> accepted result -> next WorkUnit. Export outcome/evidence manifest, record consumption and owner interruptions. Offline suite mandatory; live provider use explicitly opt-in with a finite owner budget. |
+| K8 (optional) | Kernel: ScarcityRouterAllocator over public recommendation API, then repeat the K7 reference scenario | Producer-shaped redacted fixtures, schema/version errors, `selected=null`, actual configured runtime compatibility, preserved rationale/provenance; no shadow routing. No reservation claimed where unsupported. Independent allocator integration is not a prerequisite for the first useful Kernel. |
 
 Each node must freeze its threat model, finite execution budget, input/output contract and acceptance
 tests before implementation. No node can silently widen scope to finish. Parallelize only independent
@@ -55,11 +54,12 @@ suites are additional, not a replacement for deterministic fakes.
 
 ## First Useful Vertical Slice
 
-Complete K1-K8 for one locally operated finite Program with two dependent, owner-approved engineering
-WorkUnits in a disposable repository. Use local SQLite/artifacts, Forgejo, the public Scarcity Router
-recommendation interface and one existing harness. The first accepted patch becomes an explicit
+Complete K1-K7 for one locally operated finite Program with two dependent, owner-approved engineering
+WorkUnits in a disposable repository. Use local SQLite/artifacts, Forgejo, FixedAllocator and one
+existing harness. The recommended reference-stack extension is K8, repeating the same scenario with
+the public Scarcity Router recommendation interface. The first accepted patch becomes an explicit
 verified input to the next WorkUnit. Open a PR as the delivery artifact; **do not automatically merge
-or deploy**. No UI is needed. Repeat with FixedAllocator and a deterministic fake runtime to prove
+or deploy**. No UI is needed. Repeat with a deterministic fake runtime to prove
 the optional products do not own Program semantics.
 
 Measure attempts, consumed resources with units/source, first-pass acceptance, remediation and
@@ -75,4 +75,4 @@ active Programs, bulk-import history, run a product pilot or remove old commands
 
 Automatic conditional merge needs its own exact-base/head race proof. REST/MCP entrances, other
 harness/forge adapters, distributed execution, stronger isolation options, release publication and
-adaptive Program-level allocation are subsequent bounded decisions, not hidden K8 acceptance work.
+adaptive Program-level allocation are subsequent bounded decisions, not hidden K7 acceptance work.
