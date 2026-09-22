@@ -1,0 +1,13 @@
+.git/
+.venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+*.db
+*.sqlite
+*.sqlite3
+artifacts/
+.kilo/agent-manager.json
+.kilo/worktrees/
