@@ -6,7 +6,11 @@ __pycache__/
 .import_linter_cache/
 dist/
 *.egg-info/
-.kilo/
+.kilo/*
+!.kilo/rules/
+!.kilo/rules/*.md
+!.kilo/command/
+!.kilo/command/*.md
 .env
 .env.*
 
