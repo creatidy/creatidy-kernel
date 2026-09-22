@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
@@ -146,6 +146,27 @@ def test_expected_revisions_and_illegal_transitions_are_deterministic() -> None:
         active.apply(FinishAttempt(active.revision, OWNER, "unknown"))
 
 
+def test_dataclass_replace_cannot_inject_a_lifecycle_state() -> None:
+    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
+
+    with pytest.raises(InvalidDomainValue):
+        replace(active, status=ProgramStatus.DRAFT)
+
+
+def test_forged_command_subclass_cannot_authorize_one_action_and_execute_another() -> None:
+    authority = AuthorityEnvelope(
+        OWNER,
+        frozenset({DomainAction.ACTIVATE_PROGRAM, DomainAction.PREPARE_ATTEMPT}),
+    )
+    program = Program.create(graph_spec(authority=authority))
+
+    class ForgedActivate(ActivateProgram):
+        action = DomainAction.PREPARE_ATTEMPT
+
+    with pytest.raises(InvalidDomainValue):
+        program.apply(ForgedActivate(0, OWNER))
+
+
 def test_authority_and_admission_budgets_are_checked_before_attempts() -> None:
     restricted = AuthorityEnvelope(OWNER, frozenset({DomainAction.ACTIVATE_PROGRAM}))
     active = Program.create(graph_spec(authority=restricted)).apply(ActivateProgram(0, OWNER))
@@ -224,3 +245,78 @@ def test_amendment_cancels_attempts_pinned_to_the_old_spec() -> None:
     assert amended.state("first").status is WorkUnitStatus.READY
     replacement = amended.apply(PrepareAttempt(amended.revision, OWNER, attempt_spec(amended, "a2", "first", "seed")))
     assert replacement.state("first").active_attempt_id == "a2"
+
+
+def test_amendment_removing_last_pending_work_unit_completes_active_program() -> None:
+    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
+    prepared = active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
+    finished = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1")).apply(
+        FinishAttempt(prepared.revision + 1, OWNER, "a1")
+    )
+    satisfied = finished.apply(SatisfyWorkUnit(finished.revision, OWNER, satisfaction(finished, "first", "s1", "a1")))
+    first = satisfied.spec.work_unit("first")
+
+    amended = satisfied.apply(
+        AmendProgramSpec(
+            satisfied.revision,
+            OWNER,
+            SpecAmendment(expected_revision=1, work_units=(first,)),
+        )
+    )
+
+    assert amended.status is ProgramStatus.COMPLETED
+    assert amended.ready_work_unit_ids == ()
+
+
+def test_amendment_invalidates_downstream_satisfaction_after_predecessor_change() -> None:
+    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
+    first_prepared = active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
+    first_finished = first_prepared.apply(StartAttempt(first_prepared.revision, OWNER, "a1")).apply(
+        FinishAttempt(first_prepared.revision + 1, OWNER, "a1")
+    )
+    first_satisfied = first_finished.apply(
+        SatisfyWorkUnit(
+            first_finished.revision,
+            OWNER,
+            satisfaction(first_finished, "first", "s1", "a1"),
+        )
+    )
+    second_prepared = first_satisfied.apply(
+        PrepareAttempt(
+            first_satisfied.revision,
+            OWNER,
+            attempt_spec(first_satisfied, "a2", "second", "first-output"),
+        )
+    )
+    second_finished = second_prepared.apply(StartAttempt(second_prepared.revision, OWNER, "a2")).apply(
+        FinishAttempt(second_prepared.revision + 1, OWNER, "a2")
+    )
+    both_satisfied = second_finished.apply(
+        SatisfyWorkUnit(
+            second_finished.revision,
+            OWNER,
+            satisfaction(second_finished, "second", "s2", "a2"),
+        )
+    )
+    changed_first = WorkUnit(
+        "first",
+        required_inputs=frozenset({"seed"}),
+        outputs=frozenset({"first-output", "additional-output"}),
+    )
+
+    amended = both_satisfied.apply(
+        AmendProgramSpec(
+            both_satisfied.revision,
+            OWNER,
+            SpecAmendment(
+                expected_revision=1,
+                work_units=(changed_first, both_satisfied.spec.work_unit("second")),
+            ),
+        )
+    )
+
+    assert amended.status is ProgramStatus.ACTIVE
+    assert amended.state("first").status is WorkUnitStatus.READY
+    assert amended.state("second").status is WorkUnitStatus.PENDING
+    assert amended.ready_work_unit_ids == ("first",)
+    assert tuple(item.reference_id for item in amended.satisfactions) == ("s1", "s2")

@@ -11,9 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from dataclasses import field as dataclass_field
 from enum import StrEnum
-from typing import ClassVar, cast
+from typing import cast
 
 
 class DomainError(Exception):
@@ -532,7 +531,6 @@ class DomainCommand:
 
     expected_revision: int
     actor_id: str
-    action: ClassVar[DomainAction]
 
     def __post_init__(self) -> None:
         _revision(self.expected_revision, "expected_revision", allow_zero=True)
@@ -541,28 +539,27 @@ class DomainCommand:
 
 @dataclass(frozen=True, slots=True)
 class ActivateProgram(DomainCommand):
-    action: ClassVar[DomainAction] = DomainAction.ACTIVATE_PROGRAM
+    pass
 
 
 @dataclass(frozen=True, slots=True)
 class PauseProgram(DomainCommand):
-    action: ClassVar[DomainAction] = DomainAction.PAUSE_PROGRAM
+    pass
 
 
 @dataclass(frozen=True, slots=True)
 class ResumeProgram(DomainCommand):
-    action: ClassVar[DomainAction] = DomainAction.RESUME_PROGRAM
+    pass
 
 
 @dataclass(frozen=True, slots=True)
 class CancelProgram(DomainCommand):
-    action: ClassVar[DomainAction] = DomainAction.CANCEL_PROGRAM
+    pass
 
 
 @dataclass(frozen=True, slots=True)
 class CancelWorkUnit(DomainCommand):
     work_unit_id: str
-    action: ClassVar[DomainAction] = DomainAction.CANCEL_WORK_UNIT
 
     def __post_init__(self) -> None:
         DomainCommand.__post_init__(self)
@@ -572,7 +569,6 @@ class CancelWorkUnit(DomainCommand):
 @dataclass(frozen=True, slots=True)
 class PrepareAttempt(DomainCommand):
     attempt: AttemptSpec
-    action: ClassVar[DomainAction] = DomainAction.PREPARE_ATTEMPT
 
     def __post_init__(self) -> None:
         DomainCommand.__post_init__(self)
@@ -583,7 +579,6 @@ class PrepareAttempt(DomainCommand):
 @dataclass(frozen=True, slots=True)
 class StartAttempt(DomainCommand):
     attempt_id: str
-    action: ClassVar[DomainAction] = DomainAction.START_ATTEMPT
 
     def __post_init__(self) -> None:
         DomainCommand.__post_init__(self)
@@ -593,7 +588,6 @@ class StartAttempt(DomainCommand):
 @dataclass(frozen=True, slots=True)
 class FinishAttempt(DomainCommand):
     attempt_id: str
-    action: ClassVar[DomainAction] = DomainAction.FINISH_ATTEMPT
 
     def __post_init__(self) -> None:
         DomainCommand.__post_init__(self)
@@ -603,7 +597,6 @@ class FinishAttempt(DomainCommand):
 @dataclass(frozen=True, slots=True)
 class FailAttempt(DomainCommand):
     attempt_id: str
-    action: ClassVar[DomainAction] = DomainAction.FAIL_ATTEMPT
 
     def __post_init__(self) -> None:
         DomainCommand.__post_init__(self)
@@ -613,7 +606,6 @@ class FailAttempt(DomainCommand):
 @dataclass(frozen=True, slots=True)
 class CancelAttempt(DomainCommand):
     attempt_id: str
-    action: ClassVar[DomainAction] = DomainAction.CANCEL_ATTEMPT
 
     def __post_init__(self) -> None:
         DomainCommand.__post_init__(self)
@@ -623,7 +615,6 @@ class CancelAttempt(DomainCommand):
 @dataclass(frozen=True, slots=True)
 class SatisfyWorkUnit(DomainCommand):
     satisfaction: TrustedSatisfaction
-    action: ClassVar[DomainAction] = DomainAction.SATISFY_WORK_UNIT
 
     def __post_init__(self) -> None:
         DomainCommand.__post_init__(self)
@@ -634,7 +625,6 @@ class SatisfyWorkUnit(DomainCommand):
 @dataclass(frozen=True, slots=True)
 class AmendProgramSpec(DomainCommand):
     amendment: SpecAmendment
-    action: ClassVar[DomainAction] = DomainAction.AMEND_SPEC
 
     def __post_init__(self) -> None:
         DomainCommand.__post_init__(self)
@@ -658,9 +648,6 @@ type DomainCommandType = (
 )
 
 
-_PROGRAM_TRANSITION_TOKEN = object()
-
-
 def _mark_ready(spec: ProgramSpec, states: tuple[WorkUnitState, ...]) -> tuple[WorkUnitState, ...]:
     by_id = {state.work_unit_id: state for state in states}
     satisfied = {state.work_unit_id for state in states if state.status is WorkUnitStatus.SATISFIED}
@@ -677,6 +664,35 @@ def _mark_ready(spec: ProgramSpec, states: tuple[WorkUnitState, ...]) -> tuple[W
     return tuple(updated)
 
 
+def _descendants(spec: ProgramSpec, seeds: set[str]) -> set[str]:
+    dependents: dict[str, set[str]] = {unit.work_unit_id: set() for unit in spec.work_units}
+    for unit in spec.work_units:
+        for dependency in unit.dependencies:
+            dependents[dependency].add(unit.work_unit_id)
+    affected = set(seeds) & dependents.keys()
+    pending = sorted(affected)
+    while pending:
+        work_unit_id = pending.pop(0)
+        for dependent in sorted(dependents[work_unit_id]):
+            if dependent not in affected:
+                affected.add(dependent)
+                pending.append(dependent)
+    return affected
+
+
+def _amendment_affected_work_units(previous: ProgramSpec, amended: ProgramSpec) -> set[str]:
+    previous_units = {unit.work_unit_id: unit for unit in previous.work_units}
+    amended_units = {unit.work_unit_id: unit for unit in amended.work_units}
+    changed = {
+        work_unit_id
+        for work_unit_id in previous_units.keys() | amended_units.keys()
+        if previous_units.get(work_unit_id) != amended_units.get(work_unit_id)
+    }
+    changed_inputs = previous.initial_inputs ^ amended.initial_inputs
+    changed.update(unit.work_unit_id for unit in amended.work_units if unit.required_inputs & changed_inputs)
+    return _descendants(previous, changed) | _descendants(amended, changed)
+
+
 @dataclass(frozen=True, slots=True)
 class Program:
     """Immutable aggregate enforcing legal Program and WorkUnit transitions."""
@@ -688,22 +704,20 @@ class Program:
     attempts: tuple[Attempt, ...] = ()
     satisfactions: tuple[TrustedSatisfaction, ...] = ()
     spec_history: tuple[ProgramSpec, ...] = ()
-    _transition_token: object | None = dataclass_field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        self._validate(allow_transition=False)
+
+    def _validate(self, *, allow_transition: bool) -> None:
         if type(cast(object, self.spec)) is not ProgramSpec:
             raise InvalidDomainValue("spec must be a ProgramSpec")
         if type(cast(object, self.status)) is not ProgramStatus:
             raise InvalidDomainValue("status must be a ProgramStatus")
-        if self._transition_token is not None and self._transition_token is not _PROGRAM_TRANSITION_TOKEN:
-            raise InvalidDomainValue("invalid Program construction token")
-        if self._transition_token is None and any(
-            (self.work_unit_states, self.attempts, self.satisfactions, self.spec_history)
-        ):
+        if not allow_transition and any((self.work_unit_states, self.attempts, self.satisfactions, self.spec_history)):
             raise InvalidDomainValue("use Program.create or a domain command to construct Program state")
-        if self._transition_token is None and self.revision != 0:
+        if not allow_transition and self.revision != 0:
             raise InvalidDomainValue("a new Program must start at aggregate revision zero")
-        if self.status is not ProgramStatus.DRAFT and self._transition_token is not _PROGRAM_TRANSITION_TOKEN:
+        if not allow_transition and self.status is not ProgramStatus.DRAFT:
             raise InvalidDomainValue("non-draft Programs must be produced by a domain command")
         _revision(self.revision, "revision", allow_zero=True)
         if type(self.work_unit_states) is not tuple:
@@ -732,6 +746,12 @@ class Program:
         if self.status is ProgramStatus.ACTIVE:
             states = _mark_ready(self.spec, states)
         object.__setattr__(self, "work_unit_states", states)
+        if self.status is ProgramStatus.COMPLETED and any(
+            state.status is not WorkUnitStatus.SATISFIED for state in states
+        ):
+            raise InvalidDomainValue("a completed Program must have every WorkUnit satisfied")
+        if self.status is ProgramStatus.ACTIVE and all(state.status is WorkUnitStatus.SATISFIED for state in states):
+            raise InvalidDomainValue("an active Program cannot have every WorkUnit satisfied")
         attempt_ids = tuple(item.attempt_id for item in self.attempts)
         if len(set(attempt_ids)) != len(attempt_ids):
             raise DuplicateAttempt("attempt identities must be unique")
@@ -740,6 +760,29 @@ class Program:
                 raise InvalidDomainValue("attempt belongs to a different Program")
             if attempt.spec.spec_revision > self.spec.revision:
                 raise InvalidDomainValue("attempt cannot reference a future spec revision")
+
+    @classmethod
+    def _from_transition(
+        cls,
+        *,
+        spec: ProgramSpec,
+        status: ProgramStatus,
+        revision: int,
+        work_unit_states: tuple[WorkUnitState, ...],
+        attempts: tuple[Attempt, ...],
+        satisfactions: tuple[TrustedSatisfaction, ...],
+        spec_history: tuple[ProgramSpec, ...],
+    ) -> Program:
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "spec", spec)
+        object.__setattr__(instance, "status", status)
+        object.__setattr__(instance, "revision", revision)
+        object.__setattr__(instance, "work_unit_states", work_unit_states)
+        object.__setattr__(instance, "attempts", attempts)
+        object.__setattr__(instance, "satisfactions", satisfactions)
+        object.__setattr__(instance, "spec_history", spec_history)
+        instance._validate(allow_transition=True)
+        return instance
 
     @classmethod
     def create(cls, spec: ProgramSpec) -> Program:
@@ -780,27 +823,27 @@ class Program:
         raise MissingReference(f"unknown attempt {attempt_id!r}")
 
     def apply(self, command: DomainCommandType) -> Program:
-        if isinstance(command, ActivateProgram):
+        if type(command) is ActivateProgram:
             return self._activate(command)
-        if isinstance(command, PauseProgram):
+        if type(command) is PauseProgram:
             return self._pause(command)
-        if isinstance(command, ResumeProgram):
+        if type(command) is ResumeProgram:
             return self._resume(command)
-        if isinstance(command, CancelProgram):
+        if type(command) is CancelProgram:
             return self._cancel_program(command)
-        if isinstance(command, CancelWorkUnit):
+        if type(command) is CancelWorkUnit:
             return self._cancel_work_unit(command)
-        if isinstance(command, PrepareAttempt):
+        if type(command) is PrepareAttempt:
             return self._prepare_attempt(command)
-        if isinstance(command, StartAttempt):
+        if type(command) is StartAttempt:
             return self._start_attempt(command)
-        if isinstance(command, FinishAttempt):
+        if type(command) is FinishAttempt:
             return self._finish_attempt(command)
-        if isinstance(command, FailAttempt):
+        if type(command) is FailAttempt:
             return self._fail_attempt(command)
-        if isinstance(command, CancelAttempt):
+        if type(command) is CancelAttempt:
             return self._cancel_attempt(command)
-        if isinstance(command, SatisfyWorkUnit):
+        if type(command) is SatisfyWorkUnit:
             return self._satisfy_work_unit(command)
         if type(command) is AmendProgramSpec:
             return self._amend_spec(command)
@@ -862,7 +905,7 @@ class Program:
         satisfactions: tuple[TrustedSatisfaction, ...] | None = None,
         spec_history: tuple[ProgramSpec, ...] | None = None,
     ) -> Program:
-        return Program(
+        return Program._from_transition(
             spec=self.spec if spec is None else spec,
             status=self.status if status is None else status,
             revision=self.revision + 1,
@@ -870,30 +913,35 @@ class Program:
             attempts=self.attempts if attempts is None else attempts,
             satisfactions=self.satisfactions if satisfactions is None else satisfactions,
             spec_history=self.spec_history if spec_history is None else spec_history,
-            _transition_token=_PROGRAM_TRANSITION_TOKEN,
         )
 
     def _activate(self, command: ActivateProgram) -> Program:
         self._check_revision(command.expected_revision)
-        self._authorize(command.action, command.actor_id)
+        self._authorize(DomainAction.ACTIVATE_PROGRAM, command.actor_id)
         self._require_status(ProgramStatus.DRAFT)
         return self._next(status=ProgramStatus.ACTIVE, states=_mark_ready(self.spec, self.work_unit_states))
 
     def _pause(self, command: PauseProgram) -> Program:
         self._check_revision(command.expected_revision)
-        self._authorize(command.action, command.actor_id)
+        self._authorize(DomainAction.PAUSE_PROGRAM, command.actor_id)
         self._require_status(ProgramStatus.ACTIVE)
         return self._next(status=ProgramStatus.PAUSED)
 
     def _resume(self, command: ResumeProgram) -> Program:
         self._check_revision(command.expected_revision)
-        self._authorize(command.action, command.actor_id)
+        self._authorize(DomainAction.RESUME_PROGRAM, command.actor_id)
         self._require_status(ProgramStatus.PAUSED)
-        return self._next(status=ProgramStatus.ACTIVE, states=_mark_ready(self.spec, self.work_unit_states))
+        states = _mark_ready(self.spec, self.work_unit_states)
+        status = (
+            ProgramStatus.COMPLETED
+            if all(item.status is WorkUnitStatus.SATISFIED for item in states)
+            else ProgramStatus.ACTIVE
+        )
+        return self._next(status=status, states=states)
 
     def _cancel_program(self, command: CancelProgram) -> Program:
         self._check_revision(command.expected_revision)
-        self._authorize(command.action, command.actor_id)
+        self._authorize(DomainAction.CANCEL_PROGRAM, command.actor_id)
         self._require_status(ProgramStatus.DRAFT, ProgramStatus.ACTIVE, ProgramStatus.PAUSED)
         states = tuple(
             state
@@ -911,7 +959,7 @@ class Program:
 
     def _cancel_work_unit(self, command: CancelWorkUnit) -> Program:
         self._check_revision(command.expected_revision)
-        self._authorize(command.action, command.actor_id)
+        self._authorize(DomainAction.CANCEL_WORK_UNIT, command.actor_id)
         self._require_status(ProgramStatus.ACTIVE)
         current = self.state(command.work_unit_id)
         if current.status in (WorkUnitStatus.SATISFIED, WorkUnitStatus.CANCELLED):
@@ -922,7 +970,7 @@ class Program:
 
     def _prepare_attempt(self, command: PrepareAttempt) -> Program:
         self._check_revision(command.expected_revision)
-        self._authorize(command.action, command.actor_id)
+        self._authorize(DomainAction.PREPARE_ATTEMPT, command.actor_id)
         self._require_status(ProgramStatus.ACTIVE)
         attempt_spec = command.attempt
         if any(attempt.attempt_id == attempt_spec.attempt_id for attempt in self.attempts):
@@ -957,7 +1005,7 @@ class Program:
 
     def _start_attempt(self, command: StartAttempt) -> Program:
         self._check_revision(command.expected_revision)
-        self._authorize(command.action, command.actor_id)
+        self._authorize(DomainAction.START_ATTEMPT, command.actor_id)
         self._require_status(ProgramStatus.ACTIVE)
         attempt = self.attempt(command.attempt_id)
         if attempt.status is not AttemptStatus.PREPARED:
@@ -969,7 +1017,7 @@ class Program:
 
     def _finish_attempt(self, command: FinishAttempt) -> Program:
         self._check_revision(command.expected_revision)
-        self._authorize(command.action, command.actor_id)
+        self._authorize(DomainAction.FINISH_ATTEMPT, command.actor_id)
         self._require_status(ProgramStatus.ACTIVE)
         attempt = self.attempt(command.attempt_id)
         if attempt.status is not AttemptStatus.EXECUTING:
@@ -978,7 +1026,7 @@ class Program:
 
     def _fail_attempt(self, command: FailAttempt) -> Program:
         self._check_revision(command.expected_revision)
-        self._authorize(command.action, command.actor_id)
+        self._authorize(DomainAction.FAIL_ATTEMPT, command.actor_id)
         self._require_status(ProgramStatus.ACTIVE, ProgramStatus.PAUSED)
         attempt = self.attempt(command.attempt_id)
         if attempt.status not in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING):
@@ -995,7 +1043,7 @@ class Program:
 
     def _cancel_attempt(self, command: CancelAttempt) -> Program:
         self._check_revision(command.expected_revision)
-        self._authorize(command.action, command.actor_id)
+        self._authorize(DomainAction.CANCEL_ATTEMPT, command.actor_id)
         self._require_status(ProgramStatus.ACTIVE, ProgramStatus.PAUSED)
         attempt = self.attempt(command.attempt_id)
         if attempt.status not in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING):
@@ -1012,7 +1060,7 @@ class Program:
 
     def _satisfy_work_unit(self, command: SatisfyWorkUnit) -> Program:
         self._check_revision(command.expected_revision)
-        self._authorize(command.action, command.actor_id, trusted_satisfaction=True)
+        self._authorize(DomainAction.SATISFY_WORK_UNIT, command.actor_id, trusted_satisfaction=True)
         self._require_status(ProgramStatus.ACTIVE)
         reference = command.satisfaction
         if reference.issuer_id != command.actor_id:
@@ -1059,16 +1107,29 @@ class Program:
 
     def _amend_spec(self, command: AmendProgramSpec) -> Program:
         self._check_revision(command.expected_revision)
-        self._authorize(command.action, command.actor_id)
-        self._require_status(ProgramStatus.DRAFT, ProgramStatus.ACTIVE, ProgramStatus.PAUSED)
+        self._authorize(DomainAction.AMEND_SPEC, command.actor_id)
+        self._require_status(
+            ProgramStatus.DRAFT,
+            ProgramStatus.ACTIVE,
+            ProgramStatus.PAUSED,
+            ProgramStatus.COMPLETED,
+        )
         new_spec = self.spec.amend(command.amendment)
+        affected = _amendment_affected_work_units(self.spec, new_spec)
         old_states = {state.work_unit_id: state for state in self.work_unit_states}
+        old_units = {unit.work_unit_id: unit for unit in self.spec.work_units}
         new_states: list[WorkUnitState] = []
         for unit in new_spec.work_units:
             prior = old_states.get(unit.work_unit_id)
-            preserved = prior is not None and any(
-                item.work_unit_id == unit.work_unit_id and item.work_unit_digest == unit.digest
-                for item in self.satisfactions
+            preserved = (
+                prior is not None
+                and prior.status is WorkUnitStatus.SATISFIED
+                and unit.work_unit_id not in affected
+                and old_units.get(unit.work_unit_id) == unit
+                and any(
+                    item.work_unit_id == unit.work_unit_id and item.work_unit_digest == unit.digest
+                    for item in self.satisfactions
+                )
             )
             new_states.append(
                 WorkUnitState(
@@ -1077,8 +1138,14 @@ class Program:
                 )
             )
         states = tuple(new_states)
-        if self.status is ProgramStatus.ACTIVE:
+        status = self.status
+        if self.status in (ProgramStatus.ACTIVE, ProgramStatus.COMPLETED):
             states = _mark_ready(new_spec, states)
+            status = (
+                ProgramStatus.COMPLETED
+                if all(item.status is WorkUnitStatus.SATISFIED for item in states)
+                else ProgramStatus.ACTIVE
+            )
         attempts = tuple(
             Attempt(attempt.spec, AttemptStatus.CANCELLED)
             if attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
@@ -1086,6 +1153,7 @@ class Program:
             for attempt in self.attempts
         )
         return self._next(
+            status=status,
             spec=new_spec,
             states=states,
             attempts=attempts,
