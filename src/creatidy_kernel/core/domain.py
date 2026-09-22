@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from enum import StrEnum
 from typing import cast
 
@@ -136,14 +137,47 @@ def _digest(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+_VALUE_SEAL = object()
+_TRANSITION_TOKEN = object()
+
+
+def _claim_value(instance: object, expected_type: type[object], copy_seal: object | None) -> None:
+    if type(instance) is not expected_type:
+        raise InvalidDomainValue(f"{expected_type.__name__} values cannot be subclassed")
+    if copy_seal is not None:
+        raise InvalidDomainValue("immutable domain values cannot be copied with dataclasses.replace")
+    object.__setattr__(instance, "_copy_seal", _VALUE_SEAL)
+
+
+def _reject_copy(instance: object) -> None:
+    raise InvalidDomainValue(f"{type(instance).__name__} values cannot be copied")
+
+
+def _reject_deepcopy(instance: object, memo: dict[int, object]) -> None:
+    del memo
+    _reject_copy(instance)
+
+
+def _seal_type(domain_type: type[object]) -> None:
+    def reject_subclass(subclass: type[object], **kwargs: object) -> None:
+        del subclass, kwargs
+        raise TypeError(f"{domain_type.__name__} does not support subclassing")
+
+    type.__setattr__(domain_type, "__init_subclass__", classmethod(reject_subclass))
+    type.__setattr__(domain_type, "__copy__", _reject_copy)
+    type.__setattr__(domain_type, "__deepcopy__", _reject_deepcopy)
+
+
 @dataclass(frozen=True, slots=True)
 class BudgetPolicy:
     """Finite admission limits; no runtime consumption or provider accounting."""
 
     max_attempts: int = 3
     max_active_attempts: int = 1
+    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        _claim_value(self, BudgetPolicy, self._copy_seal)
         _revision(self.max_attempts, "max_attempts", allow_zero=True)
         _revision(self.max_active_attempts, "max_active_attempts", allow_zero=True)
 
@@ -156,8 +190,10 @@ class AuthorityEnvelope:
     allowed_actions: frozenset[DomainAction] = frozenset(DomainAction)
     max_attempts: int = 3
     trusted_satisfaction_issuers: frozenset[str] = frozenset()
+    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        _claim_value(self, AuthorityEnvelope, self._copy_seal)
         _nonempty(self.owner_id, "owner_id")
         if type(self.allowed_actions) is not frozenset:
             raise InvalidDomainValue("allowed_actions must be an immutable set")
@@ -191,8 +227,10 @@ class WorkUnit:
     dependencies: tuple[str, ...] = ()
     required_inputs: frozenset[str] = frozenset()
     outputs: frozenset[str] = frozenset()
+    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        _claim_value(self, WorkUnit, self._copy_seal)
         _nonempty(self.work_unit_id, "work_unit_id")
         dependencies = _immutable_tuple(self.dependencies, "dependencies")
         if any(type(item) is not str or not item.strip() for item in dependencies):
@@ -248,12 +286,14 @@ class ProgramSpec:
     authority: AuthorityEnvelope = AuthorityEnvelope("owner")
     revision: int = 1
     parent_digest: str | None = None
+    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        _claim_value(self, ProgramSpec, self._copy_seal)
         _nonempty(self.program_id, "program_id")
         _nonempty(self.objective, "objective")
         work_units = _immutable_tuple(self.work_units, "work_units")
-        if not work_units or any(not isinstance(unit, WorkUnit) for unit in work_units):
+        if not work_units or any(type(unit) is not WorkUnit for unit in work_units):
             raise InvalidDomainValue("work_units must be a nonempty tuple of WorkUnit values")
         units = cast(tuple[WorkUnit, ...], work_units)
         unit_ids = tuple(unit.work_unit_id for unit in units)
@@ -359,8 +399,10 @@ class InputBinding:
 
     name: str
     reference: str
+    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        _claim_value(self, InputBinding, self._copy_seal)
         _nonempty(self.name, "input name")
         _nonempty(self.reference, "input reference")
 
@@ -379,8 +421,10 @@ class AttemptSpec:
     agent_definition_reference: str | None = None
     workspace_reference: str | None = None
     context_reference: str | None = None
+    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        _claim_value(self, AttemptSpec, self._copy_seal)
         for value, field in (
             (self.attempt_id, "attempt_id"),
             (self.program_id, "program_id"),
@@ -390,7 +434,7 @@ class AttemptSpec:
             _nonempty(value, field)
         _revision(self.spec_revision, "spec_revision")
         values = _immutable_tuple(self.effective_inputs, "effective_inputs")
-        if any(not isinstance(item, InputBinding) for item in values):
+        if any(type(item) is not InputBinding for item in values):
             raise InvalidDomainValue("effective_inputs must contain InputBinding values")
         inputs = cast(tuple[InputBinding, ...], values)
         names = tuple(item.name for item in inputs)
@@ -435,8 +479,10 @@ class Attempt:
 
     spec: AttemptSpec
     status: AttemptStatus = AttemptStatus.PREPARED
+    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        _claim_value(self, Attempt, self._copy_seal)
         if type(cast(object, self.spec)) is not AttemptSpec:
             raise InvalidDomainValue("spec must be an AttemptSpec")
         if type(cast(object, self.status)) is not AttemptStatus:
@@ -459,8 +505,10 @@ class TrustedSatisfaction:
     work_unit_digest: str
     issuer_id: str
     source_attempt_id: str | None = None
+    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        _claim_value(self, TrustedSatisfaction, self._copy_seal)
         for value, field in (
             (self.reference_id, "reference_id"),
             (self.program_id, "program_id"),
@@ -481,8 +529,10 @@ class WorkUnitState:
     work_unit_id: str
     status: WorkUnitStatus = WorkUnitStatus.PENDING
     active_attempt_id: str | None = None
+    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        _claim_value(self, WorkUnitState, self._copy_seal)
         _nonempty(self.work_unit_id, "work_unit_id")
         if type(cast(object, self.status)) is not WorkUnitStatus:
             raise InvalidDomainValue("status must be a WorkUnitStatus")
@@ -502,8 +552,10 @@ class SpecAmendment:
     budget: BudgetPolicy | None = None
     authority: AuthorityEnvelope | None = None
     reason: str = "owner amendment"
+    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        _claim_value(self, SpecAmendment, self._copy_seal)
         _revision(self.expected_revision, "expected_revision")
         _nonempty(self.reason, "reason")
         if all(
@@ -515,7 +567,7 @@ class SpecAmendment:
             _nonempty(self.objective, "objective")
         if self.work_units is not None:
             values = _immutable_tuple(self.work_units, "work_units")
-            if not values or any(not isinstance(item, WorkUnit) for item in values):
+            if not values or any(type(item) is not WorkUnit for item in values):
                 raise InvalidDomainValue("work_units must be a nonempty tuple of WorkUnit values")
         if self.initial_inputs is not None:
             _immutable_strings(self.initial_inputs, "initial_inputs")
@@ -693,6 +745,16 @@ def _amendment_affected_work_units(previous: ProgramSpec, amended: ProgramSpec) 
     return _descendants(previous, changed) | _descendants(amended, changed)
 
 
+def _require_control_path(status: ProgramStatus, authority: AuthorityEnvelope) -> None:
+    if status is ProgramStatus.ACTIVE and DomainAction.CANCEL_PROGRAM not in authority.allowed_actions:
+        raise AuthorityViolation("an active Program must retain a cancel control path")
+    if status is ProgramStatus.PAUSED and not {
+        DomainAction.CANCEL_PROGRAM,
+        DomainAction.RESUME_PROGRAM,
+    }.intersection(authority.allowed_actions):
+        raise AuthorityViolation("a paused Program must retain resume or cancel control")
+
+
 @dataclass(frozen=True, slots=True)
 class Program:
     """Immutable aggregate enforcing legal Program and WorkUnit transitions."""
@@ -704,11 +766,17 @@ class Program:
     attempts: tuple[Attempt, ...] = ()
     satisfactions: tuple[TrustedSatisfaction, ...] = ()
     spec_history: tuple[ProgramSpec, ...] = ()
+    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        _claim_value(self, Program, self._copy_seal)
         self._validate(allow_transition=False)
 
     def _validate(self, *, allow_transition: bool) -> None:
+        if type(self) is not Program:
+            raise InvalidDomainValue("Program values cannot be subclassed")
+        if self._copy_seal is not _VALUE_SEAL:
+            raise InvalidDomainValue("Program values must be constructed by the domain")
         if type(cast(object, self.spec)) is not ProgramSpec:
             raise InvalidDomainValue("spec must be a ProgramSpec")
         if type(cast(object, self.status)) is not ProgramStatus:
@@ -760,29 +828,6 @@ class Program:
                 raise InvalidDomainValue("attempt belongs to a different Program")
             if attempt.spec.spec_revision > self.spec.revision:
                 raise InvalidDomainValue("attempt cannot reference a future spec revision")
-
-    @classmethod
-    def _from_transition(
-        cls,
-        *,
-        spec: ProgramSpec,
-        status: ProgramStatus,
-        revision: int,
-        work_unit_states: tuple[WorkUnitState, ...],
-        attempts: tuple[Attempt, ...],
-        satisfactions: tuple[TrustedSatisfaction, ...],
-        spec_history: tuple[ProgramSpec, ...],
-    ) -> Program:
-        instance = object.__new__(cls)
-        object.__setattr__(instance, "spec", spec)
-        object.__setattr__(instance, "status", status)
-        object.__setattr__(instance, "revision", revision)
-        object.__setattr__(instance, "work_unit_states", work_unit_states)
-        object.__setattr__(instance, "attempts", attempts)
-        object.__setattr__(instance, "satisfactions", satisfactions)
-        object.__setattr__(instance, "spec_history", spec_history)
-        instance._validate(allow_transition=True)
-        return instance
 
     @classmethod
     def create(cls, spec: ProgramSpec) -> Program:
@@ -898,6 +943,7 @@ class Program:
     def _next(
         self,
         *,
+        _token: object,
         status: ProgramStatus | None = None,
         spec: ProgramSpec | None = None,
         states: tuple[WorkUnitState, ...] | None = None,
@@ -905,27 +951,46 @@ class Program:
         satisfactions: tuple[TrustedSatisfaction, ...] | None = None,
         spec_history: tuple[ProgramSpec, ...] | None = None,
     ) -> Program:
-        return Program._from_transition(
-            spec=self.spec if spec is None else spec,
-            status=self.status if status is None else status,
-            revision=self.revision + 1,
-            work_unit_states=self.work_unit_states if states is None else states,
-            attempts=self.attempts if attempts is None else attempts,
-            satisfactions=self.satisfactions if satisfactions is None else satisfactions,
-            spec_history=self.spec_history if spec_history is None else spec_history,
+        if _token is not _TRANSITION_TOKEN:
+            raise InvalidDomainValue("transitions require an explicit domain command")
+        if type(self) is not Program:
+            raise InvalidDomainValue("Program values cannot be subclassed")
+        instance = object.__new__(Program)
+        object.__setattr__(instance, "spec", self.spec if spec is None else spec)
+        object.__setattr__(instance, "status", self.status if status is None else status)
+        object.__setattr__(instance, "revision", self.revision + 1)
+        object.__setattr__(
+            instance,
+            "work_unit_states",
+            self.work_unit_states if states is None else states,
         )
+        object.__setattr__(instance, "attempts", self.attempts if attempts is None else attempts)
+        object.__setattr__(instance, "satisfactions", self.satisfactions if satisfactions is None else satisfactions)
+        object.__setattr__(
+            instance,
+            "spec_history",
+            self.spec_history if spec_history is None else spec_history,
+        )
+        object.__setattr__(instance, "_copy_seal", _VALUE_SEAL)
+        Program._validate(instance, allow_transition=True)
+        return instance
 
     def _activate(self, command: ActivateProgram) -> Program:
         self._check_revision(command.expected_revision)
         self._authorize(DomainAction.ACTIVATE_PROGRAM, command.actor_id)
         self._require_status(ProgramStatus.DRAFT)
-        return self._next(status=ProgramStatus.ACTIVE, states=_mark_ready(self.spec, self.work_unit_states))
+        _require_control_path(ProgramStatus.ACTIVE, self.spec.authority)
+        return self._next(
+            _token=_TRANSITION_TOKEN,
+            status=ProgramStatus.ACTIVE,
+            states=_mark_ready(self.spec, self.work_unit_states),
+        )
 
     def _pause(self, command: PauseProgram) -> Program:
         self._check_revision(command.expected_revision)
         self._authorize(DomainAction.PAUSE_PROGRAM, command.actor_id)
         self._require_status(ProgramStatus.ACTIVE)
-        return self._next(status=ProgramStatus.PAUSED)
+        return self._next(_token=_TRANSITION_TOKEN, status=ProgramStatus.PAUSED)
 
     def _resume(self, command: ResumeProgram) -> Program:
         self._check_revision(command.expected_revision)
@@ -937,7 +1002,7 @@ class Program:
             if all(item.status is WorkUnitStatus.SATISFIED for item in states)
             else ProgramStatus.ACTIVE
         )
-        return self._next(status=status, states=states)
+        return self._next(_token=_TRANSITION_TOKEN, status=status, states=states)
 
     def _cancel_program(self, command: CancelProgram) -> Program:
         self._check_revision(command.expected_revision)
@@ -955,7 +1020,12 @@ class Program:
             else attempt
             for attempt in self.attempts
         )
-        return self._next(status=ProgramStatus.CANCELLED, states=states, attempts=attempts)
+        return self._next(
+            _token=_TRANSITION_TOKEN,
+            status=ProgramStatus.CANCELLED,
+            states=states,
+            attempts=attempts,
+        )
 
     def _cancel_work_unit(self, command: CancelWorkUnit) -> Program:
         self._check_revision(command.expected_revision)
@@ -966,7 +1036,31 @@ class Program:
             raise IllegalTransition(f"WorkUnit {command.work_unit_id!r} is already terminal")
         if current.active_attempt_id is not None:
             raise IllegalTransition("cancel the active attempt before cancelling its WorkUnit")
-        return self._next(states=self._replace_state(WorkUnitState(command.work_unit_id, WorkUnitStatus.CANCELLED)))
+        descendants = _descendants(self.spec, {command.work_unit_id})
+        if any(self.state(work_unit_id).status is WorkUnitStatus.SATISFIED for work_unit_id in descendants):
+            raise IllegalTransition("cannot cancel a WorkUnit with a satisfied dependency descendant")
+        states_by_id = {state.work_unit_id: state for state in self.work_unit_states}
+        for work_unit_id in descendants:
+            states_by_id[work_unit_id] = WorkUnitState(work_unit_id, WorkUnitStatus.CANCELLED)
+        states = tuple(states_by_id[unit.work_unit_id] for unit in self.spec.work_units)
+        attempts = tuple(
+            Attempt(attempt.spec, AttemptStatus.CANCELLED)
+            if attempt.spec.work_unit_id in descendants
+            and attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
+            else attempt
+            for attempt in self.attempts
+        )
+        status = (
+            ProgramStatus.CANCELLED
+            if all(state.status in (WorkUnitStatus.SATISFIED, WorkUnitStatus.CANCELLED) for state in states)
+            else ProgramStatus.ACTIVE
+        )
+        return self._next(
+            _token=_TRANSITION_TOKEN,
+            status=status,
+            states=states,
+            attempts=attempts,
+        )
 
     def _prepare_attempt(self, command: PrepareAttempt) -> Program:
         self._check_revision(command.expected_revision)
@@ -1001,7 +1095,7 @@ class Program:
             raise BudgetExceeded("active attempt admission limit exceeded")
         attempt = Attempt(attempt_spec)
         states = self._replace_state(WorkUnitState(unit.work_unit_id, WorkUnitStatus.ACTIVE, attempt.attempt_id))
-        return self._next(states=states, attempts=(*self.attempts, attempt))
+        return self._next(_token=_TRANSITION_TOKEN, states=states, attempts=(*self.attempts, attempt))
 
     def _start_attempt(self, command: StartAttempt) -> Program:
         self._check_revision(command.expected_revision)
@@ -1013,7 +1107,10 @@ class Program:
         state = self.state(attempt.spec.work_unit_id)
         if state.active_attempt_id != attempt.attempt_id:
             raise IllegalTransition("attempt is not the active attempt for its WorkUnit")
-        return self._next(attempts=self._replace_attempt(Attempt(attempt.spec, AttemptStatus.EXECUTING)))
+        return self._next(
+            _token=_TRANSITION_TOKEN,
+            attempts=self._replace_attempt(Attempt(attempt.spec, AttemptStatus.EXECUTING)),
+        )
 
     def _finish_attempt(self, command: FinishAttempt) -> Program:
         self._check_revision(command.expected_revision)
@@ -1022,7 +1119,10 @@ class Program:
         attempt = self.attempt(command.attempt_id)
         if attempt.status is not AttemptStatus.EXECUTING:
             raise IllegalTransition(f"attempt {attempt.attempt_id!r} is {attempt.status.value!r}, not executing")
-        return self._next(attempts=self._replace_attempt(Attempt(attempt.spec, AttemptStatus.FINISHED)))
+        return self._next(
+            _token=_TRANSITION_TOKEN,
+            attempts=self._replace_attempt(Attempt(attempt.spec, AttemptStatus.FINISHED)),
+        )
 
     def _fail_attempt(self, command: FailAttempt) -> Program:
         self._check_revision(command.expected_revision)
@@ -1037,6 +1137,7 @@ class Program:
             states = self._replace_state(WorkUnitState(state.work_unit_id, WorkUnitStatus.READY))
             states = _mark_ready(self.spec, states)
         return self._next(
+            _token=_TRANSITION_TOKEN,
             states=states,
             attempts=self._replace_attempt(Attempt(attempt.spec, AttemptStatus.FAILED)),
         )
@@ -1054,6 +1155,7 @@ class Program:
             states = self._replace_state(WorkUnitState(state.work_unit_id, WorkUnitStatus.READY))
             states = _mark_ready(self.spec, states)
         return self._next(
+            _token=_TRANSITION_TOKEN,
             states=states,
             attempts=self._replace_attempt(Attempt(attempt.spec, AttemptStatus.CANCELLED)),
         )
@@ -1099,6 +1201,7 @@ class Program:
             else ProgramStatus.ACTIVE
         )
         return self._next(
+            _token=_TRANSITION_TOKEN,
             status=status,
             states=states,
             attempts=attempts,
@@ -1146,6 +1249,8 @@ class Program:
                 if all(item.status is WorkUnitStatus.SATISFIED for item in states)
                 else ProgramStatus.ACTIVE
             )
+        if status in (ProgramStatus.ACTIVE, ProgramStatus.PAUSED):
+            _require_control_path(status, new_spec.authority)
         attempts = tuple(
             Attempt(attempt.spec, AttemptStatus.CANCELLED)
             if attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
@@ -1153,12 +1258,30 @@ class Program:
             for attempt in self.attempts
         )
         return self._next(
+            _token=_TRANSITION_TOKEN,
             status=status,
             spec=new_spec,
             states=states,
             attempts=attempts,
             spec_history=(*self.spec_history, new_spec),
         )
+
+
+for _sealed_type in (
+    BudgetPolicy,
+    AuthorityEnvelope,
+    WorkUnit,
+    ProgramSpec,
+    InputBinding,
+    AttemptSpec,
+    Attempt,
+    TrustedSatisfaction,
+    WorkUnitState,
+    SpecAmendment,
+    Program,
+):
+    _seal_type(_sealed_type)
+del _sealed_type
 
 
 __all__ = [

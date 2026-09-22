@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import copy
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -12,6 +13,8 @@ from creatidy_kernel.core.domain import (
     AuthorityViolation,
     BudgetExceeded,
     BudgetPolicy,
+    CancelProgram,
+    CancelWorkUnit,
     CycleDetected,
     DomainAction,
     FailAttempt,
@@ -152,6 +155,133 @@ def test_dataclass_replace_cannot_inject_a_lifecycle_state() -> None:
     with pytest.raises(InvalidDomainValue):
         replace(active, status=ProgramStatus.DRAFT)
 
+    replacement_spec = ProgramSpec(
+        "replacement",
+        "forged replacement",
+        (WorkUnit("replacement"),),
+        authority=AuthorityEnvelope(OWNER, frozenset()),
+    )
+    with pytest.raises(InvalidDomainValue):
+        replace(
+            active,
+            spec=replacement_spec,
+            status=ProgramStatus.DRAFT,
+            revision=0,
+            work_unit_states=(),
+            attempts=(),
+            satisfactions=(),
+            spec_history=(),
+        )
+
+
+def test_internal_transition_builder_is_not_a_supported_construction_path() -> None:
+    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
+
+    with pytest.raises(AttributeError):
+        _ = Program._from_transition  # type: ignore[attr-defined]
+    with pytest.raises(TypeError):
+        active._next(status=ProgramStatus.CANCELLED)  # type: ignore[call-arg]
+
+
+def test_program_subclass_cannot_override_validation_or_authorization() -> None:
+    def forged_authorize(
+        self: Program,
+        action: DomainAction,
+        actor_id: str,
+        *,
+        trusted_satisfaction: bool = False,
+    ) -> None:
+        del self, action, actor_id, trusted_satisfaction
+
+    def forged_validate(self: Program, *, allow_transition: bool) -> None:
+        del self, allow_transition
+
+    with pytest.raises(TypeError):
+        type(
+            "ForgedProgram",
+            (Program,),
+            {"_authorize": forged_authorize, "_validate": forged_validate},
+        )
+
+
+def test_amendment_retains_a_control_path_for_an_active_program() -> None:
+    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
+    amendment = AmendProgramSpec(
+        active.revision,
+        OWNER,
+        SpecAmendment(
+            expected_revision=1,
+            authority=AuthorityEnvelope(OWNER, frozenset({DomainAction.CANCEL_PROGRAM})),
+        ),
+    )
+
+    amended = active.apply(amendment)
+
+    assert amended.status is ProgramStatus.ACTIVE
+    cancelled = amended.apply(CancelProgram(amended.revision, OWNER))
+    assert cancelled.status is ProgramStatus.CANCELLED
+
+
+def test_amendment_cannot_strand_an_active_program_without_control_actions() -> None:
+    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
+    amendment = AmendProgramSpec(
+        active.revision,
+        OWNER,
+        SpecAmendment(expected_revision=1, authority=AuthorityEnvelope(OWNER, frozenset())),
+    )
+
+    with pytest.raises(AuthorityViolation):
+        active.apply(amendment)
+
+
+def test_work_unit_cancellation_propagates_and_closes_an_unfinishable_graph() -> None:
+    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
+
+    cancelled = active.apply(CancelWorkUnit(active.revision, OWNER, "first"))
+
+    assert cancelled.state("first").status is WorkUnitStatus.CANCELLED
+    assert cancelled.state("second").status is WorkUnitStatus.CANCELLED
+    assert cancelled.status is ProgramStatus.CANCELLED
+
+
+def test_ordinary_copying_and_subclassing_cannot_change_immutable_intent() -> None:
+    spec = graph_spec()
+    attempt = attempt_spec(Program.create(spec).apply(ActivateProgram(0, OWNER)), "a1", "first", "seed")
+
+    with pytest.raises(InvalidDomainValue):
+        copy.copy(spec)
+    with pytest.raises(InvalidDomainValue):
+        copy.deepcopy(attempt)
+    with pytest.raises(InvalidDomainValue):
+        replace(spec, objective="changed")
+    with pytest.raises(InvalidDomainValue):
+        replace(attempt, effective_inputs=(InputBinding("seed", "changed"),))
+
+    def forged_payload(self: WorkUnit) -> dict[str, object]:
+        del self
+        return {"forged": True}
+
+    with pytest.raises(TypeError):
+        type("ForgedWorkUnit", (WorkUnit,), {"payload": forged_payload})
+
+    def forged_spec_payload(self: ProgramSpec) -> dict[str, object]:
+        del self
+        return {"forged": True}
+
+    with pytest.raises(TypeError):
+        type("ForgedProgramSpec", (ProgramSpec,), {"payload": forged_spec_payload})
+
+    def forged_input_reference(self: InputBinding) -> str:
+        del self
+        return "changed"
+
+    with pytest.raises(TypeError):
+        type(
+            "ForgedInputBinding",
+            (InputBinding,),
+            {"reference": property(forged_input_reference)},
+        )
+
 
 def test_forged_command_subclass_cannot_authorize_one_action_and_execute_another() -> None:
     authority = AuthorityEnvelope(
@@ -168,7 +298,7 @@ def test_forged_command_subclass_cannot_authorize_one_action_and_execute_another
 
 
 def test_authority_and_admission_budgets_are_checked_before_attempts() -> None:
-    restricted = AuthorityEnvelope(OWNER, frozenset({DomainAction.ACTIVATE_PROGRAM}))
+    restricted = AuthorityEnvelope(OWNER, frozenset({DomainAction.ACTIVATE_PROGRAM, DomainAction.CANCEL_PROGRAM}))
     active = Program.create(graph_spec(authority=restricted)).apply(ActivateProgram(0, OWNER))
     with pytest.raises(AuthorityViolation):
         active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
