@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
+from creatidy_kernel.core import domain as domain_module
 from creatidy_kernel.core.domain import (
     ActivateProgram,
     AmendProgramSpec,
@@ -24,10 +25,12 @@ from creatidy_kernel.core.domain import (
     InvalidDomainValue,
     MissingInput,
     MissingReference,
+    PauseProgram,
     PrepareAttempt,
     Program,
     ProgramSpec,
     ProgramStatus,
+    ResumeProgram,
     SatisfyWorkUnit,
     SpecAmendment,
     StaleRevision,
@@ -186,8 +189,10 @@ def test_expected_revisions_and_illegal_transitions_are_deterministic() -> None:
 def test_dataclass_replace_cannot_inject_a_lifecycle_state() -> None:
     active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
 
-    with pytest.raises(InvalidDomainValue):
+    with pytest.raises(ValueError):
         replace(active, status=ProgramStatus.DRAFT)
+    with pytest.raises(TypeError):
+        replace(active, _copy_seal=None)  # type: ignore[call-arg]
 
     replacement_spec = ProgramSpec(
         "replacement",
@@ -195,7 +200,7 @@ def test_dataclass_replace_cannot_inject_a_lifecycle_state() -> None:
         (WorkUnit("replacement"),),
         authority=AuthorityEnvelope(OWNER, frozenset()),
     )
-    with pytest.raises(InvalidDomainValue):
+    with pytest.raises(ValueError):
         replace(
             active,
             spec=replacement_spec,
@@ -268,6 +273,66 @@ def test_amendment_cannot_strand_an_active_program_without_control_actions() -> 
         active.apply(amendment)
 
 
+def test_paused_amendment_cannot_remove_control_needed_after_resume() -> None:
+    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
+    paused = active.apply(PauseProgram(active.revision, OWNER))
+    amendment = AmendProgramSpec(
+        paused.revision,
+        OWNER,
+        SpecAmendment(
+            expected_revision=1,
+            authority=AuthorityEnvelope(OWNER, frozenset({DomainAction.RESUME_PROGRAM})),
+        ),
+    )
+
+    with pytest.raises(AuthorityViolation):
+        paused.apply(amendment)
+
+
+def test_resume_transition_rejects_an_actionless_active_state() -> None:
+    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
+    paused = active.apply(PauseProgram(active.revision, OWNER))
+    actionless_spec = paused.spec.amend(
+        SpecAmendment(
+            expected_revision=1,
+            authority=AuthorityEnvelope(OWNER, frozenset({DomainAction.RESUME_PROGRAM})),
+        )
+    )
+
+    with pytest.raises(AuthorityViolation):
+        paused._next(  # type: ignore[call-arg]
+            _token=domain_module._TRANSITION_TOKEN,  # pyright: ignore[reportPrivateUsage]
+            spec=actionless_spec,
+            status=ProgramStatus.ACTIVE,
+            spec_history=(*paused.spec_history, actionless_spec),
+        )
+
+
+def test_paused_amendment_and_resume_retain_an_operable_control_path() -> None:
+    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
+    paused = active.apply(PauseProgram(active.revision, OWNER))
+    amendment = AmendProgramSpec(
+        paused.revision,
+        OWNER,
+        SpecAmendment(
+            expected_revision=1,
+            authority=AuthorityEnvelope(
+                OWNER,
+                frozenset({DomainAction.RESUME_PROGRAM, DomainAction.CANCEL_PROGRAM}),
+            ),
+        ),
+    )
+
+    amended = paused.apply(amendment)
+    resumed = amended.apply(ResumeProgram(amended.revision, OWNER))
+
+    assert resumed.status is ProgramStatus.ACTIVE
+    assert resumed.spec.authority.allowed_actions == frozenset(
+        {DomainAction.RESUME_PROGRAM, DomainAction.CANCEL_PROGRAM}
+    )
+    assert resumed.apply(CancelProgram(resumed.revision, OWNER)).status is ProgramStatus.CANCELLED
+
+
 def test_work_unit_cancellation_propagates_and_closes_an_unfinishable_graph() -> None:
     active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
 
@@ -286,9 +351,9 @@ def test_ordinary_copying_and_subclassing_cannot_change_immutable_intent() -> No
         copy.copy(spec)
     with pytest.raises(InvalidDomainValue):
         copy.deepcopy(attempt)
-    with pytest.raises(InvalidDomainValue):
+    with pytest.raises(ValueError):
         replace(spec, objective="changed")
-    with pytest.raises(InvalidDomainValue):
+    with pytest.raises(ValueError):
         replace(attempt, effective_inputs=(InputBinding("seed", "changed"),))
 
     def forged_payload(self: WorkUnit) -> dict[str, object]:
@@ -317,10 +382,54 @@ def test_ordinary_copying_and_subclassing_cannot_change_immutable_intent() -> No
         )
 
 
+def test_repeated_initialization_cannot_rewrite_semantic_values() -> None:
+    spec = graph_spec()
+    first = spec.work_unit("first")
+    binding = InputBinding("seed", "ref:seed")
+    program = Program.create(spec).apply(ActivateProgram(0, OWNER))
+    prepared = program.apply(PrepareAttempt(program.revision, OWNER, attempt_spec(program, "a1", "first", "seed")))
+    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
+    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
+    finished_attempt = finished.attempt("a1")
+    pinned_attempt = finished_attempt.spec
+    original_digest = spec.digest
+
+    with pytest.raises(InvalidDomainValue):
+        spec.__init__("changed", "changed", (WorkUnit("changed"),))
+    with pytest.raises(InvalidDomainValue):
+        first.__init__("changed")
+    with pytest.raises(InvalidDomainValue):
+        binding.__init__("seed", "changed")
+    with pytest.raises(InvalidDomainValue):
+        pinned_attempt.__init__(
+            "a2",
+            program.program_id,
+            "first",
+            program.spec.revision,
+            program.spec.digest,
+            (InputBinding("seed", "changed"),),
+        )
+    with pytest.raises(InvalidDomainValue):
+        finished_attempt.__init__(pinned_attempt, AttemptStatus.FAILED)
+    with pytest.raises(InvalidDomainValue):
+        finished.__init__(spec=spec, status=ProgramStatus.DRAFT)
+
+    assert spec.digest == original_digest
+    assert finished_attempt.attempt_id == "a1"
+    assert finished_attempt.status is AttemptStatus.FINISHED
+    assert pinned_attempt.input_names == frozenset({"seed"})
+
+
 def test_forged_command_subclass_cannot_authorize_one_action_and_execute_another() -> None:
     authority = AuthorityEnvelope(
         OWNER,
-        frozenset({DomainAction.ACTIVATE_PROGRAM, DomainAction.PREPARE_ATTEMPT}),
+        frozenset(
+            {
+                DomainAction.ACTIVATE_PROGRAM,
+                DomainAction.PREPARE_ATTEMPT,
+                DomainAction.CANCEL_PROGRAM,
+            }
+        ),
     )
     program = Program.create(graph_spec(authority=authority))
 

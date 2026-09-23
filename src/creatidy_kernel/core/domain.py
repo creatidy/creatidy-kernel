@@ -137,16 +137,19 @@ def _digest(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-_VALUE_SEAL = object()
 _TRANSITION_TOKEN = object()
 
 
-def _claim_value(instance: object, expected_type: type[object], copy_seal: object | None) -> None:
+def _begin_init(instance: object, expected_type: type[object], first_field: str) -> None:
     if type(instance) is not expected_type:
         raise InvalidDomainValue(f"{expected_type.__name__} values cannot be subclassed")
-    if copy_seal is not None:
-        raise InvalidDomainValue("immutable domain values cannot be copied with dataclasses.replace")
-    object.__setattr__(instance, "_copy_seal", _VALUE_SEAL)
+    if hasattr(instance, first_field):
+        raise InvalidDomainValue(f"{expected_type.__name__} values cannot be reinitialized")
+
+
+def _set_fields(instance: object, **values: object) -> None:
+    for name, value in values.items():
+        object.__setattr__(instance, name, value)
 
 
 def _reject_copy(instance: object) -> None:
@@ -168,32 +171,50 @@ def _seal_type(domain_type: type[object]) -> None:
     type.__setattr__(domain_type, "__deepcopy__", _reject_deepcopy)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class BudgetPolicy:
     """Finite admission limits; no runtime consumption or provider accounting."""
 
-    max_attempts: int = 3
-    max_active_attempts: int = 1
-    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
+    max_attempts: int = dataclass_field(default=3, init=False)
+    max_active_attempts: int = dataclass_field(default=1, init=False)
+
+    def __init__(self, max_attempts: int = 3, max_active_attempts: int = 1) -> None:
+        _begin_init(self, BudgetPolicy, "max_attempts")
+        _set_fields(self, max_attempts=max_attempts, max_active_attempts=max_active_attempts)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        _claim_value(self, BudgetPolicy, self._copy_seal)
         _revision(self.max_attempts, "max_attempts", allow_zero=True)
         _revision(self.max_active_attempts, "max_active_attempts", allow_zero=True)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class AuthorityEnvelope:
     """Owner-approved command scope and finite attempt ceiling."""
 
-    owner_id: str
-    allowed_actions: frozenset[DomainAction] = frozenset(DomainAction)
-    max_attempts: int = 3
-    trusted_satisfaction_issuers: frozenset[str] = frozenset()
-    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
+    owner_id: str = dataclass_field(init=False)
+    allowed_actions: frozenset[DomainAction] = dataclass_field(default=frozenset(DomainAction), init=False)
+    max_attempts: int = dataclass_field(default=3, init=False)
+    trusted_satisfaction_issuers: frozenset[str] = dataclass_field(default=frozenset(), init=False)
+
+    def __init__(
+        self,
+        owner_id: str,
+        allowed_actions: frozenset[DomainAction] = frozenset(DomainAction),
+        max_attempts: int = 3,
+        trusted_satisfaction_issuers: frozenset[str] = frozenset(),
+    ) -> None:
+        _begin_init(self, AuthorityEnvelope, "owner_id")
+        _set_fields(
+            self,
+            owner_id=owner_id,
+            allowed_actions=allowed_actions,
+            max_attempts=max_attempts,
+            trusted_satisfaction_issuers=trusted_satisfaction_issuers,
+        )
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        _claim_value(self, AuthorityEnvelope, self._copy_seal)
         _nonempty(self.owner_id, "owner_id")
         if type(self.allowed_actions) is not frozenset:
             raise InvalidDomainValue("allowed_actions must be an immutable set")
@@ -219,18 +240,37 @@ class AuthorityEnvelope:
         }
 
 
-@dataclass(frozen=True, slots=True)
+_DEFAULT_BUDGET = BudgetPolicy()
+_DEFAULT_AUTHORITY = AuthorityEnvelope("owner")
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class WorkUnit:
     """One bounded graph node with logical inputs and outputs."""
 
-    work_unit_id: str
-    dependencies: tuple[str, ...] = ()
-    required_inputs: frozenset[str] = frozenset()
-    outputs: frozenset[str] = frozenset()
-    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
+    work_unit_id: str = dataclass_field(init=False)
+    dependencies: tuple[str, ...] = dataclass_field(default=(), init=False)
+    required_inputs: frozenset[str] = dataclass_field(default=frozenset(), init=False)
+    outputs: frozenset[str] = dataclass_field(default=frozenset(), init=False)
+
+    def __init__(
+        self,
+        work_unit_id: str,
+        dependencies: tuple[str, ...] = (),
+        required_inputs: frozenset[str] = frozenset(),
+        outputs: frozenset[str] = frozenset(),
+    ) -> None:
+        _begin_init(self, WorkUnit, "work_unit_id")
+        _set_fields(
+            self,
+            work_unit_id=work_unit_id,
+            dependencies=dependencies,
+            required_inputs=required_inputs,
+            outputs=outputs,
+        )
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        _claim_value(self, WorkUnit, self._copy_seal)
         _nonempty(self.work_unit_id, "work_unit_id")
         dependencies = _immutable_tuple(self.dependencies, "dependencies")
         if any(type(item) is not str or not item.strip() for item in dependencies):
@@ -274,22 +314,45 @@ class WorkUnit:
         return _digest(self.payload())
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ProgramSpec:
     """Immutable owner intent and a validated finite WorkUnit graph."""
 
-    program_id: str
-    objective: str
-    work_units: tuple[WorkUnit, ...]
-    initial_inputs: frozenset[str] = frozenset()
-    budget: BudgetPolicy = BudgetPolicy()
-    authority: AuthorityEnvelope = AuthorityEnvelope("owner")
-    revision: int = 1
-    parent_digest: str | None = None
-    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
+    program_id: str = dataclass_field(init=False)
+    objective: str = dataclass_field(init=False)
+    work_units: tuple[WorkUnit, ...] = dataclass_field(init=False)
+    initial_inputs: frozenset[str] = dataclass_field(default=frozenset(), init=False)
+    budget: BudgetPolicy = dataclass_field(default=_DEFAULT_BUDGET, init=False)
+    authority: AuthorityEnvelope = dataclass_field(default=_DEFAULT_AUTHORITY, init=False)
+    revision: int = dataclass_field(default=1, init=False)
+    parent_digest: str | None = dataclass_field(default=None, init=False)
+
+    def __init__(
+        self,
+        program_id: str,
+        objective: str,
+        work_units: tuple[WorkUnit, ...],
+        initial_inputs: frozenset[str] = frozenset(),
+        budget: BudgetPolicy = _DEFAULT_BUDGET,
+        authority: AuthorityEnvelope = _DEFAULT_AUTHORITY,
+        revision: int = 1,
+        parent_digest: str | None = None,
+    ) -> None:
+        _begin_init(self, ProgramSpec, "program_id")
+        _set_fields(
+            self,
+            program_id=program_id,
+            objective=objective,
+            work_units=work_units,
+            initial_inputs=initial_inputs,
+            budget=budget,
+            authority=authority,
+            revision=revision,
+            parent_digest=parent_digest,
+        )
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        _claim_value(self, ProgramSpec, self._copy_seal)
         _nonempty(self.program_id, "program_id")
         _nonempty(self.objective, "objective")
         work_units = _immutable_tuple(self.work_units, "work_units")
@@ -393,38 +456,68 @@ def _topological_order(units: dict[str, WorkUnit]) -> tuple[str, ...]:
     return tuple(order)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class InputBinding:
     """An immutable logical input reference pinned into one AttemptSpec."""
 
-    name: str
-    reference: str
-    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
+    name: str = dataclass_field(init=False)
+    reference: str = dataclass_field(init=False)
+
+    def __init__(self, name: str, reference: str) -> None:
+        _begin_init(self, InputBinding, "name")
+        _set_fields(self, name=name, reference=reference)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        _claim_value(self, InputBinding, self._copy_seal)
         _nonempty(self.name, "input name")
         _nonempty(self.reference, "input reference")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class AttemptSpec:
     """Immutable effective inputs for one execution attempt."""
 
-    attempt_id: str
-    program_id: str
-    work_unit_id: str
-    spec_revision: int
-    spec_digest: str
-    effective_inputs: tuple[InputBinding, ...] = ()
-    allocation_reference: str | None = None
-    agent_definition_reference: str | None = None
-    workspace_reference: str | None = None
-    context_reference: str | None = None
-    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
+    attempt_id: str = dataclass_field(init=False)
+    program_id: str = dataclass_field(init=False)
+    work_unit_id: str = dataclass_field(init=False)
+    spec_revision: int = dataclass_field(init=False)
+    spec_digest: str = dataclass_field(init=False)
+    effective_inputs: tuple[InputBinding, ...] = dataclass_field(default=(), init=False)
+    allocation_reference: str | None = dataclass_field(default=None, init=False)
+    agent_definition_reference: str | None = dataclass_field(default=None, init=False)
+    workspace_reference: str | None = dataclass_field(default=None, init=False)
+    context_reference: str | None = dataclass_field(default=None, init=False)
+
+    def __init__(
+        self,
+        attempt_id: str,
+        program_id: str,
+        work_unit_id: str,
+        spec_revision: int,
+        spec_digest: str,
+        effective_inputs: tuple[InputBinding, ...] = (),
+        allocation_reference: str | None = None,
+        agent_definition_reference: str | None = None,
+        workspace_reference: str | None = None,
+        context_reference: str | None = None,
+    ) -> None:
+        _begin_init(self, AttemptSpec, "attempt_id")
+        _set_fields(
+            self,
+            attempt_id=attempt_id,
+            program_id=program_id,
+            work_unit_id=work_unit_id,
+            spec_revision=spec_revision,
+            spec_digest=spec_digest,
+            effective_inputs=effective_inputs,
+            allocation_reference=allocation_reference,
+            agent_definition_reference=agent_definition_reference,
+            workspace_reference=workspace_reference,
+            context_reference=context_reference,
+        )
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        _claim_value(self, AttemptSpec, self._copy_seal)
         for value, field in (
             (self.attempt_id, "attempt_id"),
             (self.program_id, "program_id"),
@@ -473,16 +566,19 @@ class AttemptSpec:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class Attempt:
     """Attempt record whose effective specification is never rewritten."""
 
-    spec: AttemptSpec
-    status: AttemptStatus = AttemptStatus.PREPARED
-    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
+    spec: AttemptSpec = dataclass_field(init=False)
+    status: AttemptStatus = dataclass_field(default=AttemptStatus.PREPARED, init=False)
+
+    def __init__(self, spec: AttemptSpec, status: AttemptStatus = AttemptStatus.PREPARED) -> None:
+        _begin_init(self, Attempt, "spec")
+        _set_fields(self, spec=spec, status=status)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        _claim_value(self, Attempt, self._copy_seal)
         if type(cast(object, self.spec)) is not AttemptSpec:
             raise InvalidDomainValue("spec must be an AttemptSpec")
         if type(cast(object, self.status)) is not AttemptStatus:
@@ -493,22 +589,45 @@ class Attempt:
         return self.spec.attempt_id
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class TrustedSatisfaction:
     """A typed, prevalidated reference used to advance one WorkUnit."""
 
-    reference_id: str
-    program_id: str
-    work_unit_id: str
-    spec_revision: int
-    spec_digest: str
-    work_unit_digest: str
-    issuer_id: str
-    source_attempt_id: str | None = None
-    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
+    reference_id: str = dataclass_field(init=False)
+    program_id: str = dataclass_field(init=False)
+    work_unit_id: str = dataclass_field(init=False)
+    spec_revision: int = dataclass_field(init=False)
+    spec_digest: str = dataclass_field(init=False)
+    work_unit_digest: str = dataclass_field(init=False)
+    issuer_id: str = dataclass_field(init=False)
+    source_attempt_id: str | None = dataclass_field(default=None, init=False)
+
+    def __init__(
+        self,
+        reference_id: str,
+        program_id: str,
+        work_unit_id: str,
+        spec_revision: int,
+        spec_digest: str,
+        work_unit_digest: str,
+        issuer_id: str,
+        source_attempt_id: str | None = None,
+    ) -> None:
+        _begin_init(self, TrustedSatisfaction, "reference_id")
+        _set_fields(
+            self,
+            reference_id=reference_id,
+            program_id=program_id,
+            work_unit_id=work_unit_id,
+            spec_revision=spec_revision,
+            spec_digest=spec_digest,
+            work_unit_digest=work_unit_digest,
+            issuer_id=issuer_id,
+            source_attempt_id=source_attempt_id,
+        )
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        _claim_value(self, TrustedSatisfaction, self._copy_seal)
         for value, field in (
             (self.reference_id, "reference_id"),
             (self.program_id, "program_id"),
@@ -522,17 +641,30 @@ class TrustedSatisfaction:
         _optional_nonempty(self.source_attempt_id, "source_attempt_id")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class WorkUnitState:
     """Current projection for a WorkUnit within one immutable Program value."""
 
-    work_unit_id: str
-    status: WorkUnitStatus = WorkUnitStatus.PENDING
-    active_attempt_id: str | None = None
-    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
+    work_unit_id: str = dataclass_field(init=False)
+    status: WorkUnitStatus = dataclass_field(default=WorkUnitStatus.PENDING, init=False)
+    active_attempt_id: str | None = dataclass_field(default=None, init=False)
+
+    def __init__(
+        self,
+        work_unit_id: str,
+        status: WorkUnitStatus = WorkUnitStatus.PENDING,
+        active_attempt_id: str | None = None,
+    ) -> None:
+        _begin_init(self, WorkUnitState, "work_unit_id")
+        _set_fields(
+            self,
+            work_unit_id=work_unit_id,
+            status=status,
+            active_attempt_id=active_attempt_id,
+        )
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        _claim_value(self, WorkUnitState, self._copy_seal)
         _nonempty(self.work_unit_id, "work_unit_id")
         if type(cast(object, self.status)) is not WorkUnitStatus:
             raise InvalidDomainValue("status must be a WorkUnitStatus")
@@ -541,21 +673,42 @@ class WorkUnitState:
             raise InvalidDomainValue("only an active WorkUnit may have an active attempt")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class SpecAmendment:
     """Owner-authored replacement fields for one new ProgramSpec revision."""
 
-    expected_revision: int
-    objective: str | None = None
-    work_units: tuple[WorkUnit, ...] | None = None
-    initial_inputs: frozenset[str] | None = None
-    budget: BudgetPolicy | None = None
-    authority: AuthorityEnvelope | None = None
-    reason: str = "owner amendment"
-    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
+    expected_revision: int = dataclass_field(init=False)
+    objective: str | None = dataclass_field(default=None, init=False)
+    work_units: tuple[WorkUnit, ...] | None = dataclass_field(default=None, init=False)
+    initial_inputs: frozenset[str] | None = dataclass_field(default=None, init=False)
+    budget: BudgetPolicy | None = dataclass_field(default=None, init=False)
+    authority: AuthorityEnvelope | None = dataclass_field(default=None, init=False)
+    reason: str = dataclass_field(default="owner amendment", init=False)
+
+    def __init__(
+        self,
+        expected_revision: int,
+        objective: str | None = None,
+        work_units: tuple[WorkUnit, ...] | None = None,
+        initial_inputs: frozenset[str] | None = None,
+        budget: BudgetPolicy | None = None,
+        authority: AuthorityEnvelope | None = None,
+        reason: str = "owner amendment",
+    ) -> None:
+        _begin_init(self, SpecAmendment, "expected_revision")
+        _set_fields(
+            self,
+            expected_revision=expected_revision,
+            objective=objective,
+            work_units=work_units,
+            initial_inputs=initial_inputs,
+            budget=budget,
+            authority=authority,
+            reason=reason,
+        )
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        _claim_value(self, SpecAmendment, self._copy_seal)
         _revision(self.expected_revision, "expected_revision")
         _nonempty(self.reason, "reason")
         if all(
@@ -746,37 +899,59 @@ def _amendment_affected_work_units(previous: ProgramSpec, amended: ProgramSpec) 
 
 
 def _require_control_path(status: ProgramStatus, authority: AuthorityEnvelope) -> None:
-    if status is ProgramStatus.ACTIVE and DomainAction.CANCEL_PROGRAM not in authority.allowed_actions:
-        raise AuthorityViolation("an active Program must retain a cancel control path")
-    if status is ProgramStatus.PAUSED and not {
+    if status is ProgramStatus.DRAFT and not {
         DomainAction.CANCEL_PROGRAM,
-        DomainAction.RESUME_PROGRAM,
+        DomainAction.AMEND_SPEC,
     }.intersection(authority.allowed_actions):
-        raise AuthorityViolation("a paused Program must retain resume or cancel control")
+        raise AuthorityViolation("a draft Program must retain activation, amendment, or cancel control")
+    if (
+        status in (ProgramStatus.ACTIVE, ProgramStatus.PAUSED)
+        and DomainAction.CANCEL_PROGRAM not in authority.allowed_actions
+    ):
+        raise AuthorityViolation(f"a {status.value} Program must retain a cancel control path")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class Program:
     """Immutable aggregate enforcing legal Program and WorkUnit transitions."""
 
-    spec: ProgramSpec
-    status: ProgramStatus = ProgramStatus.DRAFT
-    revision: int = 0
-    work_unit_states: tuple[WorkUnitState, ...] = ()
-    attempts: tuple[Attempt, ...] = ()
-    satisfactions: tuple[TrustedSatisfaction, ...] = ()
-    spec_history: tuple[ProgramSpec, ...] = ()
-    _copy_seal: object | None = dataclass_field(default=None, repr=False, compare=False)
+    spec: ProgramSpec = dataclass_field(init=False)
+    status: ProgramStatus = dataclass_field(default=ProgramStatus.DRAFT, init=False)
+    revision: int = dataclass_field(default=0, init=False)
+    work_unit_states: tuple[WorkUnitState, ...] = dataclass_field(default=(), init=False)
+    attempts: tuple[Attempt, ...] = dataclass_field(default=(), init=False)
+    satisfactions: tuple[TrustedSatisfaction, ...] = dataclass_field(default=(), init=False)
+    spec_history: tuple[ProgramSpec, ...] = dataclass_field(default=(), init=False)
+
+    def __init__(
+        self,
+        spec: ProgramSpec,
+        status: ProgramStatus = ProgramStatus.DRAFT,
+        revision: int = 0,
+        work_unit_states: tuple[WorkUnitState, ...] = (),
+        attempts: tuple[Attempt, ...] = (),
+        satisfactions: tuple[TrustedSatisfaction, ...] = (),
+        spec_history: tuple[ProgramSpec, ...] = (),
+    ) -> None:
+        _begin_init(self, Program, "spec")
+        _set_fields(
+            self,
+            spec=spec,
+            status=status,
+            revision=revision,
+            work_unit_states=work_unit_states,
+            attempts=attempts,
+            satisfactions=satisfactions,
+            spec_history=spec_history,
+        )
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        _claim_value(self, Program, self._copy_seal)
         self._validate(allow_transition=False)
 
     def _validate(self, *, allow_transition: bool) -> None:
         if type(self) is not Program:
             raise InvalidDomainValue("Program values cannot be subclassed")
-        if self._copy_seal is not _VALUE_SEAL:
-            raise InvalidDomainValue("Program values must be constructed by the domain")
         if type(cast(object, self.spec)) is not ProgramSpec:
             raise InvalidDomainValue("spec must be a ProgramSpec")
         if type(cast(object, self.status)) is not ProgramStatus:
@@ -787,6 +962,8 @@ class Program:
             raise InvalidDomainValue("a new Program must start at aggregate revision zero")
         if not allow_transition and self.status is not ProgramStatus.DRAFT:
             raise InvalidDomainValue("non-draft Programs must be produced by a domain command")
+        if not allow_transition:
+            _require_control_path(self.status, self.spec.authority)
         _revision(self.revision, "revision", allow_zero=True)
         if type(self.work_unit_states) is not tuple:
             raise InvalidDomainValue("work_unit_states must be an immutable tuple")
@@ -955,9 +1132,13 @@ class Program:
             raise InvalidDomainValue("transitions require an explicit domain command")
         if type(self) is not Program:
             raise InvalidDomainValue("Program values cannot be subclassed")
+        next_spec = self.spec if spec is None else spec
+        next_status = self.status if status is None else status
+        if next_status in (ProgramStatus.DRAFT, ProgramStatus.ACTIVE, ProgramStatus.PAUSED):
+            _require_control_path(next_status, next_spec.authority)
         instance = object.__new__(Program)
-        object.__setattr__(instance, "spec", self.spec if spec is None else spec)
-        object.__setattr__(instance, "status", self.status if status is None else status)
+        object.__setattr__(instance, "spec", next_spec)
+        object.__setattr__(instance, "status", next_status)
         object.__setattr__(instance, "revision", self.revision + 1)
         object.__setattr__(
             instance,
@@ -971,7 +1152,6 @@ class Program:
             "spec_history",
             self.spec_history if spec_history is None else spec_history,
         )
-        object.__setattr__(instance, "_copy_seal", _VALUE_SEAL)
         Program._validate(instance, allow_transition=True)
         return instance
 
