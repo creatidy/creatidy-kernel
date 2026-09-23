@@ -1119,8 +1119,16 @@ class Program:
         attempt = self.attempt(command.attempt_id)
         if attempt.status is not AttemptStatus.EXECUTING:
             raise IllegalTransition(f"attempt {attempt.attempt_id!r} is {attempt.status.value!r}, not executing")
+        state = self.state(attempt.spec.work_unit_id)
+        if state.active_attempt_id != attempt.attempt_id:
+            raise IllegalTransition("attempt is not the active attempt for its WorkUnit")
+        states = _mark_ready(
+            self.spec,
+            self._replace_state(WorkUnitState(state.work_unit_id, WorkUnitStatus.READY)),
+        )
         return self._next(
             _token=_TRANSITION_TOKEN,
+            states=states,
             attempts=self._replace_attempt(Attempt(attempt.spec, AttemptStatus.FINISHED)),
         )
 
@@ -1175,10 +1183,12 @@ class Program:
         if reference.work_unit_digest != unit.digest:
             raise StaleRevision("satisfaction must reference the current WorkUnit definition")
         state = self.state(unit.work_unit_id)
-        if state.status is not WorkUnitStatus.ACTIVE:
-            raise IllegalTransition(f"WorkUnit {unit.work_unit_id!r} is {state.status.value!r}, not active")
+        if state.status not in (WorkUnitStatus.ACTIVE, WorkUnitStatus.READY):
+            raise IllegalTransition(f"WorkUnit {unit.work_unit_id!r} is {state.status.value!r}, not satisfiable")
         if any(item.reference_id == reference.reference_id for item in self.satisfactions):
             raise IllegalTransition(f"satisfaction reference {reference.reference_id!r} was already applied")
+        if state.status is WorkUnitStatus.READY and reference.source_attempt_id is None:
+            raise IllegalTransition("a ready WorkUnit requires a finished satisfaction source")
         attempts = self.attempts
         if reference.source_attempt_id is not None:
             source = self.attempt(reference.source_attempt_id)
@@ -1188,7 +1198,12 @@ class Program:
                 raise StaleRevision("satisfaction source attempt is pinned to an older ProgramSpec")
             if source.status not in (AttemptStatus.EXECUTING, AttemptStatus.FINISHED):
                 raise IllegalTransition("satisfaction source attempt is not executable or finished")
-            attempts = self._replace_attempt(Attempt(source.spec, AttemptStatus.FINISHED))
+            if state.status is WorkUnitStatus.READY and source.status is not AttemptStatus.FINISHED:
+                raise IllegalTransition("a ready WorkUnit requires a finished satisfaction source")
+            if state.status is WorkUnitStatus.ACTIVE and state.active_attempt_id != source.attempt_id:
+                raise IllegalTransition("satisfaction source is not the active attempt for its WorkUnit")
+            if source.status is AttemptStatus.EXECUTING:
+                attempts = self._replace_attempt(Attempt(source.spec, AttemptStatus.FINISHED))
         elif state.active_attempt_id is not None:
             active_attempt = self.attempt(state.active_attempt_id)
             if active_attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING):

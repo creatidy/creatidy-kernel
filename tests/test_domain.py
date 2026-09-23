@@ -98,6 +98,9 @@ def test_two_node_graph_advances_only_through_legal_commands() -> None:
     prepared = program.apply(PrepareAttempt(program.revision, OWNER, attempt_spec(program, "a1", "first", "seed")))
     executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
     finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
+    assert finished.state("first").status is WorkUnitStatus.READY
+    assert finished.state("first").active_attempt_id is None
+    assert finished.attempt("a1").status is AttemptStatus.FINISHED
     advanced = finished.apply(SatisfyWorkUnit(finished.revision, OWNER, satisfaction(finished, "first", "s1", "a1")))
 
     assert advanced.state("first").status is WorkUnitStatus.SATISFIED
@@ -108,6 +111,37 @@ def test_two_node_graph_advances_only_through_legal_commands() -> None:
         PrepareAttempt(advanced.revision, OWNER, attempt_spec(advanced, "a2", "second", "first-output"))
     )
     assert second.state("second").status is WorkUnitStatus.ACTIVE
+
+
+def test_finished_attempt_releases_work_unit_for_retry_or_cancellation() -> None:
+    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
+    prepared = active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
+    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
+    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
+
+    retry = finished.apply(PrepareAttempt(finished.revision, OWNER, attempt_spec(finished, "a2", "first", "seed")))
+    assert retry.state("first").status is WorkUnitStatus.ACTIVE
+    assert retry.attempt("a1").status is AttemptStatus.FINISHED
+
+    cancelled = finished.apply(CancelWorkUnit(finished.revision, OWNER, "first"))
+    assert cancelled.state("first").status is WorkUnitStatus.CANCELLED
+    assert cancelled.state("second").status is WorkUnitStatus.CANCELLED
+    assert cancelled.status is ProgramStatus.CANCELLED
+
+
+def test_finished_attempt_consumes_finite_budget_without_corrupting_ready_state() -> None:
+    active = Program.create(graph_spec(budget=BudgetPolicy(max_attempts=1, max_active_attempts=1))).apply(
+        ActivateProgram(0, OWNER)
+    )
+    prepared = active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
+    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
+    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
+
+    with pytest.raises(BudgetExceeded):
+        finished.apply(PrepareAttempt(finished.revision, OWNER, attempt_spec(finished, "a2", "first", "seed")))
+
+    assert finished.state("first").status is WorkUnitStatus.READY
+    assert finished.attempt("a1").status is AttemptStatus.FINISHED
 
 
 def test_trusted_satisfaction_without_source_closes_active_attempt_bookkeeping() -> None:
