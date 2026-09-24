@@ -1149,8 +1149,7 @@ def _program_status(previous: ProgramStatus, states: tuple[WorkUnitState, ...]) 
         return previous
     if all(item.status is WorkUnitStatus.SATISFIED for item in states):
         return ProgramStatus.COMPLETED
-    if all(item.status in (WorkUnitStatus.SATISFIED, WorkUnitStatus.CANCELLED) for item in states):
-        return ProgramStatus.CANCELLED
+    # Abandoning an obligation does not abandon the Program; only CancelProgram does.
     return ProgramStatus.PAUSED if previous is ProgramStatus.PAUSED else ProgramStatus.ACTIVE
 
 
@@ -1383,12 +1382,19 @@ class Program:
         ):
             raise InvalidDomainValue("WorkUnit projection differs from immutable history")
         states = {item.work_unit_id: item for item in self.work_unit_states}
+        live_by_unit: set[str] = set()
         for attempt in self.attempts:
-            if attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING) and (
-                attempt.spec.work_unit_id not in states
-                or states[attempt.spec.work_unit_id].active_attempt_id != attempt.attempt_id
+            if attempt.status not in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING):
+                continue
+            unit_id = attempt.spec.work_unit_id
+            if unit_id not in states or unit_id in live_by_unit or states[unit_id].status is WorkUnitStatus.CANCELLED:
+                raise InvalidDomainValue("each live Attempt must retain one current, non-cancelled WorkUnit subject")
+            live_by_unit.add(unit_id)
+            if (
+                states[unit_id].status is WorkUnitStatus.ACTIVE
+                and states[unit_id].active_attempt_id != attempt.attempt_id
             ):
-                raise InvalidDomainValue("each live Attempt must belong to its current active WorkUnit")
+                raise InvalidDomainValue("an active WorkUnit must identify its one live Attempt")
         if self.status is ProgramStatus.COMPLETED and any(
             state.status is not WorkUnitStatus.SATISFIED for state in self.work_unit_states
         ):
@@ -1503,6 +1509,11 @@ class Program:
                 raise IllegalTransition("Attempt preparation requires an active, ready WorkUnit")
             if any(item.attempt_id == requested.attempt_id for item in attempts):
                 raise DuplicateAttempt(f"Attempt {requested.attempt_id!r} already exists")
+            if any(
+                item.spec.work_unit_id == unit.id and item.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
+                for item in attempts
+            ):
+                raise IllegalTransition("a WorkUnit already has an outstanding Attempt")
             if requested.effective_inputs != self.resolved_inputs(unit.id):
                 raise MissingInput("Attempt bindings must exactly match current approved references and provenance")
             if len(attempts) >= min(spec.budget.max_attempts, spec.authority.max_attempts):
@@ -1514,21 +1525,27 @@ class Program:
             attempts = (*attempts, Attempt(requested, actor_id=command.actor_id))
         elif isinstance(command, (StartAttempt, FinishAttempt, FailAttempt, CancelAttempt)):
             current = self.attempt(command.attempt_id)
-            work_state = self.state(current.spec.work_unit_id)
-            if work_state.active_attempt_id != command.attempt_id:
-                raise IllegalTransition("Attempt is not the current active WorkUnit Attempt")
             if type(command) is StartAttempt:
-                if status is not ProgramStatus.ACTIVE or current.status is not AttemptStatus.PREPARED:
+                work_state = self.state(current.spec.work_unit_id)
+                if (
+                    status is not ProgramStatus.ACTIVE
+                    or current.status is not AttemptStatus.PREPARED
+                    or work_state.active_attempt_id != command.attempt_id
+                ):
                     raise IllegalTransition("only a prepared Attempt in an active Program may start")
                 replacement = AttemptStatus.EXECUTING
             elif type(command) is FinishAttempt:
-                if status not in (ProgramStatus.ACTIVE, ProgramStatus.PAUSED) or (
+                if status not in (ProgramStatus.ACTIVE, ProgramStatus.PAUSED, ProgramStatus.COMPLETED) or (
                     current.status is not AttemptStatus.EXECUTING
                 ):
                     raise IllegalTransition("only an executing Attempt may finish")
                 replacement = AttemptStatus.FINISHED
             else:
-                if status not in (ProgramStatus.ACTIVE, ProgramStatus.PAUSED) or current.status not in (
+                if status not in (
+                    ProgramStatus.ACTIVE,
+                    ProgramStatus.PAUSED,
+                    ProgramStatus.COMPLETED,
+                ) or current.status not in (
                     AttemptStatus.PREPARED,
                     AttemptStatus.EXECUTING,
                 ):
@@ -1543,8 +1560,8 @@ class Program:
                 )
         elif type(command) is SatisfyWorkUnit:
             fact = command.satisfaction
-            if status not in (ProgramStatus.ACTIVE, ProgramStatus.PAUSED):
-                raise IllegalTransition("satisfaction requires an active or paused Program")
+            if status not in (ProgramStatus.ACTIVE, ProgramStatus.PAUSED, ProgramStatus.COMPLETED):
+                raise IllegalTransition("satisfaction requires an activated, non-abandoned Program")
             if fact.issuer_id != command.actor_id:
                 raise AuthorityViolation("satisfaction issuer and trusted command actor must match")
             if fact.program_id != self.program_id:
@@ -1559,25 +1576,19 @@ class Program:
             )
             if historical_spec is None:
                 raise StaleRevision("satisfaction must cite an approved historical ProgramSpec")
-            unit = spec.work_unit(fact.work_unit_id)
-            if fact.work_unit_fingerprint != historical_spec.work_unit_applicability_fingerprint(
-                unit.id
-            ) or fact.work_unit_fingerprint != spec.work_unit_applicability_fingerprint(unit.id):
-                raise StaleRevision("satisfaction's historical intent is not currently applicable")
+            historical_unit = historical_spec.work_unit(fact.work_unit_id)
+            if fact.work_unit_fingerprint != historical_spec.work_unit_applicability_fingerprint(historical_unit.id):
+                raise StaleRevision("satisfaction does not pin its historical WorkUnit intent")
             if fact.record_order != 0 or any(item.reference_id == fact.reference_id for item in satisfactions):
                 raise IllegalTransition("satisfaction has already been recorded")
-            if self.state(unit.id).status not in (WorkUnitStatus.READY, WorkUnitStatus.SATISFIED):
-                raise IllegalTransition("only a ready or satisfied WorkUnit may receive satisfaction")
             source = self.attempt(fact.source_attempt_id)
             if source.status is not AttemptStatus.FINISHED:
                 raise IllegalTransition("satisfaction requires a finished source Attempt")
-            if (source.spec.program_id, source.spec.work_unit_id) != (self.program_id, unit.id):
+            if (source.spec.program_id, source.spec.work_unit_id) != (self.program_id, historical_unit.id):
                 raise AuthorityViolation("satisfaction source Attempt has a foreign subject")
             if (source.spec.spec_revision, source.spec.spec_digest) != (fact.spec_revision, fact.spec_digest):
                 raise StaleRevision("satisfaction must cite its source Attempt's historical spec")
-            if not _same_subject(source.spec.effective_inputs, self.resolved_inputs(unit.id)):
-                raise MissingInput("finished source Attempt has inapplicable concrete inputs")
-            if {item.name for item in fact.output_bindings} != set(unit.outputs):
+            if {item.name for item in fact.output_bindings} != set(historical_unit.outputs):
                 raise MissingInput("satisfaction must bind exactly the declared outputs")
             satisfactions = (
                 *satisfactions,
@@ -1593,17 +1604,6 @@ class Program:
                     fact.output_bindings,
                     order,
                 ),
-            )
-            projected = _project(spec, attempts, satisfactions, cancellations)
-            active_by_unit = {item.work_unit_id: item.active_attempt_id for item in projected}
-            cancel_live(
-                frozenset(
-                    item.attempt_id
-                    for item in attempts
-                    if item.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
-                    and active_by_unit[item.spec.work_unit_id] != item.attempt_id
-                ),
-                "approved predecessor output changed",
             )
         elif type(command) is AmendProgramSpec:
             if status is ProgramStatus.CANCELLED:

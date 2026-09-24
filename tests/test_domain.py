@@ -518,6 +518,33 @@ def test_satisfaction_requires_finished_source_and_never_finishes_an_attempt() -
     assert accepted.satisfactions[0].source_attempt_id == "a1"
 
 
+def test_finished_attempt_may_be_satisfied_while_another_attempt_is_live() -> None:
+    done = finished(active())
+    retry = prepared(done, "first", "a2")
+    accepted = satisfied(retry, "first", "a1", "s1")
+    assert accepted.state("first").status is WorkUnitStatus.SATISFIED
+    assert accepted.attempt("a2").status is AttemptStatus.PREPARED
+    assert accepted.attempt_cancellations == ()
+    with pytest.raises(IllegalTransition):
+        accepted.apply(StartAttempt(accepted.revision, OWNER, "a2"))
+    observed = accepted.apply(FailAttempt(accepted.revision, OWNER, "a2"))
+    assert observed.attempt("a2").status is AttemptStatus.FAILED
+    assert observed.state("first").status is WorkUnitStatus.SATISFIED
+
+
+def test_late_terminal_observation_remains_legal_after_satisfaction_completes_program() -> None:
+    spec = graph_spec(work_units=(unit("only"),), initial_inputs=())
+    done = finished(active(spec), "only", "a1")
+    retry = prepared(done, "only", "a2")
+    executing = retry.apply(StartAttempt(retry.revision, OWNER, "a2"))
+    completed = satisfied(executing, "only", "a1", "s1")
+    assert completed.status is ProgramStatus.COMPLETED
+    assert completed.attempt("a2").status is AttemptStatus.EXECUTING
+    observed = completed.apply(FinishAttempt(completed.revision, OWNER, "a2"))
+    assert observed.status is ProgramStatus.COMPLETED
+    assert observed.attempt("a2").status is AttemptStatus.FINISHED
+
+
 def test_satisfaction_requires_trusted_issuer_equal_to_command_actor() -> None:
     done = finished(active())
     fact = satisfaction(done, "first", "s1", "a1")
@@ -667,6 +694,33 @@ def test_older_spec_satisfaction_can_be_admitted_when_its_subject_still_applies(
     accepted = amended.apply(SatisfyWorkUnit(amended.revision, VERIFIER, historical))
     assert accepted.state("first").status is WorkUnitStatus.SATISFIED
     assert accepted.satisfactions[0].spec_revision == 1
+
+
+def test_delayed_historical_satisfaction_is_recorded_while_current_intent_differs() -> None:
+    done = finished(active())
+    historical = satisfaction(done, "first", "s1", "a1")
+    v2 = amend(done, objective="different current objective")
+    admitted = v2.apply(SatisfyWorkUnit(v2.revision, VERIFIER, historical))
+    assert admitted.state("first").status is WorkUnitStatus.READY
+    assert admitted.satisfactions[0].spec_revision == 1
+    v3 = amend(admitted, objective=done.spec.objective)
+    assert v3.spec.revision == 3
+    assert v3.state("first").satisfaction_id == "s1"
+    assert v3.satisfactions == admitted.satisfactions
+
+
+def test_delayed_satisfaction_of_removed_work_unit_reappears_on_reintroduction() -> None:
+    target = unit("target")
+    remaining = unit("remaining")
+    done = finished(active(graph_spec(work_units=(target, remaining), initial_inputs=())), "target", "a1")
+    historical = satisfaction(done, "target", "s1", "a1")
+    removed = amend(done, work_units=(remaining,))
+    admitted = removed.apply(SatisfyWorkUnit(removed.revision, VERIFIER, historical))
+    assert tuple(state.work_unit_id for state in admitted.work_unit_states) == ("remaining",)
+    assert admitted.satisfactions[0].spec_revision == 1
+    restored = amend(admitted, work_units=(target, remaining))
+    assert restored.state("target").satisfaction_id == "s1"
+    assert restored.state("remaining").status is WorkUnitStatus.READY
 
 
 def test_satisfaction_rejects_forged_subject_fingerprint() -> None:
@@ -907,7 +961,7 @@ def test_amending_an_approved_initial_reference_invalidates_only_consuming_chain
 def test_explicit_work_unit_cancellation_records_a_decision_and_propagates() -> None:
     program = active()
     cancelled = program.apply(CancelWorkUnit(program.revision, OWNER, "first", "owner abandons chain"))
-    assert cancelled.status is ProgramStatus.CANCELLED
+    assert cancelled.status is ProgramStatus.ACTIVE
     assert cancelled.state("first").status is WorkUnitStatus.CANCELLED
     assert cancelled.state("second").status is WorkUnitStatus.CANCELLED
     assert len(cancelled.cancellations) == 1
@@ -922,7 +976,7 @@ def test_explicit_work_unit_cancellation_records_a_decision_and_propagates() -> 
 def test_owner_cancellation_supersedes_recorded_satisfaction_without_deleting_history() -> None:
     accepted = satisfied(finished(active()))
     abandoned = accepted.apply(CancelWorkUnit(accepted.revision, OWNER, "first"))
-    assert abandoned.status is ProgramStatus.CANCELLED
+    assert abandoned.status is ProgramStatus.ACTIVE
     assert abandoned.state("first").status is WorkUnitStatus.CANCELLED
     assert abandoned.state("second").status is WorkUnitStatus.CANCELLED
     assert abandoned.satisfactions == accepted.satisfactions
@@ -961,6 +1015,27 @@ def test_cancellation_inheritance_is_rebuilt_from_current_graph_not_previous_sta
     assert reattached.state("unrelated").status is WorkUnitStatus.READY
 
 
+def test_wholly_cancelled_two_node_graph_can_reconnect_and_reintroduce_work() -> None:
+    program = active()
+    first = program.spec.work_unit("first")
+    second = program.spec.work_unit("second")
+    cancelled = program.apply(CancelWorkUnit(program.revision, OWNER, "first"))
+    assert cancelled.status is ProgramStatus.ACTIVE
+    assert cancelled.state("second").status is WorkUnitStatus.CANCELLED
+
+    detached_second = WorkUnit("second", second.obligation, acceptance_criteria=second.acceptance_criteria)
+    detached = amend(cancelled, work_units=(first, detached_second))
+    assert detached.state("first").status is WorkUnitStatus.CANCELLED
+    assert detached.state("second").status is WorkUnitStatus.READY
+    removed = amend(detached, work_units=(detached_second,))
+    assert removed.ready_work_unit_ids == ("second",)
+    reconnected = amend(removed, work_units=(first, second))
+    assert reconnected.state("first").status is WorkUnitStatus.CANCELLED
+    assert reconnected.state("second").status is WorkUnitStatus.CANCELLED
+    assert reconnected.status is ProgramStatus.ACTIVE
+    assert reconnected.cancellations == cancelled.cancellations
+
+
 def test_removed_satisfaction_and_cancellation_subjects_reappear_from_history() -> None:
     target = unit("target")
     unrelated = unit("unrelated")
@@ -993,7 +1068,7 @@ def test_work_unit_cancellation_does_not_count_toward_program_completion() -> No
     cancelled = program.apply(CancelWorkUnit(program.revision, OWNER, "abandoned"))
     assert cancelled.status is ProgramStatus.ACTIVE
     result = satisfied(finished(cancelled, "fulfilled", "a1"), "fulfilled", "a1", "s1")
-    assert result.status is ProgramStatus.CANCELLED
+    assert result.status is ProgramStatus.ACTIVE
     assert result.state("fulfilled").status is WorkUnitStatus.SATISFIED
 
 
@@ -1046,16 +1121,22 @@ def test_unaffected_live_attempt_remains_bound_to_its_original_spec() -> None:
     assert modified.attempt("b1").spec.spec_digest == spec.digest
 
 
-def test_replaced_predecessor_output_cancels_inapplicable_live_child_as_domain_decision() -> None:
+def test_replaced_predecessor_output_preserves_live_child_for_separate_terminal_decision() -> None:
     spec = graph_spec(budget=BudgetPolicy(max_attempts=3))
     first_twice = finished(finished(active(spec)), "first", "a2")
     accepted = satisfied(first_twice, "first", "a1", "s1")
     child = prepared(accepted, "second", "a3")
     replaced = satisfied(child, "first", "a2", "s2")
-    assert replaced.attempt("a3").status is AttemptStatus.CANCELLED
-    assert replaced.attempt_cancellations[-1].reason == "approved predecessor output changed"
+    assert replaced.attempt("a3").status is AttemptStatus.PREPARED
+    assert replaced.attempt_cancellations == ()
     assert replaced.state("second").status is WorkUnitStatus.READY
     assert replaced.attempt("a3").spec.effective_inputs == child.attempt("a3").spec.effective_inputs
+    with pytest.raises(IllegalTransition):
+        prepared(replaced, "second", "a4")
+    stopped = replaced.apply(CancelAttempt(replaced.revision, OWNER, "a3"))
+    assert stopped.attempt("a3").status is AttemptStatus.CANCELLED
+    assert stopped.attempt_cancellations[-1].actor_id == OWNER
+    assert stopped.state("second").status is WorkUnitStatus.READY
 
 
 def test_authority_amendment_withdrawing_delegate_cancels_its_live_attempt() -> None:
@@ -1138,7 +1219,7 @@ def test_owner_control_does_not_depend_on_delegated_operational_allowlist() -> N
     paused = program.apply(PauseProgram(program.revision, OWNER))
     assert paused.apply(ResumeProgram(paused.revision, OWNER)).status is ProgramStatus.ACTIVE
     assert paused.apply(CancelProgram(paused.revision, OWNER)).status is ProgramStatus.CANCELLED
-    assert program.apply(CancelWorkUnit(program.revision, OWNER, "first")).status is ProgramStatus.CANCELLED
+    assert program.apply(CancelWorkUnit(program.revision, OWNER, "first")).status is ProgramStatus.ACTIVE
     assert amend(program, objective="owner-approved change").spec.revision == 2
 
 
@@ -1151,7 +1232,7 @@ def test_owner_control_survives_a_literally_empty_delegated_allowlist() -> None:
     activated = active()
     restricted = amend(activated, authority=empty)
     assert restricted.status is ProgramStatus.ACTIVE
-    assert restricted.apply(CancelWorkUnit(restricted.revision, OWNER, "first")).status is ProgramStatus.CANCELLED
+    assert restricted.apply(CancelWorkUnit(restricted.revision, OWNER, "first")).status is ProgramStatus.ACTIVE
 
 
 def test_actionless_and_zero_budget_programs_are_valid_present_facts() -> None:
