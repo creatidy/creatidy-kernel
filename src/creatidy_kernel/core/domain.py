@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import deque
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from enum import StrEnum
@@ -133,6 +132,16 @@ def _immutable_tuple(value: object, field: str) -> tuple[object, ...]:
     return cast(tuple[object, ...], value)
 
 
+def _immutable_text_tuple(value: object, field: str) -> tuple[str, ...]:
+    values = _immutable_tuple(value, field)
+    if any(type(item) is not str or not item.strip() for item in values):
+        raise InvalidDomainValue(f"{field} must contain nonempty text values")
+    result = cast(tuple[str, ...], values)
+    if len(set(result)) != len(result):
+        raise InvalidDomainValue(f"{field} must not contain duplicate values")
+    return result
+
+
 def _digest(value: object) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -238,18 +247,53 @@ class AuthorityEnvelope:
         }
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class PolicyReference:
+    """Opaque owner-selected policy identity pinned by version and content digest."""
+
+    policy_id: str = dataclass_field(init=False)
+    version: str = dataclass_field(init=False)
+    digest: str = dataclass_field(init=False)
+
+    def __init__(self, policy_id: str, version: str, digest: str) -> None:
+        _begin_init(self, PolicyReference, "policy_id")
+        _set_fields(self, policy_id=policy_id, version=version, digest=digest)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        _nonempty(self.policy_id, "policy_id")
+        _nonempty(self.version, "policy version")
+        _nonempty(self.digest, "policy digest")
+
+    def payload(self) -> dict[str, str]:
+        return {"policy_id": self.policy_id, "version": self.version, "digest": self.digest}
+
+
+def _immutable_policy_references(value: object, field: str) -> tuple[PolicyReference, ...]:
+    values = _immutable_tuple(value, field)
+    if any(type(item) is not PolicyReference for item in values):
+        raise InvalidDomainValue(f"{field} must contain PolicyReference values")
+    refs = cast(tuple[PolicyReference, ...], values)
+    identities = tuple((item.policy_id, item.version, item.digest) for item in refs)
+    if len(set(identities)) != len(identities):
+        raise InvalidDomainValue(f"{field} must not contain duplicate references")
+    return refs
+
+
 _DEFAULT_BUDGET = BudgetPolicy()
 _DEFAULT_AUTHORITY = AuthorityEnvelope("owner")
 
 
 @dataclass(frozen=True, slots=True, init=False)
 class WorkUnit:
-    """One bounded graph node with logical inputs and outputs."""
+    """One bounded obligation with declarative acceptance intent."""
 
     work_unit_id: str = dataclass_field(init=False)
     dependencies: tuple[str, ...] = dataclass_field(default=(), init=False)
     required_inputs: frozenset[str] = dataclass_field(default=frozenset(), init=False)
     outputs: frozenset[str] = dataclass_field(default=frozenset(), init=False)
+    acceptance_criteria: tuple[str, ...] = dataclass_field(default=(), init=False)
+    acceptance_policy_reference: PolicyReference | None = dataclass_field(default=None, init=False)
 
     def __init__(
         self,
@@ -257,6 +301,8 @@ class WorkUnit:
         dependencies: tuple[str, ...] = (),
         required_inputs: frozenset[str] = frozenset(),
         outputs: frozenset[str] = frozenset(),
+        acceptance_criteria: tuple[str, ...] = (),
+        acceptance_policy_reference: PolicyReference | None = None,
     ) -> None:
         _begin_init(self, WorkUnit, "work_unit_id")
         _set_fields(
@@ -265,6 +311,8 @@ class WorkUnit:
             dependencies=dependencies,
             required_inputs=required_inputs,
             outputs=outputs,
+            acceptance_criteria=acceptance_criteria,
+            acceptance_policy_reference=acceptance_policy_reference,
         )
         self.__post_init__()
 
@@ -278,8 +326,15 @@ class WorkUnit:
         object.__setattr__(self, "dependencies", tuple(sorted(cast(tuple[str, ...], dependencies))))
         required_inputs = _immutable_strings(self.required_inputs, "required_inputs")
         outputs = _immutable_strings(self.outputs, "outputs")
+        acceptance_criteria = _immutable_text_tuple(self.acceptance_criteria, "WorkUnit acceptance_criteria")
+        if (
+            self.acceptance_policy_reference is not None
+            and type(self.acceptance_policy_reference) is not PolicyReference
+        ):
+            raise InvalidDomainValue("acceptance_policy_reference must be a PolicyReference")
         if required_inputs & outputs:
             raise InvalidDomainValue(f"WorkUnit {self.work_unit_id!r} consumes and produces the same input")
+        object.__setattr__(self, "acceptance_criteria", acceptance_criteria)
 
     @property
     def id(self) -> str:
@@ -305,6 +360,10 @@ class WorkUnit:
             "dependencies": self.dependencies,
             "required_inputs": tuple(sorted(self.required_inputs)),
             "outputs": tuple(sorted(self.outputs)),
+            "acceptance_criteria": self.acceptance_criteria,
+            "acceptance_policy_reference": (
+                None if self.acceptance_policy_reference is None else self.acceptance_policy_reference.payload()
+            ),
         }
 
     @property
@@ -319,6 +378,8 @@ class ProgramSpec:
     program_id: str = dataclass_field(init=False)
     objective: str = dataclass_field(init=False)
     work_units: tuple[WorkUnit, ...] = dataclass_field(init=False)
+    acceptance_criteria: tuple[str, ...] = dataclass_field(default=(), init=False)
+    policy_references: tuple[PolicyReference, ...] = dataclass_field(default=(), init=False)
     initial_inputs: frozenset[str] = dataclass_field(default=frozenset(), init=False)
     budget: BudgetPolicy = dataclass_field(default=_DEFAULT_BUDGET, init=False)
     authority: AuthorityEnvelope = dataclass_field(default=_DEFAULT_AUTHORITY, init=False)
@@ -335,6 +396,8 @@ class ProgramSpec:
         authority: AuthorityEnvelope = _DEFAULT_AUTHORITY,
         revision: int = 1,
         parent_digest: str | None = None,
+        acceptance_criteria: tuple[str, ...] = (),
+        policy_references: tuple[PolicyReference, ...] = (),
     ) -> None:
         _begin_init(self, ProgramSpec, "program_id")
         _set_fields(
@@ -342,6 +405,8 @@ class ProgramSpec:
             program_id=program_id,
             objective=objective,
             work_units=work_units,
+            acceptance_criteria=acceptance_criteria,
+            policy_references=policy_references,
             initial_inputs=initial_inputs,
             budget=budget,
             authority=authority,
@@ -357,6 +422,8 @@ class ProgramSpec:
         if not work_units or any(type(unit) is not WorkUnit for unit in work_units):
             raise InvalidDomainValue("work_units must be a nonempty tuple of WorkUnit values")
         units = cast(tuple[WorkUnit, ...], work_units)
+        acceptance_criteria = _immutable_text_tuple(self.acceptance_criteria, "Program acceptance_criteria")
+        policy_references = _immutable_policy_references(self.policy_references, "policy_references")
         unit_ids = tuple(unit.work_unit_id for unit in units)
         if len(set(unit_ids)) != len(unit_ids):
             raise InvalidGraph("work_units must have unique identifiers")
@@ -367,6 +434,8 @@ class ProgramSpec:
             raise InvalidDomainValue("authority must be an AuthorityEnvelope")
         _revision(self.revision, "revision")
         _optional_nonempty(self.parent_digest, "parent_digest")
+        object.__setattr__(self, "acceptance_criteria", acceptance_criteria)
+        object.__setattr__(self, "policy_references", policy_references)
         by_id = {unit.work_unit_id: unit for unit in units}
         output_producers: dict[str, str] = {}
         for unit in units:
@@ -399,6 +468,8 @@ class ProgramSpec:
         return {
             "program_id": self.program_id,
             "objective": self.objective,
+            "acceptance_criteria": self.acceptance_criteria,
+            "policy_references": tuple(item.payload() for item in self.policy_references),
             "work_units": tuple(unit.payload() for unit in self.work_units),
             "initial_inputs": tuple(sorted(self.initial_inputs)),
             "budget": {
@@ -420,6 +491,39 @@ class ProgramSpec:
                 return unit
         raise MissingReference(f"unknown WorkUnit {work_unit_id!r}")
 
+    @property
+    def owner_intent_payload(self) -> dict[str, object]:
+        return {
+            "program_id": self.program_id,
+            "objective": self.objective,
+            "acceptance_criteria": self.acceptance_criteria,
+            "policy_references": tuple(item.payload() for item in self.policy_references),
+        }
+
+    @property
+    def owner_intent_digest(self) -> str:
+        return _digest(self.owner_intent_payload)
+
+    def work_unit_applicability_fingerprint(self, work_unit_id: str) -> str:
+        target = self.work_unit(work_unit_id)
+        relevant_ids = {target.work_unit_id}
+        pending = list(target.dependencies)
+        by_id = {unit.work_unit_id: unit for unit in self.work_units}
+        while pending:
+            dependency = pending.pop()
+            if dependency not in relevant_ids:
+                relevant_ids.add(dependency)
+                pending.extend(by_id[dependency].dependencies)
+        ordered_chain = tuple(by_id[unit_id].payload() for unit_id in self.topological_order if unit_id in relevant_ids)
+        required_inputs = {name for unit_id in relevant_ids for name in by_id[unit_id].required_inputs}
+        return _digest(
+            {
+                "owner_intent": self.owner_intent_payload,
+                "work_unit_chain": ordered_chain,
+                "initial_inputs": tuple(sorted(self.initial_inputs & required_inputs)),
+            }
+        )
+
     def amend(self, amendment: SpecAmendment) -> ProgramSpec:
         if amendment.expected_revision != self.revision:
             raise StaleRevision(
@@ -429,6 +533,12 @@ class ProgramSpec:
             program_id=self.program_id,
             objective=self.objective if amendment.objective is None else amendment.objective,
             work_units=self.work_units if amendment.work_units is None else amendment.work_units,
+            acceptance_criteria=(
+                self.acceptance_criteria if amendment.acceptance_criteria is None else amendment.acceptance_criteria
+            ),
+            policy_references=(
+                self.policy_references if amendment.policy_references is None else amendment.policy_references
+            ),
             initial_inputs=self.initial_inputs if amendment.initial_inputs is None else amendment.initial_inputs,
             budget=self.budget if amendment.budget is None else amendment.budget,
             authority=self.authority if amendment.authority is None else amendment.authority,
@@ -598,7 +708,7 @@ class TrustedSatisfaction:
     spec_digest: str = dataclass_field(init=False)
     work_unit_digest: str = dataclass_field(init=False)
     issuer_id: str = dataclass_field(init=False)
-    source_attempt_id: str | None = dataclass_field(default=None, init=False)
+    source_attempt_id: str = dataclass_field(init=False)
 
     def __init__(
         self,
@@ -609,7 +719,7 @@ class TrustedSatisfaction:
         spec_digest: str,
         work_unit_digest: str,
         issuer_id: str,
-        source_attempt_id: str | None = None,
+        source_attempt_id: str,
     ) -> None:
         _begin_init(self, TrustedSatisfaction, "reference_id")
         _set_fields(
@@ -636,7 +746,7 @@ class TrustedSatisfaction:
         ):
             _nonempty(value, field)
         _revision(self.spec_revision, "spec_revision")
-        _optional_nonempty(self.source_attempt_id, "source_attempt_id")
+        _nonempty(self.source_attempt_id, "source_attempt_id")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -682,6 +792,8 @@ class SpecAmendment:
     budget: BudgetPolicy | None = dataclass_field(default=None, init=False)
     authority: AuthorityEnvelope | None = dataclass_field(default=None, init=False)
     reason: str = dataclass_field(default="owner amendment", init=False)
+    acceptance_criteria: tuple[str, ...] | None = dataclass_field(default=None, init=False)
+    policy_references: tuple[PolicyReference, ...] | None = dataclass_field(default=None, init=False)
 
     def __init__(
         self,
@@ -692,6 +804,8 @@ class SpecAmendment:
         budget: BudgetPolicy | None = None,
         authority: AuthorityEnvelope | None = None,
         reason: str = "owner amendment",
+        acceptance_criteria: tuple[str, ...] | None = None,
+        policy_references: tuple[PolicyReference, ...] | None = None,
     ) -> None:
         _begin_init(self, SpecAmendment, "expected_revision")
         _set_fields(
@@ -703,6 +817,8 @@ class SpecAmendment:
             budget=budget,
             authority=authority,
             reason=reason,
+            acceptance_criteria=acceptance_criteria,
+            policy_references=policy_references,
         )
         self.__post_init__()
 
@@ -711,7 +827,15 @@ class SpecAmendment:
         _nonempty(self.reason, "reason")
         if all(
             value is None
-            for value in (self.objective, self.work_units, self.initial_inputs, self.budget, self.authority)
+            for value in (
+                self.objective,
+                self.work_units,
+                self.initial_inputs,
+                self.budget,
+                self.authority,
+                self.acceptance_criteria,
+                self.policy_references,
+            )
         ):
             raise InvalidDomainValue("an amendment must replace at least one field")
         if self.objective is not None:
@@ -722,6 +846,10 @@ class SpecAmendment:
                 raise InvalidDomainValue("work_units must be a nonempty tuple of WorkUnit values")
         if self.initial_inputs is not None:
             _immutable_strings(self.initial_inputs, "initial_inputs")
+        if self.acceptance_criteria is not None:
+            _immutable_text_tuple(self.acceptance_criteria, "acceptance_criteria")
+        if self.policy_references is not None:
+            _immutable_policy_references(self.policy_references, "policy_references")
         if self.budget is not None and type(cast(object, self.budget)) is not BudgetPolicy:
             raise InvalidDomainValue("budget must be a BudgetPolicy")
         if self.authority is not None and type(cast(object, self.authority)) is not AuthorityEnvelope:
@@ -883,6 +1011,14 @@ def _descendants(spec: ProgramSpec, seeds: set[str]) -> set[str]:
     return affected
 
 
+def _program_owner_intent_changed(previous: ProgramSpec, amended: ProgramSpec) -> bool:
+    return (
+        previous.objective != amended.objective
+        or previous.acceptance_criteria != amended.acceptance_criteria
+        or previous.policy_references != amended.policy_references
+    )
+
+
 def _amendment_affected_work_units(previous: ProgramSpec, amended: ProgramSpec) -> set[str]:
     previous_units = {unit.work_unit_id: unit for unit in previous.work_units}
     amended_units = {unit.work_unit_id: unit for unit in amended.work_units}
@@ -894,6 +1030,33 @@ def _amendment_affected_work_units(previous: ProgramSpec, amended: ProgramSpec) 
     changed_inputs = previous.initial_inputs ^ amended.initial_inputs
     changed.update(unit.work_unit_id for unit in amended.work_units if unit.required_inputs & changed_inputs)
     return _descendants(previous, changed) | _descendants(amended, changed)
+
+
+def _satisfaction_applies_to_spec(
+    satisfaction: TrustedSatisfaction,
+    spec_history: tuple[ProgramSpec, ...],
+    amended_spec: ProgramSpec,
+) -> bool:
+    source_spec = next(
+        (
+            item
+            for item in spec_history
+            if item.revision == satisfaction.spec_revision and item.digest == satisfaction.spec_digest
+        ),
+        None,
+    )
+    if source_spec is None:
+        return False
+    try:
+        source_unit = source_spec.work_unit(satisfaction.work_unit_id)
+        amended_spec.work_unit(satisfaction.work_unit_id)
+    except MissingReference:
+        return False
+    if satisfaction.work_unit_digest != source_unit.digest:
+        return False
+    return source_spec.work_unit_applicability_fingerprint(
+        satisfaction.work_unit_id
+    ) == amended_spec.work_unit_applicability_fingerprint(satisfaction.work_unit_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1057,6 +1220,8 @@ def _action_inapplicability(
             return BudgetExceeded("active attempt admission limit exceeded")
         return None
     if action.action is DomainAction.SATISFY_WORK_UNIT:
+        if work_state.status is not WorkUnitStatus.READY:
+            return IllegalTransition("only a ready WorkUnit with a finished Attempt can be satisfied")
         reference = action.satisfaction
         if reference is not None:
             if reference.issuer_id != action.actor_id:
@@ -1069,44 +1234,25 @@ def _action_inapplicability(
                 return StaleRevision("satisfaction must reference the current WorkUnit definition")
             if reference.reference_id in state.satisfaction_ids:
                 return IllegalTransition(f"satisfaction reference {reference.reference_id!r} was already applied")
-            if reference.source_attempt_id is not None:
-                source = next(
-                    (item for item in state.attempts if item.attempt_id == reference.source_attempt_id),
-                    None,
-                )
-                if source is None:
-                    return MissingReference(f"unknown attempt {reference.source_attempt_id!r}")
-                if source.work_unit_id != unit.work_unit_id:
-                    return AuthorityViolation("satisfaction source attempt targets a different WorkUnit")
-                if not source.current_spec:
-                    return StaleRevision("satisfaction source attempt is pinned to an older ProgramSpec")
-                if source.status not in (AttemptStatus.EXECUTING, AttemptStatus.FINISHED):
-                    return IllegalTransition("satisfaction source attempt is not executable or finished")
-                if work_state.status is WorkUnitStatus.READY and source.status is not AttemptStatus.FINISHED:
-                    return IllegalTransition("a ready WorkUnit requires a finished satisfaction source")
-                if work_state.status is WorkUnitStatus.ACTIVE and work_state.active_attempt_id != source.attempt_id:
-                    return IllegalTransition("satisfaction source is not the active attempt for its WorkUnit")
-        if work_state.status is WorkUnitStatus.READY:
-            available = reference is None and any(
-                attempt.work_unit_id == unit.work_unit_id
-                and attempt.current_spec
-                and attempt.status is AttemptStatus.FINISHED
-                for attempt in state.attempts
-            )
-            if reference is not None:
-                available = reference.source_attempt_id is not None
-            return None if available else IllegalTransition("a ready WorkUnit needs a finished current-spec Attempt")
-        if work_state.status is WorkUnitStatus.ACTIVE and work_state.active_attempt_id is not None:
-            active_attempt = next(
-                (item for item in state.attempts if item.attempt_id == work_state.active_attempt_id),
+            source = next(
+                (item for item in state.attempts if item.attempt_id == reference.source_attempt_id),
                 None,
             )
-            available = active_attempt is not None and active_attempt.status in (
-                AttemptStatus.PREPARED,
-                AttemptStatus.EXECUTING,
-            )
-            return None if available else IllegalTransition("active WorkUnit has no satisfiable Attempt")
-        return IllegalTransition("WorkUnit is not in a satisfiable state")
+            if source is None:
+                return MissingReference(f"unknown attempt {reference.source_attempt_id!r}")
+            if source.work_unit_id != unit.work_unit_id:
+                return AuthorityViolation("satisfaction source attempt targets a different WorkUnit")
+            if not source.current_spec:
+                return StaleRevision("satisfaction source attempt is pinned to an older ProgramSpec")
+            if source.status is not AttemptStatus.FINISHED:
+                return IllegalTransition("a ready WorkUnit requires a finished satisfaction source")
+        available = any(
+            attempt.work_unit_id == unit.work_unit_id
+            and attempt.current_spec
+            and attempt.status is AttemptStatus.FINISHED
+            for attempt in state.attempts
+        )
+        return None if available else IllegalTransition("a ready WorkUnit needs a finished current-spec Attempt")
     if action.action in (
         DomainAction.START_ATTEMPT,
         DomainAction.FINISH_ATTEMPT,
@@ -1141,10 +1287,6 @@ def _action_inapplicability(
             else IllegalTransition("only a prepared or executing Attempt can fail or cancel")
         )
     return IllegalTransition(f"unsupported domain action: {action.action.value}")
-
-
-def _action_applicable(spec: ProgramSpec, state: _ReachState, action: _ReachAction) -> bool:
-    return _action_inapplicability(spec, state, action) is None
 
 
 def _replace_reach_attempt(
@@ -1219,8 +1361,6 @@ def _reach_successor(spec: ProgramSpec, state: _ReachState, action: _ReachAction
         return _ReachState(state.status, states, attempts)
     if action.action is DomainAction.SATISFY_WORK_UNIT:
         attempts = state.attempts
-        if current.active_attempt_id is not None:
-            attempts = _replace_reach_attempt(attempts, current.active_attempt_id, AttemptStatus.FINISHED)
         states = _mark_ready(
             spec,
             tuple(
@@ -1260,51 +1400,105 @@ def _reach_successor(spec: ProgramSpec, state: _ReachState, action: _ReachAction
     raise InvalidDomainValue(f"unsupported reachability action: {action.action.value}")
 
 
-def _reach_actions(spec: ProgramSpec, state: _ReachState) -> tuple[_ReachAction, ...]:
-    actions = [
-        _ReachAction(action)
-        for action in (
-            DomainAction.ACTIVATE_PROGRAM,
-            DomainAction.PAUSE_PROGRAM,
-            DomainAction.RESUME_PROGRAM,
-            DomainAction.CANCEL_PROGRAM,
-            DomainAction.AMEND_SPEC,
+def _try_reach_action(spec: ProgramSpec, state: _ReachState, action: _ReachAction) -> _ReachState | None:
+    if _action_inapplicability(spec, state, action) is not None:
+        return None
+    return _reach_successor(spec, state, action)
+
+
+def _work_unit_cancel_path(
+    spec: ProgramSpec,
+    state: _ReachState,
+    work_unit_id: str,
+) -> _ReachState | None:
+    """Release at most one active Attempt, then cancel its WorkUnit/subtree."""
+
+    current = state
+    while True:
+        cancelled = _try_reach_action(
+            spec,
+            current,
+            _ReachAction(DomainAction.CANCEL_WORK_UNIT, work_unit_id),
         )
-    ]
-    for unit in spec.work_units:
-        actions.extend(
-            _ReachAction(action, unit.work_unit_id)
+        if cancelled is not None:
+            return cancelled
+        work_state = next(item for item in current.work_unit_states if item.work_unit_id == work_unit_id)
+        if work_state.status is not WorkUnitStatus.ACTIVE or work_state.active_attempt_id is None:
+            return None
+        attempt = next(item for item in current.attempts if item.attempt_id == work_state.active_attempt_id)
+        if attempt.status is AttemptStatus.PREPARED:
+            release = None
+            for action in (DomainAction.CANCEL_ATTEMPT, DomainAction.FAIL_ATTEMPT):
+                release = _try_reach_action(spec, current, _ReachAction(action, work_unit_id))
+                if release is not None:
+                    break
+            if release is not None:
+                current = release
+                continue
+            started = _try_reach_action(spec, current, _ReachAction(DomainAction.START_ATTEMPT, work_unit_id))
+            if started is None:
+                return None
+            current = started
+            continue
+        if attempt.status is AttemptStatus.EXECUTING:
+            released = None
             for action in (
-                DomainAction.CANCEL_WORK_UNIT,
-                DomainAction.PREPARE_ATTEMPT,
-                DomainAction.SATISFY_WORK_UNIT,
-                DomainAction.START_ATTEMPT,
-                DomainAction.FINISH_ATTEMPT,
-                DomainAction.FAIL_ATTEMPT,
                 DomainAction.CANCEL_ATTEMPT,
-            )
-        )
-    return tuple(actions)
+                DomainAction.FAIL_ATTEMPT,
+                DomainAction.FINISH_ATTEMPT,
+            ):
+                released = _try_reach_action(spec, current, _ReachAction(action, work_unit_id))
+                if released is not None:
+                    break
+            if released is None:
+                return None
+            current = released
+            continue
+        return None
 
 
-def _reach_key(state: _ReachState) -> tuple[object, ...]:
-    active_attempts = tuple(
-        sorted(
-            (attempt.work_unit_id, attempt.status.value)
-            for attempt in state.attempts
-            if attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
+def _work_unit_satisfaction_path(
+    spec: ProgramSpec,
+    state: _ReachState,
+    work_unit_id: str,
+    *,
+    allow_prepare: bool = True,
+) -> _ReachState | None:
+    """Walk one WorkUnit's legal execution stages to trusted satisfaction."""
+
+    if DomainAction.SATISFY_WORK_UNIT not in spec.authority.allowed_actions:
+        return None
+    current = state
+    while True:
+        work_state = next(item for item in current.work_unit_states if item.work_unit_id == work_unit_id)
+        if work_state.status is WorkUnitStatus.READY:
+            satisfaction_action = _ReachAction(DomainAction.SATISFY_WORK_UNIT, work_unit_id)
+            satisfied = _try_reach_action(spec, current, satisfaction_action)
+            if satisfied is not None:
+                return satisfied
+            if not allow_prepare:
+                return None
+            prepared = _try_reach_action(spec, current, _ReachAction(DomainAction.PREPARE_ATTEMPT, work_unit_id))
+            if prepared is None:
+                return None
+            current = prepared
+            continue
+        if work_state.status is not WorkUnitStatus.ACTIVE or work_state.active_attempt_id is None:
+            return None
+        attempt = next(item for item in current.attempts if item.attempt_id == work_state.active_attempt_id)
+        action = (
+            DomainAction.START_ATTEMPT
+            if attempt.status is AttemptStatus.PREPARED
+            else DomainAction.FINISH_ATTEMPT
+            if attempt.status is AttemptStatus.EXECUTING
+            else None
         )
-    )
-    finished_sources = tuple(
-        sorted(
-            {
-                attempt.work_unit_id
-                for attempt in state.attempts
-                if attempt.current_spec and attempt.status is AttemptStatus.FINISHED
-            }
-        )
-    )
-    return state.status, state.work_unit_states, active_attempts, len(state.attempts), finished_sources
+        if action is None:
+            return None
+        advanced = _try_reach_action(spec, current, _ReachAction(action, work_unit_id))
+        if advanced is None:
+            return None
+        current = advanced
 
 
 def _has_legal_path(
@@ -1314,33 +1508,78 @@ def _has_legal_path(
     attempts: tuple[Attempt, ...],
     satisfactions: tuple[TrustedSatisfaction, ...] = (),
 ) -> bool:
-    """Search finite K1 states via shared command applicability and transition reduction.
+    """Resolve the finite DAG in structural WorkUnit order through shared K1 command rules.
 
-    WorkUnits and status enums are finite; PrepareAttempt is bounded by the declared admission
-    budgets. Reachability uses symbolic Attempt summaries and never constructs external input or
-    trusted-satisfaction values.
+    Each WorkUnit is considered locally and at most one Attempt lifecycle is followed for it. This
+    avoids enumerating interleavings; admission checks still use the aggregate's real attempt count.
     """
 
-    initial = _reach_state(status, spec, states, attempts, satisfactions)
-    pending = deque([initial])
-    visited = {_reach_key(initial)}
-    while pending:
-        current = pending.popleft()
+    current = _reach_state(status, spec, states, attempts, satisfactions)
+    if current.status in (ProgramStatus.COMPLETED, ProgramStatus.CANCELLED):
+        return True
+    if any(
+        _action_inapplicability(spec, current, _ReachAction(action)) is None
+        for action in (DomainAction.CANCEL_PROGRAM, DomainAction.AMEND_SPEC)
+    ):
+        return True
+
+    if current.status is ProgramStatus.DRAFT:
+        activated = _try_reach_action(spec, current, _ReachAction(DomainAction.ACTIVATE_PROGRAM))
+        if activated is None:
+            return False
+        current = activated
+    elif current.status is ProgramStatus.PAUSED:
+        resumed = _try_reach_action(spec, current, _ReachAction(DomainAction.RESUME_PROGRAM))
+        if resumed is None:
+            return False
+        current = resumed
+    if current.status in (ProgramStatus.COMPLETED, ProgramStatus.CANCELLED):
+        return True
+    if current.status is not ProgramStatus.ACTIVE:
+        return False
+    if any(
+        _action_inapplicability(spec, current, _ReachAction(action)) is None
+        for action in (DomainAction.CANCEL_PROGRAM, DomainAction.AMEND_SPEC)
+    ):
+        return True
+
+    if DomainAction.CANCEL_WORK_UNIT in spec.authority.allowed_actions:
+        for work_unit_id in reversed(spec.topological_order):
+            work_state = next(item for item in current.work_unit_states if item.work_unit_id == work_unit_id)
+            if work_state.status in (WorkUnitStatus.SATISFIED, WorkUnitStatus.CANCELLED):
+                continue
+            cancelled = _work_unit_cancel_path(spec, current, work_unit_id)
+            if cancelled is not None:
+                current = cancelled
+                if current.status in (ProgramStatus.COMPLETED, ProgramStatus.CANCELLED):
+                    return True
+
+    for work_unit_id in spec.topological_order:
+        work_state = next(item for item in current.work_unit_states if item.work_unit_id == work_unit_id)
+        if work_state.status not in (WorkUnitStatus.ACTIVE, WorkUnitStatus.READY):
+            continue
+        completed_attempt = _work_unit_satisfaction_path(
+            spec,
+            current,
+            work_unit_id,
+            allow_prepare=False,
+        )
+        if completed_attempt is not None:
+            current = completed_attempt
+            if current.status in (ProgramStatus.COMPLETED, ProgramStatus.CANCELLED):
+                return True
+
+    for work_unit_id in spec.topological_order:
+        work_state = next(item for item in current.work_unit_states if item.work_unit_id == work_unit_id)
+        if work_state.status in (WorkUnitStatus.SATISFIED, WorkUnitStatus.CANCELLED):
+            continue
+        satisfied = _work_unit_satisfaction_path(spec, current, work_unit_id)
+        if satisfied is None:
+            return False
+        current = satisfied
         if current.status in (ProgramStatus.COMPLETED, ProgramStatus.CANCELLED):
             return True
-        for action in _reach_actions(spec, current):
-            if not _action_applicable(spec, current, action):
-                continue
-            if action.action is DomainAction.AMEND_SPEC:
-                return True
-            successor = _reach_successor(spec, current, action)
-            if successor.status in (ProgramStatus.COMPLETED, ProgramStatus.CANCELLED):
-                return True
-            successor_key = _reach_key(successor)
-            if successor_key not in visited:
-                visited.add(successor_key)
-                pending.append(successor)
-    return False
+    return current.status in (ProgramStatus.COMPLETED, ProgramStatus.CANCELLED)
 
 
 def _require_legal_path(
@@ -1455,11 +1694,66 @@ class Program:
         attempt_ids = tuple(item.attempt_id for item in self.attempts)
         if len(set(attempt_ids)) != len(attempt_ids):
             raise DuplicateAttempt("attempt identities must be unique")
+        states_by_unit = {state.work_unit_id: state for state in states}
+        attempts_by_id = {attempt.attempt_id: attempt for attempt in self.attempts}
+        active_attempts_by_unit: dict[str, str] = {}
         for attempt in self.attempts:
             if attempt.spec.program_id != self.spec.program_id:
                 raise InvalidDomainValue("attempt belongs to a different Program")
             if attempt.spec.spec_revision > self.spec.revision:
                 raise InvalidDomainValue("attempt cannot reference a future spec revision")
+            if attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING):
+                work_unit_id = attempt.spec.work_unit_id
+                state = states_by_unit.get(work_unit_id)
+                if (
+                    state is None
+                    or state.status is not WorkUnitStatus.ACTIVE
+                    or state.active_attempt_id != attempt.attempt_id
+                ):
+                    raise InvalidDomainValue("every active Attempt must remain bound to its active WorkUnit")
+                if work_unit_id in active_attempts_by_unit:
+                    raise InvalidDomainValue("a WorkUnit may have only one active Attempt")
+                active_attempts_by_unit[work_unit_id] = attempt.attempt_id
+        for state in states:
+            if state.status is WorkUnitStatus.ACTIVE:
+                attempt = attempts_by_id.get(cast(str, state.active_attempt_id))
+                if (
+                    attempt is None
+                    or attempt.status not in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
+                    or attempt.spec.work_unit_id != state.work_unit_id
+                ):
+                    raise InvalidDomainValue("an active WorkUnit must be bound to a live Attempt")
+        satisfaction_ids = tuple(item.reference_id for item in self.satisfactions)
+        if len(set(satisfaction_ids)) != len(satisfaction_ids):
+            raise InvalidDomainValue("satisfaction reference identities must be unique")
+        for satisfaction in self.satisfactions:
+            if satisfaction.program_id != self.spec.program_id:
+                raise InvalidDomainValue("satisfaction belongs to a different Program")
+            source_spec = next(
+                (
+                    item
+                    for item in self.spec_history
+                    if item.revision == satisfaction.spec_revision and item.digest == satisfaction.spec_digest
+                ),
+                None,
+            )
+            if source_spec is None:
+                raise InvalidDomainValue("satisfaction must remain bound to a historical ProgramSpec")
+            try:
+                source_unit = source_spec.work_unit(satisfaction.work_unit_id)
+            except MissingReference as error:
+                raise InvalidDomainValue("satisfaction WorkUnit is absent from its historical ProgramSpec") from error
+            if source_unit.digest != satisfaction.work_unit_digest:
+                raise InvalidDomainValue("satisfaction must remain bound to its historical WorkUnit definition")
+            source_attempt = attempts_by_id.get(satisfaction.source_attempt_id)
+            if (
+                source_attempt is None
+                or source_attempt.status is not AttemptStatus.FINISHED
+                or source_attempt.spec.work_unit_id != satisfaction.work_unit_id
+                or source_attempt.spec.spec_revision != satisfaction.spec_revision
+                or source_attempt.spec.spec_digest != satisfaction.spec_digest
+            ):
+                raise InvalidDomainValue("satisfaction must cite its immutable finished Attempt history")
         _require_legal_path(self.status, self.spec, states, self.attempts, self.satisfactions)
 
     @classmethod
@@ -1629,6 +1923,8 @@ class Program:
             if self.status in (ProgramStatus.ACTIVE, ProgramStatus.COMPLETED):
                 amended_states = _mark_ready(amended_spec, amended_states)
                 next_status = _status_after_work_unit_change(amended_states)
+            elif all(state.status in (WorkUnitStatus.SATISFIED, WorkUnitStatus.CANCELLED) for state in amended_states):
+                next_status = _status_after_work_unit_change(amended_states)
             return assemble(
                 next_spec=amended_spec,
                 next_status=next_status,
@@ -1674,6 +1970,7 @@ class Program:
         if type(command) is AmendProgramSpec:
             new_spec = self.spec.amend(command.amendment)
             affected = _amendment_affected_work_units(self.spec, new_spec)
+            owner_intent_unchanged = not _program_owner_intent_changed(self.spec, new_spec)
             old_states = {state.work_unit_id: state for state in self.work_unit_states}
             old_units = {unit.work_unit_id: unit for unit in self.spec.work_units}
             new_states: list[WorkUnitState] = []
@@ -1685,7 +1982,9 @@ class Program:
                     and prior.status is WorkUnitStatus.SATISFIED
                     and unchanged
                     and any(
-                        item.work_unit_id == unit.work_unit_id and item.work_unit_digest == unit.digest
+                        item.work_unit_id == unit.work_unit_id
+                        and owner_intent_unchanged
+                        and _satisfaction_applies_to_spec(item, self.spec_history, new_spec)
                         for item in self.satisfactions
                     )
                 )
@@ -1744,6 +2043,7 @@ class Program:
 for _sealed_type in (
     BudgetPolicy,
     AuthorityEnvelope,
+    PolicyReference,
     WorkUnit,
     ProgramSpec,
     InputBinding,
@@ -1786,6 +2086,7 @@ __all__ = [
     "MissingInput",
     "MissingReference",
     "PauseProgram",
+    "PolicyReference",
     "PrepareAttempt",
     "Program",
     "ProgramSpec",

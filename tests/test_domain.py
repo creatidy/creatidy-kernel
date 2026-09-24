@@ -26,6 +26,7 @@ from creatidy_kernel.core.domain import (
     MissingInput,
     MissingReference,
     PauseProgram,
+    PolicyReference,
     PrepareAttempt,
     Program,
     ProgramSpec,
@@ -78,7 +79,7 @@ def attempt_spec(program: Program, attempt_id: str, work_unit_id: str, input_nam
     )
 
 
-def satisfaction(program: Program, work_unit_id: str, reference_id: str, attempt_id: str | None) -> TrustedSatisfaction:
+def satisfaction(program: Program, work_unit_id: str, reference_id: str, attempt_id: str) -> TrustedSatisfaction:
     unit = program.spec.work_unit(work_unit_id)
     return TrustedSatisfaction(
         reference_id=reference_id,
@@ -147,12 +148,25 @@ def test_finished_attempt_consumes_finite_budget_without_corrupting_ready_state(
     assert finished.attempt("a1").status is AttemptStatus.FINISHED
 
 
-def test_trusted_satisfaction_without_source_closes_active_attempt_bookkeeping() -> None:
+def test_satisfaction_never_fabricates_attempt_completion_or_erases_active_execution() -> None:
     active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
     prepared = active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
-    reference = satisfaction(prepared, "first", "s1", None)
 
-    advanced = prepared.apply(SatisfyWorkUnit(prepared.revision, OWNER, reference))
+    with pytest.raises(IllegalTransition):
+        prepared.apply(SatisfyWorkUnit(prepared.revision, OWNER, satisfaction(prepared, "first", "s1", "a1")))
+
+    assert prepared.state("first").status is WorkUnitStatus.ACTIVE
+    assert prepared.state("first").active_attempt_id == "a1"
+    assert prepared.attempt("a1").status is AttemptStatus.PREPARED
+
+    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
+    with pytest.raises(IllegalTransition):
+        executing.apply(SatisfyWorkUnit(executing.revision, OWNER, satisfaction(executing, "first", "s1", "a1")))
+    assert executing.attempt("a1").status is AttemptStatus.EXECUTING
+    assert executing.state("first").active_attempt_id == "a1"
+
+    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
+    advanced = finished.apply(SatisfyWorkUnit(finished.revision, OWNER, satisfaction(finished, "first", "s1", "a1")))
 
     assert advanced.state("first").status is WorkUnitStatus.SATISFIED
     assert advanced.attempt("a1").status is AttemptStatus.FINISHED
@@ -423,6 +437,30 @@ def test_active_and_paused_states_without_any_legal_path_are_rejected() -> None:
         Program.create(spec)
 
 
+def test_large_attempt_only_program_is_rejected_without_attempt_interleaving_search() -> None:
+    authority = AuthorityEnvelope(
+        OWNER,
+        frozenset(
+            {
+                DomainAction.ACTIVATE_PROGRAM,
+                DomainAction.PREPARE_ATTEMPT,
+                DomainAction.FAIL_ATTEMPT,
+            }
+        ),
+        max_attempts=8,
+    )
+    spec = ProgramSpec(
+        "p",
+        "objective",
+        tuple(WorkUnit(f"wu-{index}") for index in range(8)),
+        budget=BudgetPolicy(max_attempts=8, max_active_attempts=8),
+        authority=authority,
+    )
+
+    with pytest.raises(AuthorityViolation):
+        Program.create(spec)
+
+
 def test_attempt_admission_rejects_a_prepared_state_with_no_legal_followup() -> None:
     authority = AuthorityEnvelope(
         OWNER,
@@ -485,13 +523,15 @@ def test_least_authority_finish_then_cancel_path_remains_live() -> None:
     assert cancelled.status is ProgramStatus.CANCELLED
 
 
-def test_least_authority_prepare_then_trusted_satisfaction_needs_no_start() -> None:
+def test_least_authority_prepared_attempt_requires_execution_before_satisfaction() -> None:
     authority = AuthorityEnvelope(
         OWNER,
         frozenset(
             {
                 DomainAction.ACTIVATE_PROGRAM,
                 DomainAction.PREPARE_ATTEMPT,
+                DomainAction.START_ATTEMPT,
+                DomainAction.FINISH_ATTEMPT,
                 DomainAction.SATISFY_WORK_UNIT,
             }
         ),
@@ -505,20 +545,95 @@ def test_least_authority_prepare_then_trusted_satisfaction_needs_no_start() -> N
             AttemptSpec("a1", active.program_id, "only", active.spec.revision, active.spec.digest),
         )
     )
-    with pytest.raises(AuthorityViolation):
-        prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
-    satisfied = prepared.apply(
+    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
+    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
+    satisfied = finished.apply(
         SatisfyWorkUnit(
-            prepared.revision,
+            finished.revision,
             OWNER,
-            satisfaction(prepared, "only", "s1", None),
+            satisfaction(finished, "only", "s1", "a1"),
         )
     )
 
     assert prepared.state("only").status is WorkUnitStatus.ACTIVE
     assert prepared.attempt("a1").status is AttemptStatus.PREPARED
+    assert finished.attempt("a1").status is AttemptStatus.FINISHED
     assert satisfied.status is ProgramStatus.COMPLETED
     assert satisfied.attempt("a1").status is AttemptStatus.FINISHED
+
+
+def test_paused_program_completes_when_amendment_removes_remaining_work() -> None:
+    authority = AuthorityEnvelope(
+        OWNER,
+        frozenset(
+            {
+                DomainAction.ACTIVATE_PROGRAM,
+                DomainAction.PREPARE_ATTEMPT,
+                DomainAction.START_ATTEMPT,
+                DomainAction.FINISH_ATTEMPT,
+                DomainAction.SATISFY_WORK_UNIT,
+                DomainAction.PAUSE_PROGRAM,
+                DomainAction.AMEND_SPEC,
+            }
+        ),
+    )
+    spec = ProgramSpec("p", "objective", (WorkUnit("done"), WorkUnit("remaining")), authority=authority)
+    active = Program.create(spec).apply(ActivateProgram(0, OWNER))
+    prepared = active.apply(
+        PrepareAttempt(
+            active.revision,
+            OWNER,
+            AttemptSpec("a1", active.program_id, "done", active.spec.revision, active.spec.digest),
+        )
+    )
+    finished = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1")).apply(
+        FinishAttempt(prepared.revision + 1, OWNER, "a1")
+    )
+    satisfied = finished.apply(SatisfyWorkUnit(finished.revision, OWNER, satisfaction(finished, "done", "s1", "a1")))
+    paused = satisfied.apply(PauseProgram(satisfied.revision, OWNER))
+
+    amended = paused.apply(
+        AmendProgramSpec(
+            paused.revision,
+            OWNER,
+            SpecAmendment(expected_revision=1, work_units=(paused.spec.work_unit("done"),)),
+        )
+    )
+
+    assert DomainAction.CANCEL_PROGRAM not in authority.allowed_actions
+    assert amended.state("done").status is WorkUnitStatus.SATISFIED
+    assert amended.status is ProgramStatus.COMPLETED
+
+
+def test_paused_program_cancels_when_amendment_removes_remaining_work() -> None:
+    authority = AuthorityEnvelope(
+        OWNER,
+        frozenset(
+            {
+                DomainAction.ACTIVATE_PROGRAM,
+                DomainAction.CANCEL_WORK_UNIT,
+                DomainAction.PAUSE_PROGRAM,
+                DomainAction.AMEND_SPEC,
+            }
+        ),
+    )
+    cancelled_unit = WorkUnit("cancelled")
+    spec = ProgramSpec("p", "objective", (cancelled_unit, WorkUnit("remaining")), authority=authority)
+    active = Program.create(spec).apply(ActivateProgram(0, OWNER))
+    cancelled = active.apply(CancelWorkUnit(active.revision, OWNER, "cancelled"))
+    paused = cancelled.apply(PauseProgram(cancelled.revision, OWNER))
+
+    amended = paused.apply(
+        AmendProgramSpec(
+            paused.revision,
+            OWNER,
+            SpecAmendment(expected_revision=1, work_units=(cancelled_unit,)),
+        )
+    )
+
+    assert DomainAction.CANCEL_PROGRAM not in authority.allowed_actions
+    assert amended.state("cancelled").status is WorkUnitStatus.CANCELLED
+    assert amended.status is ProgramStatus.CANCELLED
 
 
 def test_pause_requires_a_viable_resume_or_termination_path() -> None:
@@ -775,7 +890,7 @@ def test_attempt_inputs_are_immutable_and_amendments_preserve_history() -> None:
     assert amended.spec_history == (finished.spec, amended.spec)
 
 
-def test_amendment_rechecks_readiness_without_deleting_satisfaction_reference() -> None:
+def test_unrelated_amendment_preserves_applicable_satisfaction_reference() -> None:
     active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
     prepared = active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
     finished = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1")).apply(
@@ -787,12 +902,255 @@ def test_amendment_rechecks_readiness_without_deleting_satisfaction_reference() 
         AmendProgramSpec(
             advanced.revision,
             OWNER,
-            SpecAmendment(expected_revision=1, objective="new objective"),
+            SpecAmendment(expected_revision=1, budget=BudgetPolicy(max_attempts=4, max_active_attempts=1)),
         )
     )
     assert amended.state("first").status is WorkUnitStatus.SATISFIED
     assert amended.ready_work_unit_ids == ("second",)
     assert amended.satisfactions[0].reference_id == "s1"
+
+
+def test_acceptance_and_policy_intent_participate_in_digests_and_amendments() -> None:
+    policy_v1 = PolicyReference("engineering-acceptance", "v1", "sha256:policy-one")
+    policy_v2 = PolicyReference("engineering-acceptance", "v2", "sha256:policy-two")
+    unit_v1 = WorkUnit(
+        "only",
+        acceptance_criteria=("The bounded obligation is met",),
+        acceptance_policy_reference=policy_v1,
+    )
+    unit_v2 = WorkUnit(
+        "only",
+        acceptance_criteria=("The bounded obligation is independently checked",),
+        acceptance_policy_reference=policy_v2,
+    )
+    unit_changed_criteria = WorkUnit(
+        "only",
+        acceptance_criteria=("The bounded obligation is independently checked",),
+        acceptance_policy_reference=policy_v1,
+    )
+    unit_changed_policy = WorkUnit(
+        "only",
+        acceptance_criteria=("The bounded obligation is met",),
+        acceptance_policy_reference=policy_v2,
+    )
+    spec_v1 = ProgramSpec(
+        "p",
+        "deliver the owner objective",
+        (unit_v1,),
+        acceptance_criteria=("The Program objective is met",),
+        policy_references=(policy_v1,),
+    )
+    changed_program_criteria = ProgramSpec(
+        "p",
+        "deliver the owner objective",
+        (unit_v1,),
+        acceptance_criteria=("The Program objective and constraints are met",),
+        policy_references=(policy_v1,),
+    )
+    changed_program_policy = ProgramSpec(
+        "p",
+        "deliver the owner objective",
+        (unit_v1,),
+        acceptance_criteria=("The Program objective is met",),
+        policy_references=(policy_v2,),
+    )
+
+    assert unit_v1.digest != unit_v2.digest
+    assert unit_v1.digest != unit_changed_criteria.digest
+    assert unit_v1.digest != unit_changed_policy.digest
+    assert spec_v1.digest != changed_program_criteria.digest
+    assert spec_v1.digest != changed_program_policy.digest
+
+    active = Program.create(spec_v1).apply(ActivateProgram(0, OWNER))
+    prepared = active.apply(
+        PrepareAttempt(
+            active.revision,
+            OWNER,
+            AttemptSpec("a1", active.program_id, "only", spec_v1.revision, spec_v1.digest),
+        )
+    )
+    amended = prepared.apply(
+        AmendProgramSpec(
+            prepared.revision,
+            OWNER,
+            SpecAmendment(
+                expected_revision=1,
+                acceptance_criteria=("The updated Program objective is met",),
+                policy_references=(policy_v2,),
+                work_units=(unit_v2,),
+            ),
+        )
+    )
+
+    assert amended.spec.revision == 2
+    assert amended.spec.digest != spec_v1.digest
+    assert amended.spec.work_unit("only").digest == unit_v2.digest
+    assert amended.attempt("a1").spec.spec_digest == spec_v1.digest
+    assert amended.attempt("a1").spec.spec_revision == spec_v1.revision
+
+
+def test_owner_intent_amendment_has_consistent_satisfaction_applicability() -> None:
+    policy_v1 = PolicyReference("acceptance", "v1", "sha256:one")
+    policy_v2 = PolicyReference("acceptance", "v2", "sha256:two")
+    original_spec = ProgramSpec(
+        "p",
+        "original objective",
+        (WorkUnit("only", acceptance_criteria=("Original obligation",)),),
+        acceptance_criteria=("Original Program criterion",),
+        policy_references=(policy_v1,),
+    )
+    amendment = SpecAmendment(
+        expected_revision=1,
+        objective="amended objective",
+        acceptance_criteria=("Amended Program criterion",),
+        policy_references=(policy_v2,),
+    )
+
+    before_active = Program.create(original_spec).apply(ActivateProgram(0, OWNER))
+    before_prepared = before_active.apply(
+        PrepareAttempt(
+            before_active.revision,
+            OWNER,
+            AttemptSpec("before-a1", "p", "only", 1, original_spec.digest),
+        )
+    )
+    before_finished = before_prepared.apply(StartAttempt(before_prepared.revision, OWNER, "before-a1")).apply(
+        FinishAttempt(before_prepared.revision + 1, OWNER, "before-a1")
+    )
+    stale_reference = satisfaction(before_finished, "only", "old-satisfaction", "before-a1")
+    amendment_first = before_finished.apply(AmendProgramSpec(before_finished.revision, OWNER, amendment))
+
+    with pytest.raises(StaleRevision):
+        amendment_first.apply(SatisfyWorkUnit(amendment_first.revision, OWNER, stale_reference))
+
+    before_new_attempt = amendment_first.apply(
+        PrepareAttempt(
+            amendment_first.revision,
+            OWNER,
+            AttemptSpec("before-a2", "p", "only", 2, amendment_first.spec.digest),
+        )
+    )
+    before_new_finished = before_new_attempt.apply(StartAttempt(before_new_attempt.revision, OWNER, "before-a2")).apply(
+        FinishAttempt(before_new_attempt.revision + 1, OWNER, "before-a2")
+    )
+    newly_satisfied = before_new_finished.apply(
+        SatisfyWorkUnit(
+            before_new_finished.revision,
+            OWNER,
+            satisfaction(before_new_finished, "only", "new-satisfaction", "before-a2"),
+        )
+    )
+
+    after_active = Program.create(original_spec).apply(ActivateProgram(0, OWNER))
+    after_prepared = after_active.apply(
+        PrepareAttempt(
+            after_active.revision,
+            OWNER,
+            AttemptSpec("after-a1", "p", "only", 1, original_spec.digest),
+        )
+    )
+    after_finished = after_prepared.apply(StartAttempt(after_prepared.revision, OWNER, "after-a1")).apply(
+        FinishAttempt(after_prepared.revision + 1, OWNER, "after-a1")
+    )
+    satisfied_first = after_finished.apply(
+        SatisfyWorkUnit(
+            after_finished.revision,
+            OWNER,
+            satisfaction(after_finished, "only", "historical-satisfaction", "after-a1"),
+        )
+    )
+    amendment_second = satisfied_first.apply(AmendProgramSpec(satisfied_first.revision, OWNER, amendment))
+
+    assert amendment_first.spec.digest == amendment_second.spec.digest
+    assert amendment_first.state("only").status is WorkUnitStatus.READY
+    assert amendment_second.state("only").status is WorkUnitStatus.READY
+    assert amendment_first.satisfactions == ()
+    assert amendment_second.satisfactions == satisfied_first.satisfactions
+    assert newly_satisfied.state("only").status is WorkUnitStatus.SATISFIED
+
+
+def test_work_unit_intent_change_invalidates_affected_chain_only() -> None:
+    first = WorkUnit(
+        "first",
+        outputs=frozenset({"first-output"}),
+        acceptance_criteria=("old first",),
+        acceptance_policy_reference=PolicyReference("first-policy", "v1", "sha256:first-v1"),
+    )
+    child = WorkUnit("child", dependencies=("first",), required_inputs=frozenset({"first-output"}))
+    unrelated = WorkUnit("unrelated", acceptance_policy_reference=PolicyReference("local", "v1", "sha256:p"))
+    spec = ProgramSpec("p", "objective", (first, child, unrelated))
+    active = Program.create(spec).apply(ActivateProgram(0, OWNER))
+
+    first_prepared = active.apply(
+        PrepareAttempt(
+            active.revision,
+            OWNER,
+            AttemptSpec("a1", "p", "first", 1, spec.digest),
+        )
+    )
+    first_finished = first_prepared.apply(StartAttempt(first_prepared.revision, OWNER, "a1")).apply(
+        FinishAttempt(first_prepared.revision + 1, OWNER, "a1")
+    )
+    first_satisfied = first_finished.apply(
+        SatisfyWorkUnit(
+            first_finished.revision,
+            OWNER,
+            satisfaction(first_finished, "first", "s1", "a1"),
+        )
+    )
+    child_prepared = first_satisfied.apply(
+        PrepareAttempt(
+            first_satisfied.revision,
+            OWNER,
+            attempt_spec(first_satisfied, "a2", "child", "first-output"),
+        )
+    )
+    child_finished = child_prepared.apply(StartAttempt(child_prepared.revision, OWNER, "a2")).apply(
+        FinishAttempt(child_prepared.revision + 1, OWNER, "a2")
+    )
+    child_satisfied = child_finished.apply(
+        SatisfyWorkUnit(
+            child_finished.revision,
+            OWNER,
+            satisfaction(child_finished, "child", "s2", "a2"),
+        )
+    )
+    unrelated_prepared = child_satisfied.apply(
+        PrepareAttempt(
+            child_satisfied.revision,
+            OWNER,
+            AttemptSpec("a3", "p", "unrelated", 1, spec.digest),
+        )
+    )
+    unrelated_finished = unrelated_prepared.apply(StartAttempt(unrelated_prepared.revision, OWNER, "a3")).apply(
+        FinishAttempt(unrelated_prepared.revision + 1, OWNER, "a3")
+    )
+    all_satisfied = unrelated_finished.apply(
+        SatisfyWorkUnit(
+            unrelated_finished.revision,
+            OWNER,
+            satisfaction(unrelated_finished, "unrelated", "s3", "a3"),
+        )
+    )
+    changed_first = WorkUnit(
+        "first",
+        outputs=frozenset({"first-output"}),
+        acceptance_criteria=("new first criterion",),
+        acceptance_policy_reference=PolicyReference("first-policy", "v2", "sha256:first-v2"),
+    )
+
+    amended = all_satisfied.apply(
+        AmendProgramSpec(
+            all_satisfied.revision,
+            OWNER,
+            SpecAmendment(expected_revision=1, work_units=(changed_first, child, unrelated)),
+        )
+    )
+
+    assert amended.state("first").status is WorkUnitStatus.READY
+    assert amended.state("child").status is WorkUnitStatus.PENDING
+    assert amended.state("unrelated").status is WorkUnitStatus.SATISFIED
+    assert tuple(item.reference_id for item in amended.satisfactions) == ("s1", "s2", "s3")
 
 
 def test_amendment_cancels_attempts_pinned_to_the_old_spec() -> None:
