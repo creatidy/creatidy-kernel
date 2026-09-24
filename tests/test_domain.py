@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Pure present-fact regressions for the Issue #4 domain contract."""
+
 import copy
 from dataclasses import FrozenInstanceError, replace
 
@@ -14,15 +16,19 @@ from creatidy_kernel.core.domain import (
     AuthorityViolation,
     BudgetExceeded,
     BudgetPolicy,
+    CancelAttempt,
     CancelProgram,
     CancelWorkUnit,
     CycleDetected,
     DomainAction,
+    DomainError,
+    DuplicateAttempt,
     FailAttempt,
     FinishAttempt,
     IllegalTransition,
     InputBinding,
     InvalidDomainValue,
+    InvalidGraph,
     MissingInput,
     MissingReference,
     PauseProgram,
@@ -42,1205 +48,1236 @@ from creatidy_kernel.core.domain import (
 )
 
 OWNER = "owner"
+DELEGATE = "delegate"
+VERIFIER = "verifier"
+POLICY = PolicyReference("acceptance", "v1", "sha256:policy-v1")
+SEED = InputBinding("seed", "ref:approved-seed")
+
+
+def unit(
+    work_unit_id: str,
+    *,
+    obligation: str | None = None,
+    dependencies: tuple[str, ...] = (),
+    required_inputs: frozenset[str] = frozenset(),
+    outputs: frozenset[str] = frozenset(),
+) -> WorkUnit:
+    return WorkUnit(
+        work_unit_id,
+        f"deliver {work_unit_id}" if obligation is None else obligation,
+        dependencies=dependencies,
+        required_inputs=required_inputs,
+        outputs=outputs,
+        acceptance_criteria=(f"accept {work_unit_id}",),
+    )
 
 
 def graph_spec(
     *,
+    work_units: tuple[WorkUnit, ...] | None = None,
+    initial_inputs: tuple[InputBinding, ...] = (SEED,),
+    objective: str = "deliver the bounded result",
+    acceptance_criteria: tuple[str, ...] = ("Program result is accepted",),
+    policy_references: tuple[PolicyReference, ...] = (POLICY,),
     budget: BudgetPolicy | None = None,
     authority: AuthorityEnvelope | None = None,
 ) -> ProgramSpec:
+    if work_units is None:
+        work_units = (
+            unit("first", required_inputs=frozenset({"seed"}), outputs=frozenset({"first-output"})),
+            unit("second", dependencies=("first",), required_inputs=frozenset({"first-output"})),
+        )
     return ProgramSpec(
         program_id="program",
-        objective="build the bounded result",
-        initial_inputs=frozenset({"seed"}),
-        work_units=(
-            WorkUnit("first", required_inputs=frozenset({"seed"}), outputs=frozenset({"first-output"})),
-            WorkUnit(
-                "second",
-                dependencies=("first",),
-                required_inputs=frozenset({"first-output"}),
-                outputs=frozenset({"final-output"}),
-            ),
-        ),
+        objective=objective,
+        work_units=work_units,
+        initial_inputs=initial_inputs,
         budget=BudgetPolicy() if budget is None else budget,
-        authority=AuthorityEnvelope(OWNER) if authority is None else authority,
+        authority=(
+            AuthorityEnvelope(OWNER, trusted_satisfaction_issuers=frozenset({VERIFIER}))
+            if authority is None
+            else authority
+        ),
+        acceptance_criteria=acceptance_criteria,
+        policy_references=policy_references,
     )
 
 
-def attempt_spec(program: Program, attempt_id: str, work_unit_id: str, input_name: str) -> AttemptSpec:
+def active(spec: ProgramSpec | None = None) -> Program:
+    draft = Program.create(graph_spec() if spec is None else spec)
+    return draft.apply(ActivateProgram(draft.revision, OWNER))
+
+
+def attempt_spec(
+    program: Program,
+    attempt_id: str,
+    work_unit_id: str,
+    *,
+    effective_inputs: tuple[InputBinding, ...] | None = None,
+) -> AttemptSpec:
     return AttemptSpec(
         attempt_id=attempt_id,
         program_id=program.program_id,
         work_unit_id=work_unit_id,
         spec_revision=program.spec.revision,
         spec_digest=program.spec.digest,
-        effective_inputs=(InputBinding(input_name, f"ref:{input_name}"),),
+        effective_inputs=(program.resolved_inputs(work_unit_id) if effective_inputs is None else effective_inputs),
         agent_definition_reference="agent:v1",
     )
 
 
-def satisfaction(program: Program, work_unit_id: str, reference_id: str, attempt_id: str) -> TrustedSatisfaction:
-    unit = program.spec.work_unit(work_unit_id)
+def prepared(program: Program, work_unit_id: str = "first", attempt_id: str = "a1") -> Program:
+    return program.apply(PrepareAttempt(program.revision, OWNER, attempt_spec(program, attempt_id, work_unit_id)))
+
+
+def finished(program: Program, work_unit_id: str = "first", attempt_id: str = "a1") -> Program:
+    pending = prepared(program, work_unit_id, attempt_id)
+    executing = pending.apply(StartAttempt(pending.revision, OWNER, attempt_id))
+    return executing.apply(FinishAttempt(executing.revision, OWNER, attempt_id))
+
+
+def satisfaction(
+    program: Program,
+    work_unit_id: str,
+    reference_id: str,
+    attempt_id: str,
+    *,
+    output_bindings: tuple[InputBinding, ...] | None = None,
+    issuer_id: str = VERIFIER,
+) -> TrustedSatisfaction:
+    source_attempt = program.attempt(attempt_id)
+    source_spec = next(
+        item
+        for item in program.spec_history
+        if item.revision == source_attempt.spec.spec_revision and item.digest == source_attempt.spec.spec_digest
+    )
+    if output_bindings is None:
+        output_bindings = tuple(
+            InputBinding(name, f"ref:{reference_id}:{name}")
+            for name in sorted(source_spec.work_unit(work_unit_id).outputs)
+        )
     return TrustedSatisfaction(
         reference_id=reference_id,
         program_id=program.program_id,
         work_unit_id=work_unit_id,
-        spec_revision=program.spec.revision,
-        spec_digest=program.spec.digest,
-        work_unit_digest=unit.digest,
-        issuer_id=OWNER,
+        spec_revision=source_spec.revision,
+        spec_digest=source_spec.digest,
+        work_unit_fingerprint=source_spec.work_unit_applicability_fingerprint(work_unit_id),
+        issuer_id=issuer_id,
         source_attempt_id=attempt_id,
+        output_bindings=output_bindings,
     )
 
 
-def test_two_node_graph_advances_only_through_legal_commands() -> None:
-    program = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-
-    assert program.status is ProgramStatus.ACTIVE
-    assert program.ready_work_unit_ids == ("first",)
-
-    prepared = program.apply(PrepareAttempt(program.revision, OWNER, attempt_spec(program, "a1", "first", "seed")))
-    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
-    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
-    assert finished.state("first").status is WorkUnitStatus.READY
-    assert finished.state("first").active_attempt_id is None
-    assert finished.attempt("a1").status is AttemptStatus.FINISHED
-    advanced = finished.apply(SatisfyWorkUnit(finished.revision, OWNER, satisfaction(finished, "first", "s1", "a1")))
-
-    assert advanced.state("first").status is WorkUnitStatus.SATISFIED
-    assert advanced.ready_work_unit_ids == ("second",)
-    assert advanced.attempt("a1").status is AttemptStatus.FINISHED
-
-    second = advanced.apply(
-        PrepareAttempt(advanced.revision, OWNER, attempt_spec(advanced, "a2", "second", "first-output"))
-    )
-    assert second.state("second").status is WorkUnitStatus.ACTIVE
-
-
-def test_finished_attempt_releases_work_unit_for_retry_or_cancellation() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-    prepared = active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
-    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
-    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
-
-    retry = finished.apply(PrepareAttempt(finished.revision, OWNER, attempt_spec(finished, "a2", "first", "seed")))
-    assert retry.state("first").status is WorkUnitStatus.ACTIVE
-    assert retry.attempt("a1").status is AttemptStatus.FINISHED
-
-    cancelled = finished.apply(CancelWorkUnit(finished.revision, OWNER, "first"))
-    assert cancelled.state("first").status is WorkUnitStatus.CANCELLED
-    assert cancelled.state("second").status is WorkUnitStatus.CANCELLED
-    assert cancelled.status is ProgramStatus.CANCELLED
-
-
-def test_finished_attempt_consumes_finite_budget_without_corrupting_ready_state() -> None:
-    active = Program.create(graph_spec(budget=BudgetPolicy(max_attempts=1, max_active_attempts=1))).apply(
-        ActivateProgram(0, OWNER)
-    )
-    prepared = active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
-    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
-    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
-
-    with pytest.raises(BudgetExceeded):
-        finished.apply(PrepareAttempt(finished.revision, OWNER, attempt_spec(finished, "a2", "first", "seed")))
-
-    assert finished.state("first").status is WorkUnitStatus.READY
-    assert finished.attempt("a1").status is AttemptStatus.FINISHED
-
-
-def test_satisfaction_never_fabricates_attempt_completion_or_erases_active_execution() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-    prepared = active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
-
-    with pytest.raises(IllegalTransition):
-        prepared.apply(SatisfyWorkUnit(prepared.revision, OWNER, satisfaction(prepared, "first", "s1", "a1")))
-
-    assert prepared.state("first").status is WorkUnitStatus.ACTIVE
-    assert prepared.state("first").active_attempt_id == "a1"
-    assert prepared.attempt("a1").status is AttemptStatus.PREPARED
-
-    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
-    with pytest.raises(IllegalTransition):
-        executing.apply(SatisfyWorkUnit(executing.revision, OWNER, satisfaction(executing, "first", "s1", "a1")))
-    assert executing.attempt("a1").status is AttemptStatus.EXECUTING
-    assert executing.state("first").active_attempt_id == "a1"
-
-    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
-    advanced = finished.apply(SatisfyWorkUnit(finished.revision, OWNER, satisfaction(finished, "first", "s1", "a1")))
-
-    assert advanced.state("first").status is WorkUnitStatus.SATISFIED
-    assert advanced.attempt("a1").status is AttemptStatus.FINISHED
-    assert advanced.ready_work_unit_ids == ("second",)
-
-
-def test_graph_rejects_missing_references_inputs_and_cycles() -> None:
-    with pytest.raises(MissingReference):
-        ProgramSpec("p", "objective", (WorkUnit("child", dependencies=("missing",)),))
-    with pytest.raises(MissingInput):
-        ProgramSpec("p", "objective", (WorkUnit("root", required_inputs=frozenset({"missing"})),))
-    with pytest.raises(CycleDetected):
-        ProgramSpec(
-            "p",
-            "objective",
-            (WorkUnit("a", dependencies=("b",)), WorkUnit("b", dependencies=("a",))),
-        )
-
-
-def test_expected_revisions_and_illegal_transitions_are_deterministic() -> None:
-    program = Program.create(graph_spec())
-    with pytest.raises(InvalidDomainValue):
-        Program(graph_spec(), status=ProgramStatus.ACTIVE)
-    with pytest.raises(StaleRevision):
-        program.apply(ActivateProgram(1, OWNER))
-
-    active = program.apply(ActivateProgram(0, OWNER))
-    with pytest.raises(IllegalTransition):
-        active.apply(ActivateProgram(active.revision, OWNER))
-    with pytest.raises(MissingReference):
-        active.apply(FinishAttempt(active.revision, OWNER, "unknown"))
-
-
-def test_dataclass_replace_cannot_inject_a_lifecycle_state() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-
-    with pytest.raises(ValueError):
-        replace(active, status=ProgramStatus.DRAFT)
-    with pytest.raises(TypeError):
-        replace(active, _copy_seal=None)  # type: ignore[call-arg]
-
-    replacement_spec = ProgramSpec(
-        "replacement",
-        "forged replacement",
-        (WorkUnit("replacement"),),
-        authority=AuthorityEnvelope(OWNER, frozenset()),
-    )
-    with pytest.raises(ValueError):
-        replace(
-            active,
-            spec=replacement_spec,
-            status=ProgramStatus.DRAFT,
-            revision=0,
-            work_unit_states=(),
-            attempts=(),
-            satisfactions=(),
-            spec_history=(),
-        )
-
-
-def test_internal_transition_builder_is_not_a_supported_construction_path() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-
-    assert not hasattr(active, "_next")
-    assert not hasattr(Program, "_from_transition")
-    assert not hasattr(domain_module, "_TRANSITION_TOKEN")
-    with pytest.raises(AttributeError):
-        active._next(status=ProgramStatus.CANCELLED, _token=None)  # type: ignore[attr-defined]
-    with pytest.raises(InvalidDomainValue):
-        active.apply(object())  # type: ignore[arg-type]
-    assert active.status is ProgramStatus.ACTIVE
-
-
-def test_program_subclass_cannot_override_validation_or_authorization() -> None:
-    def forged_authorize(
-        self: Program,
-        action: DomainAction,
-        actor_id: str,
-        *,
-        trusted_satisfaction: bool = False,
-    ) -> None:
-        del self, action, actor_id, trusted_satisfaction
-
-    def forged_validate(self: Program, *, allow_transition: bool) -> None:
-        del self, allow_transition
-
-    with pytest.raises(TypeError):
-        type(
-            "ForgedProgram",
-            (Program,),
-            {"_authorize": forged_authorize, "_validate": forged_validate},
-        )
-
-
-def test_amendment_retains_a_control_path_for_an_active_program() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-    amendment = AmendProgramSpec(
-        active.revision,
-        OWNER,
-        SpecAmendment(
-            expected_revision=1,
-            authority=AuthorityEnvelope(OWNER, frozenset({DomainAction.CANCEL_PROGRAM})),
-        ),
-    )
-
-    amended = active.apply(amendment)
-
-    assert amended.status is ProgramStatus.ACTIVE
-    cancelled = amended.apply(CancelProgram(amended.revision, OWNER))
-    assert cancelled.status is ProgramStatus.CANCELLED
-
-
-def test_amendment_cannot_strand_an_active_program_without_control_actions() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-    amendment = AmendProgramSpec(
-        active.revision,
-        OWNER,
-        SpecAmendment(expected_revision=1, authority=AuthorityEnvelope(OWNER, frozenset())),
-    )
-
-    with pytest.raises(AuthorityViolation):
-        active.apply(amendment)
-
-
-def test_paused_amendment_cannot_remove_control_needed_after_resume() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-    paused = active.apply(PauseProgram(active.revision, OWNER))
-    amendment = AmendProgramSpec(
-        paused.revision,
-        OWNER,
-        SpecAmendment(
-            expected_revision=1,
-            authority=AuthorityEnvelope(OWNER, frozenset({DomainAction.RESUME_PROGRAM})),
-        ),
-    )
-
-    with pytest.raises(AuthorityViolation):
-        paused.apply(amendment)
-
-
-def test_resume_transition_rejects_an_actionless_active_state() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-    paused = active.apply(PauseProgram(active.revision, OWNER))
-    actionless_spec = paused.spec.amend(
-        SpecAmendment(
-            expected_revision=1,
-            authority=AuthorityEnvelope(OWNER, frozenset({DomainAction.RESUME_PROGRAM})),
-        )
-    )
-
-    with pytest.raises(AuthorityViolation):
-        paused.apply(
-            AmendProgramSpec(
-                paused.revision,
-                OWNER,
-                SpecAmendment(
-                    expected_revision=1,
-                    authority=actionless_spec.authority,
-                ),
-            )
-        )
-
-
-def test_paused_amendment_and_resume_retain_an_operable_control_path() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-    paused = active.apply(PauseProgram(active.revision, OWNER))
-    amendment = AmendProgramSpec(
-        paused.revision,
-        OWNER,
-        SpecAmendment(
-            expected_revision=1,
-            authority=AuthorityEnvelope(
-                OWNER,
-                frozenset({DomainAction.RESUME_PROGRAM, DomainAction.CANCEL_PROGRAM}),
-            ),
-        ),
-    )
-
-    amended = paused.apply(amendment)
-    resumed = amended.apply(ResumeProgram(amended.revision, OWNER))
-
-    assert resumed.status is ProgramStatus.ACTIVE
-    assert resumed.spec.authority.allowed_actions == frozenset(
-        {DomainAction.RESUME_PROGRAM, DomainAction.CANCEL_PROGRAM}
-    )
-    assert resumed.apply(CancelProgram(resumed.revision, OWNER)).status is ProgramStatus.CANCELLED
-
-
-def test_paused_amendment_remains_a_real_control_path_without_resume_or_cancel() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-    paused = active.apply(PauseProgram(active.revision, OWNER))
-    amendment = AmendProgramSpec(
-        paused.revision,
-        OWNER,
-        SpecAmendment(
-            expected_revision=1,
-            authority=AuthorityEnvelope(OWNER, frozenset({DomainAction.AMEND_SPEC})),
-        ),
-    )
-
-    amended = paused.apply(amendment)
-    changed = amended.apply(
-        AmendProgramSpec(
-            amended.revision,
-            OWNER,
-            SpecAmendment(expected_revision=2, objective="revised while paused"),
-        )
-    )
-
-    assert changed.status is ProgramStatus.PAUSED
-    assert changed.spec.objective == "revised while paused"
-    assert changed.spec.authority.allowed_actions == frozenset({DomainAction.AMEND_SPEC})
-
-
-def test_work_unit_cancellation_propagates_and_closes_an_unfinishable_graph() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-
-    cancelled = active.apply(CancelWorkUnit(active.revision, OWNER, "first"))
-
-    assert cancelled.state("first").status is WorkUnitStatus.CANCELLED
-    assert cancelled.state("second").status is WorkUnitStatus.CANCELLED
-    assert cancelled.status is ProgramStatus.CANCELLED
-
-
-def test_least_privilege_active_work_unit_cancellation_needs_no_program_cancel() -> None:
-    authority = AuthorityEnvelope(
-        OWNER,
-        frozenset({DomainAction.ACTIVATE_PROGRAM, DomainAction.CANCEL_WORK_UNIT}),
-    )
-    spec = ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority)
-
-    active = Program.create(spec).apply(ActivateProgram(0, OWNER))
-
-    assert DomainAction.CANCEL_PROGRAM not in active.spec.authority.allowed_actions
-    assert active.apply(CancelWorkUnit(active.revision, OWNER, "only")).status is ProgramStatus.CANCELLED
-
-
-def test_active_program_can_retain_amendment_control_without_program_cancellation() -> None:
-    authority = AuthorityEnvelope(
-        OWNER,
-        frozenset({DomainAction.ACTIVATE_PROGRAM, DomainAction.AMEND_SPEC}),
-    )
-    active = Program.create(ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority)).apply(
-        ActivateProgram(0, OWNER)
-    )
-
-    amended = active.apply(
-        AmendProgramSpec(
-            active.revision,
-            OWNER,
-            SpecAmendment(expected_revision=1, objective="revised objective"),
-        )
-    )
-
-    assert amended.status is ProgramStatus.ACTIVE
-    assert amended.spec.objective == "revised objective"
-    assert DomainAction.CANCEL_PROGRAM not in amended.spec.authority.allowed_actions
-
-
-def test_active_and_paused_states_without_any_legal_path_are_rejected() -> None:
-    authority = AuthorityEnvelope(
-        OWNER,
-        frozenset({DomainAction.ACTIVATE_PROGRAM, DomainAction.PAUSE_PROGRAM}),
-    )
-    spec = ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority)
-
-    with pytest.raises(AuthorityViolation):
-        Program.create(spec)
-
-
-def test_large_attempt_only_program_is_rejected_without_attempt_interleaving_search() -> None:
-    authority = AuthorityEnvelope(
-        OWNER,
-        frozenset(
-            {
-                DomainAction.ACTIVATE_PROGRAM,
-                DomainAction.PREPARE_ATTEMPT,
-                DomainAction.FAIL_ATTEMPT,
-            }
-        ),
-        max_attempts=8,
-    )
-    spec = ProgramSpec(
-        "p",
-        "objective",
-        tuple(WorkUnit(f"wu-{index}") for index in range(8)),
-        budget=BudgetPolicy(max_attempts=8, max_active_attempts=8),
-        authority=authority,
-    )
-
-    with pytest.raises(AuthorityViolation):
-        Program.create(spec)
-
-
-def test_attempt_admission_rejects_a_prepared_state_with_no_legal_followup() -> None:
-    authority = AuthorityEnvelope(
-        OWNER,
-        frozenset(
-            {
-                DomainAction.ACTIVATE_PROGRAM,
-                DomainAction.PREPARE_ATTEMPT,
-                DomainAction.FINISH_ATTEMPT,
-                DomainAction.CANCEL_WORK_UNIT,
-            }
-        ),
-    )
-    active = Program.create(ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority)).apply(
-        ActivateProgram(0, OWNER)
-    )
-
-    with pytest.raises(AuthorityViolation):
-        active.apply(
-            PrepareAttempt(
-                active.revision,
-                OWNER,
-                AttemptSpec("a1", active.program_id, "only", active.spec.revision, active.spec.digest),
-            )
-        )
-
-    assert active.state("only").status is WorkUnitStatus.READY
-    assert active.attempts == ()
-
-
-def test_least_authority_finish_then_cancel_path_remains_live() -> None:
-    authority = AuthorityEnvelope(
-        OWNER,
-        frozenset(
-            {
-                DomainAction.ACTIVATE_PROGRAM,
-                DomainAction.PREPARE_ATTEMPT,
-                DomainAction.START_ATTEMPT,
-                DomainAction.FINISH_ATTEMPT,
-                DomainAction.CANCEL_WORK_UNIT,
-            }
-        ),
-    )
-    draft = Program.create(ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority))
-    active = draft.apply(ActivateProgram(draft.revision, OWNER))
-    prepared = active.apply(
-        PrepareAttempt(
-            active.revision,
-            OWNER,
-            AttemptSpec("a1", active.program_id, "only", active.spec.revision, active.spec.digest),
-        )
-    )
-    with pytest.raises(AuthorityViolation):
-        prepared.apply(FailAttempt(prepared.revision, OWNER, "a1"))
-    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
-    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
-    cancelled = finished.apply(CancelWorkUnit(finished.revision, OWNER, "only"))
-
-    assert finished.state("only").status is WorkUnitStatus.READY
-    assert finished.attempt("a1").status is AttemptStatus.FINISHED
-    assert cancelled.status is ProgramStatus.CANCELLED
-
-
-def test_least_authority_prepared_attempt_requires_execution_before_satisfaction() -> None:
-    authority = AuthorityEnvelope(
-        OWNER,
-        frozenset(
-            {
-                DomainAction.ACTIVATE_PROGRAM,
-                DomainAction.PREPARE_ATTEMPT,
-                DomainAction.START_ATTEMPT,
-                DomainAction.FINISH_ATTEMPT,
-                DomainAction.SATISFY_WORK_UNIT,
-            }
-        ),
-    )
-    draft = Program.create(ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority))
-    active = draft.apply(ActivateProgram(draft.revision, OWNER))
-    prepared = active.apply(
-        PrepareAttempt(
-            active.revision,
-            OWNER,
-            AttemptSpec("a1", active.program_id, "only", active.spec.revision, active.spec.digest),
-        )
-    )
-    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
-    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
-    satisfied = finished.apply(
+def satisfied(
+    program: Program, work_unit_id: str = "first", attempt_id: str = "a1", reference_id: str = "s1"
+) -> Program:
+    return program.apply(
         SatisfyWorkUnit(
-            finished.revision,
-            OWNER,
-            satisfaction(finished, "only", "s1", "a1"),
+            program.revision,
+            VERIFIER,
+            satisfaction(program, work_unit_id, reference_id, attempt_id),
         )
     )
 
-    assert prepared.state("only").status is WorkUnitStatus.ACTIVE
-    assert prepared.attempt("a1").status is AttemptStatus.PREPARED
-    assert finished.attempt("a1").status is AttemptStatus.FINISHED
-    assert satisfied.status is ProgramStatus.COMPLETED
-    assert satisfied.attempt("a1").status is AttemptStatus.FINISHED
 
-
-def test_paused_program_completes_when_amendment_removes_remaining_work() -> None:
-    authority = AuthorityEnvelope(
-        OWNER,
-        frozenset(
-            {
-                DomainAction.ACTIVATE_PROGRAM,
-                DomainAction.PREPARE_ATTEMPT,
-                DomainAction.START_ATTEMPT,
-                DomainAction.FINISH_ATTEMPT,
-                DomainAction.SATISFY_WORK_UNIT,
-                DomainAction.PAUSE_PROGRAM,
-                DomainAction.AMEND_SPEC,
-            }
-        ),
-    )
-    spec = ProgramSpec("p", "objective", (WorkUnit("done"), WorkUnit("remaining")), authority=authority)
-    active = Program.create(spec).apply(ActivateProgram(0, OWNER))
-    prepared = active.apply(
-        PrepareAttempt(
-            active.revision,
-            OWNER,
-            AttemptSpec("a1", active.program_id, "done", active.spec.revision, active.spec.digest),
-        )
-    )
-    finished = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1")).apply(
-        FinishAttempt(prepared.revision + 1, OWNER, "a1")
-    )
-    satisfied = finished.apply(SatisfyWorkUnit(finished.revision, OWNER, satisfaction(finished, "done", "s1", "a1")))
-    paused = satisfied.apply(PauseProgram(satisfied.revision, OWNER))
-
-    amended = paused.apply(
+def amend(
+    program: Program,
+    *,
+    objective: str | None = None,
+    work_units: tuple[WorkUnit, ...] | None = None,
+    initial_inputs: tuple[InputBinding, ...] | None = None,
+    budget: BudgetPolicy | None = None,
+    authority: AuthorityEnvelope | None = None,
+) -> Program:
+    return program.apply(
         AmendProgramSpec(
-            paused.revision,
-            OWNER,
-            SpecAmendment(expected_revision=1, work_units=(paused.spec.work_unit("done"),)),
-        )
-    )
-
-    assert DomainAction.CANCEL_PROGRAM not in authority.allowed_actions
-    assert amended.state("done").status is WorkUnitStatus.SATISFIED
-    assert amended.status is ProgramStatus.COMPLETED
-
-
-def test_paused_program_cancels_when_amendment_removes_remaining_work() -> None:
-    authority = AuthorityEnvelope(
-        OWNER,
-        frozenset(
-            {
-                DomainAction.ACTIVATE_PROGRAM,
-                DomainAction.CANCEL_WORK_UNIT,
-                DomainAction.PAUSE_PROGRAM,
-                DomainAction.AMEND_SPEC,
-            }
-        ),
-    )
-    cancelled_unit = WorkUnit("cancelled")
-    spec = ProgramSpec("p", "objective", (cancelled_unit, WorkUnit("remaining")), authority=authority)
-    active = Program.create(spec).apply(ActivateProgram(0, OWNER))
-    cancelled = active.apply(CancelWorkUnit(active.revision, OWNER, "cancelled"))
-    paused = cancelled.apply(PauseProgram(cancelled.revision, OWNER))
-
-    amended = paused.apply(
-        AmendProgramSpec(
-            paused.revision,
-            OWNER,
-            SpecAmendment(expected_revision=1, work_units=(cancelled_unit,)),
-        )
-    )
-
-    assert DomainAction.CANCEL_PROGRAM not in authority.allowed_actions
-    assert amended.state("cancelled").status is WorkUnitStatus.CANCELLED
-    assert amended.status is ProgramStatus.CANCELLED
-
-
-def test_pause_requires_a_viable_resume_or_termination_path() -> None:
-    authority = AuthorityEnvelope(
-        OWNER,
-        frozenset(
-            {
-                DomainAction.ACTIVATE_PROGRAM,
-                DomainAction.PAUSE_PROGRAM,
-                DomainAction.RESUME_PROGRAM,
-                DomainAction.CANCEL_WORK_UNIT,
-            }
-        ),
-    )
-    active = Program.create(ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority)).apply(
-        ActivateProgram(0, OWNER)
-    )
-
-    paused = active.apply(PauseProgram(active.revision, OWNER))
-    resumed = paused.apply(ResumeProgram(paused.revision, OWNER))
-
-    assert resumed.status is ProgramStatus.ACTIVE
-    assert resumed.apply(CancelWorkUnit(resumed.revision, OWNER, "only")).status is ProgramStatus.CANCELLED
-
-
-def test_objective_amendment_preserves_cancelled_work_unit() -> None:
-    spec = ProgramSpec("p", "objective", (WorkUnit("a"), WorkUnit("b")))
-    active = Program.create(spec).apply(ActivateProgram(0, OWNER))
-    cancelled = active.apply(CancelWorkUnit(active.revision, OWNER, "a"))
-
-    amended = cancelled.apply(
-        AmendProgramSpec(
-            cancelled.revision,
-            OWNER,
-            SpecAmendment(expected_revision=1, objective="new objective"),
-        )
-    )
-
-    assert amended.state("a").status is WorkUnitStatus.CANCELLED
-    assert amended.state("b").status is WorkUnitStatus.READY
-
-
-def test_unrelated_amendment_preserves_cancelled_dependency_branch() -> None:
-    units = (
-        WorkUnit("a-root"),
-        WorkUnit("a-child", dependencies=("a-root",)),
-        WorkUnit("b-root"),
-        WorkUnit("b-child", dependencies=("b-root",)),
-    )
-    active = Program.create(ProgramSpec("p", "objective", units)).apply(ActivateProgram(0, OWNER))
-    cancelled = active.apply(CancelWorkUnit(active.revision, OWNER, "a-root"))
-
-    amended = cancelled.apply(
-        AmendProgramSpec(
-            cancelled.revision,
-            OWNER,
-            SpecAmendment(expected_revision=1, objective="new objective"),
-        )
-    )
-
-    assert amended.state("a-root").status is WorkUnitStatus.CANCELLED
-    assert amended.state("a-child").status is WorkUnitStatus.CANCELLED
-    assert amended.state("b-root").status is WorkUnitStatus.READY
-    assert amended.state("b-child").status is WorkUnitStatus.PENDING
-
-
-def test_material_work_unit_amendment_reevaluates_prior_cancellation() -> None:
-    first = WorkUnit("first")
-    second = WorkUnit("second")
-    active = Program.create(ProgramSpec("p", "objective", (first, second))).apply(ActivateProgram(0, OWNER))
-    cancelled = active.apply(CancelWorkUnit(active.revision, OWNER, "first"))
-    amended = cancelled.apply(
-        AmendProgramSpec(
-            cancelled.revision,
+            program.revision,
             OWNER,
             SpecAmendment(
-                expected_revision=1,
-                work_units=(WorkUnit("first", outputs=frozenset({"new-output"})), second),
+                program.spec.revision,
+                objective=objective,
+                work_units=work_units,
+                initial_inputs=initial_inputs,
+                budget=budget,
+                authority=authority,
             ),
         )
     )
 
-    assert amended.state("first").status is WorkUnitStatus.READY
+
+def test_two_node_dag_requires_independent_satisfaction_before_successor_is_ready() -> None:
+    program = active()
+    assert program.ready_work_unit_ids == ("first",)
+    assert program.state("second").status is WorkUnitStatus.PENDING
+
+    done = finished(program)
+    assert done.attempt("a1").status is AttemptStatus.FINISHED
+    assert done.state("first").status is WorkUnitStatus.READY
+    assert done.ready_work_unit_ids == ("first",)
+
+    accepted = satisfied(done)
+    assert accepted.attempt("a1").status is AttemptStatus.FINISHED
+    assert accepted.state("first").status is WorkUnitStatus.SATISFIED
+    assert accepted.ready_work_unit_ids == ("second",)
+
+    successor = accepted.resolved_inputs("second")
+    assert successor == (
+        InputBinding("first-output", "ref:s1:first-output", "predecessor", "first", "s1", "first-output"),
+    )
+    completed = satisfied(finished(accepted, "second", "a2"), "second", "a2", "s2")
+    assert completed.status is ProgramStatus.COMPLETED
+    assert completed.ready_work_unit_ids == ()
 
 
-def test_satisfying_remaining_work_after_cancellation_closes_cancelled_program() -> None:
-    spec = ProgramSpec("p", "objective", (WorkUnit("cancelled"), WorkUnit("remaining")))
-    active = Program.create(spec).apply(ActivateProgram(0, OWNER))
-    cancelled = active.apply(CancelWorkUnit(active.revision, OWNER, "cancelled"))
-    prepared = cancelled.apply(
-        PrepareAttempt(
-            cancelled.revision,
-            OWNER,
-            AttemptSpec(
-                "a1",
-                cancelled.program_id,
-                "remaining",
-                cancelled.spec.revision,
-                cancelled.spec.digest,
+def test_finished_attempt_is_not_acceptance_and_can_be_retried_with_distinct_inputs() -> None:
+    done = finished(active())
+    retry = prepared(done, "first", "a2")
+    assert retry.attempt("a1").status is AttemptStatus.FINISHED
+    assert retry.attempt("a2").status is AttemptStatus.PREPARED
+    assert retry.attempt("a1").spec is not retry.attempt("a2").spec
+    assert retry.attempt("a1").spec.effective_inputs == retry.attempt("a2").spec.effective_inputs
+    assert retry.state("first").active_attempt_id == "a2"
+
+
+@pytest.mark.parametrize("obligation", ["", "  "])
+def test_work_unit_requires_nonblank_obligation(obligation: str) -> None:
+    with pytest.raises(InvalidDomainValue):
+        WorkUnit("only", obligation, acceptance_criteria=("accepted",))
+
+
+def test_work_unit_requires_acceptance_criteria_or_pinned_policy() -> None:
+    with pytest.raises(InvalidDomainValue):
+        WorkUnit("only", "produce the result")
+    assert (
+        WorkUnit("only", "produce the result", acceptance_policy_reference=POLICY).acceptance_policy_reference == POLICY
+    )
+
+
+def test_program_requires_nonempty_acceptance_and_pinned_policy_references() -> None:
+    with pytest.raises(InvalidDomainValue):
+        graph_spec(acceptance_criteria=())
+    with pytest.raises(InvalidDomainValue):
+        graph_spec(policy_references=())
+    with pytest.raises(InvalidDomainValue):
+        PolicyReference("acceptance", "v1", " ")
+    assert graph_spec().policy_references == (POLICY,)
+
+
+def test_missing_dependencies_inputs_and_cycles_are_rejected() -> None:
+    with pytest.raises(MissingReference):
+        graph_spec(work_units=(unit("only", dependencies=("absent",)),))
+    with pytest.raises(MissingInput):
+        graph_spec(work_units=(unit("only", required_inputs=frozenset({"unknown"})),))
+    with pytest.raises(MissingInput):
+        graph_spec(initial_inputs=())
+    with pytest.raises(CycleDetected):
+        graph_spec(work_units=(unit("a", dependencies=("b",)), unit("b", dependencies=("a",))))
+
+
+def test_required_input_must_be_initial_or_direct_predecessor_output() -> None:
+    with pytest.raises(MissingInput):
+        graph_spec(
+            work_units=(
+                unit("root", outputs=frozenset({"produced"})),
+                unit("middle", dependencies=("root",)),
+                unit("leaf", dependencies=("middle",), required_inputs=frozenset({"produced"})),
             ),
+            initial_inputs=(),
         )
+
+
+def test_ambiguous_logical_input_producers_are_rejected() -> None:
+    with pytest.raises(InvalidGraph):
+        graph_spec(
+            work_units=(
+                unit("left", outputs=frozenset({"duplicate"})),
+                unit("right", outputs=frozenset({"duplicate"})),
+                unit("child", dependencies=("left", "right"), required_inputs=frozenset({"duplicate"})),
+            ),
+            initial_inputs=(),
+        )
+    with pytest.raises(InvalidGraph):
+        graph_spec(work_units=(unit("root", outputs=frozenset({"seed"})),))
+
+
+def test_approved_initial_bindings_are_immutable_opaque_references() -> None:
+    with pytest.raises(InvalidDomainValue):
+        InputBinding("seed", " ")
+    spec = graph_spec(initial_inputs=(InputBinding("seed", "opaque://v1"),))
+    assert active(spec).resolved_inputs("first") == (InputBinding("seed", "opaque://v1"),)
+    with pytest.raises(FrozenInstanceError):
+        spec.initial_inputs[0].reference = "opaque://v2"  # type: ignore[misc]
+
+
+def test_full_spec_digest_changes_with_every_pinned_intent_dimension() -> None:
+    baseline = graph_spec()
+    variants = (
+        graph_spec(objective="different objective"),
+        graph_spec(acceptance_criteria=("different Program acceptance",)),
+        graph_spec(policy_references=(PolicyReference("acceptance", "v2", "sha256:v2"),)),
+        graph_spec(initial_inputs=(InputBinding("seed", "ref:changed-seed"),)),
+        graph_spec(
+            work_units=(
+                unit(
+                    "first",
+                    obligation="changed",
+                    required_inputs=frozenset({"seed"}),
+                    outputs=frozenset({"first-output"}),
+                ),
+                baseline.work_unit("second"),
+            )
+        ),
+        graph_spec(budget=BudgetPolicy(max_attempts=9)),
+        graph_spec(
+            authority=AuthorityEnvelope(OWNER, max_attempts=9, trusted_satisfaction_issuers=frozenset({VERIFIER}))
+        ),
     )
-    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
-    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
-    terminated = finished.apply(
-        SatisfyWorkUnit(
-            finished.revision,
+    assert all(updated.digest != baseline.digest for updated in variants)
+
+
+def test_work_unit_acceptance_changes_its_intent_and_program_digest() -> None:
+    first = unit("first", required_inputs=frozenset({"seed"}), outputs=frozenset({"first-output"}))
+    criteria = WorkUnit(
+        "first",
+        first.obligation,
+        required_inputs=first.required_inputs,
+        outputs=first.outputs,
+        acceptance_criteria=("different acceptance",),
+    )
+    policy = WorkUnit(
+        "first",
+        first.obligation,
+        required_inputs=first.required_inputs,
+        outputs=first.outputs,
+        acceptance_criteria=first.acceptance_criteria,
+        acceptance_policy_reference=POLICY,
+    )
+    base = graph_spec(work_units=(first, graph_spec().work_unit("second")))
+    for changed in (criteria, policy):
+        revised = graph_spec(work_units=(changed, base.work_unit("second")))
+        assert revised.digest != base.digest
+        assert revised.work_unit_applicability_fingerprint("second") != base.work_unit_applicability_fingerprint(
+            "second"
+        )
+
+
+def test_applicability_fingerprint_excludes_unrelated_units_budget_authority_and_metadata() -> None:
+    original = graph_spec(work_units=(*graph_spec().work_units, unit("unrelated")))
+    changed = graph_spec(
+        work_units=(*original.work_units[:2], unit("unrelated", outputs=frozenset({"new-output"}))),
+        budget=BudgetPolicy(max_attempts=8),
+        authority=AuthorityEnvelope(OWNER, max_attempts=8, trusted_satisfaction_issuers=frozenset({VERIFIER})),
+    )
+    revised = original.amend(SpecAmendment(original.revision, budget=BudgetPolicy(max_attempts=8)))
+    assert original.digest != changed.digest != revised.digest
+    assert original.work_unit_applicability_fingerprint("first") == changed.work_unit_applicability_fingerprint("first")
+    assert original.work_unit_applicability_fingerprint("second") == changed.work_unit_applicability_fingerprint(
+        "second"
+    )
+    assert original.work_unit_applicability_fingerprint("first") == revised.work_unit_applicability_fingerprint("first")
+
+
+def test_unused_approved_initial_binding_does_not_change_acceptance_fingerprint() -> None:
+    base = graph_spec(initial_inputs=(SEED, InputBinding("unused", "ref:old")))
+    changed = graph_spec(initial_inputs=(SEED, InputBinding("unused", "ref:new")))
+    assert base.digest != changed.digest
+    assert base.work_unit_applicability_fingerprint("second") == changed.work_unit_applicability_fingerprint("second")
+
+
+def test_consumed_owner_intent_changes_fingerprint() -> None:
+    baseline = graph_spec().work_unit_applicability_fingerprint("second")
+    variants = (
+        graph_spec(objective="new objective"),
+        graph_spec(acceptance_criteria=("new Program criterion",)),
+        graph_spec(policy_references=(PolicyReference("acceptance", "v2", "sha256:v2"),)),
+        graph_spec(initial_inputs=(InputBinding("seed", "ref:new-seed"),)),
+    )
+    assert all(item.work_unit_applicability_fingerprint("second") != baseline for item in variants)
+
+
+def test_transitive_predecessor_definition_changes_descendant_fingerprint() -> None:
+    original = graph_spec(
+        work_units=(
+            unit("root"),
+            unit("middle", dependencies=("root",)),
+            unit("leaf", dependencies=("middle",)),
+            unit("independent"),
+        ),
+        initial_inputs=(),
+    )
+    changed = graph_spec(
+        work_units=(
+            WorkUnit("root", "new obligation", acceptance_criteria=("accept root",)),
+            *(item for item in original.work_units if item.id != "root"),
+        ),
+        initial_inputs=(),
+    )
+    assert original.work_unit_applicability_fingerprint("leaf") != changed.work_unit_applicability_fingerprint("leaf")
+    assert original.work_unit_applicability_fingerprint("independent") == changed.work_unit_applicability_fingerprint(
+        "independent"
+    )
+
+
+@pytest.mark.parametrize(
+    "bindings",
+    [
+        (),
+        (SEED, InputBinding("extra", "ref:extra")),
+        (InputBinding("seed", "ref:unapproved"),),
+        (InputBinding("seed", SEED.reference, "predecessor", "other", "s1", "seed"),),
+    ],
+)
+def test_attempt_admission_rejects_missing_extra_arbitrary_or_forged_provenance(
+    bindings: tuple[InputBinding, ...],
+) -> None:
+    program = active()
+    with pytest.raises(DomainError):
+        program.apply(
+            PrepareAttempt(
+                program.revision,
+                OWNER,
+                attempt_spec(program, "bad", "first", effective_inputs=bindings),
+            )
+        )
+    assert program.attempts == ()
+
+
+def test_attempt_admission_rejects_foreign_and_stale_spec_subjects() -> None:
+    program = active()
+    valid = attempt_spec(program, "a1", "first")
+    foreign = AttemptSpec(
+        "foreign", "other-program", "first", valid.spec_revision, valid.spec_digest, valid.effective_inputs
+    )
+    stale = AttemptSpec(
+        "stale", program.program_id, "first", valid.spec_revision, "unknown-digest", valid.effective_inputs
+    )
+    with pytest.raises(AuthorityViolation):
+        program.apply(PrepareAttempt(program.revision, OWNER, foreign))
+    with pytest.raises(StaleRevision):
+        program.apply(PrepareAttempt(program.revision, OWNER, stale))
+
+
+def test_attempt_bindings_must_match_current_predecessor_satisfaction() -> None:
+    accepted = satisfied(finished(active()))
+    valid = attempt_spec(accepted, "a2", "second")
+    wrong = AttemptSpec(
+        "wrong",
+        accepted.program_id,
+        "second",
+        accepted.spec.revision,
+        accepted.spec.digest,
+        (InputBinding("first-output", "ref:s1:first-output"),),
+    )
+    with pytest.raises(DomainError):
+        accepted.apply(PrepareAttempt(accepted.revision, OWNER, wrong))
+    asserted = accepted.apply(PrepareAttempt(accepted.revision, OWNER, valid))
+    assert asserted.attempt("a2").spec.effective_inputs == accepted.resolved_inputs("second")
+
+
+def test_expected_aggregate_and_spec_revisions_are_independent() -> None:
+    program = Program.create(graph_spec())
+    with pytest.raises(StaleRevision):
+        program.apply(ActivateProgram(1, OWNER))
+    activated = program.apply(ActivateProgram(0, OWNER))
+    with pytest.raises(StaleRevision):
+        activated.apply(AmendProgramSpec(activated.revision, OWNER, SpecAmendment(2, objective="new")))
+    assert activated.revision == 1
+    assert activated.spec.revision == 1
+
+
+def test_illegal_lifecycle_transitions_do_not_mutate_history() -> None:
+    program = active()
+    with pytest.raises(IllegalTransition):
+        program.apply(ActivateProgram(program.revision, OWNER))
+    with pytest.raises(MissingReference):
+        program.apply(FinishAttempt(program.revision, OWNER, "unknown"))
+    pending = prepared(program)
+    with pytest.raises(IllegalTransition):
+        pending.apply(FinishAttempt(pending.revision, OWNER, "a1"))
+    executing = pending.apply(StartAttempt(pending.revision, OWNER, "a1"))
+    with pytest.raises(IllegalTransition):
+        executing.apply(StartAttempt(executing.revision, OWNER, "a1"))
+    done = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
+    with pytest.raises(IllegalTransition):
+        done.apply(FailAttempt(done.revision, OWNER, "a1"))
+    assert program.revision == 1
+
+
+def test_satisfaction_requires_finished_source_and_never_finishes_an_attempt() -> None:
+    pending = prepared(active())
+    fact = satisfaction(pending, "first", "s1", "a1")
+    with pytest.raises(IllegalTransition):
+        pending.apply(SatisfyWorkUnit(pending.revision, VERIFIER, fact))
+    executing = pending.apply(StartAttempt(pending.revision, OWNER, "a1"))
+    with pytest.raises(IllegalTransition):
+        executing.apply(SatisfyWorkUnit(executing.revision, VERIFIER, fact))
+    assert executing.attempt("a1").status is AttemptStatus.EXECUTING
+    accepted = satisfied(executing.apply(FinishAttempt(executing.revision, OWNER, "a1")))
+    assert accepted.attempt("a1").status is AttemptStatus.FINISHED
+    assert accepted.satisfactions[0].source_attempt_id == "a1"
+
+
+def test_satisfaction_requires_trusted_issuer_equal_to_command_actor() -> None:
+    done = finished(active())
+    fact = satisfaction(done, "first", "s1", "a1")
+    with pytest.raises(AuthorityViolation):
+        done.apply(SatisfyWorkUnit(done.revision, OWNER, fact))
+    with pytest.raises(AuthorityViolation):
+        done.apply(
+            SatisfyWorkUnit(done.revision, "untrusted", satisfaction(done, "first", "bad", "a1", issuer_id="untrusted"))
+        )
+    assert satisfied(done).state("first").status is WorkUnitStatus.SATISFIED
+
+
+def test_missing_trusted_fact_does_not_invalidate_finished_work_or_the_program() -> None:
+    authority = AuthorityEnvelope(OWNER, trusted_satisfaction_issuers=frozenset())
+    done = finished(active(graph_spec(authority=authority)))
+    assert done.status is ProgramStatus.ACTIVE
+    assert done.state("first").status is WorkUnitStatus.READY
+    assert done.state("second").status is WorkUnitStatus.PENDING
+    assert done.satisfactions == ()
+    with pytest.raises(AuthorityViolation):
+        done.apply(SatisfyWorkUnit(done.revision, VERIFIER, satisfaction(done, "first", "s1", "a1")))
+
+
+def test_operational_worker_cannot_also_be_registered_as_trusted_issuer() -> None:
+    with pytest.raises(InvalidDomainValue):
+        AuthorityEnvelope(
             OWNER,
-            satisfaction(finished, "remaining", "s1", "a1"),
+            delegated_actor_ids=frozenset({DELEGATE}),
+            trusted_satisfaction_issuers=frozenset({DELEGATE}),
         )
+
+
+@pytest.mark.parametrize(
+    "outputs",
+    [
+        (),
+        (InputBinding("unexpected", "ref:unexpected"),),
+        (InputBinding("first-output", "ref:one"), InputBinding("unexpected", "ref:extra")),
+    ],
+)
+def test_satisfaction_rejects_missing_or_undeclared_output_bindings(outputs: tuple[InputBinding, ...]) -> None:
+    done = finished(active())
+    with pytest.raises(DomainError):
+        done.apply(
+            SatisfyWorkUnit(
+                done.revision,
+                VERIFIER,
+                satisfaction(done, "first", "bad", "a1", output_bindings=outputs),
+            )
+        )
+
+
+def test_satisfaction_subject_cannot_be_foreign_or_misbound_to_attempt() -> None:
+    done = finished(active())
+    foreign = TrustedSatisfaction(
+        "foreign",
+        "other-program",
+        "first",
+        done.spec.revision,
+        done.spec.digest,
+        done.spec.work_unit_applicability_fingerprint("first"),
+        VERIFIER,
+        "a1",
+        (InputBinding("first-output", "ref:foreign"),),
+    )
+    with pytest.raises(DomainError):
+        done.apply(SatisfyWorkUnit(done.revision, VERIFIER, foreign))
+    missing_attempt = TrustedSatisfaction(
+        "missing",
+        done.program_id,
+        "first",
+        done.spec.revision,
+        done.spec.digest,
+        done.spec.work_unit_applicability_fingerprint("first"),
+        VERIFIER,
+        "unknown",
+        (InputBinding("first-output", "ref:missing"),),
+    )
+    with pytest.raises(MissingReference):
+        done.apply(SatisfyWorkUnit(done.revision, VERIFIER, missing_attempt))
+    another_branch = finished(satisfied(done), "second", "a2")
+    wrong_unit = TrustedSatisfaction(
+        "misbound",
+        another_branch.program_id,
+        "first",
+        another_branch.spec.revision,
+        another_branch.spec.digest,
+        another_branch.spec.work_unit_applicability_fingerprint("first"),
+        VERIFIER,
+        "a2",
+        (InputBinding("first-output", "ref:misbound"),),
+    )
+    with pytest.raises(AuthorityViolation):
+        another_branch.apply(SatisfyWorkUnit(another_branch.revision, VERIFIER, wrong_unit))
+
+
+def test_recorded_satisfaction_has_stamped_order_and_immutable_historical_identity() -> None:
+    accepted = satisfied(finished(active()))
+    fact = accepted.satisfactions[0]
+    assert fact.record_order > 0
+    assert fact.spec_revision == 1
+    assert fact.spec_digest == accepted.spec_history[0].digest
+    assert fact.work_unit_fingerprint == accepted.spec.work_unit_applicability_fingerprint("first")
+    with pytest.raises(FrozenInstanceError):
+        fact.spec_revision = 2  # type: ignore[misc]
+
+
+def test_latest_applicable_satisfaction_wins_by_record_order_not_attempt_order() -> None:
+    done_twice = finished(finished(active()), "first", "a2")
+    first = satisfied(done_twice, "first", "a2", "s2")
+    second = satisfied(first, "first", "a1", "s1")
+    assert tuple(item.source_attempt_id for item in second.satisfactions) == ("a2", "a1")
+    assert second.satisfactions[0].record_order < second.satisfactions[1].record_order
+    assert second.state("first").satisfaction_id == "s1"
+    assert second.resolved_inputs("second") == (
+        InputBinding("first-output", "ref:s1:first-output", "predecessor", "first", "s1", "first-output"),
     )
 
-    assert terminated.state("cancelled").status is WorkUnitStatus.CANCELLED
-    assert terminated.state("remaining").status is WorkUnitStatus.SATISFIED
-    assert terminated.status is ProgramStatus.CANCELLED
+
+def test_new_predecessor_output_reference_invalidates_old_child_acceptance() -> None:
+    spec = graph_spec(
+        work_units=(*graph_spec().work_units, unit("unrelated")),
+        budget=BudgetPolicy(max_attempts=4),
+        authority=AuthorityEnvelope(OWNER, max_attempts=4, trusted_satisfaction_issuers=frozenset({VERIFIER})),
+    )
+    done_twice = finished(finished(active(spec)), "first", "a2")
+    first = satisfied(done_twice, "first", "a1", "s1")
+    child = satisfied(finished(first, "second", "a3"), "second", "a3", "s-child")
+    assert child.status is ProgramStatus.ACTIVE
+    assert child.state("second").status is WorkUnitStatus.SATISFIED
+
+    replaced = satisfied(child, "first", "a2", "s2")
+    assert replaced.state("first").satisfaction_id == "s2"
+    assert replaced.state("second").status is WorkUnitStatus.READY
+    assert replaced.state("second").satisfaction_id is None
+    assert replaced.resolved_inputs("second") == (
+        InputBinding("first-output", "ref:s2:first-output", "predecessor", "first", "s2", "first-output"),
+    )
+    assert tuple(item.reference_id for item in replaced.satisfactions) == ("s1", "s-child", "s2")
 
 
-def test_ordinary_copying_and_subclassing_cannot_change_immutable_intent() -> None:
-    spec = graph_spec()
-    attempt = attempt_spec(Program.create(spec).apply(ActivateProgram(0, OWNER)), "a1", "first", "seed")
+def test_older_spec_satisfaction_can_be_admitted_when_its_subject_still_applies() -> None:
+    done = finished(active())
+    historical = satisfaction(done, "first", "s1", "a1")
+    amended = amend(done, budget=BudgetPolicy(max_attempts=8))
+    assert historical.spec_revision < amended.spec.revision
+    accepted = amended.apply(SatisfyWorkUnit(amended.revision, VERIFIER, historical))
+    assert accepted.state("first").status is WorkUnitStatus.SATISFIED
+    assert accepted.satisfactions[0].spec_revision == 1
 
-    with pytest.raises(InvalidDomainValue):
-        copy.copy(spec)
-    with pytest.raises(InvalidDomainValue):
-        copy.deepcopy(attempt)
-    with pytest.raises(ValueError):
-        replace(spec, objective="changed")
-    with pytest.raises(ValueError):
-        replace(attempt, effective_inputs=(InputBinding("seed", "changed"),))
 
-    def forged_payload(self: WorkUnit) -> dict[str, object]:
-        del self
-        return {"forged": True}
+def test_satisfaction_rejects_forged_subject_fingerprint() -> None:
+    done = finished(active())
+    forged = TrustedSatisfaction(
+        "forged",
+        done.program_id,
+        "first",
+        done.spec.revision,
+        done.spec.digest,
+        "not-the-current-subject",
+        VERIFIER,
+        "a1",
+        (InputBinding("first-output", "ref:forged"),),
+    )
+    with pytest.raises(DomainError):
+        done.apply(SatisfyWorkUnit(done.revision, VERIFIER, forged))
 
-    with pytest.raises(TypeError):
-        type("ForgedWorkUnit", (WorkUnit,), {"payload": forged_payload})
 
-    def forged_spec_payload(self: ProgramSpec) -> dict[str, object]:
-        del self
-        return {"forged": True}
+def test_program_spec_amendment_appends_full_history_and_never_retargets_finished_attempt() -> None:
+    done = finished(active())
+    first_spec = done.spec
+    amended = amend(done, objective="new owner objective")
+    assert amended.spec.revision == 2
+    assert amended.spec.parent_digest == first_spec.digest
+    assert amended.spec_history == (first_spec, amended.spec)
+    assert amended.attempt("a1").status is AttemptStatus.FINISHED
+    assert amended.attempt("a1").spec.spec_digest == first_spec.digest
+    assert amended.attempt("a1").spec.effective_inputs == (SEED,)
 
-    with pytest.raises(TypeError):
-        type("ForgedProgramSpec", (ProgramSpec,), {"payload": forged_spec_payload})
 
-    def forged_input_reference(self: InputBinding) -> str:
-        del self
-        return "changed"
+def test_identical_semantic_amendment_is_a_complete_noop() -> None:
+    before = finished(active())
+    amendment = SpecAmendment(
+        before.spec.revision,
+        objective=before.spec.objective,
+        work_units=before.spec.work_units,
+        initial_inputs=before.spec.initial_inputs,
+        budget=BudgetPolicy(before.spec.budget.max_attempts, before.spec.budget.max_active_attempts),
+        authority=AuthorityEnvelope(
+            OWNER,
+            before.spec.authority.allowed_actions,
+            before.spec.authority.max_attempts,
+            before.spec.authority.trusted_satisfaction_issuers,
+        ),
+        acceptance_criteria=before.spec.acceptance_criteria,
+        policy_references=before.spec.policy_references,
+        reason="a different explanation is not a semantic change",
+    )
+    assert before.spec.amend(amendment) is before.spec
+    after = before.apply(AmendProgramSpec(before.revision, OWNER, amendment))
+    assert after is before
+    assert after.revision == before.revision
+    assert after.spec_history == before.spec_history
+    assert after.attempts == before.attempts
 
-    with pytest.raises(TypeError):
-        type(
-            "ForgedInputBinding",
-            (InputBinding,),
-            {"reference": property(forged_input_reference)},
+
+def test_budget_and_authority_change_is_material_but_preserves_acceptance_applicability() -> None:
+    accepted = satisfied(finished(active()))
+    changed = amend(
+        accepted,
+        budget=BudgetPolicy(max_attempts=8),
+        authority=AuthorityEnvelope(OWNER, max_attempts=8, trusted_satisfaction_issuers=frozenset({VERIFIER})),
+    )
+    assert changed.spec.digest != accepted.spec.digest
+    assert changed.spec.revision == 2
+    assert changed.state("first").status is WorkUnitStatus.SATISFIED
+    assert changed.state("first").satisfaction_id == "s1"
+    assert changed.ready_work_unit_ids == ("second",)
+
+
+@pytest.mark.parametrize("field", ["objective", "acceptance_criteria", "policy_references"])
+def test_each_program_wide_intent_change_invalidates_existing_acceptance(field: str) -> None:
+    accepted = satisfied(finished(active()))
+    if field == "objective":
+        replacement = SpecAmendment(accepted.spec.revision, objective="new objective")
+    elif field == "acceptance_criteria":
+        replacement = SpecAmendment(accepted.spec.revision, acceptance_criteria=("new Program criterion",))
+    else:
+        replacement = SpecAmendment(
+            accepted.spec.revision,
+            policy_references=(PolicyReference("acceptance", "v2", "sha256:policy-v2"),),
         )
+    changed = accepted.apply(AmendProgramSpec(accepted.revision, OWNER, replacement))
+    assert changed.state("first").status is WorkUnitStatus.READY
+    assert changed.state("second").status is WorkUnitStatus.PENDING
+    assert changed.satisfactions == accepted.satisfactions
 
 
-def test_repeated_initialization_cannot_rewrite_semantic_values() -> None:
-    spec = graph_spec()
+@pytest.mark.parametrize("field", ["obligation", "acceptance", "policy", "inputs", "outputs"])
+def test_each_local_definition_change_invalidates_only_its_chain(field: str) -> None:
+    spec = graph_spec(work_units=(*graph_spec().work_units, unit("unrelated")))
+    accepted = satisfied(finished(active(spec)))
+    accepted = satisfied(finished(accepted, "unrelated", "a2"), "unrelated", "a2", "s2")
     first = spec.work_unit("first")
-    binding = InputBinding("seed", "ref:seed")
-    program = Program.create(spec).apply(ActivateProgram(0, OWNER))
-    prepared = program.apply(PrepareAttempt(program.revision, OWNER, attempt_spec(program, "a1", "first", "seed")))
-    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
-    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
-    finished_attempt = finished.attempt("a1")
-    pinned_attempt = finished_attempt.spec
-    original_digest = spec.digest
+    changed_first = WorkUnit(
+        "first",
+        "different obligation" if field == "obligation" else first.obligation,
+        required_inputs=frozenset() if field == "inputs" else first.required_inputs,
+        outputs=first.outputs | {"extra-output"} if field == "outputs" else first.outputs,
+        acceptance_criteria=("different local criterion",) if field == "acceptance" else first.acceptance_criteria,
+        acceptance_policy_reference=PolicyReference("local", "v2", "sha256:local") if field == "policy" else None,
+    )
+    changed = amend(accepted, work_units=(changed_first, spec.work_unit("second"), spec.work_unit("unrelated")))
+    assert changed.state("first").status is WorkUnitStatus.READY
+    assert changed.state("second").status is WorkUnitStatus.PENDING
+    assert changed.state("unrelated").status is WorkUnitStatus.SATISFIED
 
-    with pytest.raises(InvalidDomainValue):
-        spec.__init__("changed", "changed", (WorkUnit("changed"),))
-    with pytest.raises(InvalidDomainValue):
-        first.__init__("changed")
-    with pytest.raises(InvalidDomainValue):
-        binding.__init__("seed", "changed")
-    with pytest.raises(InvalidDomainValue):
-        pinned_attempt.__init__(
-            "a2",
-            program.program_id,
-            "first",
-            program.spec.revision,
-            program.spec.digest,
-            (InputBinding("seed", "changed"),),
+
+def test_dependency_change_invalidates_changed_node_and_transitive_descendants() -> None:
+    root = unit("root", outputs=frozenset({"root-output"}))
+    child = unit(
+        "child", dependencies=("root",), required_inputs=frozenset({"root-output"}), outputs=frozenset({"child-output"})
+    )
+    leaf = unit("leaf", dependencies=("child",), required_inputs=frozenset({"child-output"}))
+    support = unit("support")
+    spec = graph_spec(work_units=(root, child, leaf, support), initial_inputs=())
+    accepted = active(spec)
+    for work_unit_id in ("root", "child", "leaf"):
+        attempt_id = f"a-{work_unit_id}"
+        accepted = satisfied(
+            finished(accepted, work_unit_id, attempt_id), work_unit_id, attempt_id, f"s-{work_unit_id}"
         )
-    with pytest.raises(InvalidDomainValue):
-        finished_attempt.__init__(pinned_attempt, AttemptStatus.FAILED)
-    with pytest.raises(InvalidDomainValue):
-        finished.__init__(spec=spec, status=ProgramStatus.DRAFT)
+    changed_child = unit(
+        "child",
+        dependencies=("root", "support"),
+        required_inputs=frozenset({"root-output"}),
+        outputs=frozenset({"child-output"}),
+    )
+    changed = amend(accepted, work_units=(root, changed_child, leaf, support))
+    assert changed.state("root").status is WorkUnitStatus.SATISFIED
+    assert changed.state("child").status is WorkUnitStatus.PENDING
+    assert changed.state("leaf").status is WorkUnitStatus.PENDING
+    assert changed.state("support").status is WorkUnitStatus.READY
 
-    assert spec.digest == original_digest
-    assert finished_attempt.attempt_id == "a1"
-    assert finished_attempt.status is AttemptStatus.FINISHED
-    assert pinned_attempt.input_names == frozenset({"seed"})
+
+def test_unrelated_definition_and_historical_metadata_leave_acceptance_intact() -> None:
+    spec = graph_spec(work_units=(*graph_spec().work_units, unit("unrelated")))
+    accepted = satisfied(finished(active(spec)))
+    changed = amend(
+        accepted,
+        work_units=(spec.work_unit("first"), spec.work_unit("second"), unit("unrelated", obligation="other work")),
+    )
+    assert changed.state("first").satisfaction_id == "s1"
+    assert changed.ready_work_unit_ids == ("second", "unrelated")
+    metadata_only = ProgramSpec(
+        spec.program_id,
+        spec.objective,
+        spec.work_units,
+        initial_inputs=spec.initial_inputs,
+        budget=spec.budget,
+        authority=spec.authority,
+        revision=2,
+        parent_digest="different-parent",
+        acceptance_criteria=spec.acceptance_criteria,
+        policy_references=spec.policy_references,
+    )
+    assert metadata_only.digest != spec.digest
+    assert metadata_only.work_unit_applicability_fingerprint("first") == spec.work_unit_applicability_fingerprint(
+        "first"
+    )
 
 
-def test_forged_command_subclass_cannot_authorize_one_action_and_execute_another() -> None:
-    authority = AuthorityEnvelope(
+def test_v1_v2_v1_reversion_restores_historical_satisfaction_without_rewriting_it() -> None:
+    accepted = satisfied(finished(active()))
+    first = accepted.spec.work_unit("first")
+    child = accepted.spec.work_unit("second")
+    changed = WorkUnit(
+        "first",
+        "changed obligation",
+        required_inputs=first.required_inputs,
+        outputs=first.outputs,
+        acceptance_criteria=first.acceptance_criteria,
+    )
+    v2 = amend(accepted, work_units=(changed, child))
+    assert v2.state("first").status is WorkUnitStatus.READY
+    assert v2.state("second").status is WorkUnitStatus.PENDING
+    v3 = amend(v2, work_units=(first, child))
+    assert v3.spec.revision == 3
+    assert v3.spec.digest != accepted.spec.digest
+    assert v3.state("first").status is WorkUnitStatus.SATISFIED
+    assert v3.state("first").satisfaction_id == "s1"
+    assert v3.ready_work_unit_ids == ("second",)
+    assert v3.satisfactions == accepted.satisfactions
+    assert v3.attempt("a1").spec.spec_revision == 1
+
+
+def test_transitive_predecessor_change_invalidates_descendants_but_not_other_branches() -> None:
+    spec = graph_spec(
+        work_units=(
+            unit("root", outputs=frozenset({"root-out"})),
+            unit(
+                "middle",
+                dependencies=("root",),
+                required_inputs=frozenset({"root-out"}),
+                outputs=frozenset({"middle-out"}),
+            ),
+            unit("leaf", dependencies=("middle",), required_inputs=frozenset({"middle-out"})),
+            unit("independent"),
+        ),
+        initial_inputs=(),
+        budget=BudgetPolicy(max_attempts=5, max_active_attempts=2),
+        authority=AuthorityEnvelope(OWNER, max_attempts=5, trusted_satisfaction_issuers=frozenset({VERIFIER})),
+    )
+    program = active(spec)
+    for work_unit_id in ("root", "middle", "leaf", "independent"):
+        attempt_id = f"a-{work_unit_id}"
+        program = satisfied(finished(program, work_unit_id, attempt_id), work_unit_id, attempt_id, f"s-{work_unit_id}")
+    assert program.status is ProgramStatus.COMPLETED
+    changed_root = WorkUnit(
+        "root", "new root obligation", outputs=frozenset({"root-out"}), acceptance_criteria=("accept root",)
+    )
+    reopened = amend(program, work_units=(changed_root, *(item for item in spec.work_units if item.id != "root")))
+    assert reopened.status is ProgramStatus.ACTIVE
+    assert reopened.state("root").status is WorkUnitStatus.READY
+    assert reopened.state("middle").status is WorkUnitStatus.PENDING
+    assert reopened.state("leaf").status is WorkUnitStatus.PENDING
+    assert reopened.state("independent").status is WorkUnitStatus.SATISFIED
+    assert len(reopened.satisfactions) == 4
+    reverted = amend(reopened, work_units=spec.work_units)
+    assert reverted.status is ProgramStatus.COMPLETED
+    assert reverted.state("leaf").satisfaction_id == "s-leaf"
+    assert reverted.attempt("a-leaf").spec.spec_revision == 1
+
+
+def test_amending_an_approved_initial_reference_invalidates_only_consuming_chain() -> None:
+    spec = graph_spec(work_units=(*graph_spec().work_units, unit("independent")))
+    program = active(spec)
+    program = satisfied(finished(program), "first", "a1", "s1")
+    program = satisfied(finished(program, "independent", "a2"), "independent", "a2", "s2")
+    changed = amend(program, initial_inputs=(InputBinding("seed", "ref:replacement"),))
+    assert changed.state("first").status is WorkUnitStatus.READY
+    assert changed.state("second").status is WorkUnitStatus.PENDING
+    assert changed.state("independent").status is WorkUnitStatus.SATISFIED
+    assert changed.resolved_inputs("first") == (InputBinding("seed", "ref:replacement"),)
+
+
+def test_explicit_work_unit_cancellation_records_a_decision_and_propagates() -> None:
+    program = active()
+    cancelled = program.apply(CancelWorkUnit(program.revision, OWNER, "first", "owner abandons chain"))
+    assert cancelled.status is ProgramStatus.CANCELLED
+    assert cancelled.state("first").status is WorkUnitStatus.CANCELLED
+    assert cancelled.state("second").status is WorkUnitStatus.CANCELLED
+    assert len(cancelled.cancellations) == 1
+    assert cancelled.cancellations[0].work_unit_id == "first"
+    assert cancelled.cancellations[0].reason == "owner abandons chain"
+    assert cancelled.cancellations[0].record_order > 0
+    assert cancelled.satisfactions == ()
+    with pytest.raises(FrozenInstanceError):
+        cancelled.cancellations[0].reason = "rewritten"  # type: ignore[misc]
+
+
+def test_owner_cancellation_supersedes_recorded_satisfaction_without_deleting_history() -> None:
+    accepted = satisfied(finished(active()))
+    abandoned = accepted.apply(CancelWorkUnit(accepted.revision, OWNER, "first"))
+    assert abandoned.status is ProgramStatus.CANCELLED
+    assert abandoned.state("first").status is WorkUnitStatus.CANCELLED
+    assert abandoned.state("second").status is WorkUnitStatus.CANCELLED
+    assert abandoned.satisfactions == accepted.satisfactions
+    assert abandoned.cancellations[0].work_unit_fingerprint == accepted.spec.work_unit_applicability_fingerprint(
+        "first"
+    )
+
+
+def test_cancellation_scope_changes_with_intent_and_restores_on_reversion() -> None:
+    program = active(graph_spec(work_units=(unit("a"), unit("b")), initial_inputs=()))
+    cancelled = program.apply(CancelWorkUnit(program.revision, OWNER, "a"))
+    original = cancelled.spec.work_unit("a")
+    changed_a = WorkUnit("a", "new obligation", acceptance_criteria=("accept a",))
+    v2 = amend(cancelled, work_units=(changed_a, cancelled.spec.work_unit("b")))
+    assert v2.state("a").status is WorkUnitStatus.READY
+    assert v2.state("b").status is WorkUnitStatus.READY
+    reverted = amend(v2, work_units=(original, v2.spec.work_unit("b")))
+    assert reverted.state("a").status is WorkUnitStatus.CANCELLED
+    assert reverted.state("b").status is WorkUnitStatus.READY
+    assert reverted.cancellations == cancelled.cancellations
+
+
+def test_cancellation_inheritance_is_rebuilt_from_current_graph_not_previous_state() -> None:
+    root = unit("root")
+    child = unit("child", dependencies=("root",))
+    unrelated = unit("unrelated")
+    program = active(graph_spec(work_units=(root, child, unrelated), initial_inputs=()))
+    cancelled = program.apply(CancelWorkUnit(program.revision, OWNER, "root"))
+    assert cancelled.status is ProgramStatus.ACTIVE
+    detached = amend(cancelled, work_units=(root, unit("child"), unrelated))
+    assert detached.state("root").status is WorkUnitStatus.CANCELLED
+    assert detached.state("child").status is WorkUnitStatus.READY
+    reattached = amend(detached, work_units=(root, child, unrelated))
+    assert reattached.state("root").status is WorkUnitStatus.CANCELLED
+    assert reattached.state("child").status is WorkUnitStatus.CANCELLED
+    assert reattached.state("unrelated").status is WorkUnitStatus.READY
+
+
+def test_removed_satisfaction_and_cancellation_subjects_reappear_from_history() -> None:
+    target = unit("target")
+    unrelated = unit("unrelated")
+    pending = unit("pending")
+    spec = graph_spec(work_units=(target, unrelated, pending), initial_inputs=())
+    program = satisfied(finished(active(spec), "target", "a1"), "target", "a1", "s1")
+    program = program.apply(CancelWorkUnit(program.revision, OWNER, "unrelated"))
+    removed = amend(program, work_units=(pending,))
+    assert tuple(state.work_unit_id for state in removed.work_unit_states) == ("pending",)
+    restored = amend(removed, work_units=(target, unrelated, pending))
+    assert restored.state("target").satisfaction_id == "s1"
+    assert restored.state("unrelated").status is WorkUnitStatus.CANCELLED
+    assert restored.state("pending").status is WorkUnitStatus.READY
+    assert restored.satisfactions == program.satisfactions
+    assert restored.cancellations == program.cancellations
+
+
+def test_history_projection_is_deterministic_for_same_command_and_facts() -> None:
+    program = satisfied(finished(active()))
+    command = AmendProgramSpec(program.revision, OWNER, SpecAmendment(1, objective="changed objective"))
+    first = program.apply(command)
+    second = program.apply(command)
+    assert first == second
+    assert first.state("first").status is WorkUnitStatus.READY
+
+
+def test_work_unit_cancellation_does_not_count_toward_program_completion() -> None:
+    spec = graph_spec(work_units=(unit("abandoned"), unit("fulfilled")), initial_inputs=())
+    program = active(spec)
+    cancelled = program.apply(CancelWorkUnit(program.revision, OWNER, "abandoned"))
+    assert cancelled.status is ProgramStatus.ACTIVE
+    result = satisfied(finished(cancelled, "fulfilled", "a1"), "fulfilled", "a1", "s1")
+    assert result.status is ProgramStatus.CANCELLED
+    assert result.state("fulfilled").status is WorkUnitStatus.SATISFIED
+
+
+def test_program_cancellation_is_owner_decision_not_acceptance() -> None:
+    program = active()
+    cancelled = program.apply(CancelProgram(program.revision, OWNER))
+    assert cancelled.status is ProgramStatus.CANCELLED
+    assert cancelled.work_unit_states == program.work_unit_states
+    assert cancelled.cancellations == ()
+    assert cancelled.satisfactions == ()
+    with pytest.raises(IllegalTransition):
+        cancelled.apply(ActivateProgram(cancelled.revision, OWNER))
+
+
+def test_owner_amendment_records_affected_attempt_cancellation_without_fabricating_completion() -> None:
+    pending = prepared(active())
+    amended = amend(pending, objective="changed while first is prepared")
+    assert amended.attempt("a1").status is AttemptStatus.CANCELLED
+    assert amended.attempt("a1").spec == pending.attempt("a1").spec
+    assert amended.attempt_cancellations[0].attempt_id == "a1"
+    assert amended.attempt_cancellations[0].actor_id == OWNER
+    assert amended.attempt_cancellations[0].record_order > pending.revision
+    assert amended.satisfactions == ()
+
+
+def test_explicit_attempt_cancellation_before_amendment_is_preserved_as_history() -> None:
+    pending = prepared(active())
+    cancelled = pending.apply(CancelAttempt(pending.revision, OWNER, "a1"))
+    assert cancelled.attempt("a1").status is AttemptStatus.CANCELLED
+    assert cancelled.attempt_cancellations[0].attempt_id == "a1"
+    amended = amend(cancelled, objective="changed after explicit cancellation")
+    assert amended.attempt("a1").status is AttemptStatus.CANCELLED
+    assert amended.attempt_cancellations == cancelled.attempt_cancellations
+    assert amended.attempt("a1").spec.spec_revision == 1
+
+
+def test_unaffected_live_attempt_remains_bound_to_its_original_spec() -> None:
+    spec = graph_spec(
+        work_units=(unit("a"), unit("b")),
+        initial_inputs=(),
+        budget=BudgetPolicy(max_attempts=4, max_active_attempts=2),
+    )
+    pending = prepared(active(spec), "b", "b1")
+    modified = amend(
+        pending, work_units=(WorkUnit("a", "changed", acceptance_criteria=("accept a",)), spec.work_unit("b"))
+    )
+    assert modified.state("b").status is WorkUnitStatus.ACTIVE
+    assert modified.state("b").active_attempt_id == "b1"
+    assert modified.attempt("b1").status is AttemptStatus.PREPARED
+    assert modified.attempt("b1").spec.spec_digest == spec.digest
+
+
+def test_replaced_predecessor_output_cancels_inapplicable_live_child_as_domain_decision() -> None:
+    spec = graph_spec(budget=BudgetPolicy(max_attempts=3))
+    first_twice = finished(finished(active(spec)), "first", "a2")
+    accepted = satisfied(first_twice, "first", "a1", "s1")
+    child = prepared(accepted, "second", "a3")
+    replaced = satisfied(child, "first", "a2", "s2")
+    assert replaced.attempt("a3").status is AttemptStatus.CANCELLED
+    assert replaced.attempt_cancellations[-1].reason == "approved predecessor output changed"
+    assert replaced.state("second").status is WorkUnitStatus.READY
+    assert replaced.attempt("a3").spec.effective_inputs == child.attempt("a3").spec.effective_inputs
+
+
+def test_authority_amendment_withdrawing_delegate_cancels_its_live_attempt() -> None:
+    delegated = AuthorityEnvelope(
         OWNER,
-        frozenset(
+        delegated_actor_ids=frozenset({DELEGATE}),
+        trusted_satisfaction_issuers=frozenset({VERIFIER}),
+    )
+    program = active(graph_spec(authority=delegated))
+    pending = program.apply(PrepareAttempt(program.revision, DELEGATE, attempt_spec(program, "a1", "first")))
+    restricted = amend(pending, authority=AuthorityEnvelope(OWNER, trusted_satisfaction_issuers=frozenset({VERIFIER})))
+    assert restricted.attempt("a1").actor_id == DELEGATE
+    assert restricted.attempt("a1").status is AttemptStatus.CANCELLED
+    assert restricted.attempt_cancellations[-1].record_order == restricted.revision
+
+
+def test_terminal_attempts_never_reopen_across_amendments() -> None:
+    program = finished(active())
+    first = program.spec.work_unit("first")
+    changed = WorkUnit(
+        "first",
+        "new obligation",
+        required_inputs=first.required_inputs,
+        outputs=first.outputs,
+        acceptance_criteria=first.acceptance_criteria,
+    )
+    revised = amend(program, work_units=(changed, program.spec.work_unit("second")))
+    restored = amend(revised, work_units=program.spec.work_units)
+    assert restored.attempt("a1").status is AttemptStatus.FINISHED
+    assert restored.attempt("a1").spec == program.attempt("a1").spec
+
+
+def test_amendments_do_not_reset_attempt_admission_history_or_budget() -> None:
+    program = active(graph_spec(budget=BudgetPolicy(max_attempts=1, max_active_attempts=1)))
+    done = finished(program)
+    changed = amend(done, budget=BudgetPolicy(max_attempts=1, max_active_attempts=1), objective="new objective")
+    with pytest.raises(BudgetExceeded):
+        prepared(changed, "first", "a2")
+    assert tuple(item.attempt_id for item in changed.attempts) == ("a1",)
+
+
+def test_exhausted_admission_and_pause_do_not_block_lawful_terminal_observations() -> None:
+    program = active(graph_spec(budget=BudgetPolicy(max_attempts=1, max_active_attempts=1)))
+    pending = prepared(program)
+    executing = pending.apply(StartAttempt(pending.revision, OWNER, "a1"))
+    paused = executing.apply(PauseProgram(executing.revision, OWNER))
+    failed = paused.apply(FailAttempt(paused.revision, OWNER, "a1"))
+    assert failed.attempt("a1").status is AttemptStatus.FAILED
+    assert failed.status is ProgramStatus.PAUSED
+    resumed = failed.apply(ResumeProgram(failed.revision, OWNER))
+    with pytest.raises(BudgetExceeded):
+        prepared(resumed, "first", "a2")
+
+
+def test_executing_attempt_can_finish_while_program_is_paused() -> None:
+    pending = prepared(active(graph_spec(budget=BudgetPolicy(max_attempts=1))))
+    executing = pending.apply(StartAttempt(pending.revision, OWNER, "a1"))
+    paused = executing.apply(PauseProgram(executing.revision, OWNER))
+    completed_attempt = paused.apply(FinishAttempt(paused.revision, OWNER, "a1"))
+    assert completed_attempt.status is ProgramStatus.PAUSED
+    assert completed_attempt.attempt("a1").status is AttemptStatus.FINISHED
+    assert completed_attempt.state("first").active_attempt_id is None
+
+
+def test_owner_control_does_not_depend_on_delegated_operational_allowlist() -> None:
+    spec = graph_spec(
+        authority=AuthorityEnvelope(
+            OWNER,
+            allowed_actions=frozenset(
+                {DomainAction.ACTIVATE_PROGRAM, DomainAction.PAUSE_PROGRAM, DomainAction.RESUME_PROGRAM}
+            ),
+            max_attempts=0,
+            trusted_satisfaction_issuers=frozenset({VERIFIER}),
+        )
+    )
+    program = active(spec)
+    assert program.ready_work_unit_ids == ("first",)
+    with pytest.raises(AuthorityViolation):
+        prepared(program)
+    paused = program.apply(PauseProgram(program.revision, OWNER))
+    assert paused.apply(ResumeProgram(paused.revision, OWNER)).status is ProgramStatus.ACTIVE
+    assert paused.apply(CancelProgram(paused.revision, OWNER)).status is ProgramStatus.CANCELLED
+    assert program.apply(CancelWorkUnit(program.revision, OWNER, "first")).status is ProgramStatus.CANCELLED
+    assert amend(program, objective="owner-approved change").spec.revision == 2
+
+
+def test_owner_control_survives_a_literally_empty_delegated_allowlist() -> None:
+    empty = AuthorityEnvelope(OWNER, allowed_actions=frozenset())
+    draft = Program.create(graph_spec(authority=empty))
+    changed = amend(draft, objective="owner can still revise intent")
+    assert changed.spec.revision == 2
+    assert changed.apply(CancelProgram(changed.revision, OWNER)).status is ProgramStatus.CANCELLED
+    activated = active()
+    restricted = amend(activated, authority=empty)
+    assert restricted.status is ProgramStatus.ACTIVE
+    assert restricted.apply(CancelWorkUnit(restricted.revision, OWNER, "first")).status is ProgramStatus.CANCELLED
+
+
+def test_actionless_and_zero_budget_programs_are_valid_present_facts() -> None:
+    spec = graph_spec(
+        budget=BudgetPolicy(max_attempts=0, max_active_attempts=0),
+        authority=AuthorityEnvelope(
+            OWNER,
+            allowed_actions=frozenset({DomainAction.ACTIVATE_PROGRAM}),
+            max_attempts=0,
+            trusted_satisfaction_issuers=frozenset({VERIFIER}),
+        ),
+    )
+    draft = Program.create(spec)
+    assert draft.status is ProgramStatus.DRAFT
+    assert draft.ready_work_unit_ids == ()
+    activated = draft.apply(ActivateProgram(draft.revision, OWNER))
+    assert activated.status is ProgramStatus.ACTIVE
+    assert activated.state("first").status is WorkUnitStatus.READY
+    assert activated.satisfactions == ()
+
+
+def test_delegate_cannot_amend_owner_intent_or_expand_own_authority() -> None:
+    envelope = AuthorityEnvelope(
+        OWNER,
+        allowed_actions=frozenset(
             {
                 DomainAction.ACTIVATE_PROGRAM,
                 DomainAction.PREPARE_ATTEMPT,
-                DomainAction.CANCEL_PROGRAM,
+                DomainAction.START_ATTEMPT,
+                DomainAction.FINISH_ATTEMPT,
             }
         ),
+        delegated_actor_ids=frozenset({DELEGATE}),
+        trusted_satisfaction_issuers=frozenset({VERIFIER}),
     )
-    program = Program.create(graph_spec(authority=authority))
+    program = active(graph_spec(authority=envelope))
+    with pytest.raises(AuthorityViolation):
+        program.apply(
+            AmendProgramSpec(program.revision, DELEGATE, SpecAmendment(1, authority=AuthorityEnvelope(OWNER)))
+        )
+    allowed = program.apply(PrepareAttempt(program.revision, DELEGATE, attempt_spec(program, "a1", "first")))
+    assert allowed.attempt("a1").status is AttemptStatus.PREPARED
 
+
+def test_owner_is_not_an_execution_budget_or_delegation_bypass() -> None:
+    restricted = active(
+        graph_spec(
+            authority=AuthorityEnvelope(
+                OWNER,
+                allowed_actions=frozenset({DomainAction.ACTIVATE_PROGRAM}),
+                trusted_satisfaction_issuers=frozenset({VERIFIER}),
+            )
+        )
+    )
+    with pytest.raises(AuthorityViolation):
+        prepared(restricted)
+    bounded = active(graph_spec(budget=BudgetPolicy(max_attempts=1)))
+    done = finished(bounded)
+    with pytest.raises(BudgetExceeded):
+        prepared(done, "first", "a2")
+
+
+def test_duplicate_attempts_and_unsupported_commands_are_rejected() -> None:
+    program = finished(active())
+    with pytest.raises(DuplicateAttempt):
+        prepared(program, "first", "a1")
+    with pytest.raises(InvalidDomainValue):
+        program.apply(object())  # type: ignore[arg-type]
+
+
+def test_public_construction_and_dataclass_replace_cannot_forge_lifecycle_state() -> None:
+    current = active()
+    with pytest.raises(InvalidDomainValue):
+        Program(current.spec, status=ProgramStatus.COMPLETED)
+    with pytest.raises(ValueError):
+        replace(current, status=ProgramStatus.CANCELLED)
+    with pytest.raises(ValueError):
+        replace(current.spec, objective="forged objective")
+    assert not hasattr(current, "set_state")
+    assert not hasattr(current, "force_status")
+    assert not hasattr(domain_module, "_TRANSITION_TOKEN")
+
+
+def test_copy_subclass_and_reinitialization_cannot_change_pinned_intent() -> None:
+    program = active()
+    pinned = attempt_spec(program, "a1", "first")
+    with pytest.raises(InvalidDomainValue):
+        copy.copy(program.spec)
+    with pytest.raises(InvalidDomainValue):
+        copy.deepcopy(pinned)
+    with pytest.raises(InvalidDomainValue):
+        program.spec.__init__("forged", "forged", (unit("forged"),))
+    with pytest.raises(InvalidDomainValue):
+        SEED.__init__("seed", "ref:forged")
+    with pytest.raises(TypeError):
+        type("ForgedWorkUnit", (WorkUnit,), {})
+    with pytest.raises(TypeError):
+        type("ForgedProgram", (Program,), {})
+    assert program.spec.initial_inputs == (SEED,)
+
+
+def test_attempt_effective_inputs_are_frozen_even_after_spec_amendment() -> None:
+    done = finished(active())
+    old_inputs = done.attempt("a1").spec.effective_inputs
+    with pytest.raises(FrozenInstanceError):
+        done.attempt("a1").spec.effective_inputs = ()  # type: ignore[misc]
+    amended = amend(done, initial_inputs=(InputBinding("seed", "ref:new-seed"),))
+    assert amended.attempt("a1").spec.effective_inputs == old_inputs
+    assert amended.resolved_inputs("first") != old_inputs
+
+
+def test_new_attempt_pins_newly_approved_inputs_without_mutating_previous_attempt() -> None:
+    done = finished(active())
+    revised = amend(done, initial_inputs=(InputBinding("seed", "ref:approved-v2"),))
+    retry = prepared(revised, "first", "a2")
+    assert retry.attempt("a1").spec.effective_inputs == (SEED,)
+    assert retry.attempt("a2").spec.effective_inputs == (InputBinding("seed", "ref:approved-v2"),)
+    assert retry.attempt("a1").spec.spec_revision == 1
+    assert retry.attempt("a2").spec.spec_revision == 2
+
+
+def test_command_subclass_cannot_relabel_authorization() -> None:
     class ForgedActivate(ActivateProgram):
         action = DomainAction.PREPARE_ATTEMPT
 
+    program = Program.create(graph_spec())
     with pytest.raises(InvalidDomainValue):
-        program.apply(ForgedActivate(0, OWNER))
-
-
-def test_authority_and_admission_budgets_are_checked_before_attempts() -> None:
-    restricted = AuthorityEnvelope(OWNER, frozenset({DomainAction.ACTIVATE_PROGRAM, DomainAction.CANCEL_PROGRAM}))
-    active = Program.create(graph_spec(authority=restricted)).apply(ActivateProgram(0, OWNER))
-    with pytest.raises(AuthorityViolation):
-        active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
-
-    budgeted = Program.create(graph_spec(budget=BudgetPolicy(max_attempts=1, max_active_attempts=1))).apply(
-        ActivateProgram(0, OWNER)
-    )
-    prepared = budgeted.apply(PrepareAttempt(budgeted.revision, OWNER, attempt_spec(budgeted, "a1", "first", "seed")))
-    failed = prepared.apply(FailAttempt(prepared.revision, OWNER, "a1"))
-    with pytest.raises(BudgetExceeded):
-        failed.apply(PrepareAttempt(failed.revision, OWNER, attempt_spec(failed, "a2", "first", "seed")))
-
-
-def test_attempt_inputs_are_immutable_and_amendments_preserve_history() -> None:
-    program = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-    prepared = program.apply(PrepareAttempt(program.revision, OWNER, attempt_spec(program, "a1", "first", "seed")))
-    finished = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1")).apply(
-        FinishAttempt(prepared.revision + 1, OWNER, "a1")
-    )
-    old_attempt = finished.attempt("a1")
-
-    with pytest.raises(FrozenInstanceError):
-        old_attempt.spec.effective_inputs = ()  # type: ignore[misc]
-    with pytest.raises(TypeError):
-        old_attempt.spec.effective_inputs[0] = InputBinding("seed", "changed")  # type: ignore[index]
-
-    amended = finished.apply(
-        AmendProgramSpec(
-            finished.revision,
-            OWNER,
-            SpecAmendment(expected_revision=1, objective="amended objective"),
-        )
-    )
-    assert amended.spec.revision == 2
-    assert amended.spec.parent_digest == finished.spec.digest
-    assert amended.attempt("a1").spec.spec_revision == 1
-    assert amended.attempt("a1").spec.spec_digest == finished.spec.digest
-    assert amended.spec_history == (finished.spec, amended.spec)
-
-
-def test_unrelated_amendment_preserves_applicable_satisfaction_reference() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-    prepared = active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
-    finished = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1")).apply(
-        FinishAttempt(prepared.revision + 1, OWNER, "a1")
-    )
-    advanced = finished.apply(SatisfyWorkUnit(finished.revision, OWNER, satisfaction(finished, "first", "s1", "a1")))
-
-    amended = advanced.apply(
-        AmendProgramSpec(
-            advanced.revision,
-            OWNER,
-            SpecAmendment(expected_revision=1, budget=BudgetPolicy(max_attempts=4, max_active_attempts=1)),
-        )
-    )
-    assert amended.state("first").status is WorkUnitStatus.SATISFIED
-    assert amended.ready_work_unit_ids == ("second",)
-    assert amended.satisfactions[0].reference_id == "s1"
-
-
-def test_acceptance_and_policy_intent_participate_in_digests_and_amendments() -> None:
-    policy_v1 = PolicyReference("engineering-acceptance", "v1", "sha256:policy-one")
-    policy_v2 = PolicyReference("engineering-acceptance", "v2", "sha256:policy-two")
-    unit_v1 = WorkUnit(
-        "only",
-        acceptance_criteria=("The bounded obligation is met",),
-        acceptance_policy_reference=policy_v1,
-    )
-    unit_v2 = WorkUnit(
-        "only",
-        acceptance_criteria=("The bounded obligation is independently checked",),
-        acceptance_policy_reference=policy_v2,
-    )
-    unit_changed_criteria = WorkUnit(
-        "only",
-        acceptance_criteria=("The bounded obligation is independently checked",),
-        acceptance_policy_reference=policy_v1,
-    )
-    unit_changed_policy = WorkUnit(
-        "only",
-        acceptance_criteria=("The bounded obligation is met",),
-        acceptance_policy_reference=policy_v2,
-    )
-    spec_v1 = ProgramSpec(
-        "p",
-        "deliver the owner objective",
-        (unit_v1,),
-        acceptance_criteria=("The Program objective is met",),
-        policy_references=(policy_v1,),
-    )
-    changed_program_criteria = ProgramSpec(
-        "p",
-        "deliver the owner objective",
-        (unit_v1,),
-        acceptance_criteria=("The Program objective and constraints are met",),
-        policy_references=(policy_v1,),
-    )
-    changed_program_policy = ProgramSpec(
-        "p",
-        "deliver the owner objective",
-        (unit_v1,),
-        acceptance_criteria=("The Program objective is met",),
-        policy_references=(policy_v2,),
-    )
-
-    assert unit_v1.digest != unit_v2.digest
-    assert unit_v1.digest != unit_changed_criteria.digest
-    assert unit_v1.digest != unit_changed_policy.digest
-    assert spec_v1.digest != changed_program_criteria.digest
-    assert spec_v1.digest != changed_program_policy.digest
-
-    active = Program.create(spec_v1).apply(ActivateProgram(0, OWNER))
-    prepared = active.apply(
-        PrepareAttempt(
-            active.revision,
-            OWNER,
-            AttemptSpec("a1", active.program_id, "only", spec_v1.revision, spec_v1.digest),
-        )
-    )
-    amended = prepared.apply(
-        AmendProgramSpec(
-            prepared.revision,
-            OWNER,
-            SpecAmendment(
-                expected_revision=1,
-                acceptance_criteria=("The updated Program objective is met",),
-                policy_references=(policy_v2,),
-                work_units=(unit_v2,),
-            ),
-        )
-    )
-
-    assert amended.spec.revision == 2
-    assert amended.spec.digest != spec_v1.digest
-    assert amended.spec.work_unit("only").digest == unit_v2.digest
-    assert amended.attempt("a1").spec.spec_digest == spec_v1.digest
-    assert amended.attempt("a1").spec.spec_revision == spec_v1.revision
-
-
-def test_owner_intent_amendment_has_consistent_satisfaction_applicability() -> None:
-    policy_v1 = PolicyReference("acceptance", "v1", "sha256:one")
-    policy_v2 = PolicyReference("acceptance", "v2", "sha256:two")
-    original_spec = ProgramSpec(
-        "p",
-        "original objective",
-        (WorkUnit("only", acceptance_criteria=("Original obligation",)),),
-        acceptance_criteria=("Original Program criterion",),
-        policy_references=(policy_v1,),
-    )
-    amendment = SpecAmendment(
-        expected_revision=1,
-        objective="amended objective",
-        acceptance_criteria=("Amended Program criterion",),
-        policy_references=(policy_v2,),
-    )
-
-    before_active = Program.create(original_spec).apply(ActivateProgram(0, OWNER))
-    before_prepared = before_active.apply(
-        PrepareAttempt(
-            before_active.revision,
-            OWNER,
-            AttemptSpec("before-a1", "p", "only", 1, original_spec.digest),
-        )
-    )
-    before_finished = before_prepared.apply(StartAttempt(before_prepared.revision, OWNER, "before-a1")).apply(
-        FinishAttempt(before_prepared.revision + 1, OWNER, "before-a1")
-    )
-    stale_reference = satisfaction(before_finished, "only", "old-satisfaction", "before-a1")
-    amendment_first = before_finished.apply(AmendProgramSpec(before_finished.revision, OWNER, amendment))
-
-    with pytest.raises(StaleRevision):
-        amendment_first.apply(SatisfyWorkUnit(amendment_first.revision, OWNER, stale_reference))
-
-    before_new_attempt = amendment_first.apply(
-        PrepareAttempt(
-            amendment_first.revision,
-            OWNER,
-            AttemptSpec("before-a2", "p", "only", 2, amendment_first.spec.digest),
-        )
-    )
-    before_new_finished = before_new_attempt.apply(StartAttempt(before_new_attempt.revision, OWNER, "before-a2")).apply(
-        FinishAttempt(before_new_attempt.revision + 1, OWNER, "before-a2")
-    )
-    newly_satisfied = before_new_finished.apply(
-        SatisfyWorkUnit(
-            before_new_finished.revision,
-            OWNER,
-            satisfaction(before_new_finished, "only", "new-satisfaction", "before-a2"),
-        )
-    )
-
-    after_active = Program.create(original_spec).apply(ActivateProgram(0, OWNER))
-    after_prepared = after_active.apply(
-        PrepareAttempt(
-            after_active.revision,
-            OWNER,
-            AttemptSpec("after-a1", "p", "only", 1, original_spec.digest),
-        )
-    )
-    after_finished = after_prepared.apply(StartAttempt(after_prepared.revision, OWNER, "after-a1")).apply(
-        FinishAttempt(after_prepared.revision + 1, OWNER, "after-a1")
-    )
-    satisfied_first = after_finished.apply(
-        SatisfyWorkUnit(
-            after_finished.revision,
-            OWNER,
-            satisfaction(after_finished, "only", "historical-satisfaction", "after-a1"),
-        )
-    )
-    amendment_second = satisfied_first.apply(AmendProgramSpec(satisfied_first.revision, OWNER, amendment))
-
-    assert amendment_first.spec.digest == amendment_second.spec.digest
-    assert amendment_first.state("only").status is WorkUnitStatus.READY
-    assert amendment_second.state("only").status is WorkUnitStatus.READY
-    assert amendment_first.satisfactions == ()
-    assert amendment_second.satisfactions == satisfied_first.satisfactions
-    assert newly_satisfied.state("only").status is WorkUnitStatus.SATISFIED
-
-
-def test_work_unit_intent_change_invalidates_affected_chain_only() -> None:
-    first = WorkUnit(
-        "first",
-        outputs=frozenset({"first-output"}),
-        acceptance_criteria=("old first",),
-        acceptance_policy_reference=PolicyReference("first-policy", "v1", "sha256:first-v1"),
-    )
-    child = WorkUnit("child", dependencies=("first",), required_inputs=frozenset({"first-output"}))
-    unrelated = WorkUnit("unrelated", acceptance_policy_reference=PolicyReference("local", "v1", "sha256:p"))
-    spec = ProgramSpec("p", "objective", (first, child, unrelated))
-    active = Program.create(spec).apply(ActivateProgram(0, OWNER))
-
-    first_prepared = active.apply(
-        PrepareAttempt(
-            active.revision,
-            OWNER,
-            AttemptSpec("a1", "p", "first", 1, spec.digest),
-        )
-    )
-    first_finished = first_prepared.apply(StartAttempt(first_prepared.revision, OWNER, "a1")).apply(
-        FinishAttempt(first_prepared.revision + 1, OWNER, "a1")
-    )
-    first_satisfied = first_finished.apply(
-        SatisfyWorkUnit(
-            first_finished.revision,
-            OWNER,
-            satisfaction(first_finished, "first", "s1", "a1"),
-        )
-    )
-    child_prepared = first_satisfied.apply(
-        PrepareAttempt(
-            first_satisfied.revision,
-            OWNER,
-            attempt_spec(first_satisfied, "a2", "child", "first-output"),
-        )
-    )
-    child_finished = child_prepared.apply(StartAttempt(child_prepared.revision, OWNER, "a2")).apply(
-        FinishAttempt(child_prepared.revision + 1, OWNER, "a2")
-    )
-    child_satisfied = child_finished.apply(
-        SatisfyWorkUnit(
-            child_finished.revision,
-            OWNER,
-            satisfaction(child_finished, "child", "s2", "a2"),
-        )
-    )
-    unrelated_prepared = child_satisfied.apply(
-        PrepareAttempt(
-            child_satisfied.revision,
-            OWNER,
-            AttemptSpec("a3", "p", "unrelated", 1, spec.digest),
-        )
-    )
-    unrelated_finished = unrelated_prepared.apply(StartAttempt(unrelated_prepared.revision, OWNER, "a3")).apply(
-        FinishAttempt(unrelated_prepared.revision + 1, OWNER, "a3")
-    )
-    all_satisfied = unrelated_finished.apply(
-        SatisfyWorkUnit(
-            unrelated_finished.revision,
-            OWNER,
-            satisfaction(unrelated_finished, "unrelated", "s3", "a3"),
-        )
-    )
-    changed_first = WorkUnit(
-        "first",
-        outputs=frozenset({"first-output"}),
-        acceptance_criteria=("new first criterion",),
-        acceptance_policy_reference=PolicyReference("first-policy", "v2", "sha256:first-v2"),
-    )
-
-    amended = all_satisfied.apply(
-        AmendProgramSpec(
-            all_satisfied.revision,
-            OWNER,
-            SpecAmendment(expected_revision=1, work_units=(changed_first, child, unrelated)),
-        )
-    )
-
-    assert amended.state("first").status is WorkUnitStatus.READY
-    assert amended.state("child").status is WorkUnitStatus.PENDING
-    assert amended.state("unrelated").status is WorkUnitStatus.SATISFIED
-    assert tuple(item.reference_id for item in amended.satisfactions) == ("s1", "s2", "s3")
-
-
-def test_amendment_cancels_attempts_pinned_to_the_old_spec() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-    prepared = active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
-
-    amended = prepared.apply(
-        AmendProgramSpec(
-            prepared.revision,
-            OWNER,
-            SpecAmendment(expected_revision=1, objective="new objective"),
-        )
-    )
-
-    assert amended.attempt("a1").status is AttemptStatus.CANCELLED
-    assert amended.state("first").status is WorkUnitStatus.READY
-    replacement = amended.apply(PrepareAttempt(amended.revision, OWNER, attempt_spec(amended, "a2", "first", "seed")))
-    assert replacement.state("first").active_attempt_id == "a2"
-
-
-def test_amendment_removing_last_pending_work_unit_completes_active_program() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-    prepared = active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
-    finished = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1")).apply(
-        FinishAttempt(prepared.revision + 1, OWNER, "a1")
-    )
-    satisfied = finished.apply(SatisfyWorkUnit(finished.revision, OWNER, satisfaction(finished, "first", "s1", "a1")))
-    first = satisfied.spec.work_unit("first")
-
-    amended = satisfied.apply(
-        AmendProgramSpec(
-            satisfied.revision,
-            OWNER,
-            SpecAmendment(expected_revision=1, work_units=(first,)),
-        )
-    )
-
-    assert amended.status is ProgramStatus.COMPLETED
-    assert amended.ready_work_unit_ids == ()
-
-
-def test_amendment_invalidates_downstream_satisfaction_after_predecessor_change() -> None:
-    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
-    first_prepared = active.apply(PrepareAttempt(active.revision, OWNER, attempt_spec(active, "a1", "first", "seed")))
-    first_finished = first_prepared.apply(StartAttempt(first_prepared.revision, OWNER, "a1")).apply(
-        FinishAttempt(first_prepared.revision + 1, OWNER, "a1")
-    )
-    first_satisfied = first_finished.apply(
-        SatisfyWorkUnit(
-            first_finished.revision,
-            OWNER,
-            satisfaction(first_finished, "first", "s1", "a1"),
-        )
-    )
-    second_prepared = first_satisfied.apply(
-        PrepareAttempt(
-            first_satisfied.revision,
-            OWNER,
-            attempt_spec(first_satisfied, "a2", "second", "first-output"),
-        )
-    )
-    second_finished = second_prepared.apply(StartAttempt(second_prepared.revision, OWNER, "a2")).apply(
-        FinishAttempt(second_prepared.revision + 1, OWNER, "a2")
-    )
-    both_satisfied = second_finished.apply(
-        SatisfyWorkUnit(
-            second_finished.revision,
-            OWNER,
-            satisfaction(second_finished, "second", "s2", "a2"),
-        )
-    )
-    changed_first = WorkUnit(
-        "first",
-        required_inputs=frozenset({"seed"}),
-        outputs=frozenset({"first-output", "additional-output"}),
-    )
-
-    amended = both_satisfied.apply(
-        AmendProgramSpec(
-            both_satisfied.revision,
-            OWNER,
-            SpecAmendment(
-                expected_revision=1,
-                work_units=(changed_first, both_satisfied.spec.work_unit("second")),
-            ),
-        )
-    )
-
-    assert amended.status is ProgramStatus.ACTIVE
-    assert amended.state("first").status is WorkUnitStatus.READY
-    assert amended.state("second").status is WorkUnitStatus.PENDING
-    assert amended.ready_work_unit_ids == ("first",)
-    assert tuple(item.reference_id for item in amended.satisfactions) == ("s1", "s2")
+        program.apply(ForgedActivate(program.revision, OWNER))
+    assert program.status is ProgramStatus.DRAFT
