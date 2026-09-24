@@ -216,10 +216,14 @@ def test_dataclass_replace_cannot_inject_a_lifecycle_state() -> None:
 def test_internal_transition_builder_is_not_a_supported_construction_path() -> None:
     active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
 
+    assert not hasattr(active, "_next")
+    assert not hasattr(Program, "_from_transition")
+    assert not hasattr(domain_module, "_TRANSITION_TOKEN")
     with pytest.raises(AttributeError):
-        _ = Program._from_transition  # type: ignore[attr-defined]
-    with pytest.raises(TypeError):
-        active._next(status=ProgramStatus.CANCELLED)  # type: ignore[call-arg]
+        active._next(status=ProgramStatus.CANCELLED, _token=None)  # type: ignore[attr-defined]
+    with pytest.raises(InvalidDomainValue):
+        active.apply(object())  # type: ignore[arg-type]
+    assert active.status is ProgramStatus.ACTIVE
 
 
 def test_program_subclass_cannot_override_validation_or_authorization() -> None:
@@ -300,11 +304,15 @@ def test_resume_transition_rejects_an_actionless_active_state() -> None:
     )
 
     with pytest.raises(AuthorityViolation):
-        paused._next(  # type: ignore[call-arg]
-            _token=domain_module._TRANSITION_TOKEN,  # pyright: ignore[reportPrivateUsage]
-            spec=actionless_spec,
-            status=ProgramStatus.ACTIVE,
-            spec_history=(*paused.spec_history, actionless_spec),
+        paused.apply(
+            AmendProgramSpec(
+                paused.revision,
+                OWNER,
+                SpecAmendment(
+                    expected_revision=1,
+                    authority=actionless_spec.authority,
+                ),
+            )
         )
 
 
@@ -333,6 +341,32 @@ def test_paused_amendment_and_resume_retain_an_operable_control_path() -> None:
     assert resumed.apply(CancelProgram(resumed.revision, OWNER)).status is ProgramStatus.CANCELLED
 
 
+def test_paused_amendment_remains_a_real_control_path_without_resume_or_cancel() -> None:
+    active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
+    paused = active.apply(PauseProgram(active.revision, OWNER))
+    amendment = AmendProgramSpec(
+        paused.revision,
+        OWNER,
+        SpecAmendment(
+            expected_revision=1,
+            authority=AuthorityEnvelope(OWNER, frozenset({DomainAction.AMEND_SPEC})),
+        ),
+    )
+
+    amended = paused.apply(amendment)
+    changed = amended.apply(
+        AmendProgramSpec(
+            amended.revision,
+            OWNER,
+            SpecAmendment(expected_revision=2, objective="revised while paused"),
+        )
+    )
+
+    assert changed.status is ProgramStatus.PAUSED
+    assert changed.spec.objective == "revised while paused"
+    assert changed.spec.authority.allowed_actions == frozenset({DomainAction.AMEND_SPEC})
+
+
 def test_work_unit_cancellation_propagates_and_closes_an_unfinishable_graph() -> None:
     active = Program.create(graph_spec()).apply(ActivateProgram(0, OWNER))
 
@@ -341,6 +375,196 @@ def test_work_unit_cancellation_propagates_and_closes_an_unfinishable_graph() ->
     assert cancelled.state("first").status is WorkUnitStatus.CANCELLED
     assert cancelled.state("second").status is WorkUnitStatus.CANCELLED
     assert cancelled.status is ProgramStatus.CANCELLED
+
+
+def test_least_privilege_active_work_unit_cancellation_needs_no_program_cancel() -> None:
+    authority = AuthorityEnvelope(
+        OWNER,
+        frozenset({DomainAction.ACTIVATE_PROGRAM, DomainAction.CANCEL_WORK_UNIT}),
+    )
+    spec = ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority)
+
+    active = Program.create(spec).apply(ActivateProgram(0, OWNER))
+
+    assert DomainAction.CANCEL_PROGRAM not in active.spec.authority.allowed_actions
+    assert active.apply(CancelWorkUnit(active.revision, OWNER, "only")).status is ProgramStatus.CANCELLED
+
+
+def test_active_program_can_retain_amendment_control_without_program_cancellation() -> None:
+    authority = AuthorityEnvelope(
+        OWNER,
+        frozenset({DomainAction.ACTIVATE_PROGRAM, DomainAction.AMEND_SPEC}),
+    )
+    active = Program.create(ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority)).apply(
+        ActivateProgram(0, OWNER)
+    )
+
+    amended = active.apply(
+        AmendProgramSpec(
+            active.revision,
+            OWNER,
+            SpecAmendment(expected_revision=1, objective="revised objective"),
+        )
+    )
+
+    assert amended.status is ProgramStatus.ACTIVE
+    assert amended.spec.objective == "revised objective"
+    assert DomainAction.CANCEL_PROGRAM not in amended.spec.authority.allowed_actions
+
+
+def test_active_and_paused_states_without_any_legal_path_are_rejected() -> None:
+    authority = AuthorityEnvelope(
+        OWNER,
+        frozenset({DomainAction.ACTIVATE_PROGRAM, DomainAction.PAUSE_PROGRAM}),
+    )
+    spec = ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority)
+
+    with pytest.raises(AuthorityViolation):
+        Program.create(spec)
+
+
+def test_attempt_admission_rejects_a_prepared_state_with_no_legal_followup() -> None:
+    authority = AuthorityEnvelope(
+        OWNER,
+        frozenset(
+            {
+                DomainAction.ACTIVATE_PROGRAM,
+                DomainAction.PREPARE_ATTEMPT,
+                DomainAction.FINISH_ATTEMPT,
+                DomainAction.CANCEL_WORK_UNIT,
+            }
+        ),
+    )
+    active = Program.create(ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority)).apply(
+        ActivateProgram(0, OWNER)
+    )
+
+    with pytest.raises(AuthorityViolation):
+        active.apply(
+            PrepareAttempt(
+                active.revision,
+                OWNER,
+                AttemptSpec("a1", active.program_id, "only", active.spec.revision, active.spec.digest),
+            )
+        )
+
+    assert active.state("only").status is WorkUnitStatus.READY
+    assert active.attempts == ()
+
+
+def test_pause_requires_a_viable_resume_or_termination_path() -> None:
+    authority = AuthorityEnvelope(
+        OWNER,
+        frozenset(
+            {
+                DomainAction.ACTIVATE_PROGRAM,
+                DomainAction.PAUSE_PROGRAM,
+                DomainAction.RESUME_PROGRAM,
+                DomainAction.CANCEL_WORK_UNIT,
+            }
+        ),
+    )
+    active = Program.create(ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority)).apply(
+        ActivateProgram(0, OWNER)
+    )
+
+    paused = active.apply(PauseProgram(active.revision, OWNER))
+    resumed = paused.apply(ResumeProgram(paused.revision, OWNER))
+
+    assert resumed.status is ProgramStatus.ACTIVE
+    assert resumed.apply(CancelWorkUnit(resumed.revision, OWNER, "only")).status is ProgramStatus.CANCELLED
+
+
+def test_objective_amendment_preserves_cancelled_work_unit() -> None:
+    spec = ProgramSpec("p", "objective", (WorkUnit("a"), WorkUnit("b")))
+    active = Program.create(spec).apply(ActivateProgram(0, OWNER))
+    cancelled = active.apply(CancelWorkUnit(active.revision, OWNER, "a"))
+
+    amended = cancelled.apply(
+        AmendProgramSpec(
+            cancelled.revision,
+            OWNER,
+            SpecAmendment(expected_revision=1, objective="new objective"),
+        )
+    )
+
+    assert amended.state("a").status is WorkUnitStatus.CANCELLED
+    assert amended.state("b").status is WorkUnitStatus.READY
+
+
+def test_unrelated_amendment_preserves_cancelled_dependency_branch() -> None:
+    units = (
+        WorkUnit("a-root"),
+        WorkUnit("a-child", dependencies=("a-root",)),
+        WorkUnit("b-root"),
+        WorkUnit("b-child", dependencies=("b-root",)),
+    )
+    active = Program.create(ProgramSpec("p", "objective", units)).apply(ActivateProgram(0, OWNER))
+    cancelled = active.apply(CancelWorkUnit(active.revision, OWNER, "a-root"))
+
+    amended = cancelled.apply(
+        AmendProgramSpec(
+            cancelled.revision,
+            OWNER,
+            SpecAmendment(expected_revision=1, objective="new objective"),
+        )
+    )
+
+    assert amended.state("a-root").status is WorkUnitStatus.CANCELLED
+    assert amended.state("a-child").status is WorkUnitStatus.CANCELLED
+    assert amended.state("b-root").status is WorkUnitStatus.READY
+    assert amended.state("b-child").status is WorkUnitStatus.PENDING
+
+
+def test_material_work_unit_amendment_reevaluates_prior_cancellation() -> None:
+    first = WorkUnit("first")
+    second = WorkUnit("second")
+    active = Program.create(ProgramSpec("p", "objective", (first, second))).apply(ActivateProgram(0, OWNER))
+    cancelled = active.apply(CancelWorkUnit(active.revision, OWNER, "first"))
+    amended = cancelled.apply(
+        AmendProgramSpec(
+            cancelled.revision,
+            OWNER,
+            SpecAmendment(
+                expected_revision=1,
+                work_units=(WorkUnit("first", outputs=frozenset({"new-output"})), second),
+            ),
+        )
+    )
+
+    assert amended.state("first").status is WorkUnitStatus.READY
+
+
+def test_satisfying_remaining_work_after_cancellation_closes_cancelled_program() -> None:
+    spec = ProgramSpec("p", "objective", (WorkUnit("cancelled"), WorkUnit("remaining")))
+    active = Program.create(spec).apply(ActivateProgram(0, OWNER))
+    cancelled = active.apply(CancelWorkUnit(active.revision, OWNER, "cancelled"))
+    prepared = cancelled.apply(
+        PrepareAttempt(
+            cancelled.revision,
+            OWNER,
+            AttemptSpec(
+                "a1",
+                cancelled.program_id,
+                "remaining",
+                cancelled.spec.revision,
+                cancelled.spec.digest,
+            ),
+        )
+    )
+    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
+    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
+    terminated = finished.apply(
+        SatisfyWorkUnit(
+            finished.revision,
+            OWNER,
+            satisfaction(finished, "remaining", "s1", "a1"),
+        )
+    )
+
+    assert terminated.state("cancelled").status is WorkUnitStatus.CANCELLED
+    assert terminated.state("remaining").status is WorkUnitStatus.SATISFIED
+    assert terminated.status is ProgramStatus.CANCELLED
 
 
 def test_ordinary_copying_and_subclassing_cannot_change_immutable_intent() -> None:
