@@ -25,8 +25,10 @@ the record of what was authorized or executed. Version migrations need backup an
 Use local disk, foreign keys, uniqueness/check constraints, explicit short write transactions,
 bounded busy retry, WAL and `synchronous=FULL`. No network calls inside a DB transaction. A dedicated
 writer serializes commits; compare-and-swap revisions and monotonically increasing fencing epochs
-still reject stale workers. Use a patched SQLite version (see the reference catalogue), verify
-startup pragmas, and use SQLite's backup API with an artifact manifest, not a naked copy of an open
+still reject stale workers. At startup, report the actual SQLite runtime/capabilities and verify
+required pragmas and writer topology. Require a WAL-reset fix only for a demonstrated topology that
+permits concurrent WAL writers; a single-controller, dedicated-writer topology has no unconditional
+SQLite version floor. Use SQLite's backup API with an artifact manifest, not a naked copy of an open
 database file. Never share WAL over a network filesystem. Storage/disk-full failure stops new effects.
 
 Large artifacts live in user-controlled storage outside Git, addressed by content digest. Flush and

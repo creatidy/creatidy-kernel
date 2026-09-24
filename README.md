@@ -6,9 +6,17 @@ Creatidy Kernel is the foundation of a local-first, provider-neutral control pla
 software engineering. It is for individual developers and small teams with limited AI budgets,
 premium-model quota and human attention.
 
-**Status: A0 architecture and boundary proof, not a working autonomous Program engine.** The code
-currently demonstrates a replaceable resource allocator and tested package boundaries. It does not
-run agents, contact providers, execute Programs or modify your repositories.
+**Status: deterministic K1 domain and K2A durable persistence, not an autonomous Program engine.**
+The code includes immutable Program intent, legal domain commands, single-controller SQLite history
+and rebuildable projections, plus a replaceable resource allocator. It does not run agents, schedule
+or autonomously execute Programs, contact providers, perform external effects or modify your
+repositories.
+
+The SQLite adapter accepts file-backed databases on verified local Linux mounts only. It holds an
+exclusive per-database writer lock, binds database access to the creating thread, and reports the
+runtime SQLite version, filesystem, and required pragma/capability checks at startup. WAL is never
+used on a detected network filesystem, and the adapter does not impose a blanket SQLite version
+minimum.
 
 ## Why A Kernel?
 
