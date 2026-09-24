@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import os
@@ -48,7 +47,6 @@ _LOCAL_FILESYSTEMS = {
     "ext4",
     "f2fs",
     "ntfs3",
-    "overlay",
     "xfs",
     "zfs",
 }
@@ -63,7 +61,7 @@ class UnsupportedSQLiteConfiguration(SQLiteStoreError):
 
 
 class ConcurrentWriter(SQLiteStoreError):
-    """Another controller already owns this database's writer lock."""
+    """Another controller already owns this database's exclusive SQLite connection."""
 
 
 class WrongWriterThread(SQLiteStoreError):
@@ -97,19 +95,25 @@ class CorruptHistory(SQLiteStoreError):
 @dataclass(frozen=True, slots=True)
 class SQLiteStartupEvidence:
     database_path: str
+    data_directory: str
     filesystem_type: str
     filesystem_mountpoint: str
+    filesystem_mount_id: int
+    filesystem_mount_options: tuple[str, ...]
+    filesystem_super_options: tuple[str, ...]
     sqlite_runtime_version: str
     sqlite_runtime_version_info: tuple[int, int, int]
     sqlite_threadsafety: int
     compile_options: tuple[str, ...]
     journal_mode: str
+    locking_mode: str
     synchronous: int
     foreign_keys: bool
     busy_timeout_ms: int
     application_id: int
     schema_version: int
     controller_topology: str
+    writer_process_id: int
     writer_thread_id: int
 
 
@@ -138,66 +142,30 @@ class BackupBundle:
     schema_version: int
 
 
-class _ExclusiveFileLock:
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._file = None
+@dataclass(frozen=True, slots=True)
+class _MountEntry:
+    mount_id: int
+    device: str
+    root: str
+    mountpoint: Path
+    mount_options: frozenset[str]
+    filesystem_type: str
+    source: str
+    super_options: frozenset[str]
 
-    def acquire(self) -> None:
-        self._file = self._path.open("a+b")
-        try:
-            if os.name == "nt":
-                import msvcrt
 
-                self._file.seek(0, os.SEEK_END)
-                if self._file.tell() == 0:
-                    self._file.write(b"\0")
-                    self._file.flush()
-                self._file.seek(0)
-                msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
-            elif os.name == "posix":
-                import fcntl
-
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            else:
-                raise UnsupportedSQLiteConfiguration("exclusive writer locks are unavailable on this platform")
-        except OSError as error:
-            self._file.close()
-            self._file = None
-            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
-                raise ConcurrentWriter("another controller holds the SQLite writer lock") from error
-            raise UnsupportedSQLiteConfiguration("cannot establish an exclusive SQLite writer lock") from error
-        except BaseException:
-            self._file.close()
-            self._file = None
-            raise
-
-    def release(self) -> None:
-        if self._file is None:
-            return
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                self._file.seek(0)
-                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
-            elif os.name == "posix":
-                import fcntl
-
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
-        finally:
-            self._file.close()
-            self._file = None
-
-    def close_inherited(self) -> None:
-        """Close this process's inherited descriptor without unlocking the parent's lock."""
-        if self._file is not None:
-            self._file.close()
-            self._file = None
+@dataclass(frozen=True, slots=True)
+class _StorageTopology:
+    data_directory: Path
+    filesystem_type: str
+    mountpoint: Path
+    mount_id: int
+    mount_options: tuple[str, ...]
+    super_options: tuple[str, ...]
 
 
 class SQLiteProgramStore:
-    """A file-backed K1 store with one connection, one writer thread, and one controller lock."""
+    """A file-backed K1 store with one SQLite-exclusive connection and one owner process/thread."""
 
     _connection: sqlite3.Connection
     _startup_evidence: SQLiteStartupEvidence
@@ -213,14 +181,12 @@ class SQLiteProgramStore:
             raise FileNotFoundError(f"SQLite database parent directory does not exist: {self._path.parent}")
         if self._path.exists() and not self._path.is_file():
             raise UnsupportedSQLiteConfiguration("SQLite database path must be a regular file")
-        self._filesystem_type, self._filesystem_mountpoint = _detect_local_filesystem(self._path)
+        self._storage = _inspect_local_storage(self._path.parent, database_path=self._path)
         self._owner_pid = os.getpid()
         self._owner_thread = threading.get_ident()
         self._gate = threading.RLock()
         self._busy_timeout_ms = busy_timeout_ms
         self._closed = False
-        self._writer_lock = _ExclusiveFileLock(Path(f"{self._path}.writer.lock"))
-        self._writer_lock.acquire()
         try:
             self._connection = sqlite3.connect(
                 self._path,
@@ -228,7 +194,14 @@ class SQLiteProgramStore:
                 isolation_level=None,
             )
             self._connection.row_factory = sqlite3.Row
-            self._configure_runtime()
+            try:
+                self._configure_runtime()
+                self._acquire_exclusive_ownership()
+                self._enable_wal()
+            except sqlite3.OperationalError as error:
+                if _is_sqlite_lock_contention(error):
+                    raise ConcurrentWriter("another controller owns SQLite EXCLUSIVE locking mode") from error
+                raise
             self._migrate()
             self.rebuild_projections()
             self._startup_evidence = self._read_startup_evidence()
@@ -236,7 +209,6 @@ class SQLiteProgramStore:
             connection = getattr(self, "_connection", None)
             if connection is not None:
                 connection.close()
-            self._writer_lock.release()
             raise
 
     @property
@@ -254,9 +226,7 @@ class SQLiteProgramStore:
 
     def close(self) -> None:
         if os.getpid() != self._owner_pid:
-            self._writer_lock.close_inherited()
-            self._closed = True
-            raise WrongWriterProcess("SQLite store cannot be closed from a different process")
+            raise WrongWriterProcess("inherited SQLite stores must not be used or closed in another process")
         if threading.get_ident() != self._owner_thread:
             raise WrongWriterThread("SQLite access must use the store's dedicated writer thread")
         with self._gate:
@@ -264,7 +234,6 @@ class SQLiteProgramStore:
                 return
             self._connection.close()
             self._closed = True
-            self._writer_lock.release()
 
     def create(self, spec: ProgramSpec, command_key: str) -> Program:
         self._assert_writer_thread()
@@ -519,11 +488,15 @@ class SQLiteProgramStore:
             raise ValueError("backup destination must be a new directory distinct from the database")
         if not target.parent.is_dir():
             raise FileNotFoundError(f"backup parent directory does not exist: {target.parent}")
+        destination_storage = _inspect_local_storage(target.parent)
         with self._gate:
             temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
             database = temporary / "kernel.sqlite3"
             manifest = temporary / "manifest.json"
             try:
+                temporary_storage = _inspect_local_storage(temporary)
+                if temporary_storage.mount_id != destination_storage.mount_id:
+                    raise UnsupportedSQLiteConfiguration("backup staging directory changed storage mounts")
                 backup_connection = sqlite3.connect(database, isolation_level=None)
                 try:
                     self._connection.backup(backup_connection)
@@ -545,7 +518,16 @@ class SQLiteProgramStore:
                     "history_record_count": record_count,
                     "database_sha256": file_digest,
                     "controller_topology": self._startup_evidence.controller_topology,
-                    "source_filesystem_type": self._startup_evidence.filesystem_type,
+                    "source_data_directory": str(self._storage.data_directory),
+                    "source_filesystem_type": self._storage.filesystem_type,
+                    "source_filesystem_mount_id": self._storage.mount_id,
+                    "source_filesystem_mount_options": self._storage.mount_options,
+                    "source_filesystem_super_options": self._storage.super_options,
+                    "destination_data_directory": str(destination_storage.data_directory),
+                    "destination_filesystem_type": destination_storage.filesystem_type,
+                    "destination_filesystem_mount_id": destination_storage.mount_id,
+                    "destination_filesystem_mount_options": destination_storage.mount_options,
+                    "destination_filesystem_super_options": destination_storage.super_options,
                 }
                 with manifest.open("w", encoding="utf-8") as stream:
                     stream.write(canonical_json(manifest_value) + "\n")
@@ -573,32 +555,59 @@ class SQLiteProgramStore:
         self._assert_writer_thread()
         connection = self._connection
         connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
-        mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()
-        if mode is None or str(mode[0]).lower() != "wal":
-            raise UnsupportedSQLiteConfiguration("SQLite did not enable WAL for the file-backed database")
+        locking_mode = connection.execute("PRAGMA main.locking_mode = EXCLUSIVE").fetchone()
+        self._locking_mode = "" if locking_mode is None else str(locking_mode[0]).lower()
+        if self._locking_mode != "exclusive":
+            raise UnsupportedSQLiteConfiguration("SQLite did not enable main.locking_mode=EXCLUSIVE")
         connection.execute("PRAGMA synchronous = FULL")
         connection.execute("PRAGMA foreign_keys = ON")
-        application_id = cast(int, connection.execute("PRAGMA application_id").fetchone()[0])
-        if application_id not in (0, _APPLICATION_ID):
-            raise UnsupportedSQLiteConfiguration("database application_id belongs to another application")
-        connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
-        self._journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
-        self._synchronous = cast(int, connection.execute("PRAGMA synchronous").fetchone()[0])
         self._foreign_keys = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+        self._actual_busy_timeout_ms = cast(int, connection.execute("PRAGMA busy_timeout").fetchone()[0])
+        if not self._foreign_keys or self._actual_busy_timeout_ms != self._busy_timeout_ms:
+            raise UnsupportedSQLiteConfiguration("SQLite is missing required FK or busy-timeout capability")
+
+    def _acquire_exclusive_ownership(self) -> None:
+        connection = self._connection
+        connection.execute("BEGIN EXCLUSIVE")
+        try:
+            application_id = cast(int, connection.execute("PRAGMA application_id").fetchone()[0])
+            if application_id not in (0, _APPLICATION_ID):
+                raise UnsupportedSQLiteConfiguration("database application_id belongs to another application")
+            if application_id == 0:
+                connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
+                application_id = _APPLICATION_ID
+            quick_check = connection.execute("PRAGMA quick_check(1)").fetchone()
+            if quick_check is None or quick_check[0] != "ok":
+                raise CorruptHistory("SQLite quick_check failed")
+            if str(connection.execute("PRAGMA main.locking_mode").fetchone()[0]).lower() != "exclusive":
+                raise UnsupportedSQLiteConfiguration("SQLite lost EXCLUSIVE locking mode during acquisition")
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        self._application_id = application_id
+
+    def _enable_wal(self) -> None:
+        connection = self._connection
+        mode = connection.execute("PRAGMA main.journal_mode = WAL").fetchone()
+        if mode is None or str(mode[0]).lower() != "wal":
+            raise UnsupportedSQLiteConfiguration("SQLite did not enable WAL for the file-backed database")
+        self._journal_mode = str(connection.execute("PRAGMA main.journal_mode").fetchone()[0]).lower()
+        self._locking_mode = str(connection.execute("PRAGMA main.locking_mode").fetchone()[0]).lower()
+        self._synchronous = cast(int, connection.execute("PRAGMA synchronous").fetchone()[0])
         self._actual_busy_timeout_ms = cast(int, connection.execute("PRAGMA busy_timeout").fetchone()[0])
         if (
             self._journal_mode != "wal"
+            or self._locking_mode != "exclusive"
             or self._synchronous != 2
             or not self._foreign_keys
             or self._actual_busy_timeout_ms != self._busy_timeout_ms
             or not callable(connection.backup)
         ):
             raise UnsupportedSQLiteConfiguration(
-                "SQLite is missing a required WAL, FULL, FK, timeout, or backup capability"
+                "SQLite is missing a required EXCLUSIVE, WAL, FULL, FK, timeout, or backup capability"
             )
-        quick_check = connection.execute("PRAGMA quick_check(1)").fetchone()
-        if quick_check is None or quick_check[0] != "ok":
-            raise CorruptHistory("SQLite quick_check failed")
 
     def _migrate(self) -> None:
         with self._transaction():
@@ -868,19 +877,25 @@ class SQLiteProgramStore:
         application_id = cast(int, self._connection.execute("PRAGMA application_id").fetchone()[0])
         return SQLiteStartupEvidence(
             database_path=str(self._path),
-            filesystem_type=self._filesystem_type,
-            filesystem_mountpoint=self._filesystem_mountpoint,
+            data_directory=str(self._storage.data_directory),
+            filesystem_type=self._storage.filesystem_type,
+            filesystem_mountpoint=str(self._storage.mountpoint),
+            filesystem_mount_id=self._storage.mount_id,
+            filesystem_mount_options=self._storage.mount_options,
+            filesystem_super_options=self._storage.super_options,
             sqlite_runtime_version=sqlite3.sqlite_version,
             sqlite_runtime_version_info=sqlite3.sqlite_version_info,
             sqlite_threadsafety=sqlite3.threadsafety,
             compile_options=compile_options,
             journal_mode=self._journal_mode,
+            locking_mode=self._locking_mode,
             synchronous=self._synchronous,
             foreign_keys=self._foreign_keys,
             busy_timeout_ms=self._actual_busy_timeout_ms,
             application_id=application_id,
             schema_version=schema_version,
-            controller_topology="one process lock; one SQLite writer connection; creator-thread-only writes",
+            controller_topology="one private-cache SQLite connection; retained main.locking_mode=EXCLUSIVE",
+            writer_process_id=self._owner_pid,
             writer_thread_id=self._owner_thread,
         )
 
@@ -903,42 +918,130 @@ class SQLiteProgramStore:
             raise ValueError("command_key must be a nonempty string")
 
 
-def _detect_local_filesystem(path: Path) -> tuple[str, str]:
+def _is_sqlite_lock_contention(error: sqlite3.OperationalError) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    return type(code) is int and (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+
+
+def _decode_mountinfo_field(value: str) -> str:
+    for escaped, decoded in ((r"\040", " "), (r"\011", "\t"), (r"\012", "\n"), (r"\134", "\\")):
+        value = value.replace(escaped, decoded)
+    return value
+
+
+def _parse_mountinfo(contents: str) -> tuple[_MountEntry, ...]:
+    entries: list[_MountEntry] = []
+    for line in contents.splitlines():
+        before, separator, after = line.partition(" - ")
+        if not separator:
+            raise UnsupportedSQLiteConfiguration("mount table contains an invalid record")
+        mount_fields = before.split()
+        filesystem_fields = after.split(maxsplit=2)
+        if len(mount_fields) < 6 or len(filesystem_fields) != 3:
+            raise UnsupportedSQLiteConfiguration("mount table record is incomplete")
+        try:
+            mount_id = int(mount_fields[0])
+            int(mount_fields[1])
+        except ValueError as error:
+            raise UnsupportedSQLiteConfiguration("mount table contains an invalid mount ID") from error
+        entries.append(
+            _MountEntry(
+                mount_id=mount_id,
+                device=mount_fields[2],
+                root=_decode_mountinfo_field(mount_fields[3]),
+                mountpoint=Path(_decode_mountinfo_field(mount_fields[4])),
+                mount_options=frozenset(mount_fields[5].split(",")),
+                filesystem_type=filesystem_fields[0].lower(),
+                source=_decode_mountinfo_field(filesystem_fields[1]),
+                super_options=frozenset(_decode_mountinfo_field(filesystem_fields[2]).split(",")),
+            )
+        )
+    if not entries:
+        raise UnsupportedSQLiteConfiguration("mount table is empty")
+    return tuple(entries)
+
+
+def _mount_for_path(path: Path, mounts: tuple[_MountEntry, ...]) -> _MountEntry:
+    target = path.resolve(strict=False)
+    matches: list[tuple[int, int, _MountEntry]] = []
+    for index, mount in enumerate(mounts):
+        mountpoint = mount.mountpoint.resolve(strict=False)
+        if target == mountpoint or mountpoint in target.parents:
+            matches.append((len(mountpoint.parts), index, mount))
+    if not matches:
+        raise UnsupportedSQLiteConfiguration(f"cannot identify the mount containing {target}")
+    return max(matches, key=lambda item: (item[0], item[1]))[2]
+
+
+def _require_durable_mount(mount: _MountEntry) -> None:
+    if mount.filesystem_type not in _LOCAL_FILESYSTEMS:
+        raise UnsupportedSQLiteConfiguration(
+            f"SQLite WAL requires a verified native local filesystem; found {mount.filesystem_type!r} "
+            f"at {mount.mountpoint}"
+        )
+    if "ro" in mount.mount_options or "rw" not in mount.mount_options:
+        raise UnsupportedSQLiteConfiguration(
+            f"SQLite data directory mount is not verified writable: {mount.mountpoint}"
+        )
+    options = mount.mount_options | mount.super_options
+    if "volatile" in options or "fsync=volatile" in options:
+        raise UnsupportedSQLiteConfiguration(f"volatile filesystem mode is unsupported: {mount.mountpoint}")
+
+
+def _inspect_local_storage(directory: Path, *, database_path: Path | None = None) -> _StorageTopology:
     if not sys.platform.startswith("linux"):
         raise UnsupportedSQLiteConfiguration("SQLite WAL topology requires a runtime that can verify local mounts")
-    mountinfo_path = Path("/proc/self/mountinfo")
+    data_directory = directory.expanduser().resolve(strict=True)
     try:
-        entries = mountinfo_path.read_text(encoding="utf-8").splitlines()
+        mounts = _parse_mountinfo(Path("/proc/self/mountinfo").read_text(encoding="utf-8"))
     except OSError as error:
-        raise UnsupportedSQLiteConfiguration("cannot verify the database filesystem mount") from error
-    target = path.resolve(strict=False)
-    matches: list[tuple[int, str, str]] = []
-    for entry in entries:
-        before, separator, after = entry.partition(" - ")
-        if not separator:
-            continue
-        mount_fields = before.split()
-        filesystem_fields = after.split()
-        if len(mount_fields) < 5 or not filesystem_fields:
-            continue
-        mountpoint = mount_fields[4]
-        for escaped, decoded in ((r"\040", " "), (r"\011", "\t"), (r"\012", "\n"), (r"\134", "\\")):
-            mountpoint = mountpoint.replace(escaped, decoded)
-        mount_path = Path(mountpoint).resolve(strict=False)
-        if target == mount_path or mount_path in target.parents:
-            matches.append((len(str(mount_path)), filesystem_fields[0].lower(), str(mount_path)))
-    if not matches:
-        raise UnsupportedSQLiteConfiguration("cannot identify the database filesystem mount")
-    _, filesystem_type, mountpoint = max(matches)
-    _require_local_filesystem(filesystem_type, mountpoint)
-    return filesystem_type, mountpoint
+        raise UnsupportedSQLiteConfiguration("cannot verify the database mount topology") from error
+    return _validate_storage_topology(data_directory, mounts=mounts, database_path=database_path)
 
 
-def _require_local_filesystem(filesystem_type: str, mountpoint: str) -> None:
-    if filesystem_type not in _LOCAL_FILESYSTEMS:
-        raise UnsupportedSQLiteConfiguration(
-            f"SQLite WAL requires a verified durable local filesystem; found {filesystem_type!r} at {mountpoint!r}"
-        )
+def _validate_storage_topology(
+    data_directory: Path,
+    *,
+    mounts: tuple[_MountEntry, ...],
+    database_path: Path | None = None,
+) -> _StorageTopology:
+    data_directory = data_directory.resolve(strict=True)
+    if not data_directory.is_dir():
+        raise UnsupportedSQLiteConfiguration("SQLite data directory must be an existing directory")
+    directory_mount = _mount_for_path(data_directory, mounts)
+    _require_durable_mount(directory_mount)
+
+    if database_path is not None:
+        database = database_path.expanduser().resolve(strict=False)
+        if database.parent != data_directory:
+            raise UnsupportedSQLiteConfiguration(
+                "SQLite main database must be directly inside its validated data directory"
+            )
+        database_mount = _mount_for_path(database, mounts)
+        if database_mount.mount_id != directory_mount.mount_id:
+            raise UnsupportedSQLiteConfiguration("SQLite database file and sidecar directory use different mounts")
+        if database.exists():
+            if not database.is_file() or database.stat().st_nlink != 1:
+                raise UnsupportedSQLiteConfiguration("SQLite database must be a regular single-link file")
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = Path(f"{database}{suffix}")
+            if sidecar.is_symlink():
+                raise UnsupportedSQLiteConfiguration(f"SQLite sidecar may not be a symbolic link: {sidecar}")
+            if not sidecar.exists():
+                continue
+            if not sidecar.is_file() or sidecar.stat().st_nlink != 1:
+                raise UnsupportedSQLiteConfiguration(f"SQLite sidecar must be a regular single-link file: {sidecar}")
+            if _mount_for_path(sidecar, mounts).mount_id != directory_mount.mount_id:
+                raise UnsupportedSQLiteConfiguration(f"SQLite sidecar is on a different mount: {sidecar}")
+
+    return _StorageTopology(
+        data_directory=data_directory,
+        filesystem_type=directory_mount.filesystem_type,
+        mountpoint=directory_mount.mountpoint.resolve(strict=False),
+        mount_id=directory_mount.mount_id,
+        mount_options=tuple(sorted(directory_mount.mount_options)),
+        super_options=tuple(sorted(directory_mount.super_options)),
+    )
 
 
 def _fsync_file(path: Path) -> None:

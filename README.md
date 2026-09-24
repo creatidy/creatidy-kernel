@@ -12,11 +12,17 @@ and rebuildable projections, plus a replaceable resource allocator. It does not 
 or autonomously execute Programs, contact providers, perform external effects or modify your
 repositories.
 
-The SQLite adapter accepts file-backed databases on verified local Linux mounts only. It holds an
-exclusive per-database writer lock, binds database access to the creating thread, and reports the
-runtime SQLite version, filesystem, and required pragma/capability checks at startup. WAL is never
-used on a detected network filesystem, and the adapter does not impose a blanket SQLite version
-minimum.
+The SQLite adapter accepts databases only in an existing data directory validated as one supported
+native local Linux filesystem mount. The database and its WAL/SHM/journal siblings must share that
+mount; file-only mounts, split sidecars, OverlayFS, tmpfs, ramfs, and network filesystems are
+rejected. It uses one private SQLite connection with `locking_mode=EXCLUSIVE`, retained for the
+store's lifetime, and reports the directory/mount identity, SQLite runtime, and required pragma
+checks at startup. It does not impose a blanket SQLite version minimum.
+
+Only the creating process and thread may use or close the store. After `fork()`, a child must not
+use or finalize the inherited SQLite connection; it must remain inert and then `exec` or `_exit`.
+When the controller process exits, SQLite releases its process-owned lock so a fresh controller can
+recover the database even while an inert child still holds inherited descriptors.
 
 ## Why A Kernel?
 

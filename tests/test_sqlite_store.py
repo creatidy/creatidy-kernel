@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Deterministic persistence, recovery, and command-admission regressions."""
 
+import ctypes
 import hashlib
 import json
 import os
+import select
+import signal
 import sqlite3
+import subprocess
 import sys
+import textwrap
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -20,7 +25,6 @@ from creatidy_kernel.adapters.sqlite_store import (
     IdempotencyConflict,
     SQLiteProgramStore,
     UnsupportedSQLiteConfiguration,
-    WrongWriterProcess,
     WrongWriterThread,
 )
 from creatidy_kernel.core.domain import (
@@ -112,6 +116,39 @@ def _spec_with_permutable_collections() -> ProgramSpec:
         acceptance_criteria=("the Program evidence is complete", "the Program result is complete"),
         policy_references=(PolicyReference("safety", "v1", "sha256:safety"), *base.policy_references),
     )
+
+
+def _mountinfo_record(
+    mount_id: int,
+    parent_id: int,
+    device: str,
+    root: str,
+    mountpoint: str,
+    filesystem_type: str,
+    source: str,
+    *,
+    mount_options: str = "rw,relatime",
+    super_options: str = "rw",
+) -> str:
+    def escape(value: str) -> str:
+        return value.replace("\\", r"\134").replace(" ", r"\040").replace("\t", r"\011").replace("\n", r"\012")
+
+    return (
+        f"{mount_id} {parent_id} {device} {escape(root)} {escape(mountpoint)} {mount_options} "
+        f"- {filesystem_type} {escape(source)} {super_options}"
+    )
+
+
+def _parse_mount_records(records: tuple[str, ...]) -> object:
+    parser_name = "_parse_mountinfo"
+    parser = cast(Callable[[str], object], getattr(sqlite_store_module, parser_name))
+    return parser("\n".join(records))
+
+
+def _validate_storage_records(data_directory: Path, mounts: object, database_path: Path | None = None) -> object:
+    validator_name = "_validate_storage_topology"
+    validator = cast(Callable[..., object], getattr(sqlite_store_module, validator_name))
+    return validator(data_directory.resolve(), mounts=mounts, database_path=database_path)
 
 
 def _attempt(program: Program, attempt_id: str, work_unit_id: str) -> AttemptSpec:
@@ -350,17 +387,22 @@ def test_schema_zero_migrates_and_startup_evidence_reports_runtime_capabilities(
         assert evidence.sqlite_runtime_version_info == sqlite3.sqlite_version_info
         assert evidence.sqlite_threadsafety == sqlite3.threadsafety
         assert evidence.compile_options
+        assert evidence.data_directory == str(path.parent)
         assert evidence.filesystem_type
         assert evidence.filesystem_mountpoint
+        assert evidence.filesystem_mount_id > 0
+        assert evidence.locking_mode == "exclusive"
         assert evidence.journal_mode == "wal"
         assert evidence.synchronous == 2
         assert evidence.foreign_keys
         assert evidence.busy_timeout_ms == 1234
         assert evidence.schema_version == 1
-        assert "one process lock" in evidence.controller_topology
+        assert "locking_mode=EXCLUSIVE" in evidence.controller_topology
+        assert evidence.writer_process_id == os.getpid()
+        assert not Path(f"{path}.writer.lock").exists()
         assert _connection(store).execute("PRAGMA user_version").fetchone()[0] == 1
         with pytest.raises(ConcurrentWriter):
-            SQLiteProgramStore(path)
+            SQLiteProgramStore(path, busy_timeout_ms=25)
 
 
 def test_store_enforces_its_dedicated_writer_thread(tmp_path: Path) -> None:
@@ -381,38 +423,121 @@ def test_store_enforces_its_dedicated_writer_thread(tmp_path: Path) -> None:
     assert isinstance(errors[0], WrongWriterThread)
 
 
-def test_forked_child_cannot_release_parent_writer_lock(tmp_path: Path) -> None:
+def test_replacement_controller_opens_after_owner_death_with_inert_child(tmp_path: Path) -> None:
     if not sys.platform.startswith("linux") or not hasattr(os, "fork"):
-        pytest.skip("requires the Linux SQLite writer topology and fork semantics")
-    store = SQLiteProgramStore(tmp_path / "kernel.sqlite3")
-    child_pid = os.fork()
-    if child_pid == 0:
-        try:
+        pytest.skip("requires Linux POSIX locks and fork semantics")
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = cast(Callable[..., int], libc.prctl)
+    previous_subreaper = ctypes.c_int()
+    if prctl(37, ctypes.byref(previous_subreaper), 0, 0, 0) != 0:
+        pytest.skip("PR_GET_CHILD_SUBREAPER is unavailable")
+    if prctl(36, 1, 0, 0, 0) != 0:
+        pytest.skip("cannot configure test process as child subreaper")
+
+    database = tmp_path / "kernel.sqlite3"
+    read_fd, write_fd = os.pipe()
+    controller: subprocess.Popen[bytes] | None = None
+    child_pid: int | None = None
+    child_reaped = False
+    script = textwrap.dedent(
+        """
+        import os
+        import signal
+        import sys
+        from pathlib import Path
+
+        from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore, WrongWriterProcess
+        from creatidy_kernel.core.domain import (
+            ActivateProgram,
+            AuthorityEnvelope,
+            PolicyReference,
+            ProgramSpec,
+            WorkUnit,
+        )
+
+        database = Path(sys.argv[1])
+        ready_fd = int(sys.argv[2])
+        program_spec = ProgramSpec(
+            program_id="process-test",
+            objective="verify replacement ownership",
+            work_units=(WorkUnit("unit", "remain durable", acceptance_criteria=("state is recoverable",)),),
+            acceptance_criteria=("committed facts survive controller death",),
+            policy_references=(PolicyReference("process-test", "v1", "sha256:process-test"),),
+            authority=AuthorityEnvelope("owner"),
+        )
+        store = SQLiteProgramStore(database, busy_timeout_ms=1000)
+        store.create(program_spec, "controller-create")
+        child_pid = os.fork()
+        if child_pid == 0:
             try:
                 store.close()
             except WrongWriterProcess:
                 pass
             else:
-                os._exit(10)
-            try:
-                SQLiteProgramStore(tmp_path / "kernel.sqlite3")
-            except ConcurrentWriter:
-                os._exit(0)
-            except BaseException:
-                os._exit(11)
-            else:
-                os._exit(12)
-        except BaseException:
-            os._exit(13)
-
-    waited_pid, status = os.waitpid(child_pid, 0)
-    assert waited_pid == child_pid
-    assert os.WIFEXITED(status)
-    assert os.WEXITSTATUS(status) == 0
+                os._exit(20)
+            os.write(ready_fd, f"{os.getpid()}\\n".encode())
+            os.close(ready_fd)
+            while True:
+                signal.pause()
+        os.close(ready_fd)
+        while True:
+            signal.pause()
+        """
+    )
     try:
-        assert store.create(spec(), "create-after-fork").program_id == "program-1"
+        # Fixed synthetic harness: no command or script content comes from PR input.
+        controller = subprocess.Popen(  # noqa: S603
+            [sys.executable, "-c", script, str(database), str(write_fd)],
+            pass_fds=(write_fd,),
+            close_fds=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        os.close(write_fd)
+        write_fd = -1
+        readable, _, _ = select.select((read_fd,), (), (), 10)
+        assert readable, "controller did not start its inert forked child"
+        payload = os.read(read_fd, 64)
+        if not payload:
+            _, stderr = controller.communicate(timeout=5)
+            pytest.fail(f"controller exited before starting its child: {stderr.decode('utf-8', errors='replace')}")
+        child_pid = int(payload.decode("ascii").strip())
+        assert controller.poll() is None
+
+        controller.kill()
+        controller.wait(timeout=10)
+        os.kill(child_pid, 0)
+
+        with SQLiteProgramStore(database, busy_timeout_ms=500) as replacement:
+            recovered = replacement.load("process-test")
+            assert recovered.status is ProgramStatus.DRAFT
+            active = replacement.admit("process-test", "replacement-activate", ActivateProgram(0, "owner"))
+            assert active.status is ProgramStatus.ACTIVE
+            assert replacement.startup_evidence.locking_mode == "exclusive"
+
+        os.kill(child_pid, signal.SIGKILL)
+        waited_pid, status = os.waitpid(child_pid, 0)
+        child_reaped = True
+        assert waited_pid == child_pid
+        assert os.WIFSIGNALED(status)
     finally:
-        store.close()
+        if write_fd >= 0:
+            os.close(write_fd)
+        if read_fd >= 0:
+            os.close(read_fd)
+        if controller is not None and controller.poll() is None:
+            controller.kill()
+            controller.wait(timeout=10)
+        if child_pid is not None and not child_reaped:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(child_pid, 0)
+            except ChildProcessError:
+                pass
+        prctl(36, previous_subreaper.value, 0, 0, 0)
 
 
 def test_online_backup_bundle_preserves_history_and_has_a_verifiable_manifest(tmp_path: Path) -> None:
@@ -490,12 +615,105 @@ def test_online_backup_failure_before_publish_leaves_no_bundle(tmp_path: Path, m
     assert not destination.exists()
 
 
-@pytest.mark.parametrize("filesystem_type", ("tmpfs", "ramfs"))
-def test_volatile_mount_types_are_rejected_for_durable_store(filesystem_type: str) -> None:
-    validator_name = "_require_local_filesystem"
-    validator = cast(Callable[[str, str], None], getattr(sqlite_store_module, validator_name))
-    with pytest.raises(UnsupportedSQLiteConfiguration, match="durable local filesystem"):
-        validator(filesystem_type, "/synthetic/volatile-mount")
+def test_whole_directory_bind_mount_is_accepted_and_mount_escapes_are_decoded(tmp_path: Path) -> None:
+    data_directory = tmp_path / "data directory"
+    data_directory.mkdir()
+    database = data_directory / "kernel.sqlite3"
+    database.write_bytes(b"synthetic database")
+    mounts = _parse_mount_records(
+        (
+            _mountinfo_record(1, 0, "8:1", "/", "/", "ext4", "/dev/root"),
+            _mountinfo_record(7, 1, "8:1", "/persistent", str(data_directory), "ext4", "/dev/root"),
+        )
+    )
+    topology = _validate_storage_records(data_directory, mounts, database)
+
+    assert cast(Any, topology).mount_id == 7
+    assert cast(Any, topology).data_directory == data_directory.resolve()
+    assert cast(Any, topology).filesystem_type == "ext4"
+
+
+def test_file_only_database_bind_mount_is_rejected_even_on_same_device(tmp_path: Path) -> None:
+    data_directory = tmp_path / "database-directory"
+    data_directory.mkdir()
+    database = data_directory / "kernel.sqlite3"
+    database.write_bytes(b"synthetic database")
+    mounts = _parse_mount_records(
+        (
+            _mountinfo_record(1, 0, "8:1", "/", "/", "ext4", "/dev/root"),
+            _mountinfo_record(7, 1, "8:1", "/persistent", str(data_directory), "ext4", "/dev/root"),
+            _mountinfo_record(8, 7, "8:1", "/persistent/kernel.sqlite3", str(database), "ext4", "/dev/root"),
+        )
+    )
+
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="different mounts"):
+        _validate_storage_records(data_directory, mounts, database)
+
+
+def test_separately_mounted_wal_sidecar_is_rejected(tmp_path: Path) -> None:
+    data_directory = tmp_path / "database-directory"
+    data_directory.mkdir()
+    database = data_directory / "kernel.sqlite3"
+    database.write_bytes(b"synthetic database")
+    wal = Path(f"{database}-wal")
+    wal.write_bytes(b"synthetic wal")
+    mounts = _parse_mount_records(
+        (
+            _mountinfo_record(1, 0, "8:1", "/", "/", "ext4", "/dev/root"),
+            _mountinfo_record(7, 1, "8:1", "/persistent", str(data_directory), "ext4", "/dev/root"),
+            _mountinfo_record(8, 7, "8:1", "/persistent/kernel.sqlite3-wal", str(wal), "ext4", "/dev/root"),
+        )
+    )
+
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="sidecar is on a different mount"):
+        _validate_storage_records(data_directory, mounts, database)
+
+
+@pytest.mark.parametrize("filesystem_type", ("tmpfs", "ramfs", "overlay"))
+def test_volatile_and_overlay_data_directories_are_rejected(tmp_path: Path, filesystem_type: str) -> None:
+    data_directory = tmp_path / "database-directory"
+    data_directory.mkdir()
+    mounts = _parse_mount_records(
+        (
+            _mountinfo_record(1, 0, "8:1", "/", "/", "ext4", "/dev/root"),
+            _mountinfo_record(
+                7,
+                1,
+                "0:42",
+                "/",
+                str(data_directory),
+                filesystem_type,
+                filesystem_type,
+                super_options="rw,upperdir=/upper,workdir=/work,volatile",
+            ),
+        )
+    )
+
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="native local filesystem"):
+        _validate_storage_records(data_directory, mounts)
+
+
+def test_native_filesystem_with_volatile_sync_option_is_rejected(tmp_path: Path) -> None:
+    data_directory = tmp_path / "database-directory"
+    data_directory.mkdir()
+    mounts = _parse_mount_records(
+        (
+            _mountinfo_record(1, 0, "8:1", "/", "/", "ext4", "/dev/root"),
+            _mountinfo_record(
+                7,
+                1,
+                "8:1",
+                "/persistent",
+                str(data_directory),
+                "ext4",
+                "/dev/root",
+                super_options="rw,errors=remount-ro,fsync=volatile",
+            ),
+        )
+    )
+
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="volatile filesystem mode"):
+        _validate_storage_records(data_directory, mounts)
 
 
 def test_reordered_semantically_identical_amendment_reuses_command_result(
