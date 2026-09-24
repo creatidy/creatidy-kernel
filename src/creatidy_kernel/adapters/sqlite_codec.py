@@ -591,10 +591,12 @@ def _amendment_data(amendment: SpecAmendment) -> dict[str, object]:
     return {
         "expected_revision": amendment.expected_revision,
         "objective": amendment.objective,
-        "work_units": None if amendment.work_units is None else [item.payload() for item in amendment.work_units],
+        "work_units": None
+        if amendment.work_units is None
+        else [item.payload() for item in sorted(amendment.work_units, key=lambda item: item.work_unit_id)],
         "initial_inputs": None
         if amendment.initial_inputs is None
-        else [item.payload() for item in amendment.initial_inputs],
+        else [item.payload() for item in sorted(amendment.initial_inputs, key=lambda item: item.name)],
         "budget": None
         if amendment.budget is None
         else {
@@ -603,10 +605,16 @@ def _amendment_data(amendment: SpecAmendment) -> dict[str, object]:
         },
         "authority": None if amendment.authority is None else amendment.authority.payload(),
         "reason": amendment.reason,
-        "acceptance_criteria": amendment.acceptance_criteria,
+        "acceptance_criteria": None if amendment.acceptance_criteria is None else sorted(amendment.acceptance_criteria),
         "policy_references": None
         if amendment.policy_references is None
-        else [_policy_data(item) for item in amendment.policy_references],
+        else [
+            _policy_data(item)
+            for item in sorted(
+                amendment.policy_references,
+                key=lambda item: (item.policy_id, item.version, item.digest),
+            )
+        ],
     }
 
 

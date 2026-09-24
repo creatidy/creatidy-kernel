@@ -49,8 +49,6 @@ _LOCAL_FILESYSTEMS = {
     "f2fs",
     "ntfs3",
     "overlay",
-    "ramfs",
-    "tmpfs",
     "xfs",
     "zfs",
 }
@@ -70,6 +68,10 @@ class ConcurrentWriter(SQLiteStoreError):
 
 class WrongWriterThread(SQLiteStoreError):
     """SQLite access was attempted outside the store's dedicated writer thread."""
+
+
+class WrongWriterProcess(SQLiteStoreError):
+    """SQLite access was attempted from a forked or otherwise different process."""
 
 
 class StoreClosed(SQLiteStoreError):
@@ -187,6 +189,12 @@ class _ExclusiveFileLock:
             self._file.close()
             self._file = None
 
+    def close_inherited(self) -> None:
+        """Close this process's inherited descriptor without unlocking the parent's lock."""
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
 
 class SQLiteProgramStore:
     """A file-backed K1 store with one connection, one writer thread, and one controller lock."""
@@ -206,6 +214,7 @@ class SQLiteProgramStore:
         if self._path.exists() and not self._path.is_file():
             raise UnsupportedSQLiteConfiguration("SQLite database path must be a regular file")
         self._filesystem_type, self._filesystem_mountpoint = _detect_local_filesystem(self._path)
+        self._owner_pid = os.getpid()
         self._owner_thread = threading.get_ident()
         self._gate = threading.RLock()
         self._busy_timeout_ms = busy_timeout_ms
@@ -244,6 +253,10 @@ class SQLiteProgramStore:
         self.close()
 
     def close(self) -> None:
+        if os.getpid() != self._owner_pid:
+            self._writer_lock.close_inherited()
+            self._closed = True
+            raise WrongWriterProcess("SQLite store cannot be closed from a different process")
         if threading.get_ident() != self._owner_thread:
             raise WrongWriterThread("SQLite access must use the store's dedicated writer thread")
         with self._gate:
@@ -521,6 +534,7 @@ class SQLiteProgramStore:
                     schema_version = cast(int, backup_connection.execute("PRAGMA user_version").fetchone()[0])
                 finally:
                     backup_connection.close()
+                _fsync_file(database)
                 with database.open("rb") as stream:
                     file_digest = hashlib.file_digest(stream, "sha256").hexdigest()
                 manifest_value = {
@@ -533,8 +547,13 @@ class SQLiteProgramStore:
                     "controller_topology": self._startup_evidence.controller_topology,
                     "source_filesystem_type": self._startup_evidence.filesystem_type,
                 }
-                manifest.write_text(canonical_json(manifest_value) + "\n", encoding="utf-8")
+                with manifest.open("w", encoding="utf-8") as stream:
+                    stream.write(canonical_json(manifest_value) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                _fsync_directory(temporary)
                 os.replace(temporary, target)
+                _fsync_directory(target.parent)
             except BaseException:
                 if temporary.exists():
                     for child in temporary.iterdir():
@@ -866,6 +885,8 @@ class SQLiteProgramStore:
         )
 
     def _assert_writer_thread(self) -> None:
+        if os.getpid() != self._owner_pid:
+            raise WrongWriterProcess("SQLite access must use the process that created the store")
         if threading.get_ident() != self._owner_thread:
             raise WrongWriterThread("SQLite access must use the store's dedicated writer thread")
         if getattr(self, "_closed", False):
@@ -909,8 +930,28 @@ def _detect_local_filesystem(path: Path) -> tuple[str, str]:
     if not matches:
         raise UnsupportedSQLiteConfiguration("cannot identify the database filesystem mount")
     _, filesystem_type, mountpoint = max(matches)
+    _require_local_filesystem(filesystem_type, mountpoint)
+    return filesystem_type, mountpoint
+
+
+def _require_local_filesystem(filesystem_type: str, mountpoint: str) -> None:
     if filesystem_type not in _LOCAL_FILESYSTEMS:
         raise UnsupportedSQLiteConfiguration(
-            f"SQLite WAL requires a verified local filesystem; found {filesystem_type!r}"
+            f"SQLite WAL requires a verified durable local filesystem; found {filesystem_type!r} at {mountpoint!r}"
         )
-    return filesystem_type, mountpoint
+
+
+def _fsync_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDWR)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)

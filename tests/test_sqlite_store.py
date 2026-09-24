@@ -3,7 +3,9 @@
 
 import hashlib
 import json
+import os
 import sqlite3
+import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -11,12 +13,14 @@ from typing import cast
 
 import pytest
 
+import creatidy_kernel.adapters.sqlite_store as sqlite_store_module
 from creatidy_kernel.adapters.sqlite_codec import CODEC_VERSION, RecordCodecError, program_from_json, program_json
 from creatidy_kernel.adapters.sqlite_store import (
     ConcurrentWriter,
     IdempotencyConflict,
     SQLiteProgramStore,
     UnsupportedSQLiteConfiguration,
+    WrongWriterProcess,
     WrongWriterThread,
 )
 from creatidy_kernel.core.domain import (
@@ -81,6 +85,32 @@ def spec() -> ProgramSpec:
         ),
         acceptance_criteria=("the Program result is complete",),
         policy_references=(PolicyReference("acceptance", "v1", "sha256:policy"),),
+    )
+
+
+def _spec_with_permutable_collections() -> ProgramSpec:
+    base = spec()
+    first, second = base.work_units
+    first_with_two_inputs = WorkUnit(
+        work_unit_id=first.work_unit_id,
+        obligation=first.obligation,
+        dependencies=first.dependencies,
+        required_inputs=frozenset({"seed", "seed-2"}),
+        outputs=first.outputs,
+        acceptance_criteria=first.acceptance_criteria,
+        acceptance_policy_reference=first.acceptance_policy_reference,
+    )
+    return ProgramSpec(
+        program_id=base.program_id,
+        objective=base.objective,
+        work_units=(second, first_with_two_inputs),
+        initial_inputs=(InputBinding("seed-2", "approved:seed-2"), base.initial_inputs[0]),
+        budget=base.budget,
+        authority=base.authority,
+        revision=base.revision,
+        parent_digest=base.parent_digest,
+        acceptance_criteria=("the Program evidence is complete", "the Program result is complete"),
+        policy_references=(PolicyReference("safety", "v1", "sha256:safety"), *base.policy_references),
     )
 
 
@@ -351,6 +381,40 @@ def test_store_enforces_its_dedicated_writer_thread(tmp_path: Path) -> None:
     assert isinstance(errors[0], WrongWriterThread)
 
 
+def test_forked_child_cannot_release_parent_writer_lock(tmp_path: Path) -> None:
+    if not sys.platform.startswith("linux") or not hasattr(os, "fork"):
+        pytest.skip("requires the Linux SQLite writer topology and fork semantics")
+    store = SQLiteProgramStore(tmp_path / "kernel.sqlite3")
+    child_pid = os.fork()
+    if child_pid == 0:
+        try:
+            try:
+                store.close()
+            except WrongWriterProcess:
+                pass
+            else:
+                os._exit(10)
+            try:
+                SQLiteProgramStore(tmp_path / "kernel.sqlite3")
+            except ConcurrentWriter:
+                os._exit(0)
+            except BaseException:
+                os._exit(11)
+            else:
+                os._exit(12)
+        except BaseException:
+            os._exit(13)
+
+    waited_pid, status = os.waitpid(child_pid, 0)
+    assert waited_pid == child_pid
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 0
+    try:
+        assert store.create(spec(), "create-after-fork").program_id == "program-1"
+    finally:
+        store.close()
+
+
 def test_online_backup_bundle_preserves_history_and_has_a_verifiable_manifest(tmp_path: Path) -> None:
     database = tmp_path / "kernel.sqlite3"
     with SQLiteProgramStore(database) as store:
@@ -375,6 +439,104 @@ def test_online_backup_bundle_preserves_history_and_has_a_verifiable_manifest(tm
         previous = backup_store.admit("program-1", "cancel-program", CancelProgram(8, OWNER))
         assert previous == expected
         assert len(backup_store.history("program-1")) == len(history)
+
+
+def test_online_backup_syncs_bundle_before_and_after_atomic_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracked_fsync(descriptor: int) -> None:
+        events.append("fsync")
+        real_fsync(descriptor)
+
+    def tracked_replace(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> None:
+        events.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(sqlite_store_module.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(sqlite_store_module.os, "replace", tracked_replace)
+    with SQLiteProgramStore(tmp_path / "kernel.sqlite3") as store:
+        store.create(spec(), "create")
+        bundle = store.backup(tmp_path / "backup")
+
+    assert events == ["fsync", "fsync", "fsync", "replace", "fsync"]
+    assert bundle.database.is_file()
+    assert bundle.manifest.is_file()
+
+
+def test_online_backup_failure_before_publish_leaves_no_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    real_fsync = os.fsync
+    sync_count = 0
+
+    def fail_manifest_sync(descriptor: int) -> None:
+        nonlocal sync_count
+        sync_count += 1
+        if sync_count == 2:
+            raise OSError("injected manifest sync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(sqlite_store_module.os, "fsync", fail_manifest_sync)
+    destination = tmp_path / "backup"
+    with SQLiteProgramStore(tmp_path / "kernel.sqlite3") as store:
+        store.create(spec(), "create")
+        with pytest.raises(OSError, match="injected manifest sync failure"):
+            store.backup(destination)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("filesystem_type", ("tmpfs", "ramfs"))
+def test_volatile_mount_types_are_rejected_for_durable_store(filesystem_type: str) -> None:
+    validator_name = "_require_local_filesystem"
+    validator = cast(Callable[[str, str], None], getattr(sqlite_store_module, validator_name))
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="durable local filesystem"):
+        validator(filesystem_type, "/synthetic/volatile-mount")
+
+
+def test_reordered_semantically_identical_amendment_reuses_command_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with SQLiteProgramStore(tmp_path / "kernel.sqlite3") as store:
+        initial = store.create(_spec_with_permutable_collections(), "create")
+        current = initial.spec
+        amendment = SpecAmendment(
+            expected_revision=current.revision,
+            work_units=current.work_units,
+            initial_inputs=current.initial_inputs,
+            reason="normalize order for deduplication",
+            acceptance_criteria=current.acceptance_criteria,
+            policy_references=current.policy_references,
+        )
+        reordered_amendment = SpecAmendment(
+            expected_revision=current.revision,
+            work_units=tuple(reversed(current.work_units)),
+            initial_inputs=tuple(reversed(current.initial_inputs)),
+            reason="normalize order for deduplication",
+            acceptance_criteria=tuple(reversed(current.acceptance_criteria)),
+            policy_references=tuple(reversed(current.policy_references)),
+        )
+        first_result = store.admit(
+            "program-1", "reordered-amendment", AmendProgramSpec(initial.revision, OWNER, amendment)
+        )
+        assert first_result == initial
+
+        def forbidden_apply(self: Program, command: DomainCommandType) -> Program:
+            del self, command
+            raise AssertionError("normalized duplicate amendment must not be applied again")
+
+        monkeypatch.setattr(Program, "apply", forbidden_apply)
+        duplicate = store.admit(
+            "program-1",
+            "reordered-amendment",
+            AmendProgramSpec(initial.revision, OWNER, reordered_amendment),
+        )
+        assert duplicate == first_result
+        assert len(store.history("program-1")) == 2
 
 
 def test_codec_rejects_unknown_versions_and_append_only_history_rejects_mutation(tmp_path: Path) -> None:
