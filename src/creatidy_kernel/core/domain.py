@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import deque
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from enum import StrEnum
@@ -895,8 +896,53 @@ def _amendment_affected_work_units(previous: ProgramSpec, amended: ProgramSpec) 
     return _descendants(previous, changed) | _descendants(amended, changed)
 
 
-def _action_allowed(authority: AuthorityEnvelope, action: DomainAction) -> bool:
-    return action in authority.allowed_actions
+@dataclass(frozen=True, slots=True)
+class _ReachAttempt:
+    attempt_id: str
+    work_unit_id: str
+    status: AttemptStatus
+    current_spec: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ReachState:
+    status: ProgramStatus
+    work_unit_states: tuple[WorkUnitState, ...]
+    attempts: tuple[_ReachAttempt, ...]
+    satisfaction_ids: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class _ReachAction:
+    action: DomainAction
+    work_unit_id: str | None = None
+    attempt_id: str | None = None
+    attempt_spec: AttemptSpec | None = None
+    satisfaction: TrustedSatisfaction | None = None
+    actor_id: str | None = None
+
+
+def _reach_state(
+    status: ProgramStatus,
+    spec: ProgramSpec,
+    states: tuple[WorkUnitState, ...],
+    attempts: tuple[Attempt, ...],
+    satisfactions: tuple[TrustedSatisfaction, ...] = (),
+) -> _ReachState:
+    return _ReachState(
+        status,
+        states,
+        tuple(
+            _ReachAttempt(
+                attempt.attempt_id,
+                attempt.spec.work_unit_id,
+                attempt.status,
+                attempt.spec.spec_revision == spec.revision and attempt.spec.spec_digest == spec.digest,
+            )
+            for attempt in attempts
+        ),
+        frozenset(item.reference_id for item in satisfactions),
+    )
 
 
 def _unit_can_be_cancelled(spec: ProgramSpec, states: tuple[WorkUnitState, ...], work_unit_id: str) -> bool:
@@ -908,113 +954,357 @@ def _unit_can_be_cancelled(spec: ProgramSpec, states: tuple[WorkUnitState, ...],
     return not any(by_id[descendant].status is WorkUnitStatus.SATISFIED for descendant in descendants)
 
 
-def _unit_has_finished_source(
+def _logical_inputs_available(spec: ProgramSpec, states: tuple[WorkUnitState, ...], work_unit_id: str) -> bool:
+    """Check declared producers from state; do not invent concrete input references."""
+
+    unit = spec.work_unit(work_unit_id)
+    by_id = {state.work_unit_id: state for state in states}
+    available = set(spec.initial_inputs)
+    for dependency in unit.dependencies:
+        if by_id[dependency].status is not WorkUnitStatus.SATISFIED:
+            return False
+        available.update(spec.work_unit(dependency).outputs)
+    return unit.required_inputs <= available
+
+
+def _action_inapplicability(
     spec: ProgramSpec,
-    attempts: tuple[Attempt, ...],
-    work_unit_id: str,
-) -> bool:
-    return any(
-        attempt.spec.work_unit_id == work_unit_id
-        and attempt.spec.spec_revision == spec.revision
-        and attempt.spec.spec_digest == spec.digest
-        and attempt.status is AttemptStatus.FINISHED
-        for attempt in attempts
+    state: _ReachState,
+    action: _ReachAction,
+) -> DomainError | None:
+    if action.action not in spec.authority.allowed_actions:
+        return AuthorityViolation(f"action {action.action.value!r} is outside the authority envelope")
+    status = state.status
+    if action.action is DomainAction.ACTIVATE_PROGRAM:
+        return None if status is ProgramStatus.DRAFT else IllegalTransition("Program is not a draft")
+    if action.action is DomainAction.PAUSE_PROGRAM:
+        return None if status is ProgramStatus.ACTIVE else IllegalTransition("Program is not active")
+    if action.action is DomainAction.RESUME_PROGRAM:
+        return None if status is ProgramStatus.PAUSED else IllegalTransition("Program is not paused")
+    if action.action is DomainAction.CANCEL_PROGRAM:
+        return (
+            None
+            if status in (ProgramStatus.DRAFT, ProgramStatus.ACTIVE, ProgramStatus.PAUSED)
+            else IllegalTransition("Program cannot be cancelled from its current status")
+        )
+    if action.action is DomainAction.AMEND_SPEC:
+        return (
+            None
+            if status
+            in (
+                ProgramStatus.DRAFT,
+                ProgramStatus.ACTIVE,
+                ProgramStatus.PAUSED,
+                ProgramStatus.COMPLETED,
+            )
+            else IllegalTransition("Program cannot be amended from its current status")
+        )
+    attempt_controls = (DomainAction.FAIL_ATTEMPT, DomainAction.CANCEL_ATTEMPT)
+    if action.action in attempt_controls:
+        if status not in (ProgramStatus.ACTIVE, ProgramStatus.PAUSED) or action.work_unit_id is None:
+            return IllegalTransition("attempt cannot be failed or cancelled in the current state")
+    elif status is not ProgramStatus.ACTIVE or action.work_unit_id is None:
+        return IllegalTransition("WorkUnit action is not available in the current Program state")
+    try:
+        unit = spec.work_unit(action.work_unit_id)
+    except MissingReference as error:
+        return error
+    work_state = next(item for item in state.work_unit_states if item.work_unit_id == unit.work_unit_id)
+    if action.action is DomainAction.CANCEL_WORK_UNIT:
+        return (
+            None
+            if _unit_can_be_cancelled(spec, state.work_unit_states, unit.work_unit_id)
+            else IllegalTransition(f"WorkUnit {unit.work_unit_id!r} cannot be cancelled")
+        )
+    if action.action is DomainAction.PREPARE_ATTEMPT:
+        attempt_spec = action.attempt_spec
+        if attempt_spec is not None:
+            if action.attempt_id is not None and any(item.attempt_id == action.attempt_id for item in state.attempts):
+                return DuplicateAttempt(f"attempt {action.attempt_id!r} already exists")
+            if attempt_spec.program_id != spec.program_id:
+                return AuthorityViolation("attempt is scoped to a different Program")
+            if attempt_spec.spec_revision != spec.revision or attempt_spec.spec_digest != spec.digest:
+                return StaleRevision("attempt inputs must pin the current ProgramSpec revision and digest")
+            try:
+                attempt_unit = spec.work_unit(attempt_spec.work_unit_id)
+            except MissingReference as error:
+                return error
+            if attempt_spec.input_names != attempt_unit.required_inputs:
+                missing = sorted(attempt_unit.required_inputs - attempt_spec.input_names)
+                extra = sorted(attempt_spec.input_names - attempt_unit.input_names)
+                details: list[str] = []
+                if missing:
+                    details.append(f"missing {', '.join(missing)}")
+                if extra:
+                    details.append(f"unexpected {', '.join(extra)}")
+                return MissingInput(f"attempt inputs for {attempt_unit.work_unit_id!r}: {'; '.join(details)}")
+        if work_state.status is not WorkUnitStatus.READY:
+            return IllegalTransition(f"WorkUnit {unit.work_unit_id!r} is not ready")
+        if not _logical_inputs_available(spec, state.work_unit_states, unit.work_unit_id):
+            return MissingInput(f"WorkUnit {unit.work_unit_id!r} has unavailable logical inputs")
+        if (
+            attempt_spec is None
+            and action.attempt_id is not None
+            and any(item.attempt_id == action.attempt_id for item in state.attempts)
+        ):
+            return DuplicateAttempt(f"attempt {action.attempt_id!r} already exists")
+        active_count = sum(
+            1 for attempt in state.attempts if attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
+        )
+        if len(state.attempts) >= min(spec.budget.max_attempts, spec.authority.max_attempts):
+            return BudgetExceeded("attempt admission limit exceeded")
+        if active_count >= spec.budget.max_active_attempts:
+            return BudgetExceeded("active attempt admission limit exceeded")
+        return None
+    if action.action is DomainAction.SATISFY_WORK_UNIT:
+        reference = action.satisfaction
+        if reference is not None:
+            if reference.issuer_id != action.actor_id:
+                return AuthorityViolation("satisfaction issuer and command actor must match")
+            if reference.program_id != spec.program_id:
+                return AuthorityViolation("satisfaction is scoped to a different Program")
+            if reference.spec_revision != spec.revision or reference.spec_digest != spec.digest:
+                return StaleRevision("satisfaction must reference the current ProgramSpec")
+            if reference.work_unit_digest != unit.digest:
+                return StaleRevision("satisfaction must reference the current WorkUnit definition")
+            if reference.reference_id in state.satisfaction_ids:
+                return IllegalTransition(f"satisfaction reference {reference.reference_id!r} was already applied")
+            if reference.source_attempt_id is not None:
+                source = next(
+                    (item for item in state.attempts if item.attempt_id == reference.source_attempt_id),
+                    None,
+                )
+                if source is None:
+                    return MissingReference(f"unknown attempt {reference.source_attempt_id!r}")
+                if source.work_unit_id != unit.work_unit_id:
+                    return AuthorityViolation("satisfaction source attempt targets a different WorkUnit")
+                if not source.current_spec:
+                    return StaleRevision("satisfaction source attempt is pinned to an older ProgramSpec")
+                if source.status not in (AttemptStatus.EXECUTING, AttemptStatus.FINISHED):
+                    return IllegalTransition("satisfaction source attempt is not executable or finished")
+                if work_state.status is WorkUnitStatus.READY and source.status is not AttemptStatus.FINISHED:
+                    return IllegalTransition("a ready WorkUnit requires a finished satisfaction source")
+                if work_state.status is WorkUnitStatus.ACTIVE and work_state.active_attempt_id != source.attempt_id:
+                    return IllegalTransition("satisfaction source is not the active attempt for its WorkUnit")
+        if work_state.status is WorkUnitStatus.READY:
+            available = reference is None and any(
+                attempt.work_unit_id == unit.work_unit_id
+                and attempt.current_spec
+                and attempt.status is AttemptStatus.FINISHED
+                for attempt in state.attempts
+            )
+            if reference is not None:
+                available = reference.source_attempt_id is not None
+            return None if available else IllegalTransition("a ready WorkUnit needs a finished current-spec Attempt")
+        if work_state.status is WorkUnitStatus.ACTIVE and work_state.active_attempt_id is not None:
+            active_attempt = next(
+                (item for item in state.attempts if item.attempt_id == work_state.active_attempt_id),
+                None,
+            )
+            available = active_attempt is not None and active_attempt.status in (
+                AttemptStatus.PREPARED,
+                AttemptStatus.EXECUTING,
+            )
+            return None if available else IllegalTransition("active WorkUnit has no satisfiable Attempt")
+        return IllegalTransition("WorkUnit is not in a satisfiable state")
+    if action.action in (
+        DomainAction.START_ATTEMPT,
+        DomainAction.FINISH_ATTEMPT,
+        DomainAction.FAIL_ATTEMPT,
+        DomainAction.CANCEL_ATTEMPT,
+    ):
+        if work_state.status is not WorkUnitStatus.ACTIVE or work_state.active_attempt_id is None:
+            return IllegalTransition("WorkUnit has no active Attempt")
+        active_attempt = next(
+            (item for item in state.attempts if item.attempt_id == work_state.active_attempt_id),
+            None,
+        )
+        if active_attempt is None:
+            return MissingReference(f"active Attempt {work_state.active_attempt_id!r} is missing")
+        if action.attempt_id is not None and action.attempt_id != active_attempt.attempt_id:
+            return IllegalTransition("command Attempt is not the active Attempt for its WorkUnit")
+        if action.action is DomainAction.START_ATTEMPT:
+            return (
+                None
+                if active_attempt.status is AttemptStatus.PREPARED
+                else IllegalTransition("only a prepared Attempt can start")
+            )
+        if action.action is DomainAction.FINISH_ATTEMPT:
+            return (
+                None
+                if status is ProgramStatus.ACTIVE and active_attempt.status is AttemptStatus.EXECUTING
+                else IllegalTransition("only an executing Attempt in an active Program can finish")
+            )
+        return (
+            None
+            if active_attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
+            else IllegalTransition("only a prepared or executing Attempt can fail or cancel")
+        )
+    return IllegalTransition(f"unsupported domain action: {action.action.value}")
+
+
+def _action_applicable(spec: ProgramSpec, state: _ReachState, action: _ReachAction) -> bool:
+    return _action_inapplicability(spec, state, action) is None
+
+
+def _replace_reach_attempt(
+    attempts: tuple[_ReachAttempt, ...],
+    attempt_id: str,
+    status: AttemptStatus,
+) -> tuple[_ReachAttempt, ...]:
+    return tuple(
+        _ReachAttempt(item.attempt_id, item.work_unit_id, status, item.current_spec)
+        if item.attempt_id == attempt_id
+        else item
+        for item in attempts
     )
 
 
-def _active_has_legal_path(
-    spec: ProgramSpec,
-    states: tuple[WorkUnitState, ...],
-    attempts: tuple[Attempt, ...],
-) -> bool:
-    authority = spec.authority
-    if _action_allowed(authority, DomainAction.CANCEL_PROGRAM):
-        return True
-    can_cancel_work_unit = _action_allowed(authority, DomainAction.CANCEL_WORK_UNIT)
-    if can_cancel_work_unit:
-        for state in states:
-            if not _unit_can_be_cancelled(spec, states, state.work_unit_id):
-                continue
-            descendants = _descendants(spec, {state.work_unit_id})
-            cancelled_states = tuple(
-                WorkUnitState(item.work_unit_id, WorkUnitStatus.CANCELLED) if item.work_unit_id in descendants else item
-                for item in states
-            )
-            cancelled_attempts = tuple(
-                Attempt(attempt.spec, AttemptStatus.CANCELLED)
-                if attempt.spec.work_unit_id in descendants
-                and attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
-                else attempt
-                for attempt in attempts
-            )
-            if all(
-                item.status in (WorkUnitStatus.SATISFIED, WorkUnitStatus.CANCELLED) for item in cancelled_states
-            ) or _active_has_legal_path(spec, cancelled_states, cancelled_attempts):
-                return True
-    if _action_allowed(authority, DomainAction.SATISFY_WORK_UNIT):
-        for state in states:
-            if state.status is WorkUnitStatus.READY:
-                if not _unit_has_finished_source(spec, attempts, state.work_unit_id):
-                    continue
-                satisfied_attempts = attempts
-            elif state.status is WorkUnitStatus.ACTIVE and state.active_attempt_id is not None:
-                active = next(item for item in attempts if item.attempt_id == state.active_attempt_id)
-                if active.status not in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING):
-                    continue
-                satisfied_attempts = tuple(
-                    Attempt(item.spec, AttemptStatus.FINISHED) if item.attempt_id == active.attempt_id else item
-                    for item in attempts
-                )
-            else:
-                continue
-            satisfied_states = _mark_ready(
-                spec,
-                tuple(
-                    WorkUnitState(item.work_unit_id, WorkUnitStatus.SATISFIED)
-                    if item.work_unit_id == state.work_unit_id
-                    else item
-                    for item in states
-                ),
-            )
-            if all(
-                item.status in (WorkUnitStatus.SATISFIED, WorkUnitStatus.CANCELLED) for item in satisfied_states
-            ) or _active_has_legal_path(spec, satisfied_states, satisfied_attempts):
-                return True
+def _reach_successor(spec: ProgramSpec, state: _ReachState, action: _ReachAction) -> _ReachState:
+    """Canonical lifecycle reducer shared by command application and reachability."""
 
-        active_count = sum(
-            1 for attempt in attempts if attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
+    if action.action is DomainAction.ACTIVATE_PROGRAM:
+        return _ReachState(ProgramStatus.ACTIVE, _mark_ready(spec, state.work_unit_states), state.attempts)
+    if action.action is DomainAction.PAUSE_PROGRAM:
+        return _ReachState(ProgramStatus.PAUSED, state.work_unit_states, state.attempts)
+    if action.action is DomainAction.RESUME_PROGRAM:
+        states = _mark_ready(spec, state.work_unit_states)
+        return _ReachState(_status_after_work_unit_change(states), states, state.attempts)
+    if action.action is DomainAction.CANCEL_PROGRAM:
+        states = tuple(
+            item
+            if item.status is WorkUnitStatus.SATISFIED
+            else WorkUnitState(item.work_unit_id, WorkUnitStatus.CANCELLED)
+            for item in state.work_unit_states
         )
-        admission_limit = min(spec.budget.max_attempts, authority.max_attempts)
-        if (
-            _action_allowed(authority, DomainAction.PREPARE_ATTEMPT)
-            and _action_allowed(authority, DomainAction.START_ATTEMPT)
-            and len(attempts) < admission_limit
-            and active_count < spec.budget.max_active_attempts
-            and any(state.status is WorkUnitStatus.READY for state in states)
-        ):
-            return True
+        attempts = tuple(
+            _ReachAttempt(item.attempt_id, item.work_unit_id, AttemptStatus.CANCELLED, item.current_spec)
+            if item.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
+            else item
+            for item in state.attempts
+        )
+        return _ReachState(ProgramStatus.CANCELLED, states, attempts)
 
-    for state in states:
-        if state.status is WorkUnitStatus.ACTIVE and state.active_attempt_id is not None:
-            attempt = next(item for item in attempts if item.attempt_id == state.active_attempt_id)
-            if (
-                attempt.status is AttemptStatus.PREPARED
-                and _action_allowed(authority, DomainAction.START_ATTEMPT)
-                and _action_allowed(authority, DomainAction.SATISFY_WORK_UNIT)
-            ):
-                return True
-            release_actions = (
-                (DomainAction.FAIL_ATTEMPT, DomainAction.CANCEL_ATTEMPT)
-                if attempt.status is AttemptStatus.PREPARED
-                else (DomainAction.FINISH_ATTEMPT, DomainAction.FAIL_ATTEMPT, DomainAction.CANCEL_ATTEMPT)
+    if action.work_unit_id is None:
+        raise InvalidDomainValue("a WorkUnit action requires a target identity")
+    work_unit_id = action.work_unit_id
+    current = next(item for item in state.work_unit_states if item.work_unit_id == work_unit_id)
+    if action.action is DomainAction.CANCEL_WORK_UNIT:
+        descendants = _descendants(spec, {work_unit_id})
+        states = tuple(
+            WorkUnitState(item.work_unit_id, WorkUnitStatus.CANCELLED) if item.work_unit_id in descendants else item
+            for item in state.work_unit_states
+        )
+        attempts = tuple(
+            _ReachAttempt(item.attempt_id, item.work_unit_id, AttemptStatus.CANCELLED, item.current_spec)
+            if item.work_unit_id in descendants and item.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
+            else item
+            for item in state.attempts
+        )
+        return _ReachState(_status_after_work_unit_change(states), states, attempts)
+    if action.action is DomainAction.PREPARE_ATTEMPT:
+        # Symbolic reachability carries an identity/status summary only, never an AttemptSpec.
+        attempt_id = action.attempt_id
+        if attempt_id is None:
+            attempt_id = f"__reachability_attempt_{len(state.attempts)}"
+            while any(item.attempt_id == attempt_id for item in state.attempts):
+                attempt_id = f"_{attempt_id}"
+        states = tuple(
+            WorkUnitState(work_unit_id, WorkUnitStatus.ACTIVE, attempt_id)
+            if item.work_unit_id == work_unit_id
+            else item
+            for item in state.work_unit_states
+        )
+        attempts = (*state.attempts, _ReachAttempt(attempt_id, work_unit_id, AttemptStatus.PREPARED, True))
+        return _ReachState(state.status, states, attempts)
+    if action.action is DomainAction.SATISFY_WORK_UNIT:
+        attempts = state.attempts
+        if current.active_attempt_id is not None:
+            attempts = _replace_reach_attempt(attempts, current.active_attempt_id, AttemptStatus.FINISHED)
+        states = _mark_ready(
+            spec,
+            tuple(
+                WorkUnitState(item.work_unit_id, WorkUnitStatus.SATISFIED)
+                if item.work_unit_id == work_unit_id
+                else item
+                for item in state.work_unit_states
+            ),
+        )
+        return _ReachState(_status_after_work_unit_change(states), states, attempts)
+    if action.action in (
+        DomainAction.START_ATTEMPT,
+        DomainAction.FINISH_ATTEMPT,
+        DomainAction.FAIL_ATTEMPT,
+        DomainAction.CANCEL_ATTEMPT,
+    ):
+        if current.active_attempt_id is None:
+            raise IllegalTransition("attempt action requires an active Attempt")
+        target_attempt = next(item for item in state.attempts if item.attempt_id == current.active_attempt_id)
+        if action.action is DomainAction.START_ATTEMPT:
+            attempts = _replace_reach_attempt(state.attempts, target_attempt.attempt_id, AttemptStatus.EXECUTING)
+            return _ReachState(state.status, state.work_unit_states, attempts)
+        terminal_attempt_status = {
+            DomainAction.FINISH_ATTEMPT: AttemptStatus.FINISHED,
+            DomainAction.FAIL_ATTEMPT: AttemptStatus.FAILED,
+            DomainAction.CANCEL_ATTEMPT: AttemptStatus.CANCELLED,
+        }[action.action]
+        attempts = _replace_reach_attempt(state.attempts, target_attempt.attempt_id, terminal_attempt_status)
+        states = _mark_ready(
+            spec,
+            tuple(
+                WorkUnitState(work_unit_id, WorkUnitStatus.READY) if item.work_unit_id == work_unit_id else item
+                for item in state.work_unit_states
+            ),
+        )
+        return _ReachState(state.status, states, attempts)
+    raise InvalidDomainValue(f"unsupported reachability action: {action.action.value}")
+
+
+def _reach_actions(spec: ProgramSpec, state: _ReachState) -> tuple[_ReachAction, ...]:
+    actions = [
+        _ReachAction(action)
+        for action in (
+            DomainAction.ACTIVATE_PROGRAM,
+            DomainAction.PAUSE_PROGRAM,
+            DomainAction.RESUME_PROGRAM,
+            DomainAction.CANCEL_PROGRAM,
+            DomainAction.AMEND_SPEC,
+        )
+    ]
+    for unit in spec.work_units:
+        actions.extend(
+            _ReachAction(action, unit.work_unit_id)
+            for action in (
+                DomainAction.CANCEL_WORK_UNIT,
+                DomainAction.PREPARE_ATTEMPT,
+                DomainAction.SATISFY_WORK_UNIT,
+                DomainAction.START_ATTEMPT,
+                DomainAction.FINISH_ATTEMPT,
+                DomainAction.FAIL_ATTEMPT,
+                DomainAction.CANCEL_ATTEMPT,
             )
-            if (
-                attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
-                and can_cancel_work_unit
-                and any(_action_allowed(authority, action) for action in release_actions)
-            ):
-                return True
-    return False
+        )
+    return tuple(actions)
+
+
+def _reach_key(state: _ReachState) -> tuple[object, ...]:
+    active_attempts = tuple(
+        sorted(
+            (attempt.work_unit_id, attempt.status.value)
+            for attempt in state.attempts
+            if attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
+        )
+    )
+    finished_sources = tuple(
+        sorted(
+            {
+                attempt.work_unit_id
+                for attempt in state.attempts
+                if attempt.current_spec and attempt.status is AttemptStatus.FINISHED
+            }
+        )
+    )
+    return state.status, state.work_unit_states, active_attempts, len(state.attempts), finished_sources
 
 
 def _has_legal_path(
@@ -1022,30 +1312,35 @@ def _has_legal_path(
     spec: ProgramSpec,
     states: tuple[WorkUnitState, ...],
     attempts: tuple[Attempt, ...],
+    satisfactions: tuple[TrustedSatisfaction, ...] = (),
 ) -> bool:
-    authority = spec.authority
-    if status is ProgramStatus.DRAFT:
-        if _action_allowed(authority, DomainAction.CANCEL_PROGRAM) or _action_allowed(
-            authority, DomainAction.AMEND_SPEC
-        ):
+    """Search finite K1 states via shared command applicability and transition reduction.
+
+    WorkUnits and status enums are finite; PrepareAttempt is bounded by the declared admission
+    budgets. Reachability uses symbolic Attempt summaries and never constructs external input or
+    trusted-satisfaction values.
+    """
+
+    initial = _reach_state(status, spec, states, attempts, satisfactions)
+    pending = deque([initial])
+    visited = {_reach_key(initial)}
+    while pending:
+        current = pending.popleft()
+        if current.status in (ProgramStatus.COMPLETED, ProgramStatus.CANCELLED):
             return True
-        if _action_allowed(authority, DomainAction.ACTIVATE_PROGRAM):
-            ready = _mark_ready(spec, states)
-            return _active_has_legal_path(spec, ready, attempts)
-        return False
-    if status is ProgramStatus.ACTIVE:
-        if _action_allowed(authority, DomainAction.AMEND_SPEC):
-            return True
-        return _active_has_legal_path(spec, states, attempts)
-    if status is ProgramStatus.PAUSED:
-        if _action_allowed(authority, DomainAction.AMEND_SPEC):
-            return True
-        if _action_allowed(authority, DomainAction.CANCEL_PROGRAM):
-            return True
-        if _action_allowed(authority, DomainAction.RESUME_PROGRAM):
-            return _active_has_legal_path(spec, _mark_ready(spec, states), attempts)
-        return False
-    return True
+        for action in _reach_actions(spec, current):
+            if not _action_applicable(spec, current, action):
+                continue
+            if action.action is DomainAction.AMEND_SPEC:
+                return True
+            successor = _reach_successor(spec, current, action)
+            if successor.status in (ProgramStatus.COMPLETED, ProgramStatus.CANCELLED):
+                return True
+            successor_key = _reach_key(successor)
+            if successor_key not in visited:
+                visited.add(successor_key)
+                pending.append(successor)
+    return False
 
 
 def _require_legal_path(
@@ -1053,9 +1348,10 @@ def _require_legal_path(
     spec: ProgramSpec,
     states: tuple[WorkUnitState, ...],
     attempts: tuple[Attempt, ...],
+    satisfactions: tuple[TrustedSatisfaction, ...],
 ) -> None:
     if status in (ProgramStatus.DRAFT, ProgramStatus.ACTIVE, ProgramStatus.PAUSED) and not _has_legal_path(
-        status, spec, states, attempts
+        status, spec, states, attempts, satisfactions
     ):
         raise AuthorityViolation(f"{status.value} Program state has no legal progress or control path")
 
@@ -1164,7 +1460,7 @@ class Program:
                 raise InvalidDomainValue("attempt belongs to a different Program")
             if attempt.spec.spec_revision > self.spec.revision:
                 raise InvalidDomainValue("attempt cannot reference a future spec revision")
-        _require_legal_path(self.status, self.spec, states, self.attempts)
+        _require_legal_path(self.status, self.spec, states, self.attempts, self.satisfactions)
 
     @classmethod
     def create(cls, spec: ProgramSpec) -> Program:
@@ -1208,257 +1504,174 @@ class Program:
         if type(self) is not Program:
             raise InvalidDomainValue("Program values cannot be subclassed")
 
-        def transition(
+        if type(command) is ActivateProgram:
+            action = DomainAction.ACTIVATE_PROGRAM
+        elif type(command) is PauseProgram:
+            action = DomainAction.PAUSE_PROGRAM
+        elif type(command) is ResumeProgram:
+            action = DomainAction.RESUME_PROGRAM
+        elif type(command) is CancelProgram:
+            action = DomainAction.CANCEL_PROGRAM
+        elif type(command) is CancelWorkUnit:
+            action = DomainAction.CANCEL_WORK_UNIT
+        elif type(command) is PrepareAttempt:
+            action = DomainAction.PREPARE_ATTEMPT
+        elif type(command) is StartAttempt:
+            action = DomainAction.START_ATTEMPT
+        elif type(command) is FinishAttempt:
+            action = DomainAction.FINISH_ATTEMPT
+        elif type(command) is FailAttempt:
+            action = DomainAction.FAIL_ATTEMPT
+        elif type(command) is CancelAttempt:
+            action = DomainAction.CANCEL_ATTEMPT
+        elif type(command) is SatisfyWorkUnit:
+            action = DomainAction.SATISFY_WORK_UNIT
+        elif type(command) is AmendProgramSpec:
+            action = DomainAction.AMEND_SPEC
+        else:
+            raise InvalidDomainValue(f"unsupported domain command: {type(command).__name__}")
+
+        self._check_revision(command.expected_revision)
+        self._authorize(action, command.actor_id, trusted_satisfaction=action is DomainAction.SATISFY_WORK_UNIT)
+        target_work_unit_id: str | None = None
+        attempt_id: str | None = None
+        if type(command) is CancelWorkUnit:
+            target_work_unit_id = command.work_unit_id
+        elif type(command) is PrepareAttempt:
+            target_work_unit_id = command.attempt.work_unit_id
+            attempt_id = command.attempt.attempt_id
+        elif type(command) is SatisfyWorkUnit:
+            target_work_unit_id = command.satisfaction.work_unit_id
+        elif type(command) is StartAttempt:
+            attempt_id = command.attempt_id
+            target_work_unit_id = self.attempt(attempt_id).spec.work_unit_id
+        elif type(command) is FinishAttempt:
+            attempt_id = command.attempt_id
+            target_work_unit_id = self.attempt(attempt_id).spec.work_unit_id
+        elif type(command) is FailAttempt:
+            attempt_id = command.attempt_id
+            target_work_unit_id = self.attempt(attempt_id).spec.work_unit_id
+        elif type(command) is CancelAttempt:
+            attempt_id = command.attempt_id
+            target_work_unit_id = self.attempt(attempt_id).spec.work_unit_id
+        current_reach_state = _reach_state(
+            self.status,
+            self.spec,
+            self.work_unit_states,
+            self.attempts,
+            self.satisfactions,
+        )
+        attempt_spec = command.attempt if type(command) is PrepareAttempt else None
+        satisfaction = command.satisfaction if type(command) is SatisfyWorkUnit else None
+        reach_action = _ReachAction(
+            action,
+            target_work_unit_id,
+            attempt_id,
+            attempt_spec,
+            satisfaction,
+            command.actor_id,
+        )
+        inapplicability = _action_inapplicability(self.spec, current_reach_state, reach_action)
+        if inapplicability is not None:
+            raise inapplicability
+
+        def assemble(
             *,
-            status: ProgramStatus | None = None,
-            spec: ProgramSpec | None = None,
-            states: tuple[WorkUnitState, ...] | None = None,
-            attempts: tuple[Attempt, ...] | None = None,
-            satisfactions: tuple[TrustedSatisfaction, ...] | None = None,
-            spec_history: tuple[ProgramSpec, ...] | None = None,
+            next_spec: ProgramSpec,
+            next_status: ProgramStatus,
+            next_states: tuple[WorkUnitState, ...],
+            next_attempts: tuple[Attempt, ...],
+            next_satisfactions: tuple[TrustedSatisfaction, ...],
+            next_spec_history: tuple[ProgramSpec, ...],
         ) -> Program:
-            next_spec = self.spec if spec is None else spec
             instance = object.__new__(Program)
             object.__setattr__(instance, "spec", next_spec)
-            object.__setattr__(instance, "status", self.status if status is None else status)
+            object.__setattr__(instance, "status", next_status)
             object.__setattr__(instance, "revision", self.revision + 1)
-            object.__setattr__(instance, "work_unit_states", self.work_unit_states if states is None else states)
-            object.__setattr__(instance, "attempts", self.attempts if attempts is None else attempts)
-            object.__setattr__(
-                instance,
-                "satisfactions",
-                self.satisfactions if satisfactions is None else satisfactions,
-            )
-            object.__setattr__(
-                instance,
-                "spec_history",
-                self.spec_history if spec_history is None else spec_history,
-            )
+            object.__setattr__(instance, "work_unit_states", next_states)
+            object.__setattr__(instance, "attempts", next_attempts)
+            object.__setattr__(instance, "satisfactions", next_satisfactions)
+            object.__setattr__(instance, "spec_history", next_spec_history)
             Program._validate(instance, allow_transition=True)
             return instance
 
+        def transition(
+            *,
+            prepared_attempt: AttemptSpec | None = None,
+            satisfaction: TrustedSatisfaction | None = None,
+        ) -> Program:
+            next_state = _reach_successor(self.spec, current_reach_state, reach_action)
+            current_attempts = {attempt.attempt_id: attempt for attempt in self.attempts}
+            next_attempts_list: list[Attempt] = []
+            for item in next_state.attempts:
+                previous = current_attempts.get(item.attempt_id)
+                if previous is not None:
+                    next_attempts_list.append(Attempt(previous.spec, item.status))
+                elif prepared_attempt is not None and item.attempt_id == prepared_attempt.attempt_id:
+                    next_attempts_list.append(Attempt(prepared_attempt, item.status))
+            next_attempts = tuple(next_attempts_list)
+            next_satisfactions = (*self.satisfactions, satisfaction) if satisfaction is not None else self.satisfactions
+            return assemble(
+                next_spec=self.spec,
+                next_status=next_state.status,
+                next_states=next_state.work_unit_states,
+                next_attempts=next_attempts,
+                next_satisfactions=next_satisfactions,
+                next_spec_history=self.spec_history,
+            )
+
+        def amend_transition(
+            amended_spec: ProgramSpec,
+            amended_states: tuple[WorkUnitState, ...],
+            amended_attempts: tuple[Attempt, ...],
+        ) -> Program:
+            next_status = self.status
+            if self.status in (ProgramStatus.ACTIVE, ProgramStatus.COMPLETED):
+                amended_states = _mark_ready(amended_spec, amended_states)
+                next_status = _status_after_work_unit_change(amended_states)
+            return assemble(
+                next_spec=amended_spec,
+                next_status=next_status,
+                next_states=amended_states,
+                next_attempts=amended_attempts,
+                next_satisfactions=self.satisfactions,
+                next_spec_history=(*self.spec_history, amended_spec),
+            )
+
         if type(command) is ActivateProgram:
-            self._check_revision(command.expected_revision)
-            self._authorize(DomainAction.ACTIVATE_PROGRAM, command.actor_id)
-            self._require_status(ProgramStatus.DRAFT)
-            return transition(status=ProgramStatus.ACTIVE, states=_mark_ready(self.spec, self.work_unit_states))
+            return transition()
 
         if type(command) is PauseProgram:
-            self._check_revision(command.expected_revision)
-            self._authorize(DomainAction.PAUSE_PROGRAM, command.actor_id)
-            self._require_status(ProgramStatus.ACTIVE)
-            return transition(status=ProgramStatus.PAUSED)
+            return transition()
 
         if type(command) is ResumeProgram:
-            self._check_revision(command.expected_revision)
-            self._authorize(DomainAction.RESUME_PROGRAM, command.actor_id)
-            self._require_status(ProgramStatus.PAUSED)
-            states = _mark_ready(self.spec, self.work_unit_states)
-            status = _status_after_work_unit_change(states)
-            return transition(status=status, states=states)
+            return transition()
 
         if type(command) is CancelProgram:
-            self._check_revision(command.expected_revision)
-            self._authorize(DomainAction.CANCEL_PROGRAM, command.actor_id)
-            self._require_status(ProgramStatus.DRAFT, ProgramStatus.ACTIVE, ProgramStatus.PAUSED)
-            states = tuple(
-                state
-                if state.status is WorkUnitStatus.SATISFIED
-                else WorkUnitState(state.work_unit_id, WorkUnitStatus.CANCELLED)
-                for state in self.work_unit_states
-            )
-            attempts = tuple(
-                Attempt(attempt.spec, AttemptStatus.CANCELLED)
-                if attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
-                else attempt
-                for attempt in self.attempts
-            )
-            return transition(status=ProgramStatus.CANCELLED, states=states, attempts=attempts)
+            return transition()
 
         if type(command) is CancelWorkUnit:
-            self._check_revision(command.expected_revision)
-            self._authorize(DomainAction.CANCEL_WORK_UNIT, command.actor_id)
-            self._require_status(ProgramStatus.ACTIVE)
-            current = self.state(command.work_unit_id)
-            if current.status in (WorkUnitStatus.SATISFIED, WorkUnitStatus.CANCELLED):
-                raise IllegalTransition(f"WorkUnit {command.work_unit_id!r} is already terminal")
-            if current.active_attempt_id is not None:
-                raise IllegalTransition("cancel the active attempt before cancelling its WorkUnit")
-            descendants = _descendants(self.spec, {command.work_unit_id})
-            if any(self.state(work_unit_id).status is WorkUnitStatus.SATISFIED for work_unit_id in descendants):
-                raise IllegalTransition("cannot cancel a WorkUnit with a satisfied dependency descendant")
-            states_by_id = {state.work_unit_id: state for state in self.work_unit_states}
-            for work_unit_id in descendants:
-                states_by_id[work_unit_id] = WorkUnitState(work_unit_id, WorkUnitStatus.CANCELLED)
-            states = tuple(states_by_id[unit.work_unit_id] for unit in self.spec.work_units)
-            attempts = tuple(
-                Attempt(attempt.spec, AttemptStatus.CANCELLED)
-                if attempt.spec.work_unit_id in descendants
-                and attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
-                else attempt
-                for attempt in self.attempts
-            )
-            status = _status_after_work_unit_change(states)
-            return transition(status=status, states=states, attempts=attempts)
+            return transition()
 
         if type(command) is PrepareAttempt:
-            self._check_revision(command.expected_revision)
-            self._authorize(DomainAction.PREPARE_ATTEMPT, command.actor_id)
-            self._require_status(ProgramStatus.ACTIVE)
-            attempt_spec = command.attempt
-            if any(attempt.attempt_id == attempt_spec.attempt_id for attempt in self.attempts):
-                raise DuplicateAttempt(f"attempt {attempt_spec.attempt_id!r} already exists")
-            if attempt_spec.program_id != self.program_id:
-                raise AuthorityViolation("attempt is scoped to a different Program")
-            if attempt_spec.spec_revision != self.spec.revision or attempt_spec.spec_digest != self.spec.digest:
-                raise StaleRevision("attempt inputs must pin the current ProgramSpec revision and digest")
-            unit = self.spec.work_unit(attempt_spec.work_unit_id)
-            current = self.state(unit.work_unit_id)
-            if current.status is not WorkUnitStatus.READY:
-                raise IllegalTransition(f"WorkUnit {unit.work_unit_id!r} is {current.status.value!r}, not ready")
-            if attempt_spec.input_names != unit.required_inputs:
-                missing = sorted(unit.required_inputs - attempt_spec.input_names)
-                extra = sorted(attempt_spec.input_names - unit.required_inputs)
-                details: list[str] = []
-                if missing:
-                    details.append(f"missing {', '.join(missing)}")
-                if extra:
-                    details.append(f"unexpected {', '.join(extra)}")
-                raise MissingInput(f"attempt inputs for {unit.work_unit_id!r}: {'; '.join(details)}")
-            active_count = sum(
-                1 for attempt in self.attempts if attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
-            )
-            if len(self.attempts) >= min(self.spec.budget.max_attempts, self.spec.authority.max_attempts):
-                raise BudgetExceeded("attempt admission limit exceeded")
-            if active_count >= self.spec.budget.max_active_attempts:
-                raise BudgetExceeded("active attempt admission limit exceeded")
-            attempt = Attempt(attempt_spec)
-            states = self._replace_state(WorkUnitState(unit.work_unit_id, WorkUnitStatus.ACTIVE, attempt.attempt_id))
-            return transition(states=states, attempts=(*self.attempts, attempt))
+            return transition(prepared_attempt=command.attempt)
 
         if type(command) is StartAttempt:
-            self._check_revision(command.expected_revision)
-            self._authorize(DomainAction.START_ATTEMPT, command.actor_id)
-            self._require_status(ProgramStatus.ACTIVE)
-            attempt = self.attempt(command.attempt_id)
-            if attempt.status is not AttemptStatus.PREPARED:
-                raise IllegalTransition(f"attempt {attempt.attempt_id!r} is {attempt.status.value!r}, not prepared")
-            state = self.state(attempt.spec.work_unit_id)
-            if state.active_attempt_id != attempt.attempt_id:
-                raise IllegalTransition("attempt is not the active attempt for its WorkUnit")
-            return transition(attempts=self._replace_attempt(Attempt(attempt.spec, AttemptStatus.EXECUTING)))
+            return transition()
 
         if type(command) is FinishAttempt:
-            self._check_revision(command.expected_revision)
-            self._authorize(DomainAction.FINISH_ATTEMPT, command.actor_id)
-            self._require_status(ProgramStatus.ACTIVE)
-            attempt = self.attempt(command.attempt_id)
-            if attempt.status is not AttemptStatus.EXECUTING:
-                raise IllegalTransition(f"attempt {attempt.attempt_id!r} is {attempt.status.value!r}, not executing")
-            state = self.state(attempt.spec.work_unit_id)
-            if state.active_attempt_id != attempt.attempt_id:
-                raise IllegalTransition("attempt is not the active attempt for its WorkUnit")
-            states = _mark_ready(
-                self.spec,
-                self._replace_state(WorkUnitState(state.work_unit_id, WorkUnitStatus.READY)),
-            )
-            return transition(
-                states=states,
-                attempts=self._replace_attempt(Attempt(attempt.spec, AttemptStatus.FINISHED)),
-            )
+            return transition()
 
         if type(command) is FailAttempt:
-            self._check_revision(command.expected_revision)
-            self._authorize(DomainAction.FAIL_ATTEMPT, command.actor_id)
-            self._require_status(ProgramStatus.ACTIVE, ProgramStatus.PAUSED)
-            attempt = self.attempt(command.attempt_id)
-            if attempt.status not in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING):
-                raise IllegalTransition(f"attempt {attempt.attempt_id!r} cannot fail from {attempt.status.value!r}")
-            states = self.work_unit_states
-            state = self.state(attempt.spec.work_unit_id)
-            if state.active_attempt_id == attempt.attempt_id:
-                states = self._replace_state(WorkUnitState(state.work_unit_id, WorkUnitStatus.READY))
-                states = _mark_ready(self.spec, states)
-            return transition(
-                states=states,
-                attempts=self._replace_attempt(Attempt(attempt.spec, AttemptStatus.FAILED)),
-            )
+            return transition()
 
         if type(command) is CancelAttempt:
-            self._check_revision(command.expected_revision)
-            self._authorize(DomainAction.CANCEL_ATTEMPT, command.actor_id)
-            self._require_status(ProgramStatus.ACTIVE, ProgramStatus.PAUSED)
-            attempt = self.attempt(command.attempt_id)
-            if attempt.status not in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING):
-                raise IllegalTransition(f"attempt {attempt.attempt_id!r} cannot cancel from {attempt.status.value!r}")
-            states = self.work_unit_states
-            state = self.state(attempt.spec.work_unit_id)
-            if state.active_attempt_id == attempt.attempt_id:
-                states = self._replace_state(WorkUnitState(state.work_unit_id, WorkUnitStatus.READY))
-                states = _mark_ready(self.spec, states)
-            return transition(
-                states=states,
-                attempts=self._replace_attempt(Attempt(attempt.spec, AttemptStatus.CANCELLED)),
-            )
+            return transition()
 
         if type(command) is SatisfyWorkUnit:
-            self._check_revision(command.expected_revision)
-            self._authorize(DomainAction.SATISFY_WORK_UNIT, command.actor_id, trusted_satisfaction=True)
-            self._require_status(ProgramStatus.ACTIVE)
-            reference = command.satisfaction
-            if reference.issuer_id != command.actor_id:
-                raise AuthorityViolation("satisfaction issuer and command actor must match")
-            if reference.program_id != self.program_id:
-                raise AuthorityViolation("satisfaction is scoped to a different Program")
-            if reference.spec_revision != self.spec.revision or reference.spec_digest != self.spec.digest:
-                raise StaleRevision("satisfaction must reference the current ProgramSpec")
-            unit = self.spec.work_unit(reference.work_unit_id)
-            if reference.work_unit_digest != unit.digest:
-                raise StaleRevision("satisfaction must reference the current WorkUnit definition")
-            state = self.state(unit.work_unit_id)
-            if state.status not in (WorkUnitStatus.ACTIVE, WorkUnitStatus.READY):
-                raise IllegalTransition(f"WorkUnit {unit.work_unit_id!r} is {state.status.value!r}, not satisfiable")
-            if any(item.reference_id == reference.reference_id for item in self.satisfactions):
-                raise IllegalTransition(f"satisfaction reference {reference.reference_id!r} was already applied")
-            if state.status is WorkUnitStatus.READY and reference.source_attempt_id is None:
-                raise IllegalTransition("a ready WorkUnit requires a finished satisfaction source")
-            attempts = self.attempts
-            if reference.source_attempt_id is not None:
-                source = self.attempt(reference.source_attempt_id)
-                if source.spec.work_unit_id != unit.work_unit_id:
-                    raise AuthorityViolation("satisfaction source attempt targets a different WorkUnit")
-                if source.spec.spec_digest != self.spec.digest or source.spec.spec_revision != self.spec.revision:
-                    raise StaleRevision("satisfaction source attempt is pinned to an older ProgramSpec")
-                if source.status not in (AttemptStatus.EXECUTING, AttemptStatus.FINISHED):
-                    raise IllegalTransition("satisfaction source attempt is not executable or finished")
-                if state.status is WorkUnitStatus.READY and source.status is not AttemptStatus.FINISHED:
-                    raise IllegalTransition("a ready WorkUnit requires a finished satisfaction source")
-                if state.status is WorkUnitStatus.ACTIVE and state.active_attempt_id != source.attempt_id:
-                    raise IllegalTransition("satisfaction source is not the active attempt for its WorkUnit")
-                if source.status is AttemptStatus.EXECUTING:
-                    attempts = self._replace_attempt(Attempt(source.spec, AttemptStatus.FINISHED))
-            elif state.active_attempt_id is not None:
-                active_attempt = self.attempt(state.active_attempt_id)
-                if active_attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING):
-                    attempts = self._replace_attempt(Attempt(active_attempt.spec, AttemptStatus.FINISHED))
-            states = _mark_ready(
-                self.spec,
-                self._replace_state(WorkUnitState(unit.work_unit_id, WorkUnitStatus.SATISFIED)),
-            )
-            status = _status_after_work_unit_change(states)
-            return transition(
-                status=status, states=states, attempts=attempts, satisfactions=(*self.satisfactions, reference)
-            )
+            return transition(satisfaction=command.satisfaction)
 
         if type(command) is AmendProgramSpec:
-            self._check_revision(command.expected_revision)
-            self._authorize(DomainAction.AMEND_SPEC, command.actor_id)
-            self._require_status(
-                ProgramStatus.DRAFT,
-                ProgramStatus.ACTIVE,
-                ProgramStatus.PAUSED,
-                ProgramStatus.COMPLETED,
-            )
             new_spec = self.spec.amend(command.amendment)
             affected = _amendment_affected_work_units(self.spec, new_spec)
             old_states = {state.work_unit_id: state for state in self.work_unit_states}
@@ -1486,23 +1699,13 @@ class Program:
                 )
                 new_states.append(WorkUnitState(unit.work_unit_id, state_status))
             states = tuple(new_states)
-            status = self.status
-            if self.status in (ProgramStatus.ACTIVE, ProgramStatus.COMPLETED):
-                states = _mark_ready(new_spec, states)
-                status = _status_after_work_unit_change(states)
             attempts = tuple(
                 Attempt(attempt.spec, AttemptStatus.CANCELLED)
                 if attempt.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING)
                 else attempt
                 for attempt in self.attempts
             )
-            return transition(
-                status=status,
-                spec=new_spec,
-                states=states,
-                attempts=attempts,
-                spec_history=(*self.spec_history, new_spec),
-            )
+            return amend_transition(new_spec, states, attempts)
 
         raise InvalidDomainValue(f"unsupported domain command: {type(command).__name__}")
 
@@ -1536,21 +1739,6 @@ class Program:
         if trusted_satisfaction and actor_id in self.spec.authority.trusted_satisfaction_issuers:
             return
         raise AuthorityViolation(f"actor {actor_id!r} is not authorized for {action.value!r}")
-
-    def _require_status(self, *allowed: ProgramStatus) -> None:
-        if self.status not in allowed:
-            names = ", ".join(item.value for item in allowed)
-            raise IllegalTransition(f"Program is {self.status.value!r}; requires {names}")
-
-    def _replace_state(self, replacement: WorkUnitState) -> tuple[WorkUnitState, ...]:
-        return tuple(
-            replacement if state.work_unit_id == replacement.work_unit_id else state for state in self.work_unit_states
-        )
-
-    def _replace_attempt(self, replacement: Attempt) -> tuple[Attempt, ...]:
-        return tuple(
-            replacement if attempt.attempt_id == replacement.attempt_id else attempt for attempt in self.attempts
-        )
 
 
 for _sealed_type in (

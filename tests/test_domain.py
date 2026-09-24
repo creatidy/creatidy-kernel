@@ -452,6 +452,75 @@ def test_attempt_admission_rejects_a_prepared_state_with_no_legal_followup() -> 
     assert active.attempts == ()
 
 
+def test_least_authority_finish_then_cancel_path_remains_live() -> None:
+    authority = AuthorityEnvelope(
+        OWNER,
+        frozenset(
+            {
+                DomainAction.ACTIVATE_PROGRAM,
+                DomainAction.PREPARE_ATTEMPT,
+                DomainAction.START_ATTEMPT,
+                DomainAction.FINISH_ATTEMPT,
+                DomainAction.CANCEL_WORK_UNIT,
+            }
+        ),
+    )
+    draft = Program.create(ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority))
+    active = draft.apply(ActivateProgram(draft.revision, OWNER))
+    prepared = active.apply(
+        PrepareAttempt(
+            active.revision,
+            OWNER,
+            AttemptSpec("a1", active.program_id, "only", active.spec.revision, active.spec.digest),
+        )
+    )
+    with pytest.raises(AuthorityViolation):
+        prepared.apply(FailAttempt(prepared.revision, OWNER, "a1"))
+    executing = prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
+    finished = executing.apply(FinishAttempt(executing.revision, OWNER, "a1"))
+    cancelled = finished.apply(CancelWorkUnit(finished.revision, OWNER, "only"))
+
+    assert finished.state("only").status is WorkUnitStatus.READY
+    assert finished.attempt("a1").status is AttemptStatus.FINISHED
+    assert cancelled.status is ProgramStatus.CANCELLED
+
+
+def test_least_authority_prepare_then_trusted_satisfaction_needs_no_start() -> None:
+    authority = AuthorityEnvelope(
+        OWNER,
+        frozenset(
+            {
+                DomainAction.ACTIVATE_PROGRAM,
+                DomainAction.PREPARE_ATTEMPT,
+                DomainAction.SATISFY_WORK_UNIT,
+            }
+        ),
+    )
+    draft = Program.create(ProgramSpec("p", "objective", (WorkUnit("only"),), authority=authority))
+    active = draft.apply(ActivateProgram(draft.revision, OWNER))
+    prepared = active.apply(
+        PrepareAttempt(
+            active.revision,
+            OWNER,
+            AttemptSpec("a1", active.program_id, "only", active.spec.revision, active.spec.digest),
+        )
+    )
+    with pytest.raises(AuthorityViolation):
+        prepared.apply(StartAttempt(prepared.revision, OWNER, "a1"))
+    satisfied = prepared.apply(
+        SatisfyWorkUnit(
+            prepared.revision,
+            OWNER,
+            satisfaction(prepared, "only", "s1", None),
+        )
+    )
+
+    assert prepared.state("only").status is WorkUnitStatus.ACTIVE
+    assert prepared.attempt("a1").status is AttemptStatus.PREPARED
+    assert satisfied.status is ProgramStatus.COMPLETED
+    assert satisfied.attempt("a1").status is AttemptStatus.FINISHED
+
+
 def test_pause_requires_a_viable_resume_or_termination_path() -> None:
     authority = AuthorityEnvelope(
         OWNER,
