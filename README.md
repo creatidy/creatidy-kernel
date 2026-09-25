@@ -6,10 +6,11 @@ Creatidy Kernel is the foundation of a local-first, provider-neutral control pla
 software engineering. It is for individual developers and small teams with limited AI budgets,
 premium-model quota and human attention.
 
-**Status: deterministic K1 domain and K2A durable persistence, not an autonomous Program engine.**
+**Status: deterministic K1 domain and K2A/K2B durable persistence, not an autonomous Program engine.**
 The code includes immutable Program intent, legal domain commands, single-controller SQLite history
-and rebuildable projections, plus a replaceable resource allocator. It does not run agents, schedule
-or autonomously execute Programs, contact providers, perform external effects or modify your
+and rebuildable projections, an external-operation journal/outbox with a synthetic effect seam and
+content-addressed artifacts, plus a replaceable resource allocator. It does not run agents, schedule
+or autonomously execute Programs, contact providers, perform live external effects or modify your
 repositories.
 
 The SQLite adapter accepts databases only in an existing data directory validated as one supported
