@@ -7,12 +7,13 @@ import errno
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import sys
 import tempfile
 import threading
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,7 +39,7 @@ from creatidy_kernel.core.domain import (
     ProgramStatus,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _APPLICATION_ID = 0x43544B31
 _DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _LOCAL_FILESYSTEMS = {
@@ -92,6 +93,27 @@ class IdempotencyConflict(SQLiteStoreError):
 
 class CorruptHistory(SQLiteStoreError):
     """Durable history or its verified projection is inconsistent."""
+
+
+class OperationConflict(SQLiteStoreError):
+    """An operation identity, fence, receipt, or retry violates the journal contract."""
+
+
+_OBSERVATION_KINDS = frozenset({"accepted", "rejected", "running", "waiting", "terminal", "unknown"})
+
+
+@dataclass(frozen=True, slots=True)
+class OperationRecord:
+    operation_id: str
+    effect_key: str
+    request_digest: str
+    request_json: str
+    fence: int
+    lease_until: int | None
+    status: str
+    accepted_reference: str | None
+    retry_proof: str | None
+    attempts: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,11 +203,14 @@ class SQLiteProgramStore:
         if raw_path == ":memory:" or raw_path.startswith("file:"):
             raise UnsupportedSQLiteConfiguration("the store requires a file-backed local SQLite database path")
         self._path = Path(path).expanduser().resolve(strict=False)
+        self._artifact_directory = self._path.parent / f"{self._path.name}.artifacts"
         if not self._path.parent.is_dir():
             raise FileNotFoundError(f"SQLite database parent directory does not exist: {self._path.parent}")
         if self._path.exists() and not self._path.is_file():
             raise UnsupportedSQLiteConfiguration("SQLite database path must be a regular file")
         self._storage = _inspect_local_storage(self._path.parent, database_path=self._path)
+        if self._path.name == "kernel.sqlite3" and (self._path.parent / "manifest.json").exists():
+            self._verify_backup_manifest(self._path.parent)
         self._owner_pid = os.getpid()
         self._owner_thread = threading.get_ident()
         self._owner_thread_local = threading.local()
@@ -216,6 +241,7 @@ class SQLiteProgramStore:
                 raise
             self._migrate()
             self.rebuild_projections()
+            self._validate_operation_records()
             self._startup_evidence = self._read_startup_evidence()
         except BaseException:
             connection = getattr(self, "_connection", None)
@@ -318,6 +344,31 @@ class SQLiteProgramStore:
             return program
 
     def admit(self, program_id: str, command_key: str, command: DomainCommandType) -> Program:
+        return self._admit(program_id, command_key, command, intent=None)
+
+    def admit_with_intent(
+        self,
+        program_id: str,
+        command_key: str,
+        command: DomainCommandType,
+        operation_id: str,
+        effect_key: str,
+        request: dict[str, object],
+    ) -> Program:
+        """Atomically admit a K1 decision and its K2B logical effect/outbox."""
+        self._validate_command_key(operation_id)
+        self._validate_command_key(effect_key)
+        if type(request) is not dict:
+            raise TypeError("request must be a JSON object")
+        return self._admit(program_id, command_key, command, intent=(operation_id, effect_key, request))
+
+    def _admit(
+        self,
+        program_id: str,
+        command_key: str,
+        command: DomainCommandType,
+        intent: tuple[str, str, dict[str, object]] | None,
+    ) -> Program:
         self._assert_writer_thread()
         self._validate_program_id(program_id)
         self._validate_command_key(command_key)
@@ -327,6 +378,14 @@ class SQLiteProgramStore:
         with self._gate, self._transaction():
             duplicate = self._duplicate_result(command_key, input_digest)
             if duplicate is not None:
+                if intent is not None:
+                    operation_id, effect_key, request = intent
+                    raw = canonical_json({"version": 1, "request": request})
+                    row = self._connection.execute(
+                        "SELECT effect_key, request_json FROM operations WHERE operation_id = ?", (operation_id,)
+                    ).fetchone()
+                    if row is None or (row["effect_key"], row["request_json"]) != (effect_key, raw):
+                        raise OperationConflict("duplicate command has no matching atomically admitted intent")
                 return duplicate
             current = self._load_head(program_id)
             next_program = current.apply(command)
@@ -362,6 +421,8 @@ class SQLiteProgramStore:
                 result_json=facts_json,
                 result_digest=facts_digest,
             )
+            if intent is not None:
+                self._insert_intent(*intent, allow_existing=False)
         return next_program
 
     def history(self, program_id: str) -> tuple[HistoryRecord, ...]:
@@ -390,6 +451,432 @@ class SQLiteProgramStore:
                 )
                 for row in rows
             )
+
+    def intent(self, operation_id: str, effect_key: str, request: dict[str, object]) -> OperationRecord:
+        """Commit the original logical effect and outbox together, independently of K2A admission."""
+        self._assert_writer_thread()
+        for value in (operation_id, effect_key):
+            self._validate_command_key(value)
+        if type(request) is not dict:
+            raise TypeError("request must be a JSON object")
+        with self._gate, self._transaction():
+            self._insert_intent(operation_id, effect_key, request)
+        return self.operation(operation_id)
+
+    def _insert_intent(
+        self, operation_id: str, effect_key: str, request: dict[str, object], *, allow_existing: bool = True
+    ) -> None:
+        request_json = canonical_json({"version": 1, "request": request})
+        digest = hashlib.sha256(request_json.encode("utf-8")).hexdigest()
+        existing = self._connection.execute(
+            "SELECT operation_id, effect_key, request_digest FROM operations WHERE operation_id = ? OR effect_key = ?",
+            (operation_id, effect_key),
+        ).fetchall()
+        if existing:
+            if not allow_existing:
+                raise OperationConflict("new command cannot claim a previously committed effect")
+            if len(existing) != 1 or any(
+                row["operation_id"] != operation_id
+                or row["effect_key"] != effect_key
+                or row["request_digest"] != digest
+                for row in existing
+            ):
+                raise OperationConflict("logical effect identity is bound to a different request")
+        else:
+            self._connection.execute(
+                "INSERT INTO operations (operation_id, effect_key, request_json, request_digest) VALUES (?, ?, ?, ?)",
+                (operation_id, effect_key, request_json, digest),
+            )
+            self._connection.execute("INSERT INTO operation_outbox (operation_id) VALUES (?)", (operation_id,))
+
+    def operation(self, operation_id: str) -> OperationRecord:
+        self._assert_writer_thread()
+        self._validate_command_key(operation_id)
+        with self._gate:
+            row = self._connection.execute(
+                "SELECT o.*, (SELECT COUNT(*) FROM delivery_attempts a WHERE a.operation_id = o.operation_id) "
+                "AS attempts FROM operations o WHERE o.operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise OperationConflict("unknown operation")
+            return OperationRecord(
+                *(
+                    row[key]
+                    for key in (
+                        "operation_id",
+                        "effect_key",
+                        "request_digest",
+                        "request_json",
+                        "fence",
+                        "lease_until",
+                        "status",
+                        "accepted_reference",
+                        "retry_proof",
+                        "attempts",
+                    )
+                )
+            )
+
+    def claim(self, operation_id: str, *, now: int, lease_seconds: int) -> int:
+        """Durably record the attempt before the caller can invoke the fake effect seam."""
+        self._assert_writer_thread()
+        if type(now) is not int or type(lease_seconds) is not int or lease_seconds <= 0:
+            raise ValueError("now must be an integer and lease_seconds positive")
+        with self._gate, self._transaction():
+            op = self.operation(operation_id)
+            if op.lease_until is not None and op.lease_until > now:
+                raise OperationConflict("delivery lease is held")
+            if op.status in {"accepted", "running", "waiting", "terminal", "rejected"}:
+                raise OperationConflict("operation already has a domain outcome")
+            if op.attempts and op.retry_proof not in {"absent", "idempotent"}:
+                raise OperationConflict("uncertain delivery requires reconciliation before retry")
+            fence = op.fence + 1
+            self._connection.execute(
+                "UPDATE operations SET fence = ?, lease_until = ?, status = 'dispatched', retry_proof = NULL "
+                "WHERE operation_id = ?",
+                (fence, now + lease_seconds, operation_id),
+            )
+            self._connection.execute(
+                "INSERT INTO delivery_attempts (operation_id, fence, claimed_at, lease_until) VALUES (?, ?, ?, ?)",
+                (operation_id, fence, now, now + lease_seconds),
+            )
+            return fence
+
+    def deliver_fake(
+        self,
+        operation_id: str,
+        observation_id: str,
+        *,
+        now: int,
+        lease_seconds: int,
+        fake: Callable[[str, str], tuple[bool, str | None, str | None]],
+    ) -> OperationRecord:
+        """Invoke a synthetic effect only after the delivery claim has committed."""
+        fence = self.claim(operation_id, now=now, lease_seconds=lease_seconds)
+        op = self.operation(operation_id)
+        transported, kind, reference = fake(op.effect_key, op.request_json)
+        self.record_transport(operation_id, fence, transported)
+        if not transported or kind is None:
+            return self.operation(operation_id)
+        return self.observe(operation_id, fence, observation_id, kind, reference=reference)
+
+    def record_transport(self, operation_id: str, fence: int, succeeded: bool) -> None:
+        """Persist a transport report without treating it as domain acceptance."""
+        self._assert_writer_thread()
+        if type(succeeded) is not bool:
+            raise TypeError("transport outcome must be boolean")
+        with self._gate, self._transaction():
+            op = self.operation(operation_id)
+            if op.fence != fence or op.attempts == 0 or op.retry_proof is not None:
+                raise OperationConflict("stale transport fence")
+            prior = self._connection.execute(
+                "SELECT succeeded FROM operation_transports WHERE operation_id = ? AND fence = ?",
+                (operation_id, fence),
+            ).fetchone()
+            if prior is not None:
+                if bool(prior["succeeded"]) != succeeded:
+                    raise OperationConflict("transport report conflicts with prior outcome")
+            else:
+                self._connection.execute(
+                    "INSERT INTO operation_transports VALUES (?, ?, ?)", (operation_id, fence, int(succeeded))
+                )
+
+    def observe(
+        self,
+        operation_id: str,
+        fence: int,
+        observation_id: str,
+        kind: str,
+        *,
+        reference: str | None = None,
+    ) -> OperationRecord:
+        """Record a domain receipt, not a transport result; reject stale publications."""
+        self._assert_writer_thread()
+        self._validate_command_key(observation_id)
+        if kind not in _OBSERVATION_KINDS:
+            raise ValueError("unsupported domain observation")
+        if kind in {"accepted", "waiting"} and (type(reference) is not str or not reference.strip()):
+            raise OperationConflict("acceptance and waiting require a matching durable reference")
+        with self._gate, self._transaction():
+            op = self.operation(operation_id)
+            if type(fence) is not int or op.fence != fence or op.attempts == 0:
+                raise OperationConflict("stale or missing delivery fence")
+            if op.retry_proof is not None:
+                raise OperationConflict("reconciled fence cannot publish a late callback")
+            duplicate = self._connection.execute(
+                "SELECT operation_id, fence, kind, reference FROM operation_observations WHERE observation_id = ?",
+                (observation_id,),
+            ).fetchone()
+            if duplicate is not None:
+                if tuple(duplicate) != (operation_id, fence, kind, reference):
+                    raise OperationConflict("observation identity is bound to different evidence")
+                return op
+            if op.status in {"terminal", "rejected"} or (
+                op.status in {"accepted", "running", "waiting"} and kind == "rejected"
+            ):
+                raise OperationConflict("domain outcome cannot regress")
+            if kind in {"running", "waiting", "terminal"} and op.accepted_reference is None:
+                raise OperationConflict("execution observation requires domain acceptance")
+            if kind in {"running", "waiting", "terminal"} and reference != op.accepted_reference:
+                raise OperationConflict("execution reference differs from accepted domain receipt")
+            if kind == "accepted" and op.accepted_reference not in (None, reference):
+                raise OperationConflict("conflicting domain acceptance")
+            if kind == "accepted" and op.status in {"running", "waiting"}:
+                raise OperationConflict("domain progress cannot regress to acceptance")
+            if kind in {"running", "waiting"} and op.status == "unknown":
+                raise OperationConflict("unknown delivery must be reconciled")
+            next_status = (
+                kind if kind != "unknown" or op.status not in {"accepted", "running", "waiting"} else op.status
+            )
+            self._connection.execute(
+                "INSERT INTO operation_observations (observation_id, operation_id, fence, kind, reference) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (observation_id, operation_id, fence, kind, reference),
+            )
+            self._connection.execute(
+                "UPDATE operations SET status = ?, accepted_reference = COALESCE(accepted_reference, ?) "
+                "WHERE operation_id = ?",
+                (next_status, reference if kind == "accepted" else None, operation_id),
+            )
+        return self.operation(operation_id)
+
+    def reconcile(
+        self,
+        operation_id: str,
+        fence: int,
+        outcome: str,
+        *,
+        now: int,
+        evidence: str,
+        reference: str | None = None,
+        matched_digest: str | None = None,
+        authoritative_absence: bool = False,
+    ) -> OperationRecord:
+        """Persist synthetic lookup evidence; only authoritative absence or same-key guarantee permits retry."""
+        self._assert_writer_thread()
+        if outcome not in {"absent", "idempotent", "found", "unknown"}:
+            raise ValueError("unsupported reconciliation outcome")
+        if type(now) is not int:
+            raise ValueError("reconciliation time must be an integer")
+        if type(evidence) is not str or not evidence.strip():
+            raise OperationConflict("reconciliation requires durable lookup evidence")
+        with self._gate, self._transaction():
+            op = self.operation(operation_id)
+            if op.fence != fence or not op.attempts or op.status not in {"dispatched", "unknown"}:
+                raise OperationConflict("stale fence or finalized operation")
+            if op.lease_until is not None and op.lease_until > now:
+                raise OperationConflict("delivery lease is still held")
+            if outcome in {"found", "idempotent"} and matched_digest != op.request_digest:
+                raise OperationConflict("remote effect or idempotency guarantee does not match original request")
+            if outcome == "absent" and authoritative_absence is not True:
+                raise OperationConflict("retry requires authoritative absence, not an incomplete lookup")
+            if outcome == "found" and (not reference or op.accepted_reference not in (None, reference)):
+                raise OperationConflict("found effect requires matching domain reference")
+            if outcome in {"absent", "idempotent"} and op.accepted_reference is not None:
+                raise OperationConflict("accepted effect cannot be retried")
+            status = "accepted" if outcome == "found" else "unknown"
+            self._connection.execute(
+                "INSERT INTO operation_reconciliations "
+                "(operation_id, fence, outcome, reference, evidence, matched_digest, authoritative_absence) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (operation_id, fence, outcome, reference, evidence, matched_digest, int(authoritative_absence)),
+            )
+            self._connection.execute(
+                "UPDATE operations SET status = ?, accepted_reference = COALESCE(accepted_reference, ?), "
+                "retry_proof = ?, lease_until = NULL WHERE operation_id = ?",
+                (
+                    status,
+                    reference if outcome == "found" else None,
+                    outcome if outcome in {"absent", "idempotent"} else None,
+                    operation_id,
+                ),
+            )
+        return self.operation(operation_id)
+
+    def finalize_artifact(self, operation_id: str, name: str, data: bytes) -> str:
+        """Flush bytes to a content address before publishing an immutable DB reference."""
+        self._assert_writer_thread()
+        self.operation(operation_id)
+        self._validate_command_key(name)
+        if type(data) is not bytes:
+            raise TypeError("artifact must be bytes")
+        digest = hashlib.sha256(data).hexdigest()
+        with self._gate:
+            directory = self._artifact_directory
+            if not directory.exists():
+                directory.mkdir(mode=0o700)
+                _fsync_directory(directory.parent)
+            if directory.is_symlink() or not directory.is_dir():
+                raise CorruptHistory("artifact directory must be a real directory")
+            _inspect_local_storage(directory)
+            blob = directory / digest
+            if blob.exists():
+                self._verify_blob(blob, digest, len(data))
+            else:
+                descriptor, temporary = tempfile.mkstemp(prefix=".artifact-", dir=directory)
+                try:
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(data)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    if blob.exists():
+                        self._verify_blob(blob, digest, len(data))
+                    else:
+                        os.replace(temporary, blob)
+                        _fsync_directory(directory)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            with self._transaction():
+                existing = self._connection.execute(
+                    "SELECT digest, size FROM artifact_references WHERE operation_id = ? AND name = ?",
+                    (operation_id, name),
+                ).fetchone()
+                if existing is not None:
+                    if (existing["digest"], existing["size"]) != (digest, len(data)):
+                        raise OperationConflict("artifact reference is immutable")
+                else:
+                    self._connection.execute(
+                        "INSERT INTO artifact_references VALUES (?, ?, ?, ?)",
+                        (operation_id, name, digest, len(data)),
+                    )
+        return f"sha256:{digest}"
+
+    def artifact(self, operation_id: str, name: str) -> bytes:
+        self._assert_writer_thread()
+        with self._gate:
+            row = self._connection.execute(
+                "SELECT digest, size FROM artifact_references WHERE operation_id = ? AND name = ?",
+                (operation_id, name),
+            ).fetchone()
+            if row is None:
+                raise OperationConflict("unknown artifact reference")
+            blob = self._artifact_directory / cast(str, row["digest"])
+            self._verify_blob(blob, cast(str, row["digest"]), cast(int, row["size"]))
+            return blob.read_bytes()
+
+    @staticmethod
+    def _verify_blob(blob: Path, digest: str, size: int) -> None:
+        if blob.is_symlink() or not blob.is_file() or blob.stat().st_nlink != 1 or blob.stat().st_size != size:
+            raise CorruptHistory("artifact blob is missing or invalid")
+        with blob.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
+                raise CorruptHistory("artifact digest mismatch")
+
+    def _validate_operation_records(self) -> None:
+        for row in self._connection.execute(
+            "SELECT operation_id, request_json, request_digest, fence, status, accepted_reference, retry_proof "
+            "FROM operations"
+        ):
+            raw = cast(str, row["request_json"])
+            try:
+                value = json.loads(raw)
+                if set(value) != {"version", "request"} or value["version"] != 1 or type(value["request"]) is not dict:
+                    raise ValueError("invalid versioned request")
+                if canonical_json(value) != raw or hashlib.sha256(raw.encode()).hexdigest() != row["request_digest"]:
+                    raise ValueError("request digest mismatch")
+            except (ValueError, TypeError) as error:
+                raise CorruptHistory("operation request is not canonical or digest-valid") from error
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM operation_outbox WHERE operation_id = ?", (row["operation_id"],)
+                ).fetchone()
+                is None
+            ):
+                raise CorruptHistory("operation is missing its outbox entry")
+            attempts = self._connection.execute(
+                "SELECT COUNT(*), MAX(fence) FROM delivery_attempts WHERE operation_id = ?", (row["operation_id"],)
+            ).fetchone()
+            if row["fence"] != attempts[0] or (attempts[0] and row["fence"] != attempts[1]):
+                raise CorruptHistory("operation fence differs from durable delivery attempts")
+            status = row["status"]
+            if (status == "intent") != (attempts[0] == 0):
+                raise CorruptHistory("operation intent and attempts disagree")
+            accepted = self._connection.execute(
+                "SELECT 1 FROM operation_observations WHERE operation_id = ? AND kind = 'accepted' "
+                "AND reference = ? UNION SELECT 1 FROM operation_reconciliations WHERE operation_id = ? "
+                "AND outcome = 'found' AND reference = ?",
+                (row["operation_id"], row["accepted_reference"], row["operation_id"], row["accepted_reference"]),
+            ).fetchone()
+            if (row["accepted_reference"] is not None) != (accepted is not None):
+                raise CorruptHistory("domain acceptance has no matching durable receipt")
+            if status in {"accepted", "running", "waiting", "terminal"} and accepted is None:
+                raise CorruptHistory("operation advanced without domain acceptance")
+            if status in {"rejected", "running", "waiting", "terminal"}:
+                receipt = self._connection.execute(
+                    "SELECT 1 FROM operation_observations WHERE operation_id = ? AND kind = ?",
+                    (row["operation_id"], status),
+                ).fetchone()
+                if receipt is None:
+                    raise CorruptHistory("operation status has no matching durable observation")
+            if row["retry_proof"] is not None:
+                proof = self._connection.execute(
+                    "SELECT 1 FROM operation_reconciliations WHERE operation_id = ? AND fence = ? AND outcome = ?",
+                    (row["operation_id"], row["fence"], row["retry_proof"]),
+                ).fetchone()
+                if proof is None:
+                    raise CorruptHistory("retry proof has no matching reconciliation")
+        for row in self._connection.execute("SELECT digest, size FROM artifact_references"):
+            self._verify_blob(
+                self._artifact_directory / cast(str, row["digest"]), cast(str, row["digest"]), cast(int, row["size"])
+            )
+
+    @staticmethod
+    def _verify_backup_manifest(directory: Path) -> None:
+        try:
+            manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+            if manifest["format"] != "creatidy-kernel-sqlite-backup" or manifest["schema_version"] not in (1, 2):
+                raise ValueError("unsupported backup manifest")
+            with (directory / "kernel.sqlite3").open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != manifest["database_sha256"]:
+                    raise ValueError("backup database digest mismatch")
+            entries = cast(list[dict[str, object]], manifest["artifacts"]) if manifest["schema_version"] == 2 else []
+            for entry in entries:
+                digest, size = entry["digest"], entry["size"]
+                if type(digest) is not str or len(digest) != 64 or type(size) is not int:
+                    raise ValueError("invalid artifact manifest entry")
+                SQLiteProgramStore._verify_blob(directory / "kernel.sqlite3.artifacts" / digest, digest, size)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise CorruptHistory("backup bundle manifest verification failed") from error
+
+    @classmethod
+    def restore_backup(cls, bundle: BackupBundle, target: str | Path) -> Path:
+        """Restore only a verified Kernel bundle into a new, offline database path."""
+        if type(bundle) is not BackupBundle:
+            raise TypeError("restore requires a Kernel BackupBundle")
+        cls._verify_backup_manifest(bundle.directory)
+        destination = Path(target).expanduser().resolve(strict=False)
+        artifacts = destination.parent / f"{destination.name}.artifacts"
+        if destination.exists() or artifacts.exists() or not destination.parent.is_dir():
+            raise ValueError("restore requires a new database path and artifact directory")
+        _inspect_local_storage(destination.parent)
+        manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+        entries = manifest.get("artifacts", [])
+        if entries:
+            artifacts.mkdir(mode=0o700)
+            for entry in entries:
+                source = bundle.directory / "kernel.sqlite3.artifacts" / entry["digest"]
+                blob = artifacts / entry["digest"]
+                shutil.copyfile(source, blob)
+                _fsync_file(blob)
+                cls._verify_blob(blob, entry["digest"], entry["size"])
+            _fsync_directory(artifacts)
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as stream, bundle.database.open("rb") as source:
+                shutil.copyfileobj(source, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            with open(temporary, "rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != manifest["database_sha256"]:
+                    raise CorruptHistory("restored SQLite image differs from verified backup")
+            os.replace(temporary, destination)
+            _fsync_directory(destination.parent)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return destination
 
     def export_history(self, program_id: str) -> str:
         """Export all versioned command envelopes and resulting K1 fact snapshots."""
@@ -528,6 +1015,23 @@ class SQLiteProgramStore:
                 _fsync_file(database)
                 with database.open("rb") as stream:
                     file_digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                artifacts = [
+                    (cast(str, row["digest"]), cast(int, row["size"]))
+                    for row in self._connection.execute(
+                        "SELECT DISTINCT digest, size FROM artifact_references ORDER BY digest"
+                    )
+                ]
+                if artifacts:
+                    artifact_target = temporary / "kernel.sqlite3.artifacts"
+                    artifact_target.mkdir()
+                    for digest, size in artifacts:
+                        source = self._artifact_directory / digest
+                        self._verify_blob(source, digest, size)
+                        destination_blob = artifact_target / digest
+                        shutil.copyfile(source, destination_blob)
+                        _fsync_file(destination_blob)
+                        self._verify_blob(destination_blob, digest, size)
+                    _fsync_directory(artifact_target)
                 manifest_value = {
                     "format": "creatidy-kernel-sqlite-backup",
                     "manifest_version": 1,
@@ -535,6 +1039,7 @@ class SQLiteProgramStore:
                     "sqlite_runtime_version": sqlite3.sqlite_version,
                     "history_record_count": record_count,
                     "database_sha256": file_digest,
+                    "artifacts": [{"digest": digest, "size": size} for digest, size in artifacts],
                     "controller_topology": self._startup_evidence.controller_topology,
                     "cache_mode": self._startup_evidence.cache_mode,
                     "source_data_directory": str(self._storage.data_directory),
@@ -561,7 +1066,12 @@ class SQLiteProgramStore:
             except BaseException:
                 if temporary.exists():
                     for child in temporary.iterdir():
-                        child.unlink()
+                        if child.is_dir():
+                            for blob in child.iterdir():
+                                blob.unlink()
+                            child.rmdir()
+                        else:
+                            child.unlink()
                     temporary.rmdir()
                 raise
         return BackupBundle(
@@ -652,6 +1162,9 @@ class SQLiteProgramStore:
             if version == 0:
                 self._migrate_0_to_1()
                 version = 1
+            if version == 1:
+                self._migrate_1_to_2()
+                version = 2
             if version != SCHEMA_VERSION:
                 raise UnsupportedSQLiteConfiguration(f"no migration path from schema version {version}")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -739,19 +1252,140 @@ class SQLiteProgramStore:
         for statement in statements:
             self._connection.execute(statement)
 
+    def _migrate_1_to_2(self) -> None:
+        statements = (
+            """CREATE TABLE operations (
+                operation_id TEXT PRIMARY KEY, effect_key TEXT NOT NULL UNIQUE,
+                request_json TEXT NOT NULL, request_digest TEXT NOT NULL CHECK(length(request_digest) = 64),
+                fence INTEGER NOT NULL DEFAULT 0 CHECK(fence >= 0), lease_until INTEGER,
+                status TEXT NOT NULL DEFAULT 'intent' CHECK(status IN
+                    ('intent','dispatched','accepted','rejected','running','waiting','terminal','unknown')),
+                accepted_reference TEXT, retry_proof TEXT CHECK(retry_proof IN ('absent','idempotent'))
+            ) WITHOUT ROWID""",
+            """CREATE TABLE operation_outbox (
+                operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id)
+            ) WITHOUT ROWID""",
+            """CREATE TABLE delivery_attempts (
+                operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+                fence INTEGER NOT NULL CHECK(fence > 0), claimed_at INTEGER NOT NULL,
+                lease_until INTEGER NOT NULL, PRIMARY KEY(operation_id, fence)
+            ) WITHOUT ROWID""",
+            """CREATE TABLE operation_observations (
+                observation_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL,
+                fence INTEGER NOT NULL, kind TEXT NOT NULL CHECK(kind IN
+                    ('accepted','rejected','running','waiting','terminal','unknown')),
+                reference TEXT, FOREIGN KEY(operation_id, fence) REFERENCES delivery_attempts(operation_id, fence)
+            ) WITHOUT ROWID""",
+            """CREATE TABLE operation_transports (
+                operation_id TEXT NOT NULL, fence INTEGER NOT NULL,
+                succeeded INTEGER NOT NULL CHECK(succeeded IN (0,1)), PRIMARY KEY(operation_id, fence),
+                FOREIGN KEY(operation_id, fence) REFERENCES delivery_attempts(operation_id, fence)
+            ) WITHOUT ROWID""",
+            """CREATE TABLE operation_reconciliations (
+                sequence INTEGER PRIMARY KEY,
+                operation_id TEXT NOT NULL, fence INTEGER NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN ('absent','idempotent','found','unknown')),
+                reference TEXT, evidence TEXT NOT NULL CHECK(length(evidence) > 0), matched_digest TEXT,
+                authoritative_absence INTEGER NOT NULL CHECK(authoritative_absence IN (0,1)),
+                FOREIGN KEY(operation_id, fence) REFERENCES delivery_attempts(operation_id, fence)
+            )""",
+            """CREATE TABLE artifact_references (
+                operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+                name TEXT NOT NULL, digest TEXT NOT NULL CHECK(length(digest) = 64),
+                size INTEGER NOT NULL CHECK(size >= 0), PRIMARY KEY(operation_id, name)
+            ) WITHOUT ROWID""",
+            """CREATE TRIGGER operations_no_delete BEFORE DELETE ON operations
+                BEGIN SELECT RAISE(ABORT, 'operations cannot be deleted'); END""",
+            """CREATE TRIGGER outbox_no_update BEFORE UPDATE ON operation_outbox
+                BEGIN SELECT RAISE(ABORT, 'outbox is immutable'); END""",
+            """CREATE TRIGGER outbox_no_delete BEFORE DELETE ON operation_outbox
+                BEGIN SELECT RAISE(ABORT, 'outbox is immutable'); END""",
+        )
+        for statement in statements:
+            self._connection.execute(statement)
+        for table in (
+            "delivery_attempts",
+            "operation_observations",
+            "operation_transports",
+            "operation_reconciliations",
+            "artifact_references",
+        ):
+            for action in ("UPDATE", "DELETE"):
+                self._connection.execute(
+                    f"CREATE TRIGGER {table}_no_{action.lower()} BEFORE {action} ON {table} "
+                    f"BEGIN SELECT RAISE(ABORT, '{table} is immutable'); END"
+                )
+
     def _validate_schema(self) -> None:
         tables = {
             cast(str, row[0])
             for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
         }
-        required = {"history", "command_admissions", "program_projection", "work_unit_projection", "attempt_projection"}
+        required = {
+            "history",
+            "command_admissions",
+            "program_projection",
+            "work_unit_projection",
+            "attempt_projection",
+            "operations",
+            "operation_outbox",
+            "delivery_attempts",
+            "operation_observations",
+            "operation_transports",
+            "operation_reconciliations",
+            "artifact_references",
+        }
         if not required <= tables:
             raise UnsupportedSQLiteConfiguration("database schema is missing required K2 tables")
+        columns = {
+            "operations": {
+                "operation_id",
+                "effect_key",
+                "request_json",
+                "request_digest",
+                "fence",
+                "lease_until",
+                "status",
+                "accepted_reference",
+                "retry_proof",
+            },
+            "operation_outbox": {"operation_id"},
+            "delivery_attempts": {"operation_id", "fence", "claimed_at", "lease_until"},
+            "operation_observations": {"observation_id", "operation_id", "fence", "kind", "reference"},
+            "operation_transports": {"operation_id", "fence", "succeeded"},
+            "operation_reconciliations": {
+                "sequence",
+                "operation_id",
+                "fence",
+                "outcome",
+                "reference",
+                "evidence",
+                "matched_digest",
+                "authoritative_absence",
+            },
+            "artifact_references": {"operation_id", "name", "digest", "size"},
+        }
+        for table, expected in columns.items():
+            actual = {cast(str, row["name"]) for row in self._connection.execute(f"PRAGMA table_info({table})")}
+            if actual != expected:
+                raise UnsupportedSQLiteConfiguration(f"database schema has invalid {table} columns")
         triggers = {
             cast(str, row[0])
             for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'").fetchall()
         }
         required_triggers = {"history_no_update", "history_no_delete", "admissions_no_update", "admissions_no_delete"}
+        required_triggers |= {"operations_no_delete", "outbox_no_update", "outbox_no_delete"}
+        required_triggers |= {
+            f"{table}_no_{action}"
+            for table in (
+                "delivery_attempts",
+                "operation_observations",
+                "operation_transports",
+                "operation_reconciliations",
+                "artifact_references",
+            )
+            for action in ("update", "delete")
+        }
         if not required_triggers <= triggers:
             raise UnsupportedSQLiteConfiguration("database schema is missing append-only history constraints")
         if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:

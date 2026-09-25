@@ -446,11 +446,11 @@ def test_schema_zero_migrates_and_startup_evidence_reports_runtime_capabilities(
         assert evidence.synchronous == 2
         assert evidence.foreign_keys
         assert evidence.busy_timeout_ms == 1234
-        assert evidence.schema_version == 1
+        assert evidence.schema_version == 2
         assert "locking_mode=EXCLUSIVE" in evidence.controller_topology
         assert evidence.writer_process_id == os.getpid()
         assert not Path(f"{path}.writer.lock").exists()
-        assert _connection(store).execute("PRAGMA user_version").fetchone()[0] == 1
+        assert _connection(store).execute("PRAGMA user_version").fetchone()[0] == 2
         with pytest.raises(ConcurrentWriter):
             SQLiteProgramStore(path, busy_timeout_ms=25)
 
@@ -698,13 +698,13 @@ def test_online_backup_bundle_preserves_history_and_has_a_verifiable_manifest(sq
         expected = _complete_and_cancel(store)
         history = store.history("program-1")
         exported = json.loads(store.export_history("program-1"))
-        assert exported["schema_version"] == 1
+        assert exported["schema_version"] == 2
         assert len(exported["records"]) == len(history)
         bundle = store.backup(sqlite_tmp_path / "backup")
 
     manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
     assert manifest["format"] == "creatidy-kernel-sqlite-backup"
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == 2
     assert manifest["history_record_count"] == len(history)
     assert manifest["source_filesystem_type"]
     assert manifest["database_sha256"] == hashlib.sha256(bundle.database.read_bytes()).hexdigest()
