@@ -6,9 +6,26 @@ Creatidy Kernel is the foundation of a local-first, provider-neutral control pla
 software engineering. It is for individual developers and small teams with limited AI budgets,
 premium-model quota and human attention.
 
-**Status: A0 architecture and boundary proof, not a working autonomous Program engine.** The code
-currently demonstrates a replaceable resource allocator and tested package boundaries. It does not
-run agents, contact providers, execute Programs or modify your repositories.
+**Status: deterministic K1 domain and K2A durable persistence, not an autonomous Program engine.**
+The code includes immutable Program intent, legal domain commands, single-controller SQLite history
+and rebuildable projections, plus a replaceable resource allocator. It does not run agents, schedule
+or autonomously execute Programs, contact providers, perform external effects or modify your
+repositories.
+
+The SQLite adapter accepts databases only in an existing data directory validated as one supported
+native local Linux filesystem mount. The database and its WAL/SHM/journal siblings must share that
+mount; file-only mounts, split sidecars, OverlayFS, tmpfs, ramfs, checkpoint-disabled F2FS, and
+network filesystems are rejected. It uses one SQLite connection explicitly opened with
+`cache=private` and `locking_mode=EXCLUSIVE`, retained for the store's lifetime. Startup reports the
+directory/mount identity, SQLite runtime, and required pragma checks. The adapter does not impose a
+blanket SQLite version minimum.
+
+Only the creating process and thread may use or close the store. After `fork()`, a child must not
+use or finalize the inherited SQLite connection; it must remain inert and then `exec` or `_exit`.
+When the controller process exits, SQLite releases its process-owned lock so a fresh controller can
+recover the database even while an inert child still holds inherited descriptors.
+The host must not remount, replace or move the data directory while the store is open; close the
+store before changing its storage topology.
 
 ## Why A Kernel?
 
@@ -51,6 +68,11 @@ The example prints a configured allocation; it makes no model call or reservatio
 Forgejo server, Scarcity Router, Prefect, M5-B or private Creatidy infrastructure. Dependency setup
 needs access to the configured package index unless already cached; the tests and example run offline.
 On systems without Make, the individual commands are listed in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+SQLite persistence tests require a verified native local Linux filesystem. They use pytest's temporary
+directory by default; if it is on a rejected filesystem, set `CREATIDY_TEST_STORAGE_DIR` to a
+directory on a supported native mount. CI selects a dedicated directory under the checkout; the
+adapter verifies its topology before opening SQLite.
 
 ## Architecture Decisions
 

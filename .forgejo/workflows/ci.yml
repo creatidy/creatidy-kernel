@@ -32,7 +32,13 @@ jobs:
           enable-cache: false
       - name: Install locked tooling
         run: uv sync --locked
+      - name: Prepare SQLite integration-test directory
+        env:
+          CREATIDY_TEST_STORAGE_DIR: ${{ github.workspace }}/.ci-sqlite-storage
+        run: mkdir -p "$CREATIDY_TEST_STORAGE_DIR"
       - name: Repository gate
+        env:
+          CREATIDY_TEST_STORAGE_DIR: ${{ github.workspace }}/.ci-sqlite-storage
         run: make check
       - name: Built-package gate
         run: make package-check

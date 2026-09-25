@@ -8,8 +8,9 @@ Acceptance below is required future evidence, not a list of tests already implem
 
 ```mermaid
 flowchart LR
-    K1[K1 Domain and immutable intent] --> K2[K2 SQLite history and operations]
-    K2 --> K3[K3 Isolated fake execution and authority]
+    K1[K1 Domain and immutable intent] --> K2A[K2A SQLite history and projections]
+    K2A --> K2B[K2B External operations and delivery recovery]
+    K2B --> K3[K3 Isolated fake execution and authority]
     K3 --> K4[K4 Verification and bounded remediation]
     K4 --> K5[K5 Forgejo adapter]
     K4 --> K6[K6 Existing harness adapter]
@@ -21,7 +22,8 @@ flowchart LR
 | Node | Owner and bounded delivery | Acceptance / stop condition |
 | --- | --- | --- |
 | K1 | Kernel: ProgramSpec, WorkUnit graph, immutable Attempt inputs, legal domain commands and policy/authority values | Reject cycles, missing inputs, out-of-envelope actions and stale revisions. Pure transition tests; no engine/framework dependency. Explicit spec amendment semantics. |
-| K2 | Kernel: SQLite adapter, history/projections, idempotent command admission, outbox/Operation records, leases/fences, backup/export seam | Fault injection around every commit/send/receipt boundary; reopen and reconstruct without replaying effects; same-key/different-input rejected; real WAL configuration/version verified. No network inside transactions. |
+| K2A (#5) | Kernel: SQLite adapter for final K1 facts, explicit versioned records/codecs, append-only history, rebuildable projections, command admission, migration and backup/export | Round-trip all K1 facts; rebuild without current-command replay; same-key/same-input returns the recorded result and changed input fails closed; atomic history/dedupe/projection writes; reopen, migration, backup and runtime/topology evidence. No Operations/outbox or external effects. |
+| K2B (#13) | Kernel: external Operation/outbox records, delivery attempts, leases/fences and reconciliation handoff | Fault injection around commit/send/receipt boundaries; restart preserves uncertainty without duplicate effects; no network inside transactions. |
 | K3 | Kernel: fake Runtime plus Workspace/authority enforcement using an existing sandbox implementation | Isolated worker cannot read control state or owner credentials, mint grants or change gate policy. Exact operation/Attempt recovery, cancel races and stale workers tested. No custom sandbox or live paid inference. |
 | K4 | Kernel: Candidate/Evidence/AcceptedResult, independent verification, findings/convergence and local outcome observations | Exact subjects, fresh reviewer context and identity, no form-only acceptance; synthetic two-WorkUnit flow covers A-F before live adapters. Finite time/resource budgets, pause versus HumanGate separation, unknown usage preserved. |
 | K5 | Kernel: minimal Forgejo adapter for repository/change/check observations and authorized branch/push/PR effects | Shared fake/Forgejo contract suite with synthetic local forge; explicit domain receipts, pagination/absence semantics, duplicate/uncertain operation handling. No automatic merge in this slice. |
