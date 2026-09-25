@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -146,13 +148,14 @@ class BackupBundle:
 @dataclass(frozen=True, slots=True)
 class _MountEntry:
     mount_id: int
-    device: str
-    root: str
-    mountpoint: Path
-    mount_options: frozenset[str]
+    parent_id: int
+    device: bytes
+    root: bytes
+    mountpoint: bytes
+    mount_options: frozenset[bytes]
     filesystem_type: str
-    source: str
-    super_options: frozenset[str]
+    source: bytes
+    super_options: frozenset[bytes]
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +203,10 @@ class SQLiteProgramStore:
             try:
                 self._configure_runtime()
                 self._acquire_exclusive_ownership()
+                self._assert_storage_topology_unchanged()
                 self._enable_wal()
+                self._assert_storage_topology_unchanged()
+                self._set_application_id()
             except sqlite3.OperationalError as error:
                 if _is_sqlite_lock_contention(error):
                     raise ConcurrentWriter("another controller owns SQLite EXCLUSIVE locking mode") from error
@@ -514,6 +520,9 @@ class SQLiteProgramStore:
                     schema_version = cast(int, backup_connection.execute("PRAGMA user_version").fetchone()[0])
                 finally:
                     backup_connection.close()
+                backup_storage = _inspect_local_storage(temporary, database_path=database)
+                if backup_storage.mount_id != destination_storage.mount_id:
+                    raise UnsupportedSQLiteConfiguration("backup database or sidecars changed storage mounts")
                 _fsync_file(database)
                 with database.open("rb") as stream:
                     file_digest = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -544,6 +553,9 @@ class SQLiteProgramStore:
                 _fsync_directory(temporary)
                 os.replace(temporary, target)
                 _fsync_directory(target.parent)
+                published_storage = _inspect_local_storage(target, database_path=target / "kernel.sqlite3")
+                if published_storage.mount_id != destination_storage.mount_id:
+                    raise UnsupportedSQLiteConfiguration("published backup changed storage mounts")
             except BaseException:
                 if temporary.exists():
                     for child in temporary.iterdir():
@@ -581,9 +593,6 @@ class SQLiteProgramStore:
             application_id = cast(int, connection.execute("PRAGMA application_id").fetchone()[0])
             if application_id not in (0, _APPLICATION_ID):
                 raise UnsupportedSQLiteConfiguration("database application_id belongs to another application")
-            if application_id == 0:
-                connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
-                application_id = _APPLICATION_ID
             quick_check = connection.execute("PRAGMA quick_check(1)").fetchone()
             if quick_check is None or quick_check[0] != "ok":
                 raise CorruptHistory("SQLite quick_check failed")
@@ -595,6 +604,22 @@ class SQLiteProgramStore:
                 connection.execute("ROLLBACK")
             raise
         self._application_id = application_id
+
+    def _assert_storage_topology_unchanged(self) -> None:
+        current = _inspect_local_storage(self._path.parent, database_path=self._path)
+        if current != self._storage:
+            raise UnsupportedSQLiteConfiguration("SQLite storage topology changed during initialization")
+
+    def _set_application_id(self) -> None:
+        if self._application_id == _APPLICATION_ID:
+            return
+        with self._transaction():
+            application_id = cast(int, self._connection.execute("PRAGMA application_id").fetchone()[0])
+            if application_id not in (0, _APPLICATION_ID):
+                raise UnsupportedSQLiteConfiguration("database application_id changed during initialization")
+            if application_id == 0:
+                self._connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
+        self._application_id = _APPLICATION_ID
 
     def _enable_wal(self) -> None:
         connection = self._connection
@@ -932,125 +957,195 @@ def _is_sqlite_lock_contention(error: sqlite3.OperationalError) -> bool:
     return type(code) is int and (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
 
 
-def _decode_mountinfo_field(value: str) -> str:
-    for escaped, decoded in ((r"\040", " "), (r"\011", "\t"), (r"\012", "\n"), (r"\134", "\\")):
-        value = value.replace(escaped, decoded)
-    return value
+def _unescape_mountinfo_path(value: bytes) -> bytes:
+    escaped_values = {0o040, 0o011, 0o012, 0o134}
+    output = bytearray()
+    offset = 0
+    while offset < len(value):
+        if value[offset] == 0x5C and offset + 3 < len(value):
+            octal = value[offset + 1 : offset + 4]
+            if all(0x30 <= digit <= 0x37 for digit in octal):
+                decoded = int(octal, 8)
+                if decoded in escaped_values:
+                    output.append(decoded)
+                    offset += 4
+                    continue
+        output.append(value[offset])
+        offset += 1
+    return bytes(output)
 
 
-def _parse_mountinfo(contents: str) -> tuple[_MountEntry, ...]:
-    entries: list[_MountEntry] = []
-    for line in contents.splitlines():
-        before, separator, after = line.partition(" - ")
+def _parse_mountinfo(contents: bytes) -> dict[int, _MountEntry]:
+    entries: dict[int, _MountEntry] = {}
+    for record in contents.split(b"\n"):
+        if not record:
+            continue
+        before, separator, after = record.partition(b" - ")
         if not separator:
             raise UnsupportedSQLiteConfiguration("mount table contains an invalid record")
-        mount_fields = before.split()
-        filesystem_fields = after.split(maxsplit=2)
-        if len(mount_fields) < 6 or len(filesystem_fields) != 3:
+        mount_fields = [field for field in before.split(b" ") if field]
+        filesystem_fields = [field for field in after.split(b" ") if field]
+        if len(mount_fields) < 6 or len(filesystem_fields) < 3:
             raise UnsupportedSQLiteConfiguration("mount table record is incomplete")
         try:
             mount_id = int(mount_fields[0])
-            int(mount_fields[1])
-        except ValueError as error:
-            raise UnsupportedSQLiteConfiguration("mount table contains an invalid mount ID") from error
-        entries.append(
-            _MountEntry(
-                mount_id=mount_id,
-                device=mount_fields[2],
-                root=_decode_mountinfo_field(mount_fields[3]),
-                mountpoint=Path(_decode_mountinfo_field(mount_fields[4])),
-                mount_options=frozenset(mount_fields[5].split(",")),
-                filesystem_type=filesystem_fields[0].lower(),
-                source=_decode_mountinfo_field(filesystem_fields[1]),
-                super_options=frozenset(_decode_mountinfo_field(filesystem_fields[2]).split(",")),
-            )
+            parent_id = int(mount_fields[1])
+            filesystem_type = filesystem_fields[0].decode("ascii").lower()
+        except (ValueError, UnicodeDecodeError) as error:
+            raise UnsupportedSQLiteConfiguration("mount table has an invalid ID or filesystem type") from error
+        if mount_id in entries:
+            raise UnsupportedSQLiteConfiguration("mount table contains a duplicate mount ID")
+        entries[mount_id] = _MountEntry(
+            mount_id=mount_id,
+            parent_id=parent_id,
+            device=mount_fields[2],
+            root=mount_fields[3],
+            mountpoint=mount_fields[4],
+            mount_options=frozenset(mount_fields[5].split(b",")),
+            filesystem_type=filesystem_type,
+            source=filesystem_fields[1],
+            super_options=frozenset(filesystem_fields[2].split(b",")),
         )
     if not entries:
         raise UnsupportedSQLiteConfiguration("mount table is empty")
-    return tuple(entries)
-
-
-def _mount_for_path(path: Path, mounts: tuple[_MountEntry, ...]) -> _MountEntry:
-    target = path.resolve(strict=False)
-    matches: list[tuple[int, int, _MountEntry]] = []
-    for index, mount in enumerate(mounts):
-        mountpoint = mount.mountpoint.resolve(strict=False)
-        if target == mountpoint or mountpoint in target.parents:
-            matches.append((len(mountpoint.parts), index, mount))
-    if not matches:
-        raise UnsupportedSQLiteConfiguration(f"cannot identify the mount containing {target}")
-    return max(matches, key=lambda item: (item[0], item[1]))[2]
+    return entries
 
 
 def _require_durable_mount(mount: _MountEntry) -> None:
     if mount.filesystem_type not in _LOCAL_FILESYSTEMS:
         raise UnsupportedSQLiteConfiguration(
-            f"SQLite WAL requires a verified native local filesystem; found {mount.filesystem_type!r} "
-            f"at {mount.mountpoint}"
+            f"SQLite WAL requires a verified native local filesystem; found {mount.filesystem_type!r}"
         )
-    if "ro" in mount.mount_options or "rw" not in mount.mount_options:
-        raise UnsupportedSQLiteConfiguration(
-            f"SQLite data directory mount is not verified writable: {mount.mountpoint}"
-        )
+    if b"ro" in mount.mount_options or b"rw" not in mount.mount_options:
+        raise UnsupportedSQLiteConfiguration("SQLite data directory mount is not verified writable")
     options = mount.mount_options | mount.super_options
-    if "volatile" in options or "fsync=volatile" in options:
-        raise UnsupportedSQLiteConfiguration(f"volatile filesystem mode is unsupported: {mount.mountpoint}")
+    if b"volatile" in options or b"fsync=volatile" in options:
+        raise UnsupportedSQLiteConfiguration("volatile filesystem mode is unsupported")
+
+
+def _topology_from_mount_ids(
+    data_directory: Path,
+    *,
+    directory_mount_id: int,
+    child_mount_ids: dict[str, int],
+    mounts: dict[int, _MountEntry],
+) -> _StorageTopology:
+    directory_mount = mounts.get(directory_mount_id)
+    if directory_mount is None:
+        raise UnsupportedSQLiteConfiguration("data directory mount ID is absent from mountinfo")
+    _require_durable_mount(directory_mount)
+    for label, mount_id in child_mount_ids.items():
+        mount = mounts.get(mount_id)
+        if mount is None:
+            raise UnsupportedSQLiteConfiguration(f"SQLite {label} mount ID is absent from mountinfo")
+        _require_durable_mount(mount)
+        if mount_id != directory_mount_id:
+            raise UnsupportedSQLiteConfiguration(f"SQLite {label} is on a different mount from its data directory")
+    return _StorageTopology(
+        data_directory=data_directory,
+        filesystem_type=directory_mount.filesystem_type,
+        mountpoint=Path(os.fsdecode(_unescape_mountinfo_path(directory_mount.mountpoint))),
+        mount_id=directory_mount.mount_id,
+        mount_options=tuple(os.fsdecode(option) for option in sorted(directory_mount.mount_options)),
+        super_options=tuple(os.fsdecode(option) for option in sorted(directory_mount.super_options)),
+    )
+
+
+def _fd_mount_id(descriptor: int) -> int:
+    try:
+        contents = Path(f"/proc/self/fdinfo/{descriptor}").read_bytes()
+    except OSError as error:
+        raise UnsupportedSQLiteConfiguration("cannot inspect descriptor mount identity") from error
+    for line in contents.split(b"\n"):
+        key, separator, value = line.partition(b":")
+        if key == b"mnt_id" and separator:
+            mount_id = value.strip(b" \t")
+            if mount_id.isdigit():
+                return int(mount_id)
+            raise UnsupportedSQLiteConfiguration("descriptor has a malformed mount ID")
+    raise UnsupportedSQLiteConfiguration("runtime does not expose fdinfo mount IDs")
+
+
+def _probe_child(name: bytes, *, directory_fd: int, flags: int, label: str) -> int | None:
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as error:
+        if error.errno == errno.ENOENT:
+            return None
+        raise UnsupportedSQLiteConfiguration(f"cannot inspect SQLite {label} path") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise UnsupportedSQLiteConfiguration(f"SQLite {label} must be a regular single-link file")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _inspect_local_storage(directory: Path, *, database_path: Path | None = None) -> _StorageTopology:
     if not sys.platform.startswith("linux"):
-        raise UnsupportedSQLiteConfiguration("SQLite WAL topology requires a runtime that can verify local mounts")
+        raise UnsupportedSQLiteConfiguration("SQLite WAL topology requires a runtime that can inspect fdinfo mount IDs")
     data_directory = directory.expanduser().resolve(strict=True)
-    try:
-        mounts = _parse_mountinfo(Path("/proc/self/mountinfo").read_text(encoding="utf-8"))
-    except OSError as error:
-        raise UnsupportedSQLiteConfiguration("cannot verify the database mount topology") from error
-    return _validate_storage_topology(data_directory, mounts=mounts, database_path=database_path)
-
-
-def _validate_storage_topology(
-    data_directory: Path,
-    *,
-    mounts: tuple[_MountEntry, ...],
-    database_path: Path | None = None,
-) -> _StorageTopology:
-    data_directory = data_directory.resolve(strict=True)
     if not data_directory.is_dir():
         raise UnsupportedSQLiteConfiguration("SQLite data directory must be an existing directory")
-    directory_mount = _mount_for_path(data_directory, mounts)
-    _require_durable_mount(directory_mount)
+    path_flag = getattr(os, "O_PATH", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    nofollow_flag = getattr(os, "O_NOFOLLOW", None)
+    if any(type(flag) is not int for flag in (path_flag, directory_flag, nofollow_flag)):
+        raise UnsupportedSQLiteConfiguration("runtime lacks O_PATH/O_DIRECTORY/O_NOFOLLOW topology probes")
 
-    if database_path is not None:
-        database = database_path.expanduser().resolve(strict=False)
-        if database.parent != data_directory:
-            raise UnsupportedSQLiteConfiguration(
-                "SQLite main database must be directly inside its validated data directory"
+    descriptors: dict[str, int] = {}
+    try:
+        directory_flags = cast(int, path_flag) | cast(int, directory_flag) | cast(int, nofollow_flag) | os.O_CLOEXEC
+        try:
+            directory_fd = os.open(data_directory, directory_flags)
+        except OSError as error:
+            raise UnsupportedSQLiteConfiguration("cannot open SQLite data directory for topology validation") from error
+        descriptors["data_directory"] = directory_fd
+        directory_mount_id = _fd_mount_id(directory_fd)
+        child_mount_ids: dict[str, int] = {}
+
+        if database_path is not None:
+            database = database_path.expanduser().resolve(strict=False)
+            if database.parent != data_directory:
+                raise UnsupportedSQLiteConfiguration("SQLite database must be directly inside its data directory")
+            child_flags = cast(int, path_flag) | cast(int, nofollow_flag) | os.O_CLOEXEC
+            child_names = (("database", os.fsencode(database.name)),) + tuple(
+                (f"sidecar {suffix}", os.fsencode(database.name) + suffix.encode("ascii"))
+                for suffix in ("-wal", "-shm", "-journal")
             )
-        database_mount = _mount_for_path(database, mounts)
-        if database_mount.mount_id != directory_mount.mount_id:
-            raise UnsupportedSQLiteConfiguration("SQLite database file and sidecar directory use different mounts")
-        if database.exists():
-            if not database.is_file() or database.stat().st_nlink != 1:
-                raise UnsupportedSQLiteConfiguration("SQLite database must be a regular single-link file")
-        for suffix in ("-wal", "-shm", "-journal"):
-            sidecar = Path(f"{database}{suffix}")
-            if sidecar.is_symlink():
-                raise UnsupportedSQLiteConfiguration(f"SQLite sidecar may not be a symbolic link: {sidecar}")
-            if not sidecar.exists():
-                continue
-            if not sidecar.is_file() or sidecar.stat().st_nlink != 1:
-                raise UnsupportedSQLiteConfiguration(f"SQLite sidecar must be a regular single-link file: {sidecar}")
-            if _mount_for_path(sidecar, mounts).mount_id != directory_mount.mount_id:
-                raise UnsupportedSQLiteConfiguration(f"SQLite sidecar is on a different mount: {sidecar}")
+            for label, name in child_names:
+                descriptor = _probe_child(name, directory_fd=directory_fd, flags=child_flags, label=label)
+                if descriptor is None:
+                    continue
+                descriptors[label] = descriptor
+                child_mount_ids[label] = _fd_mount_id(descriptor)
 
-    return _StorageTopology(
-        data_directory=data_directory,
-        filesystem_type=directory_mount.filesystem_type,
-        mountpoint=directory_mount.mountpoint.resolve(strict=False),
-        mount_id=directory_mount.mount_id,
-        mount_options=tuple(sorted(directory_mount.mount_options)),
-        super_options=tuple(sorted(directory_mount.super_options)),
-    )
+        try:
+            mounts = _parse_mountinfo(Path("/proc/self/mountinfo").read_bytes())
+        except OSError as error:
+            raise UnsupportedSQLiteConfiguration("cannot read the Linux mount table") from error
+        topology = _topology_from_mount_ids(
+            data_directory,
+            directory_mount_id=directory_mount_id,
+            child_mount_ids=child_mount_ids,
+            mounts=mounts,
+        )
+
+        # O_PATH probes do not take SQLite POSIX locks and keep their mount IDs from being reused.
+        for label, descriptor in descriptors.items():
+            expected_id = directory_mount_id if label == "data_directory" else child_mount_ids[label]
+            if _fd_mount_id(descriptor) != expected_id:
+                raise UnsupportedSQLiteConfiguration(f"SQLite {label} mount identity changed during validation")
+        second_mounts = _parse_mountinfo(Path("/proc/self/mountinfo").read_bytes())
+        for label, expected_id in (("data directory", directory_mount_id), *child_mount_ids.items()):
+            if second_mounts.get(expected_id) != mounts.get(expected_id):
+                raise UnsupportedSQLiteConfiguration(f"SQLite {label} mount options changed during validation")
+        return topology
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
 
 
 def _fsync_file(path: Path) -> None:

@@ -24,6 +24,8 @@ Only the creating process and thread may use or close the store. After `fork()`,
 use or finalize the inherited SQLite connection; it must remain inert and then `exec` or `_exit`.
 When the controller process exits, SQLite releases its process-owned lock so a fresh controller can
 recover the database even while an inert child still holds inherited descriptors.
+The host must not remount, replace or move the data directory while the store is open; close the
+store before changing its storage topology.
 
 ## Why A Kernel?
 

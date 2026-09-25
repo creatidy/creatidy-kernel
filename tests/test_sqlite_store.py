@@ -2,6 +2,7 @@
 """Deterministic persistence, recovery, and command-admission regressions."""
 
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -139,33 +140,64 @@ def _mountinfo_record(
     mount_id: int,
     parent_id: int,
     device: str,
-    root: str,
-    mountpoint: str,
+    root: str | bytes,
+    mountpoint: str | bytes,
     filesystem_type: str,
-    source: str,
+    source: str | bytes,
     *,
     mount_options: str = "rw,relatime",
     super_options: str = "rw",
-) -> str:
-    def escape(value: str) -> str:
-        return value.replace("\\", r"\134").replace(" ", r"\040").replace("\t", r"\011").replace("\n", r"\012")
+) -> bytes:
+    def escape(value: str | bytes) -> bytes:
+        raw = os.fsencode(value) if isinstance(value, str) else value
+        result = bytearray()
+        for item in raw:
+            if item == 0x5C:
+                result.extend(b"\\134")
+            elif item == 0x20:
+                result.extend(b"\\040")
+            elif item == 0x09:
+                result.extend(b"\\011")
+            elif item == 0x0A:
+                result.extend(b"\\012")
+            else:
+                result.append(item)
+        return bytes(result)
 
-    return (
-        f"{mount_id} {parent_id} {device} {escape(root)} {escape(mountpoint)} {mount_options} "
-        f"- {filesystem_type} {escape(source)} {super_options}"
+    before = b" ".join(
+        (
+            str(mount_id).encode("ascii"),
+            str(parent_id).encode("ascii"),
+            device.encode("ascii"),
+            escape(root),
+            escape(mountpoint),
+            mount_options.encode("ascii"),
+        )
     )
+    after = b" ".join((filesystem_type.encode("ascii"), escape(source), super_options.encode("ascii")))
+    return before + b" - " + after
 
 
-def _parse_mount_records(records: tuple[str, ...]) -> object:
+def _parse_mount_records(records: tuple[bytes, ...]) -> dict[int, object]:
     parser_name = "_parse_mountinfo"
-    parser = cast(Callable[[str], object], getattr(sqlite_store_module, parser_name))
-    return parser("\n".join(records))
+    parser = cast(Callable[[bytes], dict[int, object]], getattr(sqlite_store_module, parser_name))
+    return parser(b"\n".join(records))
 
 
-def _validate_storage_records(data_directory: Path, mounts: object, database_path: Path | None = None) -> object:
-    validator_name = "_validate_storage_topology"
+def _topology_for_mount_ids(
+    data_directory: Path,
+    directory_mount_id: int,
+    child_mount_ids: dict[str, int],
+    mounts: dict[int, object],
+) -> object:
+    validator_name = "_topology_from_mount_ids"
     validator = cast(Callable[..., object], getattr(sqlite_store_module, validator_name))
-    return validator(data_directory.resolve(), mounts=mounts, database_path=database_path)
+    return validator(
+        data_directory.resolve(),
+        directory_mount_id=directory_mount_id,
+        child_mount_ids=child_mount_ids,
+        mounts=mounts,
+    )
 
 
 def _attempt(program: Program, attempt_id: str, work_unit_id: str) -> AttemptSpec:
@@ -669,105 +701,210 @@ def test_online_backup_failure_before_publish_leaves_no_bundle(
     assert not destination.exists()
 
 
-def test_whole_directory_bind_mount_is_accepted_and_mount_escapes_are_decoded(tmp_path: Path) -> None:
-    data_directory = tmp_path / "data directory"
-    data_directory.mkdir()
-    database = data_directory / "kernel.sqlite3"
-    database.write_bytes(b"synthetic database")
+def test_whole_directory_bind_mount_is_accepted_with_unicode_mountpoint() -> None:
+    data_directory = Path("/synthetic/data directory\u00a0\u0085\u2028\u2029")
+    raw_mountpoint = os.fsencode(data_directory)
     mounts = _parse_mount_records(
         (
-            _mountinfo_record(1, 0, "8:1", "/", "/", "ext4", "/dev/root"),
-            _mountinfo_record(7, 1, "8:1", "/persistent", str(data_directory), "ext4", "/dev/root"),
+            _mountinfo_record(1, 0, "8:1", b"/", b"/", "ext4", b"/dev/root"),
+            _mountinfo_record(7, 1, "8:1", b"/persistent", raw_mountpoint, "ext4", b"/dev/root"),
         )
     )
-    topology = _validate_storage_records(data_directory, mounts, database)
+    topology = _topology_for_mount_ids(data_directory, 7, {"database": 7}, mounts)
 
     assert cast(Any, topology).mount_id == 7
-    assert cast(Any, topology).data_directory == data_directory.resolve()
-    assert cast(Any, topology).filesystem_type == "ext4"
+    assert cast(Any, topology).data_directory == data_directory
+    assert os.fsencode(cast(Any, topology).mountpoint) == raw_mountpoint
 
 
-def test_file_only_database_bind_mount_is_rejected_even_on_same_device(tmp_path: Path) -> None:
-    data_directory = tmp_path / "database-directory"
-    data_directory.mkdir()
-    database = data_directory / "kernel.sqlite3"
-    database.write_bytes(b"synthetic database")
+def test_hidden_deeper_native_mount_does_not_override_actual_visible_mount() -> None:
+    data_directory = Path("/synthetic/srv/app/data")
     mounts = _parse_mount_records(
         (
-            _mountinfo_record(1, 0, "8:1", "/", "/", "ext4", "/dev/root"),
-            _mountinfo_record(7, 1, "8:1", "/persistent", str(data_directory), "ext4", "/dev/root"),
-            _mountinfo_record(8, 7, "8:1", "/persistent/kernel.sqlite3", str(database), "ext4", "/dev/root"),
+            _mountinfo_record(1, 0, "8:1", b"/", b"/", "ext4", b"/dev/root"),
+            _mountinfo_record(5, 1, "8:1", b"/apps", b"/synthetic/srv/app", "ext4", b"/dev/root"),
+            _mountinfo_record(7, 5, "8:1", b"/apps/data", b"/synthetic/srv/app/data", "ext4", b"/dev/root"),
+            _mountinfo_record(8, 5, "0:42", b"/", b"/synthetic/srv/app", "tmpfs", b"tmpfs"),
         )
     )
 
-    with pytest.raises(UnsupportedSQLiteConfiguration, match="different mounts"):
-        _validate_storage_records(data_directory, mounts, database)
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="native local filesystem"):
+        _topology_for_mount_ids(data_directory, 8, {"database": 8}, mounts)
 
 
-def test_separately_mounted_wal_sidecar_is_rejected(tmp_path: Path) -> None:
-    data_directory = tmp_path / "database-directory"
-    data_directory.mkdir()
-    database = data_directory / "kernel.sqlite3"
-    database.write_bytes(b"synthetic database")
-    wal = Path(f"{database}-wal")
-    wal.write_bytes(b"synthetic wal")
+def test_file_only_database_bind_mount_is_rejected_even_on_same_device() -> None:
+    data_directory = Path("/synthetic/database-directory")
     mounts = _parse_mount_records(
         (
-            _mountinfo_record(1, 0, "8:1", "/", "/", "ext4", "/dev/root"),
-            _mountinfo_record(7, 1, "8:1", "/persistent", str(data_directory), "ext4", "/dev/root"),
-            _mountinfo_record(8, 7, "8:1", "/persistent/kernel.sqlite3-wal", str(wal), "ext4", "/dev/root"),
+            _mountinfo_record(1, 0, "8:1", b"/", b"/", "ext4", b"/dev/root"),
+            _mountinfo_record(7, 1, "8:1", b"/persistent", b"/synthetic/database-directory", "ext4", b"/dev/root"),
+            _mountinfo_record(
+                8,
+                7,
+                "8:1",
+                b"/persistent/kernel.sqlite3",
+                b"/synthetic/database-directory/kernel.sqlite3",
+                "ext4",
+                b"/dev/root",
+            ),
         )
     )
 
-    with pytest.raises(UnsupportedSQLiteConfiguration, match="sidecar is on a different mount"):
-        _validate_storage_records(data_directory, mounts, database)
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="different mount"):
+        _topology_for_mount_ids(data_directory, 7, {"database": 8}, mounts)
 
 
-@pytest.mark.parametrize("filesystem_type", ("tmpfs", "ramfs", "overlay"))
-def test_volatile_and_overlay_data_directories_are_rejected(tmp_path: Path, filesystem_type: str) -> None:
-    data_directory = tmp_path / "database-directory"
-    data_directory.mkdir()
+def test_separately_mounted_wal_sidecar_is_rejected_even_on_same_device() -> None:
+    data_directory = Path("/synthetic/database-directory")
     mounts = _parse_mount_records(
         (
-            _mountinfo_record(1, 0, "8:1", "/", "/", "ext4", "/dev/root"),
+            _mountinfo_record(1, 0, "8:1", b"/", b"/", "ext4", b"/dev/root"),
+            _mountinfo_record(7, 1, "8:1", b"/persistent", b"/synthetic/database-directory", "ext4", b"/dev/root"),
+            _mountinfo_record(
+                8,
+                7,
+                "8:1",
+                b"/persistent/kernel.sqlite3-wal",
+                b"/synthetic/database-directory/kernel.sqlite3-wal",
+                "ext4",
+                b"/dev/root",
+            ),
+        )
+    )
+
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="different mount"):
+        _topology_for_mount_ids(data_directory, 7, {"database": 7, "sidecar -wal": 8}, mounts)
+
+
+@pytest.mark.parametrize("filesystem_type", ("tmpfs", "ramfs", "overlay", "nfs4"))
+def test_volatile_and_remote_mount_ids_are_rejected(filesystem_type: str) -> None:
+    data_directory = Path("/synthetic/database-directory")
+    mounts = _parse_mount_records(
+        (
+            _mountinfo_record(1, 0, "8:1", b"/", b"/", "ext4", b"/dev/root"),
             _mountinfo_record(
                 7,
                 1,
                 "0:42",
-                "/",
-                str(data_directory),
+                b"/",
+                b"/synthetic/database-directory",
                 filesystem_type,
-                filesystem_type,
+                filesystem_type.encode("ascii"),
                 super_options="rw,upperdir=/upper,workdir=/work,volatile",
             ),
         )
     )
 
     with pytest.raises(UnsupportedSQLiteConfiguration, match="native local filesystem"):
-        _validate_storage_records(data_directory, mounts)
+        _topology_for_mount_ids(data_directory, 7, {"database": 7}, mounts)
 
 
-def test_native_filesystem_with_volatile_sync_option_is_rejected(tmp_path: Path) -> None:
-    data_directory = tmp_path / "database-directory"
-    data_directory.mkdir()
+def test_native_mount_with_volatile_sync_option_is_rejected() -> None:
+    data_directory = Path("/synthetic/database-directory")
     mounts = _parse_mount_records(
         (
-            _mountinfo_record(1, 0, "8:1", "/", "/", "ext4", "/dev/root"),
+            _mountinfo_record(1, 0, "8:1", b"/", b"/", "ext4", b"/dev/root"),
             _mountinfo_record(
                 7,
                 1,
                 "8:1",
-                "/persistent",
-                str(data_directory),
+                b"/persistent",
+                b"/synthetic/database-directory",
                 "ext4",
-                "/dev/root",
+                b"/dev/root",
                 super_options="rw,errors=remount-ro,fsync=volatile",
             ),
         )
     )
 
     with pytest.raises(UnsupportedSQLiteConfiguration, match="volatile filesystem mode"):
-        _validate_storage_records(data_directory, mounts)
+        _topology_for_mount_ids(data_directory, 7, {}, mounts)
+
+
+def test_mountinfo_parser_preserves_non_utf8_path_bytes() -> None:
+    raw_mountpoint = b"/synthetic/non-utf8-\xff"
+    mounts = _parse_mount_records(
+        (
+            _mountinfo_record(1, 0, "8:1", b"/", b"/", "ext4", b"/dev/root"),
+            _mountinfo_record(7, 1, "8:1", b"/persistent", raw_mountpoint, "ext4", b"/dev/root"),
+        )
+    )
+    topology = _topology_for_mount_ids(Path(os.fsdecode(raw_mountpoint)), 7, {}, mounts)
+    assert os.fsencode(cast(Any, topology).mountpoint) == raw_mountpoint
+
+
+def test_mountinfo_rejects_duplicate_and_missing_mount_ids() -> None:
+    record = _mountinfo_record(1, 0, "8:1", b"/", b"/", "ext4", b"/dev/root")
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="duplicate mount ID"):
+        _parse_mount_records((record, record))
+
+    mounts = _parse_mount_records((record,))
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="absent from mountinfo"):
+        _topology_for_mount_ids(Path("/synthetic/database-directory"), 999, {}, mounts)
+
+
+def test_storage_probe_rejects_dangling_sidecar_symlink_and_closes_probes(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = sqlite_tmp_path / "kernel.sqlite3"
+    Path(f"{database}-wal").symlink_to(sqlite_tmp_path / "missing-wal-target")
+    real_open = os.open
+    opened_descriptors: list[int] = []
+
+    def tracked_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite_store_module.os, "open", tracked_open)
+        with pytest.raises(UnsupportedSQLiteConfiguration, match="regular single-link file"):
+            SQLiteProgramStore(database)
+
+    for descriptor in opened_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_storage_probe_rejects_hardlinked_database_and_special_sidecar(sqlite_tmp_path: Path) -> None:
+    database = sqlite_tmp_path / "hardlinked.sqlite3"
+    database.write_bytes(b"placeholder")
+    os.link(database, sqlite_tmp_path / "database-alias")
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="regular single-link file"):
+        SQLiteProgramStore(database)
+
+    fifo_database = sqlite_tmp_path / "fifo.sqlite3"
+    os.mkfifo(f"{fifo_database}-wal")
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="regular single-link file"):
+        SQLiteProgramStore(fifo_database)
+
+
+def test_storage_probe_does_not_treat_permission_error_as_missing_sidecar(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = sqlite_tmp_path / "kernel.sqlite3"
+    real_open = os.open
+
+    def deny_wal(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == b"kernel.sqlite3-wal" and dir_fd is not None:
+            raise PermissionError(errno.EACCES, "injected WAL probe denial")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(sqlite_store_module.os, "open", deny_wal)
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="cannot inspect SQLite sidecar -wal"):
+        SQLiteProgramStore(database)
 
 
 def test_reordered_semantically_identical_amendment_reuses_command_result(
