@@ -20,9 +20,10 @@
   defects, temporary provider errors, and routine remediation are engineering work, not automatic
   Human Gates. Ask the owner only when a real authority, security, architecture, scope, or budget
   decision is required.
-- Do not encode Program execution, M5-B protocols, private autonomy, or general model-provider routing
-  in repository Markdown. The explicit `/deliver-issue` reviewer binding is development workflow
-  configuration, not Kernel runtime routing. Kernel development remains normal single-issue mode.
+- Do not encode Program execution, M5-B protocols, private autonomy, or general product-runtime
+  model-provider routing in repository Markdown. `/deliver-issue` review dispatch is development
+  workflow guidance using the existing Creatidy review-routing contract; it creates no Kernel runtime
+  dependency. Kernel development remains normal single-issue mode.
 
 ## Progress And Handoff
 

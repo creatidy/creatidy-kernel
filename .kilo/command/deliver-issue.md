@@ -33,13 +33,47 @@ duplicate either procedure here.
 
 ## Independent Review
 
-1. Freeze the **exact PR HEAD** and base before each review. Every substantive full PR review and
-   architecture/model-correction review is bound to `GPT-6 Astra / openai / max` in a fresh local
-   Agent Manager session. Do not classify the PR to choose reviewer quality. This repository-local
-   development-workflow binding intentionally overrides normal dynamic reviewer routing at this
-   review dispatch boundary only; implementation and remediation remain unaffected.
-2. For each full PR review, submit this **literal logical Agent Manager payload** (substitute the
-   actual PR URL):
+1. For **each** new full PR review, including a review after any changed HEAD, freeze the exact PR
+   HEAD and base first. A fresh HEAD is a new AI dispatch boundary; never reuse the previous
+   selection just because it is the same PR. Build the repository-review requirements from the
+   selected issue, full PR, immutable correctness/security concerns, actual review task capability
+   floor, known author capability floor when available, and review criticality. Treat persistence or
+   durability, recovery/reconciliation, concurrency, authority/security/privacy, lifecycle/state
+   semantics, external-effect safety, and corruption-sensitive migrations as architecture/security
+   criticality. Do not guess unknown author capability. Review-requirement classification determines
+   capability requirements only; it does not select or rank a reviewer model.
+2. Use the existing Creatidy repository-review routing contract: Scarcity Router profile
+   `repository_review` plus a **monotone** `tightening` equal to the element-wise maximum of actual
+   task requirements, known author floor, and review-criticality requirements. Architecture/security
+   and remediation reviews require task level `L4`, minima at least
+   `{"reasoning":5,"coding":5,"tool_use":5}`, and both `requires_tool_use=true` and
+   `requires_reasoning_mode=true`; preserve any known stronger author floor. For an ordinary review,
+   derive the task floor from its actual requirements and preserve the calibrated profile and any
+   stronger author floor. Do not lower requirements for availability or scarcity.
+3. Make **one valid Scarcity Router selection for this review dispatch boundary**, with `profile_id`
+   XOR `requirement` (use the established profile `repository_review` with `tightening`; do not
+   invent router fields). A changed review HEAD or a separate architecture/model-correction review
+   is a new boundary and requires a new selection. Never make repeated selections to shop for a
+   preferred identity. A router `invalid_request` is a malformed call, not a selection: diagnose the
+   schema/input defect and use only the bounded corrected retry policy. Use the exact eligible
+   identity returned by the valid selection. If the router returns no selection or is unavailable,
+   record the routing failure and fail closed: after bounded corrected infrastructure attempts use
+   `REVIEW_INFRASTRUCTURE_BLOCKED`; if proceeding would require an owner decision to change the
+   review requirement or routing policy, use `GENUINE_OWNER_DECISION_REQUIRED`. Never reuse an
+   earlier selection or invent a route.
+4. If the selected configuration cannot be dispatched, follow the existing harness-fallback policy:
+   inspect **only** the Router-returned ordered eligible alternatives and use the first dispatchable
+   eligible alternative that satisfies every hard requirement. Never dispatch an excluded candidate,
+   lower requirements, or create a local reviewer ranking/fallback table. Record both
+   `router_selected` and `dispatched`, with `routing_result=HARNESS_FALLBACK` when applicable. If no
+   eligible configuration is dispatchable, stop with `REVIEW_INFRASTRUCTURE_BLOCKED`. Resolve model
+   identifiers against the current Agent Manager catalog; do not guess, translate, or alias model or
+   variant names. Use only the existing provider-ID adapter documented in the parent workspace's
+   model-routing contract. This is public Kernel **development workflow** guidance, not a Kernel
+   product dependency on Scarcity Router or the parent workspace.
+5. For every full PR review, submit this **literal logical Agent Manager payload**, substituting the
+   exact routed model `M`, routed provider `P` after the existing provider adapter, routed variant
+   `V`, and actual PR URL:
 
    ```json
    {
@@ -47,47 +81,56 @@ duplicate either procedure here.
      "versions": false,
      "tasks": [{
        "prompt": "/review-pr <PR URL>",
-       "model": "GPT-6 Astra",
-       "provider": "openai",
-       "variant": "max"
+       "model": "M",
+       "provider": "P_AFTER_EXISTING_PROVIDER_ADAPTER",
+       "variant": "V"
      }]
    }
    ```
 
-   `mode` and `versions` are request-level fields. `prompt`, `model`, `provider`, and `variant`
-   belong inside **each** `tasks[]` entry; never put model, provider, or variant at the top level.
-   For architecture/model-correction, use the same mode, versions, and task-level model/provider/
-   variant with a correction-specific read-only prompt and its distinct verdict contract below.
-3. Use a **fresh, distinct, read-only reviewer session** for each substantive review. The reviewer
-   independently fetches PR #/URL, confirms its HEAD still matches the frozen one, fetches the
-   selected issue, and performs a full review of the **whole current PR** and acceptance evidence,
-   not only prior findings or the latest diff. The implementation session cannot review or approve
-   its own work. A changed HEAD requires another fresh session and full review.
-4. Track separately: `REQUESTED` (payload submitted); `DISPATCH_VERIFIED` (valid task-level payload
-   **and** explicit Agent Manager `Resolved models:` evidence matching `GPT-6 Astra (openai)` with
-   variant `max` for that session); reviewer session completed; and review verdict obtained for the
-   frozen HEAD. Request acceptance, `action=list` session/state, prompt text, and reviewer self-report
-   are not model-resolution evidence. If provider/model/variant resolution is absent or differs,
-   mark review `NOT_RUN`, not a valid review cycle or remediation cycle. Inspect the submitted payload
-   against the actual Agent Manager schema and correct the diagnosed error before retrying.
-5. There is **no reviewer-model fallback**: GPT-6 Luna is not allowed, GPT-6 Sol and the current
-   implementation/controller model are not substitutes, Scarcity Router must not replace this bound
-   reviewer, and Z.ai models are not permitted in this review lane. Diagnose each launch failure and
-   allow at most **two corrected launch retries** for the frozen HEAD, changing only the diagnosed
-   bad input; do not repeat a malformed request or churn unrelated parameters. If Astra/max cannot
-   be validly dispatched, stop with `REVIEW_INFRASTRUCTURE_BLOCKED` at zero remediation cost.
-   Record invalid attempts only as diagnostics, never as review cycles. A genuinely new owner policy
-   decision, not a provider wait, stops with `GENUINE_OWNER_DECISION_REQUIRED`.
+   `mode` and `versions` are top-level request fields. `prompt`, `model`, `provider`, and `variant`
+   belong inside **each** `tasks[]` entry; never put model, provider, or variant at top level. Use the
+   returned model and variant verbatim and only the established provider adapter; no guessed
+   identity, alias, local routing table, or implementation/controller-model substitution. For an
+   architecture/model-correction dispatch, the task prompt begins with `/review-pr <PR URL>` and
+   adds the correction question and its distinct verdict contract below, while preserving the
+   read-only/fresh/frozen-HEAD requirements.
+6. Launch a **fresh, distinct, read-only reviewer session** for each substantive review. A distinct
+   session provides independence even if Router legitimately selects the implementation session's
+   same model configuration. Do not add a different-family/provider requirement unless the review
+   contract explicitly requires it. The reviewer fetches the PR and selected issue, confirms the
+   current HEAD/base still match the frozen inputs, and performs a full review of the **whole current
+   PR** and acceptance evidence, not only prior findings or the latest diff. The implementation
+   session never performs the substantive independent review.
+7. Track separately: routing selected; `REQUESTED` (dispatch payload submitted); `DISPATCH_VERIFIED`
+   (task-level configuration valid and explicit Agent Manager resolution equivalent to
+   `Resolved models: - <session>: <M> (<P_AFTER_EXISTING_PROVIDER_ADAPTER>) · <V>` matches the actual
+   dispatched Router-eligible model/variant and provider after the documented adapter);
+   reviewer session completed; and verdict obtained for the frozen HEAD. A harness fallback must
+   match the eligible alternative actually dispatched, not be mislabeled as the primary selection.
+   Request acceptance, `action=list` session/state, prompt text, and reviewer self-report are not
+   model-resolution evidence. If resolution is absent or mismatched, mark review `NOT_RUN`; do not
+   increment the valid review counter or remediation budget. Inspect the payload against the actual
+   Agent Manager schema, correct the diagnosed error, and never silently substitute a reviewer.
+8. Diagnose a concrete launch failure before retrying. Allow at most **two corrected launch retries**
+   for the frozen review boundary, changing only the diagnosed bad input; do not repeat the same
+   malformed request or churn unrelated parameters. Router-returned eligible alternatives are the
+   only harness fallback. If no valid independent reviewer can be dispatched or resolved, stop with
+   `REVIEW_INFRASTRUCTURE_BLOCKED`; record failures only as invalid diagnostics, never as review
+   cycles. Infrastructure/routing failures consume no remediation budget. A genuine material owner
+   decision stops with `GENUINE_OWNER_DECISION_REQUIRED`.
 
 ## Ledger And Remediation
 
 After **each valid, completed full review**, persist a concise numbered entry on the selected issue
-or PR: review cycle number; exact reviewed HEAD and bound reviewer; independent review reference and
-verdict (`APPROVE`, `REQUEST_CHANGES`, or `COMMENT`); concise blocker IDs/titles; remediation status
-(`none`, `pending`, or `done`); resulting HEAD if changed; and `remediation_used / 10`. Include the
-dispatch-verification outcome without publishing private routing details. Update or append a linked
+or PR: review cycle number; exact reviewed HEAD; review profile and monotone capability floor; route
+selected and dispatched identities (including adapter/fallback status); Router catalog/policy
+versions and degraded flag when present; reviewer session/task ID; dispatch-verification state;
+independent review reference and verdict (`APPROVE`, `REQUEST_CHANGES`, or `COMMENT`); concise
+blocker IDs/titles; remediation status (`none`, `pending`, or `done`); resulting HEAD if changed; and
+`remediation_used / 10`. Do not record quota snapshots or transcripts. Update or append a linked
 remediation entry immediately after pushing a changed HEAD, so a fresh session can reconstruct both
-the count and the next review subject. Preserve prior entries and finding identities; reconcile an
+the count and next review subject. Preserve prior entries and finding identities; reconcile an
 interrupted or inconsistent ledger before continuing. No prompts, chain-of-thought, or transcripts.
 
 - Initial review and every fresh review cost **zero** remediation cycles. A `REQUEST_CHANGES` verdict
@@ -102,8 +145,11 @@ interrupted or inconsistent ledger before continuing. No prompts, chain-of-thoug
   remediation unless a valid in-scope change is made, and obtain a conclusive fresh review.
 - Do not point-patch indefinitely. If a fundamental defect recurs, fixes oscillate, a domain/model
   inconsistency appears, or resolution seems to change the issue contract or accepted architecture,
-  first dispatch a **fresh, read-only, model-bound** architecture/model-correction review of the frozen
-  HEAD. It returns `BOUNDED_CORRECTION` or `GENUINE_OWNER_DECISION_REQUIRED`. The review costs zero;
+  freeze the exact HEAD/base, derive architecture/security requirements, and make a **new**
+  `repository_review` Scarcity Router dispatch using L4/5/5/5 (and any known stronger author floor).
+  Launch a fresh read-only reviewer with the returned configuration and verified task-level dispatch.
+  This architecture/model-correction review returns `BOUNDED_CORRECTION` or
+  `GENUINE_OWNER_DECISION_REQUIRED`. The review costs zero;
   a bounded correction compatible with the selected issue and architecture costs one when changed,
   followed by validation, push, ledger update, and fresh full independent PR review. Never widen
   scope or change acceptance criteria to obtain approval. A material owner authority, architecture,
