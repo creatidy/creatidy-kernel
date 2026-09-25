@@ -16,7 +16,8 @@ commands live in `.kilo/command/`.
 - The repository currently uses normal single-issue mode only. Do not add a Program execution
   exception or encode Program state-machine semantics in Markdown workflow.
 
-See `.kilo/rules/10-task-system.md` and `.kilo/command/implement-issue.md`.
+See `.kilo/rules/10-task-system.md`, `.kilo/command/implement-issue.md`, and
+`.kilo/command/deliver-issue.md` for bounded issue-to-independent-review delivery.
 
 ## Architecture Boundaries
 
