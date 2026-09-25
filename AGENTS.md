@@ -16,7 +16,8 @@ commands live in `.kilo/command/`.
 - The repository currently uses normal single-issue mode only. Do not add a Program execution
   exception or encode Program state-machine semantics in Markdown workflow.
 
-See `.kilo/rules/10-task-system.md` and `.kilo/command/implement-issue.md`.
+See `.kilo/rules/10-task-system.md`, `.kilo/command/implement-issue.md`, and
+`.kilo/command/deliver-issue.md` for bounded issue-to-independent-review delivery.
 
 ## Architecture Boundaries
 
@@ -42,6 +43,11 @@ See `.kilo/rules/10-task-system.md` and `.kilo/command/implement-issue.md`.
   means integrated into `develop`, not released.
 
 See `.kilo/rules/20-forgejo-mcp.md` and `.kilo/command/review-pr.md`.
+
+`/deliver-issue` independent review is a fresh Scarcity Router dispatch boundary. The reviewer
+session must use exactly the routed provider/model/variant and independently verify Agent Manager
+resolution before review evidence is accepted. The implementation session never substitutes for the
+independent reviewer; see `/deliver-issue` for the dispatch and verification contract.
 
 ## Issue And Change Discipline
 
