@@ -2,7 +2,8 @@
 
 Scope: a trusted owner and control-plane host, potentially malicious workers and workload content.
 A compromised host administrator can read/change the database and credentials; A0 does not promise
-protection from that administrator. No worker execution or enforcement broker is implemented yet.
+protection from that administrator. K3 synthetic fakes exercise worker and authority behavior but
+provide no OS isolation, real credential broker or live worker execution.
 
 ## Boundaries
 
