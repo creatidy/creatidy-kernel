@@ -20,9 +20,9 @@
   defects, temporary provider errors, and routine remediation are engineering work, not automatic
   Human Gates. Ask the owner only when a real authority, security, architecture, scope, or budget
   decision is required.
-- Do not encode Program execution, M5-B protocols, private autonomy, or model-provider routing in
-  repository Markdown. Kernel development is normal single-issue mode until deterministic product
-  code provides another authority.
+- Do not encode Program execution, M5-B protocols, private autonomy, or general model-provider routing
+  in repository Markdown. The explicit `/deliver-issue` reviewer binding is development workflow
+  configuration, not Kernel runtime routing. Kernel development remains normal single-issue mode.
 
 ## Progress And Handoff
 

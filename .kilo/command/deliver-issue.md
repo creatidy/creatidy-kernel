@@ -11,8 +11,9 @@ Deliver exactly one owner-selected Forgejo issue in `Creatidy/creatidy-kernel`:
 This is normal single-issue development, not Program execution or a Kernel runtime state machine.
 The owner selects the issue once; the delivery session carries PR/review results and remediation
 instructions between sessions, without asking the owner to relay them. Use `/implement-issue` for
-issue-to-PR work and `/review-pr` for each read-only review; their preconditions and guardrails still
-apply. Do not duplicate their procedures here.
+issue-to-PR work and `/review-pr` for each full PR review. Architecture/model-correction reviews
+use its read-only, fresh-context and frozen-HEAD guardrails but have their own verdicts. Do not
+duplicate either procedure here.
 
 ## Start And Deliver
 
@@ -32,38 +33,56 @@ apply. Do not duplicate their procedures here.
 
 ## Independent Review
 
-1. Freeze the **exact PR HEAD** and base before each review. Classify the change, then resolve the
-   reviewer through the configured maintainer/model-routing policy when available. Use
-   `critical-independent-review` for persistence/durability, recovery/reconciliation, concurrency,
-   authority/security/privacy, lifecycle/state-machine semantics, external-effect safety, and
-   migrations that risk corruption or semantic reinterpretation. Otherwise use
-   `standard-independent-review`. Architecture/model-correction review is always critical. These
-   are capability classes, not public model/provider assignments.
-2. Create a **fresh, distinct, read-only reviewer session** for each substantive review, passing the
-   PR, frozen HEAD, selected issue, and `/review-pr` contract. Require a full review of the current
-   PR and acceptance evidence, not only previous findings or the latest diff. The implementation
-   session cannot review or approve its own work. Do not reuse a prior reviewer session after a HEAD
-   change. Use the configured private dispatch rules rather than encoding provider details here.
-3. Track separately: reviewer requested; dispatch configuration valid; requested model resolved
-   where the execution environment exposes resolution evidence; independent session completed; and
-   verdict obtained for the frozen HEAD. Request acceptance, session status, prompt text, and
-   reviewer self-report are not model-resolution evidence. Require explicit resolution evidence
-   when the environment supplies it; follow the governing routing policy for any unobservable
-   identity. Do not count a malformed dispatch, wrong/unresolved required reviewer, incomplete
-   review, or changed HEAD as a valid review cycle. Never silently substitute for an explicitly
-   required reviewer.
-4. Diagnose a concrete launch failure before retrying. Allow at most **two corrected launch retries**
-   for a frozen HEAD, changing only the diagnosed bad input; do not retry the same malformed request
-   or churn unrelated parameters. If no valid independent session can be obtained, stop with
-   `REVIEW_INFRASTRUCTURE_BLOCKED`; dispatch failures consume no remediation budget. Record failed
-   attempts only as clearly invalid diagnostics, never as review cycles. If routing requires a new
-   owner policy decision rather than infrastructure repair, stop with
-   `GENUINE_OWNER_DECISION_REQUIRED`.
+1. Freeze the **exact PR HEAD** and base before each review. Every substantive full PR review and
+   architecture/model-correction review is bound to `GPT-6 Astra / openai / max` in a fresh local
+   Agent Manager session. Do not classify the PR to choose reviewer quality. This repository-local
+   development-workflow binding intentionally overrides normal dynamic reviewer routing at this
+   review dispatch boundary only; implementation and remediation remain unaffected.
+2. For each full PR review, submit this **literal logical Agent Manager payload** (substitute the
+   actual PR URL):
+
+   ```json
+   {
+     "mode": "local",
+     "versions": false,
+     "tasks": [{
+       "prompt": "/review-pr <PR URL>",
+       "model": "GPT-6 Astra",
+       "provider": "openai",
+       "variant": "max"
+     }]
+   }
+   ```
+
+   `mode` and `versions` are request-level fields. `prompt`, `model`, `provider`, and `variant`
+   belong inside **each** `tasks[]` entry; never put model, provider, or variant at the top level.
+   For architecture/model-correction, use the same mode, versions, and task-level model/provider/
+   variant with a correction-specific read-only prompt and its distinct verdict contract below.
+3. Use a **fresh, distinct, read-only reviewer session** for each substantive review. The reviewer
+   independently fetches PR #/URL, confirms its HEAD still matches the frozen one, fetches the
+   selected issue, and performs a full review of the **whole current PR** and acceptance evidence,
+   not only prior findings or the latest diff. The implementation session cannot review or approve
+   its own work. A changed HEAD requires another fresh session and full review.
+4. Track separately: `REQUESTED` (payload submitted); `DISPATCH_VERIFIED` (valid task-level payload
+   **and** explicit Agent Manager `Resolved models:` evidence matching `GPT-6 Astra (openai)` with
+   variant `max` for that session); reviewer session completed; and review verdict obtained for the
+   frozen HEAD. Request acceptance, `action=list` session/state, prompt text, and reviewer self-report
+   are not model-resolution evidence. If provider/model/variant resolution is absent or differs,
+   mark review `NOT_RUN`, not a valid review cycle or remediation cycle. Inspect the submitted payload
+   against the actual Agent Manager schema and correct the diagnosed error before retrying.
+5. There is **no reviewer-model fallback**: GPT-6 Luna is not allowed, GPT-6 Sol and the current
+   implementation/controller model are not substitutes, Scarcity Router must not replace this bound
+   reviewer, and Z.ai models are not permitted in this review lane. Diagnose each launch failure and
+   allow at most **two corrected launch retries** for the frozen HEAD, changing only the diagnosed
+   bad input; do not repeat a malformed request or churn unrelated parameters. If Astra/max cannot
+   be validly dispatched, stop with `REVIEW_INFRASTRUCTURE_BLOCKED` at zero remediation cost.
+   Record invalid attempts only as diagnostics, never as review cycles. A genuinely new owner policy
+   decision, not a provider wait, stops with `GENUINE_OWNER_DECISION_REQUIRED`.
 
 ## Ledger And Remediation
 
 After **each valid, completed full review**, persist a concise numbered entry on the selected issue
-or PR: review cycle number; exact reviewed HEAD and reviewer class; independent review reference and
+or PR: review cycle number; exact reviewed HEAD and bound reviewer; independent review reference and
 verdict (`APPROVE`, `REQUEST_CHANGES`, or `COMMENT`); concise blocker IDs/titles; remediation status
 (`none`, `pending`, or `done`); resulting HEAD if changed; and `remediation_used / 10`. Include the
 dispatch-verification outcome without publishing private routing details. Update or append a linked
@@ -83,7 +102,7 @@ interrupted or inconsistent ledger before continuing. No prompts, chain-of-thoug
   remediation unless a valid in-scope change is made, and obtain a conclusive fresh review.
 - Do not point-patch indefinitely. If a fundamental defect recurs, fixes oscillate, a domain/model
   inconsistency appears, or resolution seems to change the issue contract or accepted architecture,
-  first dispatch a **fresh, read-only critical** architecture/model-correction review of the frozen
+  first dispatch a **fresh, read-only, model-bound** architecture/model-correction review of the frozen
   HEAD. It returns `BOUNDED_CORRECTION` or `GENUINE_OWNER_DECISION_REQUIRED`. The review costs zero;
   a bounded correction compatible with the selected issue and architecture costs one when changed,
   followed by validation, push, ledger update, and fresh full independent PR review. Never widen
@@ -99,7 +118,8 @@ interrupted or inconsistent ledger before continuing. No prompts, chain-of-thoug
 validation, green required Forgejo CI, issue acceptance criteria, and no unresolved blocking review
 finding. If the HEAD moved, repeat the fresh full review and required checks; do not reuse approval.
 If required evidence is temporarily unavailable, diagnose it and do not claim readiness or invent a
-human gate. Report the precise blocker in the ledger. End with exactly one of:
+human gate. After bounded corrected attempts to obtain required verification evidence fail, record
+the precise blocker and use `REVIEW_INFRASTRUCTURE_BLOCKED`. End with exactly one of:
 
 - `READY_FOR_OWNER_MERGE`: exact-HEAD approval and all final evidence verified; do not merge.
 - `REMEDIATION_BUDGET_EXHAUSTED`: 10/10 and no approval, with remaining blockers identified.

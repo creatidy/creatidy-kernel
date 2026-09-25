@@ -44,6 +44,10 @@ See `.kilo/rules/10-task-system.md`, `.kilo/command/implement-issue.md`, and
 
 See `.kilo/rules/20-forgejo-mcp.md` and `.kilo/command/review-pr.md`.
 
+`/deliver-issue` independent full PR and architecture/model-correction reviews are model-bound to
+fresh local Agent Manager sessions on GPT-6 Astra / OpenAI / max. No reviewer fallback or controller-
+model substitution is permitted; see `/deliver-issue` for exact dispatch and verification.
+
 ## Issue And Change Discipline
 
 - Agent-created issues use durable `Goal`, `Why`, `Scope`, `Acceptance Criteria`, `Constraints`, and
