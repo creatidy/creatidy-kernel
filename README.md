@@ -71,8 +71,8 @@ On systems without Make, the individual commands are listed in [CONTRIBUTING.md]
 
 SQLite persistence tests require a verified native local Linux filesystem. They use pytest's temporary
 directory by default; if it is on a rejected filesystem, set `CREATIDY_TEST_STORAGE_DIR` to a
-directory on a supported native mount. The CI workflow provisions this directory under the runner's
-temporary storage, and the adapter verifies its topology.
+directory on a supported native mount. CI selects a dedicated directory under the checkout; the
+adapter verifies its topology before opening SQLite.
 
 ## Architecture Decisions
 
