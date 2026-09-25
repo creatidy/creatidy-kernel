@@ -473,6 +473,74 @@ def test_store_enforces_its_dedicated_writer_thread(sqlite_tmp_path: Path) -> No
     assert isinstance(errors[0], WrongWriterThread)
 
 
+def test_terminated_creator_thread_token_survives_identifier_reuse(sqlite_tmp_path: Path) -> None:
+    database = sqlite_tmp_path / "thread-owner.sqlite3"
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import sys
+        import threading
+        from pathlib import Path
+
+        from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+        from creatidy_kernel.core.domain import AuthorityEnvelope, PolicyReference, ProgramSpec, WorkUnit
+
+        holder = []
+
+        def create_store():
+            spec = ProgramSpec(
+                program_id="thread-owner",
+                objective="verify creator-thread identity",
+                work_units=(WorkUnit("unit", "remain durable", acceptance_criteria=("state is valid",)),),
+                acceptance_criteria=("ownership is bound to one thread",),
+                policy_references=(PolicyReference("thread-test", "v1", "sha256:thread-test"),),
+                authority=AuthorityEnvelope("owner"),
+            )
+            store = SQLiteProgramStore(Path(sys.argv[1]))
+            store.create(spec, "create")
+            holder.append((store, store.startup_evidence.writer_thread_id))
+
+        creator = threading.Thread(target=create_store)
+        creator.start()
+        creator.join()
+        store, creator_ident = holder[0]
+        native_get_ident = threading.get_ident
+        outcomes = []
+
+        def access_from_replacement_thread():
+            threading.get_ident = lambda: creator_ident
+            try:
+                for operation in (lambda: store.load("thread-owner"), store.close):
+                    try:
+                        operation()
+                    except Exception as error:
+                        outcomes.append(type(error).__name__)
+                    else:
+                        outcomes.append("allowed")
+            finally:
+                threading.get_ident = native_get_ident
+            print(json.dumps(outcomes), flush=True)
+            os._exit(0)
+
+        replacement = threading.Thread(target=access_from_replacement_thread)
+        replacement.start()
+        replacement.join()
+        os._exit(1)
+        """
+    )
+    # Fixed local regression harness; no command or script content comes from PR input.
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", script, str(database)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["WrongWriterThread", "WrongWriterThread"]
+
+
 def test_store_explicitly_forces_private_cache_against_shared_cache_peer(
     sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

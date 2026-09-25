@@ -188,6 +188,9 @@ class SQLiteProgramStore:
         self._storage = _inspect_local_storage(self._path.parent, database_path=self._path)
         self._owner_pid = os.getpid()
         self._owner_thread = threading.get_ident()
+        self._owner_thread_local = threading.local()
+        self._owner_thread_token = object()
+        self._owner_thread_local.store_token = self._owner_thread_token
         self._gate = threading.RLock()
         self._busy_timeout_ms = busy_timeout_ms
         self._cache_mode = "private"
@@ -236,8 +239,7 @@ class SQLiteProgramStore:
     def close(self) -> None:
         if os.getpid() != self._owner_pid:
             raise WrongWriterProcess("inherited SQLite stores must not be used or closed in another process")
-        if threading.get_ident() != self._owner_thread:
-            raise WrongWriterThread("SQLite access must use the store's dedicated writer thread")
+        self._assert_owner_thread()
         with self._gate:
             if self._closed:
                 return
@@ -936,10 +938,13 @@ class SQLiteProgramStore:
     def _assert_writer_thread(self) -> None:
         if os.getpid() != self._owner_pid:
             raise WrongWriterProcess("SQLite access must use the process that created the store")
-        if threading.get_ident() != self._owner_thread:
-            raise WrongWriterThread("SQLite access must use the store's dedicated writer thread")
+        self._assert_owner_thread()
         if getattr(self, "_closed", False):
             raise StoreClosed("SQLite store is closed")
+
+    def _assert_owner_thread(self) -> None:
+        if getattr(self._owner_thread_local, "store_token", None) is not self._owner_thread_token:
+            raise WrongWriterThread("SQLite access must use the store's creating thread")
 
     @staticmethod
     def _validate_program_id(program_id: str) -> None:

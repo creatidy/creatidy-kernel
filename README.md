@@ -69,6 +69,11 @@ Forgejo server, Scarcity Router, Prefect, M5-B or private Creatidy infrastructur
 needs access to the configured package index unless already cached; the tests and example run offline.
 On systems without Make, the individual commands are listed in [CONTRIBUTING.md](CONTRIBUTING.md).
 
+SQLite persistence tests require a verified native local Linux filesystem. They use pytest's temporary
+directory by default; if it is on a rejected filesystem, set `CREATIDY_TEST_STORAGE_DIR` to a
+directory on a supported native mount. The CI workflow provisions this directory under the runner's
+temporary storage, and the adapter verifies its topology.
+
 ## Architecture Decisions
 
 | Contract | Document |
