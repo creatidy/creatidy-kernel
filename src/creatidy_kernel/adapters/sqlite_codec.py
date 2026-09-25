@@ -401,6 +401,7 @@ def _program_value(program: Program) -> dict[str, object]:
     if type(program) is not Program:
         raise RecordCodecError("only exact K1 Program values can be persisted")
     _validate_program(program)
+    _validate_persisted_fact_references(program)
     return {
         "program_id": program.program_id,
         "status": program.status.value,
@@ -520,6 +521,7 @@ def program_from_json(raw: str) -> Program:
         if program.program_id != _text(value["program_id"], "Program program_id"):
             raise RecordCodecError("Program ID differs from its current ProgramSpec")
         _validate_program(program)
+        _validate_persisted_fact_references(program)
         return program
     except RecordCodecError:
         raise
@@ -531,6 +533,31 @@ def _validate_program(program: Program) -> None:
     validator_name = "_validate"
     validator = cast(Callable[[], None], getattr(program, validator_name))
     validator()
+
+
+def _validate_persisted_fact_references(program: Program) -> None:
+    attempts = {attempt.attempt_id: attempt for attempt in program.attempts}
+    cancellation_ids: set[str] = set()
+    for cancellation in program.attempt_cancellations:
+        attempt = attempts.get(cancellation.attempt_id)
+        if attempt is None or attempt.status is not AttemptStatus.CANCELLED:
+            raise RecordCodecError("AttemptCancellation must reference an existing cancelled Attempt")
+        if cancellation.attempt_id in cancellation_ids:
+            raise RecordCodecError("AttemptCancellation references must be unique")
+        if cancellation.record_order > program.revision:
+            raise RecordCodecError("AttemptCancellation has no authoritative aggregate record order")
+        cancellation_ids.add(cancellation.attempt_id)
+
+    historical_specs = {(spec.revision, spec.digest) for spec in program.spec_history}
+    previous_conclusion_order = 0
+    for conclusion in program.conclusions:
+        if (conclusion.spec_revision, conclusion.spec_digest) not in historical_specs:
+            raise RecordCodecError("ProgramConclusion must cite an existing historical ProgramSpec")
+        if conclusion.record_order > program.revision:
+            raise RecordCodecError("ProgramConclusion has no authoritative aggregate record order")
+        if conclusion.record_order <= previous_conclusion_order:
+            raise RecordCodecError("ProgramConclusion facts must preserve authoritative order")
+        previous_conclusion_order = conclusion.record_order
 
 
 def create_input_json(spec: ProgramSpec) -> str:

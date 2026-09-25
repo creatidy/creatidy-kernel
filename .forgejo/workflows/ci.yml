@@ -19,6 +19,8 @@ jobs:
     name: check
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      CREATIDY_TEST_STORAGE_DIR: ${{ runner.temp }}/creatidy-kernel-sqlite-tests
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -32,6 +34,8 @@ jobs:
           enable-cache: false
       - name: Install locked tooling
         run: uv sync --locked
+      - name: Prepare SQLite integration-test directory
+        run: mkdir -p "$CREATIDY_TEST_STORAGE_DIR"
       - name: Repository gate
         run: make check
       - name: Built-package gate

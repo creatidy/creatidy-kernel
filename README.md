@@ -15,9 +15,10 @@ repositories.
 The SQLite adapter accepts databases only in an existing data directory validated as one supported
 native local Linux filesystem mount. The database and its WAL/SHM/journal siblings must share that
 mount; file-only mounts, split sidecars, OverlayFS, tmpfs, ramfs, and network filesystems are
-rejected. It uses one private SQLite connection with `locking_mode=EXCLUSIVE`, retained for the
-store's lifetime, and reports the directory/mount identity, SQLite runtime, and required pragma
-checks at startup. It does not impose a blanket SQLite version minimum.
+rejected. It uses one SQLite connection explicitly opened with `cache=private` and
+`locking_mode=EXCLUSIVE`, retained for the store's lifetime. Startup reports the directory/mount
+identity, SQLite runtime, and required pragma checks. The adapter does not impose a blanket SQLite
+version minimum.
 
 Only the creating process and thread may use or close the store. After `fork()`, a child must not
 use or finalize the inherited SQLite connection; it must remain inert and then `exec` or `_exit`.

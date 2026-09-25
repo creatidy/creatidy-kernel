@@ -6,13 +6,15 @@ import hashlib
 import json
 import os
 import select
+import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -59,6 +61,21 @@ from creatidy_kernel.core.domain import (
 OWNER = "owner"
 WORKER = "worker-7"
 VERIFIER = "verifier"
+
+
+@pytest.fixture
+def sqlite_tmp_path(tmp_path: Path) -> Iterator[Path]:
+    configured_root = os.environ.get("CREATIDY_TEST_STORAGE_DIR")
+    if configured_root is None:
+        yield tmp_path
+        return
+    storage_root = Path(configured_root).expanduser()
+    storage_root.mkdir(parents=True, exist_ok=True)
+    test_directory = Path(tempfile.mkdtemp(prefix="creatidy-kernel-", dir=storage_root))
+    try:
+        yield test_directory
+    finally:
+        shutil.rmtree(test_directory)
 
 
 def spec() -> ProgramSpec:
@@ -215,8 +232,8 @@ def _complete_and_cancel(store: SQLiteProgramStore) -> Program:
     return _apply(store, "cancel-program", CancelProgram(program.revision, OWNER))
 
 
-def test_round_trip_preserves_all_final_k1_facts_and_actor_authority_order(tmp_path: Path) -> None:
-    path = tmp_path / "kernel.sqlite3"
+def test_round_trip_preserves_all_final_k1_facts_and_actor_authority_order(sqlite_tmp_path: Path) -> None:
+    path = sqlite_tmp_path / "kernel.sqlite3"
     with SQLiteProgramStore(path) as store:
         expected = _complete_and_cancel(store)
         records = store.history(expected.program_id)
@@ -272,9 +289,9 @@ def test_round_trip_preserves_all_final_k1_facts_and_actor_authority_order(tmp_p
 
 
 def test_duplicate_command_returns_prior_result_without_reapplying_and_conflicts_fail_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with SQLiteProgramStore(tmp_path / "kernel.sqlite3") as store:
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
         store.create(spec(), "create")
         activate = ActivateProgram(0, OWNER)
         prior_result = store.admit("program-1", "activate-once", activate)
@@ -294,8 +311,8 @@ def test_duplicate_command_returns_prior_result_without_reapplying_and_conflicts
         assert len(store.history("program-1")) == 3
 
 
-def test_all_remaining_k1_command_codecs_validate_on_reopen(tmp_path: Path) -> None:
-    path = tmp_path / "kernel.sqlite3"
+def test_all_remaining_k1_command_codecs_validate_on_reopen(sqlite_tmp_path: Path) -> None:
+    path = sqlite_tmp_path / "kernel.sqlite3"
     with SQLiteProgramStore(path) as store:
         store.create(spec(), "create")
         program = _apply(store, "activate", ActivateProgram(0, OWNER))
@@ -331,9 +348,9 @@ def test_all_remaining_k1_command_codecs_validate_on_reopen(tmp_path: Path) -> N
 
 
 def test_history_dedupe_and_projections_roll_back_as_one_transaction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with SQLiteProgramStore(tmp_path / "kernel.sqlite3") as store:
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
         initial = store.create(spec(), "create")
         original_writer = _projection_writer(store)
 
@@ -360,9 +377,9 @@ def test_history_dedupe_and_projections_roll_back_as_one_transaction(
 
 
 def test_projection_rebuild_decodes_versioned_facts_without_replaying_commands(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with SQLiteProgramStore(tmp_path / "kernel.sqlite3") as store:
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
         expected = _complete_and_cancel(store)
         _connection(store).execute("DELETE FROM program_projection")
 
@@ -375,8 +392,8 @@ def test_projection_rebuild_decodes_versioned_facts_without_replaying_commands(
         assert store.load("program-1") == expected
 
 
-def test_schema_zero_migrates_and_startup_evidence_reports_runtime_capabilities(tmp_path: Path) -> None:
-    path = tmp_path / "kernel.sqlite3"
+def test_schema_zero_migrates_and_startup_evidence_reports_runtime_capabilities(sqlite_tmp_path: Path) -> None:
+    path = sqlite_tmp_path / "kernel.sqlite3"
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA user_version = 0")
     connection.close()
@@ -388,6 +405,7 @@ def test_schema_zero_migrates_and_startup_evidence_reports_runtime_capabilities(
         assert evidence.sqlite_threadsafety == sqlite3.threadsafety
         assert evidence.compile_options
         assert evidence.data_directory == str(path.parent)
+        assert evidence.cache_mode == "private"
         assert evidence.filesystem_type
         assert evidence.filesystem_mountpoint
         assert evidence.filesystem_mount_id > 0
@@ -405,8 +423,8 @@ def test_schema_zero_migrates_and_startup_evidence_reports_runtime_capabilities(
             SQLiteProgramStore(path, busy_timeout_ms=25)
 
 
-def test_store_enforces_its_dedicated_writer_thread(tmp_path: Path) -> None:
-    store = SQLiteProgramStore(tmp_path / "kernel.sqlite3")
+def test_store_enforces_its_dedicated_writer_thread(sqlite_tmp_path: Path) -> None:
+    store = SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3")
     errors: list[BaseException] = []
 
     def load_from_other_thread() -> None:
@@ -423,7 +441,41 @@ def test_store_enforces_its_dedicated_writer_thread(tmp_path: Path) -> None:
     assert isinstance(errors[0], WrongWriterThread)
 
 
-def test_replacement_controller_opens_after_owner_death_with_inert_child(tmp_path: Path) -> None:
+def test_store_explicitly_forces_private_cache_against_shared_cache_peer(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = sqlite_tmp_path / "kernel.sqlite3"
+    real_connect = sqlite3.connect
+    observed: list[tuple[str, bool]] = []
+
+    def capture_connect(database: str | Path, **kwargs: object) -> sqlite3.Connection:
+        observed.append((str(database), bool(kwargs.get("uri"))))
+        connector = cast(Callable[..., sqlite3.Connection], real_connect)
+        return connector(database, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite_store_module.sqlite3, "connect", capture_connect)
+        with SQLiteProgramStore(path) as store:
+            store.create(spec(), "create")
+            assert store.startup_evidence.cache_mode == "private"
+            peer: sqlite3.Connection | None = None
+            try:
+                with pytest.raises(sqlite3.OperationalError):
+                    peer = real_connect(
+                        f"{path.as_uri()}?cache=shared",
+                        timeout=0.05,
+                        isolation_level=None,
+                        uri=True,
+                    )
+                    peer.execute("BEGIN EXCLUSIVE")
+            finally:
+                if peer is not None:
+                    peer.close()
+
+    assert observed == [(f"{path.as_uri()}?cache=private", True)]
+
+
+def test_replacement_controller_opens_after_owner_death_with_inert_child(sqlite_tmp_path: Path) -> None:
     if not sys.platform.startswith("linux") or not hasattr(os, "fork"):
         pytest.skip("requires Linux POSIX locks and fork semantics")
     libc = ctypes.CDLL(None, use_errno=True)
@@ -434,7 +486,7 @@ def test_replacement_controller_opens_after_owner_death_with_inert_child(tmp_pat
     if prctl(36, 1, 0, 0, 0) != 0:
         pytest.skip("cannot configure test process as child subreaper")
 
-    database = tmp_path / "kernel.sqlite3"
+    database = sqlite_tmp_path / "kernel.sqlite3"
     read_fd, write_fd = os.pipe()
     controller: subprocess.Popen[bytes] | None = None
     child_pid: int | None = None
@@ -540,15 +592,15 @@ def test_replacement_controller_opens_after_owner_death_with_inert_child(tmp_pat
         prctl(36, previous_subreaper.value, 0, 0, 0)
 
 
-def test_online_backup_bundle_preserves_history_and_has_a_verifiable_manifest(tmp_path: Path) -> None:
-    database = tmp_path / "kernel.sqlite3"
+def test_online_backup_bundle_preserves_history_and_has_a_verifiable_manifest(sqlite_tmp_path: Path) -> None:
+    database = sqlite_tmp_path / "kernel.sqlite3"
     with SQLiteProgramStore(database) as store:
         expected = _complete_and_cancel(store)
         history = store.history("program-1")
         exported = json.loads(store.export_history("program-1"))
         assert exported["schema_version"] == 1
         assert len(exported["records"]) == len(history)
-        bundle = store.backup(tmp_path / "backup")
+        bundle = store.backup(sqlite_tmp_path / "backup")
 
     manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
     assert manifest["format"] == "creatidy-kernel-sqlite-backup"
@@ -567,7 +619,7 @@ def test_online_backup_bundle_preserves_history_and_has_a_verifiable_manifest(tm
 
 
 def test_online_backup_syncs_bundle_before_and_after_atomic_publish(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     events: list[str] = []
     real_fsync = os.fsync
@@ -586,16 +638,18 @@ def test_online_backup_syncs_bundle_before_and_after_atomic_publish(
 
     monkeypatch.setattr(sqlite_store_module.os, "fsync", tracked_fsync)
     monkeypatch.setattr(sqlite_store_module.os, "replace", tracked_replace)
-    with SQLiteProgramStore(tmp_path / "kernel.sqlite3") as store:
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
         store.create(spec(), "create")
-        bundle = store.backup(tmp_path / "backup")
+        bundle = store.backup(sqlite_tmp_path / "backup")
 
     assert events == ["fsync", "fsync", "fsync", "replace", "fsync"]
     assert bundle.database.is_file()
     assert bundle.manifest.is_file()
 
 
-def test_online_backup_failure_before_publish_leaves_no_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_online_backup_failure_before_publish_leaves_no_bundle(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     real_fsync = os.fsync
     sync_count = 0
 
@@ -607,8 +661,8 @@ def test_online_backup_failure_before_publish_leaves_no_bundle(tmp_path: Path, m
         real_fsync(descriptor)
 
     monkeypatch.setattr(sqlite_store_module.os, "fsync", fail_manifest_sync)
-    destination = tmp_path / "backup"
-    with SQLiteProgramStore(tmp_path / "kernel.sqlite3") as store:
+    destination = sqlite_tmp_path / "backup"
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
         store.create(spec(), "create")
         with pytest.raises(OSError, match="injected manifest sync failure"):
             store.backup(destination)
@@ -717,9 +771,9 @@ def test_native_filesystem_with_volatile_sync_option_is_rejected(tmp_path: Path)
 
 
 def test_reordered_semantically_identical_amendment_reuses_command_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with SQLiteProgramStore(tmp_path / "kernel.sqlite3") as store:
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
         initial = store.create(_spec_with_permutable_collections(), "create")
         current = initial.spec
         amendment = SpecAmendment(
@@ -757,21 +811,64 @@ def test_reordered_semantically_identical_amendment_reuses_command_result(
         assert len(store.history("program-1")) == 2
 
 
-def test_codec_rejects_unknown_versions_and_append_only_history_rejects_mutation(tmp_path: Path) -> None:
+def test_codec_rejects_unknown_versions_and_append_only_history_rejects_mutation(sqlite_tmp_path: Path) -> None:
     initial = Program.create(spec())
     payload = json.loads(program_json(initial))
     payload["schema_version"] = CODEC_VERSION + 1
     with pytest.raises(RecordCodecError, match="unsupported"):
         program_from_json(json.dumps(payload))
 
-    with SQLiteProgramStore(tmp_path / "kernel.sqlite3") as store:
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
         store.create(spec(), "create")
         with pytest.raises(sqlite3.IntegrityError, match="append-only"):
             _connection(store).execute("UPDATE history SET actor_id = 'forged' WHERE sequence = 1")
 
 
-def test_noop_amendment_is_recorded_in_history_without_inventing_k1_revision(tmp_path: Path) -> None:
-    with SQLiteProgramStore(tmp_path / "kernel.sqlite3") as store:
+def test_rehydration_rejects_unreferenced_and_out_of_order_terminal_facts() -> None:
+    initial = Program.create(spec())
+    payload = json.loads(program_json(initial))
+    payload["value"]["attempt_cancellations"].append(
+        {"attempt_id": "missing-attempt", "actor_id": OWNER, "reason": "test", "record_order": 1}
+    )
+    with pytest.raises(RecordCodecError, match="existing cancelled Attempt"):
+        program_from_json(json.dumps(payload))
+
+    payload = json.loads(program_json(initial))
+    payload["value"]["conclusions"].append(
+        {
+            "status": ProgramStatus.COMPLETED.value,
+            "spec_revision": 999,
+            "spec_digest": "sha256:missing-spec",
+            "record_order": 999,
+        }
+    )
+    with pytest.raises(RecordCodecError, match="historical ProgramSpec"):
+        program_from_json(json.dumps(payload))
+
+    payload = json.loads(program_json(initial))
+    payload["value"]["conclusions"].append(
+        {
+            "status": ProgramStatus.COMPLETED.value,
+            "spec_revision": initial.spec.revision,
+            "spec_digest": initial.spec.digest,
+            "record_order": 999,
+        }
+    )
+    with pytest.raises(RecordCodecError, match="authoritative aggregate record order"):
+        program_from_json(json.dumps(payload))
+
+    active = initial.apply(ActivateProgram(initial.revision, OWNER))
+    prepared = active.apply(PrepareAttempt(active.revision, WORKER, _attempt(active, "attempt-1", "first")))
+    payload = json.loads(program_json(prepared))
+    payload["value"]["attempt_cancellations"].append(
+        {"attempt_id": "attempt-1", "actor_id": OWNER, "reason": "test", "record_order": prepared.revision}
+    )
+    with pytest.raises(RecordCodecError, match="cancelled Attempt"):
+        program_from_json(json.dumps(payload))
+
+
+def test_noop_amendment_is_recorded_in_history_without_inventing_k1_revision(sqlite_tmp_path: Path) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
         initial = store.create(spec(), "create")
         unchanged = store.admit(
             "program-1",
@@ -793,8 +890,8 @@ def test_store_rejects_non_file_backed_database_paths(tmp_path: Path) -> None:
         SQLiteProgramStore(":memory:")
 
 
-def test_missing_append_only_guard_fails_closed_on_reopen(tmp_path: Path) -> None:
-    path = tmp_path / "kernel.sqlite3"
+def test_missing_append_only_guard_fails_closed_on_reopen(sqlite_tmp_path: Path) -> None:
+    path = sqlite_tmp_path / "kernel.sqlite3"
     with SQLiteProgramStore(path) as store:
         store.create(spec(), "create")
         connection = _connection(store)

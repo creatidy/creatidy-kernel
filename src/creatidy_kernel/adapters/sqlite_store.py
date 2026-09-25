@@ -96,6 +96,7 @@ class CorruptHistory(SQLiteStoreError):
 class SQLiteStartupEvidence:
     database_path: str
     data_directory: str
+    cache_mode: str
     filesystem_type: str
     filesystem_mountpoint: str
     filesystem_mount_id: int
@@ -186,12 +187,14 @@ class SQLiteProgramStore:
         self._owner_thread = threading.get_ident()
         self._gate = threading.RLock()
         self._busy_timeout_ms = busy_timeout_ms
+        self._cache_mode = "private"
         self._closed = False
         try:
             self._connection = sqlite3.connect(
-                self._path,
+                f"{self._path.as_uri()}?cache=private",
                 timeout=busy_timeout_ms / 1000,
                 isolation_level=None,
+                uri=True,
             )
             self._connection.row_factory = sqlite3.Row
             try:
@@ -497,7 +500,11 @@ class SQLiteProgramStore:
                 temporary_storage = _inspect_local_storage(temporary)
                 if temporary_storage.mount_id != destination_storage.mount_id:
                     raise UnsupportedSQLiteConfiguration("backup staging directory changed storage mounts")
-                backup_connection = sqlite3.connect(database, isolation_level=None)
+                backup_connection = sqlite3.connect(
+                    f"{database.as_uri()}?cache=private",
+                    isolation_level=None,
+                    uri=True,
+                )
                 try:
                     self._connection.backup(backup_connection)
                     integrity = backup_connection.execute("PRAGMA integrity_check").fetchone()
@@ -518,6 +525,7 @@ class SQLiteProgramStore:
                     "history_record_count": record_count,
                     "database_sha256": file_digest,
                     "controller_topology": self._startup_evidence.controller_topology,
+                    "cache_mode": self._startup_evidence.cache_mode,
                     "source_data_directory": str(self._storage.data_directory),
                     "source_filesystem_type": self._storage.filesystem_type,
                     "source_filesystem_mount_id": self._storage.mount_id,
@@ -878,6 +886,7 @@ class SQLiteProgramStore:
         return SQLiteStartupEvidence(
             database_path=str(self._path),
             data_directory=str(self._storage.data_directory),
+            cache_mode=self._cache_mode,
             filesystem_type=self._storage.filesystem_type,
             filesystem_mountpoint=str(self._storage.mountpoint),
             filesystem_mount_id=self._storage.mount_id,
@@ -894,7 +903,7 @@ class SQLiteProgramStore:
             busy_timeout_ms=self._actual_busy_timeout_ms,
             application_id=application_id,
             schema_version=schema_version,
-            controller_topology="one private-cache SQLite connection; retained main.locking_mode=EXCLUSIVE",
+            controller_topology="one cache=private SQLite connection; retained main.locking_mode=EXCLUSIVE",
             writer_process_id=self._owner_pid,
             writer_thread_id=self._owner_thread,
         )
