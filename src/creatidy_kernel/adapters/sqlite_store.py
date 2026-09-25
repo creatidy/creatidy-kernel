@@ -1024,6 +1024,10 @@ def _require_durable_mount(mount: _MountEntry) -> None:
     if b"ro" in mount.mount_options or b"rw" not in mount.mount_options:
         raise UnsupportedSQLiteConfiguration("SQLite data directory mount is not verified writable")
     options = mount.mount_options | mount.super_options
+    if mount.filesystem_type == "f2fs" and any(
+        option == b"checkpoint=disable" or option.startswith(b"checkpoint=disable:") for option in options
+    ):
+        raise UnsupportedSQLiteConfiguration("checkpoint-disabled F2FS is not durable SQLite storage")
     if b"volatile" in options or b"fsync=volatile" in options:
         raise UnsupportedSQLiteConfiguration("volatile filesystem mode is unsupported")
 

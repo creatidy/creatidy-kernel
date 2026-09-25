@@ -889,6 +889,66 @@ def test_native_mount_with_volatile_sync_option_is_rejected() -> None:
         _topology_for_mount_ids(data_directory, 7, {}, mounts)
 
 
+@pytest.mark.parametrize(
+    "checkpoint_option",
+    ("checkpoint=disable", "checkpoint=disable:8192", "checkpoint=disable:5%"),
+)
+@pytest.mark.parametrize("option_location", ("mount", "super"))
+def test_checkpoint_disabled_f2fs_is_rejected_from_mountinfo_options(
+    checkpoint_option: str, option_location: str
+) -> None:
+    data_directory = Path("/synthetic/f2fs-database-directory")
+    mount_options = "rw,relatime"
+    super_options = "rw"
+    if option_location == "mount":
+        mount_options = f"{mount_options},{checkpoint_option}"
+    else:
+        super_options = f"{super_options},{checkpoint_option}"
+    mounts = _parse_mount_records(
+        (
+            _mountinfo_record(1, 0, "8:1", b"/", b"/", "ext4", b"/dev/root"),
+            _mountinfo_record(
+                7,
+                1,
+                "8:1",
+                b"/persistent",
+                b"/synthetic/f2fs-database-directory",
+                "f2fs",
+                b"/dev/f2fs",
+                mount_options=mount_options,
+                super_options=super_options,
+            ),
+        )
+    )
+
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="checkpoint-disabled F2FS"):
+        _topology_for_mount_ids(data_directory, 7, {"database": 7}, mounts)
+
+
+@pytest.mark.parametrize("checkpoint_option", (None, "checkpoint=enable"))
+def test_default_or_checkpoint_enabled_f2fs_remains_supported(checkpoint_option: str | None) -> None:
+    data_directory = Path("/synthetic/f2fs-database-directory")
+    super_options = "rw" if checkpoint_option is None else f"rw,{checkpoint_option}"
+    mounts = _parse_mount_records(
+        (
+            _mountinfo_record(1, 0, "8:1", b"/", b"/", "ext4", b"/dev/root"),
+            _mountinfo_record(
+                7,
+                1,
+                "8:1",
+                b"/persistent",
+                b"/synthetic/f2fs-database-directory",
+                "f2fs",
+                b"/dev/f2fs",
+                super_options=super_options,
+            ),
+        )
+    )
+
+    topology = _topology_for_mount_ids(data_directory, 7, {"database": 7}, mounts)
+    assert cast(Any, topology).filesystem_type == "f2fs"
+
+
 def test_mountinfo_parser_preserves_non_utf8_path_bytes() -> None:
     raw_mountpoint = b"/synthetic/non-utf8-\xff"
     mounts = _parse_mount_records(
