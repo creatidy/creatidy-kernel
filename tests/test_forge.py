@@ -18,6 +18,7 @@ from creatidy_kernel.core.forge import (
     Effect,
     EffectStatus,
     ForgeConflict,
+    Observation,
     Presence,
     Reference,
     UnsupportedForge,
@@ -418,6 +419,122 @@ def test_pr_snapshot_contention_fails_without_post(
     assert transport.posts == 0
 
 
+def test_existing_same_sha_snapshot_is_contention(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    snapshot = pr_payload(effect, transport.max_bytes)[0]
+    transport.branches[snapshot] = HEAD.value.removeprefix("forgejo:")
+    with pytest.raises(ForgeConflict, match="snapshot namespace occupied"):
+        forge.apply(effect)
+    assert transport.posts == transport.pushes == 0
+
+
+def test_snapshot_creation_uses_atomic_cas_without_absence_read(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    assert transport.direct_absence is False
+    snapshot = pr_payload(effect, transport.max_bytes)[0]
+    original = forge.branch
+    reads = 0
+
+    def observed(repository: Reference, branch: str) -> Observation:
+        nonlocal reads
+        if branch == snapshot:
+            reads += 1
+            assert transport.pushes == 1
+        return original(repository, branch)
+
+    with patch.object(forge, "branch", side_effect=observed):
+        receipt = forge.apply(effect)
+    assert receipt.status is EffectStatus.ACCEPTED
+    assert receipt.reference is not None
+    assert reads == 2 and transport.posts == 1
+
+
+@pytest.mark.parametrize(
+    "phase,presence",
+    [
+        (phase, presence)
+        for phase in ("before_post", "after_post", "reconcile")
+        for presence in (Presence.UNKNOWN, Presence.INACCESSIBLE, Presence.ABSENT)
+    ],
+)
+def test_unreadable_snapshot_returns_unknown_without_false_conflict(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], phase: str, presence: Presence
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    snapshot = pr_payload(effect, transport.max_bytes)[0]
+    reference = None
+    if phase == "reconcile":
+        accepted = forge.apply(effect)
+        assert accepted.reference is not None
+        reference = accepted.reference
+    original = forge.branch
+    reads = 0
+
+    def altered(repository: Reference, branch: str) -> Observation:
+        nonlocal reads
+        if branch == snapshot:
+            reads += 1
+            if (
+                phase == "reconcile"
+                or (phase == "before_post" and reads == 1)
+                or (phase == "after_post" and reads == 2)
+            ):
+                return Observation(presence)
+        return original(repository, branch)
+
+    with patch.object(forge, "branch", side_effect=altered):
+        receipt = forge.reconcile(effect, reference) if reference else forge.apply(effect)
+    assert receipt.status is EffectStatus.UNKNOWN
+    assert transport.posts == (0 if phase == "before_post" else 1)
+
+
+def test_unknown_snapshot_push_response_never_posts_or_retries(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    transport.lost_reply = True
+    assert forge.apply(effect).status is EffectStatus.UNKNOWN
+    assert transport.pushes == 1 and transport.posts == 0
+    replay = replace(effect, delivery_attempts=2)
+    permitted.append(replay)
+    assert forge.apply(replay).status is EffectStatus.UNKNOWN
+    assert transport.posts == 0
+
+
+@pytest.mark.parametrize("side", ["head", "base"])
+def test_malformed_immediate_pr_payload_is_unknown_in_both_adapters(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], side: str
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    original = transport.request
+
+    def malformed(method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
+        status, payload = original(method, path, body)
+        if method == "POST" and status == 201 and isinstance(payload, dict):
+            subject = cast(dict[str, object], payload).get(side)
+            assert isinstance(subject, dict)
+            cast(dict[str, object], subject)["sha"] = "invalid"
+        return status, cast(object, payload)
+
+    with patch.object(transport, "request", side_effect=malformed):
+        assert forge.apply(effect).status is EffectStatus.UNKNOWN
+    assert transport.posts == 1
+
+
 def test_pr_base_revision_cannot_be_part_of_effect_authority() -> None:
     with pytest.raises(ForgeConflict, match="observation only"):
         replace(operation("pr"), base_revision=BASE)
@@ -430,10 +547,15 @@ def test_lost_pr_post_reply_releases_guard_but_does_not_retry(
     effect = operation("pr")
     permitted.append(effect)
     snapshot = pr_payload(effect, transport.max_bytes)[0]
-    with transport.hold(REPO, snapshot):
-        assert transport.compare_and_push(REPO, snapshot, None, HEAD) is EffectStatus.ACCEPTED
-    transport.lost_reply = True
-    assert forge.apply(effect).status is EffectStatus.UNKNOWN
+    original = transport.request
+
+    def lost_post(method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
+        if method == "POST":
+            transport.lost_reply = True
+        return original(method, path, body)
+
+    with patch.object(transport, "request", side_effect=lost_post):
+        assert forge.apply(effect).status is EffectStatus.UNKNOWN
     assert transport.posts == 1 and len(transport.pulls) == 1
     assert transport.branches[snapshot] == HEAD.value.removeprefix("forgejo:")
     with transport.hold(REPO, snapshot):
@@ -563,17 +685,14 @@ def test_stale_rejected_uncertain_and_inaccessible(
     assert moved.observed_base == Reference(f"forgejo:{MOVED_BASE}")
     assert transport.posts == 1
     transport.branches["develop"] = BASE.value.removeprefix("forgejo:")
-    transport.domain_rejection = True
-    assert forge.apply(effect).status is EffectStatus.REJECTED
-    transport.domain_rejection = False
-    transport.lost_reply = True
-    assert forge.apply(effect).status is EffectStatus.UNKNOWN
-    assert transport.posts == 3
+    with pytest.raises(ForgeConflict, match="snapshot namespace occupied"):
+        forge.apply(effect)
+    assert transport.posts == 1
     assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
     replay = replace(effect, delivery_attempts=2)
     permitted.append(replay)
     assert forge.apply(replay).status is EffectStatus.UNKNOWN
-    assert transport.posts == 3
+    assert transport.posts == 1
     transport.forbidden = True
     assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
 

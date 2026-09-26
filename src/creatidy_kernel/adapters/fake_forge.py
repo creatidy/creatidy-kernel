@@ -386,17 +386,19 @@ class FakeForge(Forge):
         if base.presence is not Presence.FOUND:
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
         with self.transport.hold(effect.repository, snapshot):
-            current = self.branch(effect.repository, snapshot)
-            if current.presence is Presence.FOUND and current.revision != effect.revision:
-                raise ForgeConflict("snapshot head differs")
-            if current.presence is not Presence.FOUND:
+            try:
                 status = self.transport.compare_and_push(effect.repository, snapshot, None, effect.revision)
-                if status is EffectStatus.STALE:
-                    raise ForgeConflict("snapshot namespace occupied")
-                if status is not EffectStatus.ACCEPTED:
-                    return Receipt(EffectStatus.UNKNOWN, effect.operation)
-            if self.branch(effect.repository, snapshot).revision != effect.revision:
+            except OSError:
+                status = EffectStatus.UNKNOWN
+            if status is EffectStatus.STALE:
+                raise ForgeConflict("snapshot namespace occupied")
+            if status is not EffectStatus.ACCEPTED:
+                return Receipt(EffectStatus.UNKNOWN, effect.operation)
+            after = self.branch(effect.repository, snapshot)
+            if after.presence is Presence.FOUND and after.revision != effect.revision:
                 raise ForgeConflict("snapshot head differs")
+            if after.presence is not Presence.FOUND:
+                return Receipt(EffectStatus.UNKNOWN, effect.operation)
             try:
                 status, record = self.transport.request(
                     "POST",
@@ -410,7 +412,10 @@ class FakeForge(Forge):
             if status != 201 or not isinstance(record, dict):
                 return Receipt(EffectStatus.UNKNOWN, effect.operation)
             data = cast(dict[str, object], record)
-            pull = self._pull(effect.repository, data)
+            try:
+                pull = self._pull(effect.repository, data)
+            except ValueError:
+                return Receipt(EffectStatus.UNKNOWN, effect.operation)
             head_data, base_data = data.get("head"), data.get("base")
             if (
                 pull.head != effect.revision
@@ -422,8 +427,11 @@ class FakeForge(Forge):
                 or data.get("title") != effect.title
             ):
                 raise ForgeConflict("PR response differs from authorized head or base identity")
-            if self.branch(effect.repository, snapshot).revision != effect.revision:
+            final_snapshot = self.branch(effect.repository, snapshot)
+            if final_snapshot.presence is Presence.FOUND and final_snapshot.revision != effect.revision:
                 raise ForgeConflict("snapshot head moved during PR creation")
+            if final_snapshot.presence is not Presence.FOUND:
+                return Receipt(EffectStatus.UNKNOWN, effect.operation)
             return Receipt(EffectStatus.ACCEPTED, effect.operation, pull.reference, observed_base=pull.base)
 
     def reconcile(self, effect: Effect, known_reference: Reference | None = None) -> Receipt:
@@ -464,8 +472,11 @@ class FakeForge(Forge):
                 or pull.get("title") != effect.title
             ):
                 return Receipt(EffectStatus.UNKNOWN, effect.operation)
-            if self.branch(effect.repository, snapshot).revision != effect.revision:
+            current = self.branch(effect.repository, snapshot)
+            if current.presence is Presence.FOUND and current.revision != effect.revision:
                 raise ForgeConflict("snapshot head moved")
+            if current.presence is not Presence.FOUND:
+                return Receipt(EffectStatus.UNKNOWN, effect.operation)
             return Receipt(EffectStatus.ACCEPTED, effect.operation, known_reference, observed_base=observation.base)
         return Receipt(EffectStatus.UNKNOWN, effect.operation)
 

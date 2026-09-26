@@ -359,21 +359,19 @@ class ForgejoForge(Forge):
     def _create_pr(self, effect: Effect, snapshot: str, body: str) -> Receipt:
         if effect.revision is None:
             raise ForgeConflict("revision required")
-        snapshot_before = self.branch(effect.repository, snapshot)
-        if snapshot_before.presence is Presence.FOUND:
-            if snapshot_before.revision != effect.revision:
-                raise ForgeConflict("snapshot head differs from accepted candidate")
-        else:
-            try:
-                created = self.git.compare_and_push(effect.repository, snapshot, None, effect.revision)
-            except OSError:
-                created = EffectStatus.UNKNOWN
-            if created is EffectStatus.STALE:
-                raise ForgeConflict("snapshot namespace occupied")
-            if created is not EffectStatus.ACCEPTED:
-                return Receipt(EffectStatus.UNKNOWN, effect.operation)
-        if self.branch(effect.repository, snapshot).revision != effect.revision:
+        try:
+            created = self.git.compare_and_push(effect.repository, snapshot, None, effect.revision)
+        except OSError:
+            created = EffectStatus.UNKNOWN
+        if created is EffectStatus.STALE:
+            raise ForgeConflict("snapshot namespace occupied")
+        if created is not EffectStatus.ACCEPTED:
+            return Receipt(EffectStatus.UNKNOWN, effect.operation)
+        snapshot_after = self.branch(effect.repository, snapshot)
+        if snapshot_after.presence is Presence.FOUND and snapshot_after.revision != effect.revision:
             raise ForgeConflict("snapshot head differs from accepted candidate")
+        if snapshot_after.presence is not Presence.FOUND:
+            return Receipt(EffectStatus.UNKNOWN, effect.operation)
         try:
             status, payload = self._request(
                 "POST",
@@ -399,8 +397,11 @@ class ForgejoForge(Forge):
                 or observed.head != effect.revision
             ):
                 raise ForgeConflict("PR response differs from authorized head or base identity")
-            if self.branch(effect.repository, snapshot).revision != effect.revision:
+            final_snapshot = self.branch(effect.repository, snapshot)
+            if final_snapshot.presence is Presence.FOUND and final_snapshot.revision != effect.revision:
                 raise ForgeConflict("snapshot head moved during PR creation")
+            if final_snapshot.presence is not Presence.FOUND:
+                return Receipt(EffectStatus.UNKNOWN, effect.operation)
             return Receipt(EffectStatus.ACCEPTED, effect.operation, observed.reference, observed_base=observed.base)
         except ForgeConflict:
             raise
@@ -439,6 +440,9 @@ class ForgejoForge(Forge):
             raise
         except (ValueError, TypeError):
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
-        if self.branch(effect.repository, snapshot).revision != effect.revision:
+        current = self.branch(effect.repository, snapshot)
+        if current.presence is Presence.FOUND and current.revision != effect.revision:
             raise ForgeConflict("snapshot head moved")
+        if current.presence is not Presence.FOUND:
+            return Receipt(EffectStatus.UNKNOWN, effect.operation)
         return Receipt(EffectStatus.ACCEPTED, effect.operation, known_reference, observed_base=observed.base)
