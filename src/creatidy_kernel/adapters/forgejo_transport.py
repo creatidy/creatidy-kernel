@@ -7,11 +7,17 @@ Run only in a trusted controller with scoped credentials; never in a worker.
 import json
 import os
 import re
+import selectors
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
+import time
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from pathlib import Path
+from typing import BinaryIO, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -37,6 +43,31 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
+@contextmanager
+def _deadline(seconds: int):
+    # urllib's socket timeout is per I/O; on non-main threads there is no
+    # interruptible total deadline, so never claim one there.
+    if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
+        raise OSError("total HTTP deadline unsupported in this context")
+    previous = signal.getsignal(signal.SIGALRM)
+    if signal.getitimer(signal.ITIMER_REAL)[0] > 0:
+        raise OSError("total HTTP deadline unavailable with active alarm")
+
+    def expired(_signum: int, _frame: object) -> None:
+        raise TimeoutError("forge HTTP operation deadline exceeded")
+
+    signal.signal(signal.SIGALRM, expired)
+    end = time.monotonic() + seconds
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+        if time.monotonic() >= end:
+            raise TimeoutError("forge HTTP operation deadline exceeded")
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 class HTTPSForgejoTransport:
     def __init__(
         self, api_url: str, token: Callable[[], str], *, timeout: int = 15, max_bytes: int = 1_000_000
@@ -57,44 +88,95 @@ class HTTPSForgejoTransport:
     def request(self, method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
         if method not in {"GET", "POST"} or not path.startswith("/repos/") or ".." in path or "#" in path:
             raise ValueError("unsupported forge request")
-        secret = self.token()
-        if not secret or "\n" in secret or "\r" in secret:
-            raise ValueError("invalid forge credential")
-        data = json.dumps(dict(body)).encode("utf-8") if body is not None else None
-        request = Request(  # noqa: S310 - URL is constrained to HTTPS above and redirects are disabled.
-            f"{self.api_url}{path}",
-            data=data,
-            headers={
-                "Authorization": f"token {secret}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            method=method,
-        )
         try:
-            with self.opener.open(request, timeout=self.timeout) as response:
-                status = response.status
-                content = response.read(self.max_bytes + 1)
-        except HTTPError as error:
-            with error:
-                status = error.code
-                content = error.read(self.max_bytes + 1)
-        except URLError as error:
+            with _deadline(self.timeout):
+                data = json.dumps(dict(body)).encode("utf-8") if body is not None else None
+                if data is not None and len(data) > self.max_bytes:
+                    raise ValueError("forge HTTP request exceeds safe limit")
+                secret = self.token()
+                if not secret or "\n" in secret or "\r" in secret:
+                    raise ValueError("invalid forge credential")
+                request = Request(  # noqa: S310 - HTTPS only; redirects disabled.
+                    f"{self.api_url}{path}",
+                    data=data,
+                    headers={
+                        "Authorization": f"token {secret}",
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                    },
+                    method=method,
+                )
+                try:
+                    with self.opener.open(request, timeout=self.timeout) as response:
+                        status = response.status
+                        content = response.read(self.max_bytes + 1)
+                except HTTPError as error:
+                    with error:
+                        status = error.code
+                        content = error.read(self.max_bytes + 1)
+                if len(content) > self.max_bytes:
+                    raise OSError("forge HTTP response exceeds safe limit")
+                try:
+                    payload: object = json.loads(content) if content else None
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    payload = None
+        except (URLError, TimeoutError) as error:
             raise OSError("forge HTTP outcome unknown") from error
-        if len(content) > self.max_bytes:
-            raise OSError("forge HTTP response exceeds safe limit")
-        try:
-            payload: object = json.loads(content) if content else None
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            payload = None
         return status, payload
+
+
+def run_git_bounded(
+    argv: list[str], cwd: Path, env: dict[str, str], timeout: int, max_bytes: int
+) -> subprocess.CompletedProcess[str]:
+    with subprocess.Popen(  # noqa: S603 - caller supplies fixed binary and controlled arguments/environment.
+        argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+    ) as process:
+        if process.stdout is None or process.stderr is None:
+            raise OSError("Git output pipes unavailable")
+        output = {process.stdout: bytearray(), process.stderr: bytearray()}
+        deadline = time.monotonic() + timeout
+        with selectors.DefaultSelector() as selector:
+            for pipe in output:
+                selector.register(pipe, selectors.EVENT_READ, pipe)
+            try:
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Git operation timed out")
+                    for key, _ in selector.select(remaining):
+                        pipe = cast(BinaryIO, key.data)
+                        chunk = os.read(pipe.fileno(), min(8192, max_bytes + 1))
+                        if not chunk:
+                            selector.unregister(pipe)
+                        else:
+                            output[pipe].extend(chunk)
+                            if sum(len(part) for part in output.values()) > max_bytes:
+                                raise OverflowError("Git output limit exceeded")
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
+        return subprocess.CompletedProcess(
+            argv,
+            process.returncode,
+            output[process.stdout].decode("utf-8", "replace"),
+            output[process.stderr].decode("utf-8", "replace"),
+        )
 
 
 class ConditionalGitTransport:
     """Push from an isolated bare repository, never loading workload Git configuration."""
 
     def __init__(
-        self, repository: Reference, remote_url: str, worktree: Path, *, timeout: int = 60, askpass: Path | None = None
+        self,
+        repository: Reference,
+        remote_url: str,
+        object_source: Path,
+        *,
+        timeout: int = 60,
+        askpass: Path | None = None,
+        max_output_bytes: int = 65536,
     ) -> None:
         _https(remote_url)
         repo_path = repository.value.removeprefix("forgejo:")
@@ -103,20 +185,42 @@ class ConditionalGitTransport:
             or remote_url.rstrip("/").split("/", 3)[-1].removesuffix(".git") != repo_path
         ):
             raise ForgeConflict("remote URL must bind the exact repository")
-        if not worktree.is_dir() or timeout <= 0:
-            raise ValueError("existing local Git repository and finite timeout required")
+        if timeout <= 0 or max_output_bytes <= 0:
+            raise ValueError("finite Git limits required")
+        # This must be a controller-owned, non-worker-writable bare repository.
+        # Path checks reject indirection, but do not establish hostile isolation.
+        if not object_source.is_absolute() or object_source.is_symlink() or not object_source.is_dir():
+            raise ValueError("explicit absolute bare object source required")
+        if any(parent.is_symlink() for parent in object_source.parents):
+            raise ValueError("symlink in object source path forbidden")
+        source = object_source.resolve(strict=True)
+        if (source / ".git").exists() or not (source / "HEAD").is_file() or not (source / "refs").is_dir():
+            raise ValueError("bare object source required")
+        objects = source / "objects"
+        if not objects.is_dir() or (objects / "info" / "alternates").exists() or (source / "commondir").exists():
+            raise ValueError("object source indirection forbidden")
+        for current, directories, files in os.walk(source, followlinks=False):
+            if any((Path(current) / entry).is_symlink() for entry in [*directories, *files]):
+                raise ValueError("symlink in object source forbidden")
         self.repository = repository
         self.remote_url = remote_url
-        self.worktree = worktree
+        self.object_source = source
+        self.source_identity = (
+            source.stat().st_dev,
+            source.stat().st_ino,
+            objects.stat().st_dev,
+            objects.stat().st_ino,
+        )
         self.timeout = timeout
+        self.max_output_bytes = max_output_bytes
         # The caller supplies a trusted executable which obtains a scoped credential
         # outside the worktree. Never inherit Git's ambient credential helpers.
         if askpass is not None and (
             not askpass.is_absolute() or not askpass.is_file() or not os.access(askpass, os.X_OK)
         ):
             raise ValueError("askpass must be a trusted absolute executable")
-        if askpass is not None and askpass.resolve().is_relative_to(worktree.resolve()):
-            raise ValueError("askpass cannot be controlled by the worktree")
+        if askpass is not None and askpass.resolve().is_relative_to(source):
+            raise ValueError("askpass cannot be controlled by the object source")
         self.askpass = askpass
         binary = shutil.which("git")
         if binary is None or not Path(binary).is_absolute():
@@ -152,26 +256,36 @@ class ConditionalGitTransport:
             if self.askpass is not None:
                 env["GIT_ASKPASS"] = str(self.askpass)
 
-            def run_git(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-                return subprocess.run(  # noqa: S603 - fixed Git binary, controlled arguments and environment.
-                    argv, cwd=cwd, capture_output=True, text=True, check=False, timeout=self.timeout, env=env
-                )
+            def run_git(argv: list[str]) -> subprocess.CompletedProcess[str]:
+                return run_git_bounded(argv, root, env, self.timeout, self.max_output_bytes)
 
-            # This read-only discovery does not execute hooks; no worktree config is
-            # used by the push itself, including includeIf, url rewrites or helpers.
             try:
-                objects = run_git(
-                    [self.git_binary, "rev-parse", "--path-format=absolute", "--git-path", "objects"], self.worktree
-                )
-                if objects.returncode != 0 or not Path(objects.stdout.strip()).is_dir():
+                source = self.object_source
+                objects = source / "objects"
+                if (
+                    source.is_symlink()
+                    or any(parent.is_symlink() for parent in source.parents)
+                    or (source.stat().st_dev, source.stat().st_ino, objects.stat().st_dev, objects.stat().st_ino)
+                    != self.source_identity
+                    or (source / "commondir").exists()
+                    or (objects / "info" / "alternates").exists()
+                    or any(
+                        (Path(current) / entry).is_symlink()
+                        for current, dirs, files in os.walk(source)
+                        for entry in [*dirs, *files]
+                    )
+                ):
                     return EffectStatus.UNKNOWN
-                initialized = run_git([self.git_binary, "init", "--bare", "--template=", str(root / "repo")], root)
+                env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(objects)
+                initialized = run_git([self.git_binary, "init", "--bare", "--template=", str(root / "repo")])
                 if initialized.returncode != 0:
                     return EffectStatus.UNKNOWN
-                checked = run_git([self.git_binary, "check-ref-format", "--branch", branch], root)
+                checked = run_git([self.git_binary, "check-ref-format", "--branch", branch])
                 if checked.returncode != 0:
                     raise ForgeConflict("invalid Git branch")
-                env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = objects.stdout.strip()
+                kind = run_git([self.git_binary, f"--git-dir={root / 'repo'}", "cat-file", "-t", sha])
+                if kind.returncode != 0 or kind.stdout != "commit\n":
+                    return EffectStatus.UNKNOWN
                 pushed = run_git(
                     [
                         self.git_binary,
@@ -189,11 +303,25 @@ class ConditionalGitTransport:
                         self.remote_url,
                         f"{sha}:{ref}",
                     ],
-                    root,
                 )
-            except (OSError, subprocess.TimeoutExpired):
+            except (OSError, TimeoutError, subprocess.TimeoutExpired, OverflowError):
                 return EffectStatus.UNKNOWN
-        if pushed.returncode == 0:
+        success = f"{sha}:{ref}\t"
+        lines = pushed.stdout.splitlines()
+        if (
+            pushed.returncode == 0
+            and len(lines) == 3
+            and lines[0] == f"To {self.remote_url}"
+            and lines[2] == "Done"
+            and (
+                re.fullmatch(rf"\*\t{re.escape(success)}\[new branch\]", lines[1])
+                or re.fullmatch(rf" \t{re.escape(success)}[0-9a-f]{{7,64}}\.\.[0-9a-f]{{7,64}}", lines[1])
+                or re.fullmatch(
+                    rf"\+\t{re.escape(success)}[0-9a-f]{{7,64}}\.\.[0-9a-f]{{7,64}} \(forced update\)", lines[1]
+                )
+                or lines[1] == f"=\t{success}[up to date]"
+            )
+        ):
             return EffectStatus.ACCEPTED
         rejected = f"!\t{sha}:{ref}\t[rejected] (stale info)"
-        return EffectStatus.STALE if pushed.stdout.splitlines() == [rejected] else EffectStatus.UNKNOWN
+        return EffectStatus.STALE if lines == [rejected] and pushed.returncode != 0 else EffectStatus.UNKNOWN

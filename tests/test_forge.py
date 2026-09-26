@@ -87,6 +87,15 @@ def test_observations_and_pagination(boundary: tuple[Forge, SyntheticForgeTransp
     assert not forge.changes(REPO).complete
 
 
+@pytest.mark.parametrize("cursor", ["invalid", "0", "01", "-1", "١"])
+def test_invalid_pagination_cursor_is_incomplete(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], cursor: str
+) -> None:
+    forge, _, _ = boundary
+    for page in (forge.changes(REPO, cursor), forge.checks(REPO, HEAD, cursor)):
+        assert page.items == () and page.next_cursor is None and not page.complete
+
+
 def test_check_observations_fail_closed(boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]]) -> None:
     forge, transport, _ = boundary
     transport.statuses.append({"id": 1, "context": "scan", "status": "error"})
@@ -224,6 +233,16 @@ def test_direct_absence_is_explicit_and_never_retries_uncertain_pr(
     assert forge.change(REPO, Reference(f"{REPO.value}#99")).presence is Presence.INACCESSIBLE
 
 
+def test_repository_identity_absence_classes(boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]]) -> None:
+    forge, transport, _ = boundary
+    transport.repository_missing = True
+    assert forge.identity(REPO).presence is Presence.UNKNOWN
+    transport.direct_absence = True
+    assert forge.identity(REPO).presence is Presence.ABSENT
+    transport.forbidden = True
+    assert forge.identity(REPO).presence is Presence.INACCESSIBLE
+
+
 @pytest.mark.parametrize("suffix", ["", "0", "01", "-1", "abc", "1x", "١"])
 def test_malformed_change_id_rejected(
     boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], suffix: str
@@ -359,11 +378,31 @@ def test_reconciliation_budgets_and_malformed_pages_fail_closed() -> None:
     assert limited.reconcile(effect).status is EffectStatus.UNKNOWN
     assert forge.changes(REPO, "invalid").complete is False
     assert forge.changes(REPO, "0").complete is False
+    assert forge.checks(REPO, HEAD, "-1").complete is False
     repeated = ForgejoForge(transport, transport, lambda _effect: True)
     page = repeated.changes(REPO)
     with patch.object(repeated, "changes", return_value=replace(page, items=(), next_cursor="1")):
         assert repeated.reconcile(effect).status is EffectStatus.UNKNOWN
     assert transport.posts == 1
+
+
+@pytest.mark.parametrize("budget,accepted", [(2, False), (3, False), (4, True)])
+def test_reconciliation_counts_all_auth_reads(budget: int, accepted: bool) -> None:
+    transport = SyntheticForgeTransport(REPO)
+    effect = operation("pr")
+    creator = ForgejoForge(transport, transport, lambda _effect: True)
+    assert creator.apply(effect).status is EffectStatus.ACCEPTED
+    seen: list[str] = []
+    original = transport.request
+
+    def counting(method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
+        seen.append(path)
+        return original(method, path, body)
+
+    limited = ForgejoForge(transport, transport, lambda _effect: True, max_reconcile_requests=budget)
+    with patch.object(transport, "request", side_effect=counting):
+        assert (limited.reconcile(effect).status is EffectStatus.ACCEPTED) is accepted
+    assert len(seen) == budget
 
 
 def test_forgejo_read_failure_and_wrong_change_are_unknown() -> None:

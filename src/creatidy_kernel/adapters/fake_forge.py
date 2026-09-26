@@ -34,6 +34,7 @@ class SyntheticForgeTransport:
         self.pushes = 0
         self.posts = 0
         self.direct_absence = False
+        self.repository_missing = False
 
     def authoritative_absence(self, path: str) -> bool:
         return self.direct_absence and not self.forbidden
@@ -59,6 +60,8 @@ class SyntheticForgeTransport:
         uri = urlsplit(path)
         parts = [unquote(part) for part in uri.path.split("/") if part]
         if len(parts) < 3 or parts[:3] != ["repos", *self.repository.value.removeprefix("forgejo:").split("/")]:
+            return 404, {}
+        if self.repository_missing and method == "GET":
             return 404, {}
         route = parts[3:]
         if method == "GET" and not route:
@@ -123,6 +126,8 @@ class FakeForge(Forge):
     def identity(self, repository: Reference) -> Observation:
         if self.transport.forbidden:
             return Observation(Presence.INACCESSIBLE)
+        if self.transport.repository_missing:
+            return Observation(Presence.ABSENT if self.transport.direct_absence else Presence.UNKNOWN)
         if repository != self.transport.repository:
             return Observation(Presence.UNKNOWN)
         return Observation(Presence.FOUND, repository)
@@ -179,9 +184,9 @@ class FakeForge(Forge):
     ) -> tuple[list[dict[str, object]], str | None, bool]:
         if self.identity(repository).presence is not Presence.FOUND:
             return [], None, False
+        if cursor is not None and (not cursor.isascii() or not cursor.isdigit() or cursor[0] == "0"):
+            return [], None, False
         page = 1 if cursor is None else int(cursor)
-        if page < 1:
-            raise ValueError("invalid cursor")
         size = self.transport.page_size
         items = records[(page - 1) * size : page * size]
         return items, str(page + 1) if items else None, not items

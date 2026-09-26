@@ -102,9 +102,12 @@ class ForgejoForge(Forge):
             return 0, None
 
     def identity(self, repository: Reference) -> Observation:
-        status, payload = self._read(f"/repos/{self._repo(repository)}")
+        path = f"/repos/{self._repo(repository)}"
+        status, payload = self._read(path)
         if status == 403:
             return Observation(Presence.INACCESSIBLE)
+        if status == 404 and self.http.authoritative_absence(path):
+            return Observation(Presence.ABSENT)
         if status != 200:
             return Observation(Presence.UNKNOWN)
         try:
@@ -378,10 +381,19 @@ class ForgejoForge(Forge):
                     if item.head == effect.revision and item.base == effect.base_revision:
                         if effect.base_branch is None:
                             return Receipt(EffectStatus.UNKNOWN, effect.operation)
-                        if (
-                            self.branch(effect.repository, effect.base_branch).revision != effect.base_revision
-                            or self.branch(effect.repository, effect.branch).revision != effect.revision
-                        ):
+                        if requests >= self.max_reconcile_requests:
+                            return Receipt(
+                                EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted"
+                            )
+                        base = self.branch(effect.repository, effect.base_branch)
+                        requests += 1
+                        if requests >= self.max_reconcile_requests:
+                            return Receipt(
+                                EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted"
+                            )
+                        head = self.branch(effect.repository, effect.branch)
+                        requests += 1
+                        if base.revision != effect.base_revision or head.revision != effect.revision:
                             return Receipt(EffectStatus.UNKNOWN, effect.operation, item.reference, "head/base moved")
                         return Receipt(EffectStatus.ACCEPTED, effect.operation, item.reference)
                     return Receipt(EffectStatus.UNKNOWN, effect.operation, item.reference, "changed PR subject")
