@@ -6,10 +6,14 @@ Creatidy Kernel is the foundation of a local-first, provider-neutral control pla
 software engineering. It is for individual developers and small teams with limited AI budgets,
 premium-model quota and human attention.
 
-**Status: deterministic K1 domain and K2A/K2B durable persistence, not an autonomous Program engine.**
+**Status: deterministic K1 domain, K2A/K2B durable persistence, and synthetic K3 execution boundaries,
+not an autonomous Program engine.**
 The code includes immutable Program intent, legal domain commands, single-controller SQLite history
 and rebuildable projections, an external-operation journal/outbox with a synthetic effect seam and
-content-addressed artifacts, plus a replaceable resource allocator. It does not run agents, schedule
+content-addressed artifacts, plus a replaceable resource allocator. Synthetic Runtime, Workspace and
+authority fixtures exercise execution and candidate submission without a live harness. Their
+trusted-development mode is not an OS/container security boundary for hostile code; real isolation
+requires an existing sandbox and scoped credentials. The package does not run live agents, schedule
 or autonomously execute Programs, contact providers, perform live external effects or modify your
 repositories.
 
