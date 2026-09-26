@@ -169,6 +169,19 @@ def test_conditional_git_creation_stale_and_uncertainty(tmp_path: Path) -> None:
             ),
         ]
         assert transport.compare_and_push(REPO, "new", None, Reference(f"forgejo:{SHA}")) is EffectStatus.ACCEPTED
+        for expected in (None, Reference(f"forgejo:{OLD}")):
+            run.side_effect = [
+                *setup,
+                CompletedProcess(
+                    [],
+                    0,
+                    f"To https://forge.invalid/team/project.git\n=\t{SHA}:refs/heads/new\t[up to date]\nDone\n",
+                    "",
+                ),
+            ]
+            assert (
+                transport.compare_and_push(REPO, "new", expected, Reference(f"forgejo:{SHA}")) is EffectStatus.UNKNOWN
+            )
     with pytest.raises(ForgeConflict):
         transport.compare_and_push(REPO, "--delete", None, Reference(f"forgejo:{SHA}"))
     with pytest.raises(ForgeConflict):
@@ -223,6 +236,13 @@ def test_success_receipt_matches_real_git_porcelain(tmp_path: Path) -> None:
 
     with patch("creatidy_kernel.adapters.forgejo_transport.run_git_bounded", side_effect=local_push):
         assert transport.compare_and_push(REPO, "new", None, Reference(f"forgejo:{sha}")) is EffectStatus.ACCEPTED
+        # A preexisting target at the desired revision is not proof of absent-target CAS.
+        assert transport.compare_and_push(REPO, "new", None, Reference(f"forgejo:{sha}")) is EffectStatus.UNKNOWN
+        # Even an expected-old value already equal to the target must not turn a no-op into acceptance.
+        assert (
+            transport.compare_and_push(REPO, "new", Reference(f"forgejo:{'b' * 40}"), Reference(f"forgejo:{sha}"))
+            is EffectStatus.UNKNOWN
+        )
 
 
 def test_bare_source_rejects_indirection_and_unverified_objects(tmp_path: Path) -> None:
@@ -290,6 +310,20 @@ def test_git_failure_kills_descendants(tmp_path: Path, overflow: bool) -> None:
     )
     with pytest.raises(OverflowError if overflow else TimeoutError):
         run_git_bounded([sys.executable, "-c", parent], tmp_path, {"PATH": os.environ["PATH"]}, 1, 100)
+    time.sleep(1.6)
+    assert not marker.exists()
+
+
+def test_completed_git_failure_kills_descendant_with_closed_output(tmp_path: Path) -> None:
+    marker = tmp_path / "child-survived"
+    child = "import pathlib,time,sys; time.sleep(1.5); pathlib.Path(sys.argv[1]).touch()"
+    parent = (
+        "import subprocess,sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}, {str(marker)!r}], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); sys.exit(1)"
+    )
+    result = run_git_bounded([sys.executable, "-c", parent], tmp_path, {"PATH": os.environ["PATH"]}, 2, 100)
+    assert result.returncode == 1
     time.sleep(1.6)
     assert not marker.exists()
 

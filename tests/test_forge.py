@@ -133,11 +133,11 @@ def test_branch_creation_and_reconcile_lost_push(
     permitted.append(effect)
     transport.lost_reply = True
     assert forge.apply(effect).status is EffectStatus.UNKNOWN
-    assert forge.reconcile(effect).status is EffectStatus.ACCEPTED
+    assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
     assert transport.pushes == 1
     replay = replace(effect, delivery_attempts=2)
     permitted.append(replay)
-    assert forge.apply(replay).status is EffectStatus.ACCEPTED
+    assert forge.apply(replay).status is EffectStatus.UNKNOWN
     assert transport.pushes == 1
 
 
@@ -193,7 +193,8 @@ def test_pr_artifact_not_merge_and_replay(boundary: tuple[Forge, SyntheticForgeT
     assert "merge" not in forge.capabilities()
     retry = replace(effect, delivery_attempts=2)
     permitted.append(retry)
-    assert forge.apply(retry).status is EffectStatus.ACCEPTED
+    assert forge.apply(retry).status is EffectStatus.UNKNOWN
+    assert forge.reconcile(effect, receipt.reference).status is EffectStatus.ACCEPTED
     assert transport.posts == 1
 
 
@@ -213,7 +214,11 @@ def test_stale_rejected_uncertain_and_inaccessible(
     transport.lost_reply = True
     assert forge.apply(effect).status is EffectStatus.UNKNOWN
     assert transport.posts == 2
-    assert forge.reconcile(effect).status is EffectStatus.ACCEPTED
+    assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+    replay = replace(effect, delivery_attempts=2)
+    permitted.append(replay)
+    assert forge.apply(replay).status is EffectStatus.UNKNOWN
+    assert transport.posts == 2
     transport.forbidden = True
     assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
 
@@ -273,6 +278,34 @@ def test_malformed_change_id_rejected(
         forge.change(REPO, Reference(f"{REPO.value}#{suffix}"))
 
 
+@pytest.mark.parametrize(
+    "reference", ["forgejo:other/project#1", "forgejo:team/project#01", "forgejo:team/project#abc"]
+)
+def test_pr_reconciliation_rejects_foreign_or_malformed_reference(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], reference: str
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    assert forge.apply(effect).status is EffectStatus.ACCEPTED
+    with pytest.raises(ForgeConflict):
+        forge.reconcile(effect, Reference(reference))
+    assert transport.posts == 1
+
+
+def test_pr_reconciliation_does_not_adopt_wrong_known_reference(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    receipt = forge.apply(effect)
+    assert receipt.reference is not None
+    transport.pulls.append({**transport.pulls[0], "number": 2, "title": "Other"})
+    assert forge.reconcile(effect, Reference(f"{REPO.value}#2")).status is EffectStatus.UNKNOWN
+    assert forge.reconcile(effect, receipt.reference).status is EffectStatus.ACCEPTED
+
+
 def test_canonical_marker_does_not_confuse_colon_keys(
     boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
 ) -> None:
@@ -308,14 +341,14 @@ def test_pr_identity_fails_closed_on_post_and_reconcile(
     if isinstance(forge, ForgejoForge):
         with patch.object(transport, "request", side_effect=corrupted):
             assert forge.apply(effect).status is EffectStatus.UNKNOWN
-            assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+            assert forge.reconcile(effect, Reference(f"{REPO.value}#1")).status is EffectStatus.UNKNOWN
     else:
         assert forge.apply(effect).status is EffectStatus.ACCEPTED
         subject = transport.pulls[0][side]
         assert isinstance(subject, dict)
         subject["repo"] = {"full_name": identity} if identity is not None else None
         assert forge.change(REPO, Reference(f"{REPO.value}#1")).presence is Presence.UNKNOWN
-        assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+        assert forge.reconcile(effect, Reference(f"{REPO.value}#1")).status is EffectStatus.UNKNOWN
 
 
 def test_branch_source_stale_and_pr_key_conflict(
@@ -332,10 +365,10 @@ def test_branch_source_stale_and_pr_key_conflict(
     permitted.append(effect)
     assert forge.apply(effect).status is EffectStatus.ACCEPTED
     transport.pulls[0]["title"] = "Changed remotely"
-    assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+    assert forge.reconcile(effect, Reference(f"{REPO.value}#1")).status is EffectStatus.UNKNOWN
 
 
-def test_reconcile_scans_later_page(boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]]) -> None:
+def test_known_reference_ignores_later_pages(boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]]) -> None:
     forge, transport, permitted = boundary
     for number in (1, 2):
         transport.pulls.append(
@@ -357,25 +390,27 @@ def test_reconcile_scans_later_page(boundary: tuple[Forge, SyntheticForgeTranspo
         )
     effect = operation("pr")
     permitted.append(effect)
-    assert forge.apply(effect).status is EffectStatus.ACCEPTED
+    accepted = forge.apply(effect)
+    assert accepted.status is EffectStatus.ACCEPTED and accepted.reference is not None
     assert forge.changes(REPO).next_cursor == "2"
     replay = replace(effect, delivery_attempts=2)
     permitted.append(replay)
     receipt = forge.apply(replay)
-    assert receipt.status is EffectStatus.ACCEPTED
-    assert receipt.reference == Reference("forgejo:team/project#3")
+    assert receipt.status is EffectStatus.UNKNOWN
+    assert forge.reconcile(effect, accepted.reference).status is EffectStatus.ACCEPTED
     assert transport.posts == 1
 
 
 @pytest.mark.parametrize("conflict_first", [False, True])
 @pytest.mark.parametrize("across_page", [False, True])
-def test_duplicate_marker_never_reconciles(
+def test_concurrent_marker_insertion_cannot_be_adopted_without_reference(
     boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], conflict_first: bool, across_page: bool
 ) -> None:
     forge, transport, permitted = boundary
     effect = operation("pr")
     permitted.append(effect)
-    assert forge.apply(effect).status is EffectStatus.ACCEPTED
+    accepted = forge.apply(effect)
+    assert accepted.status is EffectStatus.ACCEPTED and accepted.reference is not None
     conflict = {
         **transport.pulls[0],
         "number": 2,
@@ -389,15 +424,16 @@ def test_duplicate_marker_never_reconciles(
     else:
         transport.pulls.append(conflict)
     assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+    assert forge.reconcile(effect, accepted.reference).status is EffectStatus.ACCEPTED
 
 
-def test_fake_reconciliation_limit_never_accepts_partial_scan() -> None:
+def test_known_reference_does_not_depend_on_list_size() -> None:
     transport = SyntheticForgeTransport(REPO)
-    forge = FakeForge(transport, lambda _effect: True, max_reconcile_pulls=1)
+    forge = FakeForge(transport, lambda _effect: True)
     effect = operation("pr")
     assert forge.apply(effect).status is EffectStatus.ACCEPTED
     transport.pulls.append({**transport.pulls[0], "number": 2})
-    assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+    assert forge.reconcile(effect, Reference(f"{REPO.value}#1")).status is EffectStatus.ACCEPTED
 
 
 def test_pr_local_request_refusal_is_rejected_without_post() -> None:
@@ -441,13 +477,14 @@ def test_server_cap_does_not_hide_later_pr() -> None:
     first = forge.changes(REPO)
     assert len(first.items) == 1 and not first.complete and first.next_cursor == "2"
     assert forge.apply(effect).status is EffectStatus.ACCEPTED
-    assert forge.reconcile(effect).status is EffectStatus.ACCEPTED
+    assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+    assert forge.reconcile(effect, Reference(f"{REPO.value}#3")).status is EffectStatus.ACCEPTED
     assert forge.changes(REPO, "4").complete
 
 
-def test_reconciliation_budgets_and_malformed_pages_fail_closed() -> None:
+def test_malformed_pages_do_not_supply_reconciliation_evidence() -> None:
     transport = SyntheticForgeTransport(REPO, page_size=1)
-    forge = ForgejoForge(transport, transport, lambda _effect: True, max_reconcile_pages=1)
+    forge = ForgejoForge(transport, transport, lambda _effect: True)
     effect = operation("pr")
     transport.pulls.append(
         {
@@ -468,24 +505,19 @@ def test_reconciliation_budgets_and_malformed_pages_fail_closed() -> None:
     )
     assert forge.apply(effect).status is EffectStatus.ACCEPTED
     assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
-    limited = ForgejoForge(transport, transport, lambda _effect: True, max_reconcile_requests=1)
-    assert limited.reconcile(effect).status is EffectStatus.UNKNOWN
     assert forge.changes(REPO, "invalid").complete is False
     assert forge.changes(REPO, "0").complete is False
     assert forge.checks(REPO, HEAD, "-1").complete is False
-    repeated = ForgejoForge(transport, transport, lambda _effect: True)
-    page = repeated.changes(REPO)
-    with patch.object(repeated, "changes", return_value=replace(page, items=(), next_cursor="1")):
-        assert repeated.reconcile(effect).status is EffectStatus.UNKNOWN
+    assert forge.reconcile(effect, Reference(f"{REPO.value}#2")).status is EffectStatus.ACCEPTED
     assert transport.posts == 1
 
 
-@pytest.mark.parametrize("budget,accepted", [(3, False), (4, False), (5, True)])
-def test_reconciliation_counts_all_auth_reads(budget: int, accepted: bool) -> None:
+def test_known_reference_reads_only_exact_pr_and_branches() -> None:
     transport = SyntheticForgeTransport(REPO)
     effect = operation("pr")
     creator = ForgejoForge(transport, transport, lambda _effect: True)
-    assert creator.apply(effect).status is EffectStatus.ACCEPTED
+    receipt = creator.apply(effect)
+    assert receipt.status is EffectStatus.ACCEPTED and receipt.reference is not None
     seen: list[str] = []
     original = transport.request
 
@@ -493,10 +525,13 @@ def test_reconciliation_counts_all_auth_reads(budget: int, accepted: bool) -> No
         seen.append(path)
         return original(method, path, body)
 
-    limited = ForgejoForge(transport, transport, lambda _effect: True, max_reconcile_requests=budget)
     with patch.object(transport, "request", side_effect=counting):
-        assert (limited.reconcile(effect).status is EffectStatus.ACCEPTED) is accepted
-    assert len(seen) == budget
+        assert creator.reconcile(effect, receipt.reference).status is EffectStatus.ACCEPTED
+    assert seen == [
+        "/repos/team/project/pulls/1",
+        "/repos/team/project/branches/develop",
+        "/repos/team/project/branches/feature",
+    ]
 
 
 def test_forgejo_read_failure_and_wrong_change_are_unknown() -> None:

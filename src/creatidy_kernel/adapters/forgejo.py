@@ -64,17 +64,13 @@ class ForgejoForge(Forge):
         authorize: Callable[[Effect], bool],
         *,
         page_size: int = 30,
-        max_reconcile_pages: int = 20,
-        max_reconcile_requests: int = 100,
     ) -> None:
-        if min(page_size, max_reconcile_pages, max_reconcile_requests) <= 0:
-            raise ValueError("page size and reconciliation limits must be positive")
+        if page_size <= 0:
+            raise ValueError("page size must be positive")
         self.http = http
         self.git = git
         self.authorize = authorize
         self.page_size = page_size
-        self.max_reconcile_pages = max_reconcile_pages
-        self.max_reconcile_requests = max_reconcile_requests
 
     def capabilities(self) -> frozenset[str]:
         return frozenset({"identity", "branch", "change", "checks", "branch_create", "conditional_push", "pr"})
@@ -327,86 +323,42 @@ class ForgejoForge(Forge):
         except (ValueError, TypeError):
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
 
-    def reconcile(self, effect: Effect) -> Receipt:
+    def reconcile(self, effect: Effect, known_reference: Reference | None = None) -> Receipt:
         self._authorized(effect)
         if effect.action != "pr":
-            observed = self.branch(effect.repository, effect.branch)
-            if observed.presence is Presence.FOUND and observed.revision == effect.revision:
-                if effect.action == "branch" and (
-                    effect.base_branch is None
-                    or self.branch(effect.repository, effect.base_branch).revision != effect.base_revision
-                ):
-                    return Receipt(EffectStatus.UNKNOWN, effect.operation, effect.revision, "source moved")
-                return Receipt(EffectStatus.ACCEPTED, effect.operation, effect.revision)
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
-        marker = effect_marker(effect.operation)
-        cursor: str | None = None
-        seen: set[str] = set()
-        requests = 0
-        candidate: Reference | None = None
-        for _ in range(self.max_reconcile_pages):
-            if requests >= self.max_reconcile_requests:
-                return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted")
-            page = self.changes(effect.repository, cursor)
-            requests += 1
-            if not page.complete and page.next_cursor is None:
+        if known_reference is None:
+            return Receipt(EffectStatus.UNKNOWN, effect.operation)
+        prefix = f"{effect.repository.value}#"
+        suffix = known_reference.value.removeprefix(prefix)
+        if (
+            not known_reference.value.startswith(prefix)
+            or not suffix.isascii()
+            or not suffix.isdigit()
+            or suffix[0] == "0"
+        ):
+            raise ForgeConflict("change does not belong to repository")
+        status, payload = self._read(f"/repos/{self._repo(effect.repository)}/pulls/{suffix}")
+        if status != 200:
+            return Receipt(EffectStatus.UNKNOWN, effect.operation)
+        try:
+            data = _object(payload)
+            observed = self._change_observation(effect.repository, data)
+            if (
+                observed.reference != known_reference
+                or observed.head != effect.revision
+                or observed.base != effect.base_revision
+                or _object(data.get("head")).get("ref") != effect.branch
+                or _object(data.get("base")).get("ref") != effect.base_branch
+                or data.get("title") != effect.title
+                or data.get("body") != f"{effect.body or ''}\n\n{effect_marker(effect.operation)}"
+            ):
                 return Receipt(EffectStatus.UNKNOWN, effect.operation)
-            for item in page.items:
-                if item.reference is None:
-                    return Receipt(EffectStatus.UNKNOWN, effect.operation)
-                if requests >= self.max_reconcile_requests:
-                    return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted")
-                status, payload = self._read(
-                    f"/repos/{self._repo(effect.repository)}/pulls/{item.reference.value.rsplit('#', 1)[-1]}"
-                )
-                requests += 1
-                if status != 200:
-                    return Receipt(EffectStatus.UNKNOWN, effect.operation)
-                try:
-                    data = _object(payload)
-                    observed = self._change_observation(effect.repository, data)
-                except ValueError:
-                    return Receipt(EffectStatus.UNKNOWN, effect.operation)
-                if observed.reference != item.reference or observed.head != item.head or observed.base != item.base:
-                    return Receipt(EffectStatus.UNKNOWN, effect.operation)
-                expected_body = f"{effect.body or ''}\n\n{marker}"
-                if marker in str(data.get("body", "")):
-                    if candidate is not None:
-                        return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="duplicate key")
-                    try:
-                        head_ref = _object(data.get("head")).get("ref")
-                        base_ref = _object(data.get("base")).get("ref")
-                    except ValueError:
-                        return Receipt(EffectStatus.UNKNOWN, effect.operation)
-                    if (
-                        data.get("body") != expected_body
-                        or data.get("title") != effect.title
-                        or (head_ref != effect.branch or base_ref != effect.base_branch)
-                    ):
-                        return Receipt(EffectStatus.UNKNOWN, effect.operation, item.reference, "conflicting key")
-                    if item.head != effect.revision or item.base != effect.base_revision:
-                        return Receipt(EffectStatus.UNKNOWN, effect.operation, item.reference, "changed PR subject")
-                    candidate = item.reference
-            if page.next_cursor is None:
-                if not page.complete or candidate is None or effect.base_branch is None:
-                    return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="scan incomplete or no candidate")
-                if requests >= self.max_reconcile_requests:
-                    return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted")
-                base = self.branch(effect.repository, effect.base_branch)
-                requests += 1
-                if requests >= self.max_reconcile_requests:
-                    return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted")
-                head = self.branch(effect.repository, effect.branch)
-                requests += 1
-                if (
-                    base.presence is not Presence.FOUND
-                    or head.presence is not Presence.FOUND
-                    or (base.revision != effect.base_revision or head.revision != effect.revision)
-                ):
-                    return Receipt(EffectStatus.UNKNOWN, effect.operation, candidate, "head/base moved")
-                return Receipt(EffectStatus.ACCEPTED, effect.operation, candidate)
-            if page.next_cursor in seen or page.next_cursor == cursor:
-                return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="repeated page cursor")
-            seen.add(page.next_cursor)
-            cursor = page.next_cursor
-        return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="reconciliation page budget exhausted")
+        except (ValueError, TypeError):
+            return Receipt(EffectStatus.UNKNOWN, effect.operation)
+        if (
+            self.branch(effect.repository, effect.base_branch or "").revision != effect.base_revision
+            or self.branch(effect.repository, effect.branch).revision != effect.revision
+        ):
+            return Receipt(EffectStatus.UNKNOWN, effect.operation, known_reference, "head/base moved")
+        return Receipt(EffectStatus.ACCEPTED, effect.operation, known_reference)

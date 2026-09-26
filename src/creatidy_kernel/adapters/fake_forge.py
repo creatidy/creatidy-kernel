@@ -116,14 +116,9 @@ class SyntheticForgeTransport:
 class FakeForge(Forge):
     """Models forge state without HTTP or the Forgejo adapter's payload mapping."""
 
-    def __init__(
-        self, transport: SyntheticForgeTransport, authorize: Callable[[Effect], bool], *, max_reconcile_pulls: int = 600
-    ) -> None:
-        if max_reconcile_pulls <= 0:
-            raise ValueError("reconciliation limit must be positive")
+    def __init__(self, transport: SyntheticForgeTransport, authorize: Callable[[Effect], bool]) -> None:
         self.transport = transport
         self.authorize = authorize
-        self.max_reconcile_pulls = max_reconcile_pulls
 
     def capabilities(self) -> frozenset[str]:
         return frozenset({"identity", "branch", "change", "checks", "branch_create", "conditional_push", "pr"})
@@ -322,29 +317,25 @@ class FakeForge(Forge):
             return Receipt(EffectStatus.UNKNOWN, effect.operation, pull.reference)
         return Receipt(EffectStatus.ACCEPTED, effect.operation, pull.reference)
 
-    def reconcile(self, effect: Effect) -> Receipt:
+    def reconcile(self, effect: Effect, known_reference: Reference | None = None) -> Receipt:
         self._authorized(effect)
         if effect.action != "pr":
-            branch = self.branch(effect.repository, effect.branch)
-            if branch.presence is Presence.FOUND and branch.revision == effect.revision:
-                if effect.action == "branch" and (
-                    effect.base_branch is None
-                    or self.branch(effect.repository, effect.base_branch).revision != effect.base_revision
-                ):
-                    return Receipt(EffectStatus.UNKNOWN, effect.operation, effect.revision, "source moved")
-                return Receipt(EffectStatus.ACCEPTED, effect.operation, effect.revision)
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
-        if self.identity(effect.repository).presence is not Presence.FOUND:
+        if known_reference is None:
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
-        if len(self.transport.pulls) > self.max_reconcile_pulls:
-            return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted")
-        marker = effect_marker(effect.operation)
-        candidate: Reference | None = None
+        suffix = known_reference.value.removeprefix(f"{effect.repository.value}#")
+        if (
+            not known_reference.value.startswith(f"{effect.repository.value}#")
+            or not suffix.isascii()
+            or not suffix.isdigit()
+            or suffix[0] == "0"
+        ):
+            raise ForgeConflict("change does not belong to repository")
+        if self.change(effect.repository, known_reference).presence is not Presence.FOUND:
+            return Receipt(EffectStatus.UNKNOWN, effect.operation)
         for pull in self.transport.pulls:
-            if marker not in str(pull.get("body", "")):
+            if pull.get("number") != int(suffix):
                 continue
-            if candidate is not None:
-                return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="duplicate key")
             try:
                 observation = self._pull(effect.repository, pull)
             except ValueError:
@@ -352,7 +343,8 @@ class FakeForge(Forge):
             head = pull.get("head")
             base = pull.get("base")
             if (
-                pull.get("body") != f"{effect.body or ''}\n\n{marker}"
+                observation.reference != known_reference
+                or pull.get("body") != f"{effect.body or ''}\n\n{effect_marker(effect.operation)}"
                 or pull.get("title") != effect.title
                 or not isinstance(head, dict)
                 or not isinstance(base, dict)
@@ -361,13 +353,11 @@ class FakeForge(Forge):
                 or observation.head != effect.revision
                 or observation.base != effect.base_revision
             ):
-                return Receipt(EffectStatus.UNKNOWN, effect.operation, observation.reference)
-            candidate = observation.reference
-        if candidate is None:
-            return Receipt(EffectStatus.UNKNOWN, effect.operation)
-        if (
-            self.branch(effect.repository, effect.base_branch or "").revision != effect.base_revision
-            or self.branch(effect.repository, effect.branch).revision != effect.revision
-        ):
-            return Receipt(EffectStatus.UNKNOWN, effect.operation, candidate, "head/base moved")
-        return Receipt(EffectStatus.ACCEPTED, effect.operation, candidate)
+                return Receipt(EffectStatus.UNKNOWN, effect.operation)
+            if (
+                self.branch(effect.repository, effect.base_branch or "").revision != effect.base_revision
+                or self.branch(effect.repository, effect.branch).revision != effect.revision
+            ):
+                return Receipt(EffectStatus.UNKNOWN, effect.operation, known_reference, "head/base moved")
+            return Receipt(EffectStatus.ACCEPTED, effect.operation, known_reference)
+        return Receipt(EffectStatus.UNKNOWN, effect.operation)

@@ -167,6 +167,11 @@ def run_git_bounded(
                             if sum(len(part) for part in output.values()) > max_bytes:
                                 raise OverflowError("Git output limit exceeded")
                 process.wait(timeout=max(0, deadline - time.monotonic()))
+                if process.returncode != 0:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
             except BaseException:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -331,7 +336,6 @@ class ConditionalGitTransport:
                 or re.fullmatch(
                     rf"\+\t{re.escape(success)}[0-9a-f]{{7,64}}\.\.[0-9a-f]{{7,64}} \(forced update\)", lines[1]
                 )
-                or lines[1] == f"=\t{success}[up to date]"
             )
         ):
             return EffectStatus.ACCEPTED
