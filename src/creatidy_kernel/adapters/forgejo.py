@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping
 from typing import Protocol, cast
 from urllib.parse import quote
 
+from creatidy_kernel.adapters.forge_refs import repository_path, valid_branch
 from creatidy_kernel.adapters.forgejo_transport import LocalRequestRefusal
 from creatidy_kernel.core.forge import (
     CheckResult,
@@ -101,12 +102,7 @@ class ForgejoForge(Forge):
         return frozenset(capabilities)
 
     def _repo(self, reference: Reference) -> str:
-        if not reference.value.startswith("forgejo:"):
-            raise ForgeConflict("wrong forge provider")
-        path = reference.value.removeprefix("forgejo:")
-        if len(path.split("/")) != 2 or any(not part or part in {".", ".."} for part in path.split("/")):
-            raise ForgeConflict("invalid repository handle")
-        return "/".join(quote(part, safe="") for part in path.split("/"))
+        return repository_path(reference)
 
     @staticmethod
     def _revision(reference: Reference) -> str:
@@ -146,6 +142,7 @@ class ForgejoForge(Forge):
         return Observation(Presence.FOUND, repository)
 
     def branch(self, repository: Reference, branch: str) -> Observation:
+        valid_branch(branch)
         path = f"/repos/{self._repo(repository)}/branches/{quote(branch, safe='')}"
         status, payload = self._read(path)
         if status in {401, 403}:
@@ -197,7 +194,7 @@ class ForgejoForge(Forge):
         ):
             raise ValueError("pull request repository differs")
         number = data.get("number")
-        if not isinstance(number, int) or number <= 0:
+        if type(number) is not int or not _number(str(number)):
             raise ValueError("invalid pull request number")
         return Observation(
             Presence.FOUND,
@@ -261,6 +258,9 @@ class ForgejoForge(Forge):
 
     def _authorized(self, effect: Effect) -> None:
         self._repo(effect.repository)
+        valid_branch(effect.branch)
+        if effect.base_branch is not None:
+            valid_branch(effect.base_branch)
         if not self.authorize(effect):
             raise ForgeConflict("exact forge effect was not authorized")
         if effect.revision is None:

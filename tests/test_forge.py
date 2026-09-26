@@ -268,6 +268,79 @@ def test_malformed_pr_post_response_never_accepted(side: str) -> None:
     assert transport.posts == 1
 
 
+@pytest.mark.parametrize("number", [0, True, -1, 10**18, "1"])
+def test_invalid_pr_number_never_supplies_receipt(number: object) -> None:
+    transport = SyntheticForgeTransport(REPO)
+    forge = ForgejoForge(transport, transport, lambda _effect: True)
+    original = transport.request
+
+    def corrupted(method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
+        status, payload = original(method, path, body)
+        if method == "POST" and status == 201 and isinstance(payload, dict):
+            payload["number"] = number
+        return status, cast(object, payload)
+
+    with patch.object(transport, "request", side_effect=corrupted):
+        assert forge.apply(operation("pr")).status is EffectStatus.UNKNOWN
+    assert transport.posts == 1
+
+
+@pytest.mark.parametrize("number", [0, True, -1, 10**18, "1"])
+def test_invalid_stored_pr_number_is_not_observed(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], number: object
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    receipt = forge.apply(effect)
+    assert receipt.status is EffectStatus.ACCEPTED and receipt.reference is not None
+    transport.pulls[0]["number"] = number
+    assert forge.change(REPO, receipt.reference).presence is Presence.UNKNOWN
+    assert not forge.changes(REPO).complete
+    assert forge.reconcile(effect, receipt.reference).status is EffectStatus.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "path", ["te%61m/project", "team/pro%2Fject", "team/pro?ject", "team/pro#ject", "team/pro:ject"]
+)
+def test_noncanonical_repository_rejected_at_adapter_boundary(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], path: str
+) -> None:
+    forge, transport, permitted = boundary
+    repository = Reference(f"forgejo:{path}")
+    with pytest.raises(ForgeConflict, match="repository"):
+        forge.identity(repository)
+    with pytest.raises(ForgeConflict, match="repository"):
+        forge.branch(repository, "feature")
+    effect = replace(operation("push"), repository=repository)
+    permitted.append(effect)
+    with pytest.raises(ForgeConflict, match="repository"):
+        forge.apply(effect)
+    assert transport.pushes == transport.posts == 0
+
+
+@pytest.mark.parametrize("branch", ["bad..name", "bad.lock", "a//b", "a/.hidden", "a@{b", "a?b", "a\\b"])
+def test_invalid_git_branches_rejected_before_observation_or_effect(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], branch: str
+) -> None:
+    forge, transport, permitted = boundary
+    with pytest.raises(ForgeConflict, match="Git branch"):
+        forge.branch(REPO, branch)
+    for action in ("branch", "push", "pr"):
+        effect = replace(operation(action), branch=branch)
+        permitted.append(effect)
+        with pytest.raises(ForgeConflict, match="Git branch"):
+            forge.apply(effect)
+        with pytest.raises(ForgeConflict, match="Git branch"):
+            forge.reconcile(effect)
+        if action in {"branch", "pr"}:
+            effect = replace(operation(action), base_branch=branch)
+            permitted.append(effect)
+            with pytest.raises(ForgeConflict, match="Git branch"):
+                forge.apply(effect)
+    assert transport.pushes == transport.posts == 0
+
+
 @pytest.mark.parametrize(
     "attribute,missing", [("supports_pr", {"pr"}), ("supports_conditional_push", {"branch_create", "conditional_push"})]
 )

@@ -22,6 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from creatidy_kernel.adapters.forge_refs import repository_path, valid_branch
 from creatidy_kernel.core.forge import EffectStatus, ForgeConflict, Reference
 
 
@@ -206,11 +207,8 @@ class ConditionalGitTransport:
         max_output_bytes: int = 65536,
     ) -> None:
         _https(remote_url)
-        repo_path = repository.value.removeprefix("forgejo:")
-        if (
-            not repository.value.startswith("forgejo:")
-            or remote_url.rstrip("/").split("/", 3)[-1].removesuffix(".git") != repo_path
-        ):
+        repo_path = repository_path(repository)
+        if remote_url.rstrip("/").split("/", 3)[-1].removesuffix(".git") != repo_path:
             raise ForgeConflict("remote URL must bind the exact repository")
         if timeout <= 0 or max_output_bytes <= 0:
             raise ValueError("finite Git limits required")
@@ -258,8 +256,7 @@ class ConditionalGitTransport:
     ) -> EffectStatus:
         if repository != self.repository:
             raise ForgeConflict("repository outside configured Git remote")
-        if branch.startswith("-"):
-            raise ForgeConflict("invalid Git branch")
+        valid_branch(branch)
         sha = revision.value.removeprefix("forgejo:")
         old = expected.value.removeprefix("forgejo:") if expected else ""
         if not revision.value.startswith("forgejo:") or not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", sha):

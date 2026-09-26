@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from typing import cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from creatidy_kernel.adapters.forge_refs import repository_path, valid_branch
 from creatidy_kernel.core.forge import (
     CheckResult,
     Effect,
@@ -140,6 +141,7 @@ class FakeForge(Forge):
         return frozenset(capabilities)
 
     def identity(self, repository: Reference) -> Observation:
+        repository_path(repository)
         if self.transport.forbidden:
             return Observation(Presence.INACCESSIBLE)
         if self.transport.repository_missing:
@@ -149,6 +151,8 @@ class FakeForge(Forge):
         return Observation(Presence.FOUND, repository)
 
     def branch(self, repository: Reference, branch: str) -> Observation:
+        repository_path(repository)
+        valid_branch(branch)
         if self.identity(repository).presence is not Presence.FOUND:
             return Observation(self.identity(repository).presence)
         sha = self.transport.branches.get(branch)
@@ -159,6 +163,7 @@ class FakeForge(Forge):
         return Observation(Presence.ABSENT if self.transport.direct_absence else Presence.UNKNOWN)
 
     def change(self, repository: Reference, change: Reference) -> Observation:
+        repository_path(repository)
         suffix = change.value.removeprefix(f"{repository.value}#")
         if not change.value.startswith(f"{repository.value}#") or not _number(suffix):
             raise ForgeConflict("change does not belong to repository")
@@ -181,6 +186,9 @@ class FakeForge(Forge):
         repo = {"full_name": repository.value.removeprefix("forgejo:")}
         if cast(dict[str, object], head).get("repo") != repo or cast(dict[str, object], base).get("repo") != repo:
             raise ValueError("pull repository differs")
+        number = pull.get("number")
+        if type(number) is not int or not _number(str(number)):
+            raise ValueError("invalid pull request number")
         head_sha = cast(dict[str, object], head).get("sha")
         base_sha = cast(dict[str, object], base).get("sha")
         if (
@@ -200,6 +208,7 @@ class FakeForge(Forge):
     def _page(
         self, repository: Reference, records: list[dict[str, object]], cursor: str | None
     ) -> tuple[list[dict[str, object]], str | None, bool]:
+        repository_path(repository)
         if self.identity(repository).presence is not Presence.FOUND:
             return [], None, False
         if cursor is not None and not _number(cursor):
@@ -253,6 +262,10 @@ class FakeForge(Forge):
         return Page(tuple(checks), next_cursor, complete)
 
     def _authorized(self, effect: Effect) -> None:
+        repository_path(effect.repository)
+        valid_branch(effect.branch)
+        if effect.base_branch is not None:
+            valid_branch(effect.base_branch)
         if effect.repository != self.transport.repository or not self.authorize(effect):
             raise ForgeConflict("exact forge effect was not authorized")
         self._revision(effect.revision)

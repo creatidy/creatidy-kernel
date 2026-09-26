@@ -190,6 +190,19 @@ def test_conditional_git_creation_stale_and_uncertainty(tmp_path: Path) -> None:
         transport.compare_and_push(REPO, "new", None, Reference("forgejo:short"))
 
 
+@pytest.mark.parametrize(
+    "path", ["te%61m/project", "team/pro%2Fject", "team/pro?ject", "team/pro#ject", "team/pro:ject"]
+)
+def test_git_remote_rejects_noncanonical_repository(tmp_path: Path, path: str) -> None:
+    with pytest.raises(ForgeConflict, match="repository"):
+        ConditionalGitTransport(Reference(f"forgejo:{path}"), "https://forge.invalid/team/project.git", bare(tmp_path))
+
+
+def test_git_remote_rejects_escaped_raw_url_for_canonical_repository(tmp_path: Path) -> None:
+    with pytest.raises(ForgeConflict, match="repository"):
+        ConditionalGitTransport(REPO, "https://forge.invalid/te%61m/project.git", bare(tmp_path))
+
+
 def test_success_receipt_matches_real_git_porcelain(tmp_path: Path) -> None:
     git = shutil.which("git")
     assert git is not None
