@@ -24,8 +24,12 @@ architecture. The review is read-only and never merges.
 6. Classify findings by severity: blocking defect, non-blocking suggestion, author question,
    security/privacy note, test/documentation gap, or durable follow-up candidate. Missing work needed
    by the issue remains blocking or non-blocking review work, not an automatic follow-up issue.
-7. Present the review or post the explicitly requested review through Forgejo MCP. Do not edit the
-   branch, push commits, auto-approve your own work, auto-merge, or bypass branch protection.
+7. Give a substantive `### Overall Recommendation` for the exact frozen HEAD, with explicit blocking
+   findings (or none). Present the review or post the explicitly requested review through Forgejo MCP.
+   Report the actual persisted Forgejo review state separately. If the shared PR-author account
+   prevents equivalent formal submission, preserve the substantive verdict in the review body and
+   record the identity limitation; a stored `COMMENT` is not a formal `APPROVED` review. Do not edit
+   the branch, push commits, auto-approve your own work, auto-merge, or bypass branch protection.
 
 ## Review Format
 
@@ -49,6 +53,10 @@ architecture. The review is read-only and never merges.
 ### Overall Recommendation
 [APPROVE | REQUEST_CHANGES | COMMENT]
 ```
+
+`### Overall Recommendation` is the independent reviewer's substantive verdict, not a transcription
+of Forgejo's persisted state. Do not infer `APPROVE` from arbitrary comment text or claim Forgejo
+formally approved when it recorded `COMMENT`.
 
 Use an acceptance-evidence table when a linked issue exists. Create a follow-up only through
 `/create-follow-up-issue.md` after confirming it is durable, distinct, actionable, and non-duplicate.
