@@ -14,7 +14,12 @@ from unittest.mock import patch
 
 import pytest
 
-from creatidy_kernel.adapters.forgejo_transport import ConditionalGitTransport, HTTPSForgejoTransport, run_git_bounded
+from creatidy_kernel.adapters.forgejo_transport import (
+    ConditionalGitTransport,
+    HTTPSForgejoTransport,
+    LocalRequestRefusal,
+    run_git_bounded,
+)
 from creatidy_kernel.core.forge import EffectStatus, ForgeConflict, Reference
 
 REPO = Reference("forgejo:team/project")
@@ -68,6 +73,16 @@ def test_https_total_deadline_interrupts_trickling_response() -> None:
     assert time.monotonic() - start < 3
 
 
+def test_oversized_pr_is_refused_before_serialization_credentials_or_network() -> None:
+    transport = HTTPSForgejoTransport("https://forge.invalid/api/v1", lambda: "scoped", max_bytes=64)
+    with patch("creatidy_kernel.adapters.forgejo_transport.json.dumps") as serialize:
+        with patch.object(transport.opener, "open") as opened:
+            with pytest.raises(LocalRequestRefusal):
+                transport.request("POST", "/repos/team/project/pulls", {"body": "x" * 100_000})
+            serialize.assert_not_called()
+            opened.assert_not_called()
+
+
 def test_conditional_git_push_uses_single_expected_old_ref(tmp_path: Path) -> None:
     source = bare(tmp_path)
     transport = ConditionalGitTransport(REPO, "https://forge.invalid/team/project.git", source)
@@ -119,12 +134,22 @@ def test_conditional_git_creation_stale_and_uncertainty(tmp_path: Path) -> None:
             CompletedProcess([], 0, "", ""),
             CompletedProcess([], 0, "commit\n", ""),
         ]
-        run.side_effect = [*setup, CompletedProcess([], 1, f"!\t{SHA}:refs/heads/new\t[rejected] (stale info)\n", "")]
+        run.side_effect = [
+            *setup,
+            CompletedProcess(
+                [],
+                1,
+                f"To https://forge.invalid/team/project.git\n!\t{SHA}:refs/heads/new\t[rejected] (stale info)\nDone\n",
+                "",
+            ),
+        ]
         assert transport.compare_and_push(REPO, "new", None, Reference(f"forgejo:{SHA}")) is EffectStatus.STALE
         assert "--force-with-lease=refs/heads/new:" in run.call_args.args[0]
         run.side_effect = [*setup, CompletedProcess([], 1, "", "connection closed")]
         assert transport.compare_and_push(REPO, "new", None, Reference(f"forgejo:{SHA}")) is EffectStatus.UNKNOWN
         run.side_effect = [*setup, CompletedProcess([], 1, "", "remote: stale info")]
+        assert transport.compare_and_push(REPO, "new", None, Reference(f"forgejo:{SHA}")) is EffectStatus.UNKNOWN
+        run.side_effect = [*setup, CompletedProcess([], 1, f"!\t{SHA}:refs/heads/new\t[rejected] (stale info)\n", "")]
         assert transport.compare_and_push(REPO, "new", None, Reference(f"forgejo:{SHA}")) is EffectStatus.UNKNOWN
         run.side_effect = [*setup, CompletedProcess([], 1, f"!\t{SHA}:refs/heads/other\t[rejected] (stale info)", "")]
         assert transport.compare_and_push(REPO, "new", None, Reference(f"forgejo:{SHA}")) is EffectStatus.UNKNOWN
@@ -148,6 +173,8 @@ def test_conditional_git_creation_stale_and_uncertainty(tmp_path: Path) -> None:
         transport.compare_and_push(REPO, "--delete", None, Reference(f"forgejo:{SHA}"))
     with pytest.raises(ForgeConflict):
         ConditionalGitTransport(REPO, "https://forge.invalid/other/repo.git", transport.object_source)
+    with pytest.raises(ForgeConflict, match="full Git object ID"):
+        transport.compare_and_push(REPO, "new", None, Reference("forgejo:short"))
 
 
 def test_success_receipt_matches_real_git_porcelain(tmp_path: Path) -> None:
@@ -217,10 +244,12 @@ def test_bare_source_rejects_indirection_and_unverified_objects(tmp_path: Path) 
     with pytest.raises(ValueError, match="indirection"):
         ConditionalGitTransport(REPO, url, source)
     commondir.unlink()
-    (source / "objects" / "escape").symlink_to(tmp_path, target_is_directory=True)
+    (source / "objects" / "info").rmdir()
+    (source / "objects" / "info").symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
         ConditionalGitTransport(REPO, url, source)
-    (source / "objects" / "escape").unlink()
+    (source / "objects" / "info").unlink()
+    (source / "objects" / "info").mkdir()
     transport = ConditionalGitTransport(REPO, url, source)
     assert transport.compare_and_push(REPO, "new", None, Reference(f"forgejo:{SHA}")) is EffectStatus.UNKNOWN
     git = shutil.which("git")
@@ -247,6 +276,22 @@ def test_git_capture_flood_and_timeout_kill_process(tmp_path: Path) -> None:
         )
     with pytest.raises((TimeoutError, subprocess.TimeoutExpired)):
         run_git_bounded([sys.executable, "-c", "import time; time.sleep(5)"], tmp_path, env, 1, 100)
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_git_failure_kills_descendants(tmp_path: Path, overflow: bool) -> None:
+    marker = tmp_path / "child-survived"
+    child = "import pathlib,time,sys; time.sleep(1.5); pathlib.Path(sys.argv[1]).touch()"
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}, {str(marker)!r}]); "
+        + ("sys.stdout.write('x'*10000); sys.stdout.flush(); " if overflow else "")
+        + "time.sleep(5)"
+    )
+    with pytest.raises(OverflowError if overflow else TimeoutError):
+        run_git_bounded([sys.executable, "-c", parent], tmp_path, {"PATH": os.environ["PATH"]}, 1, 100)
+    time.sleep(1.6)
+    assert not marker.exists()
 
 
 def test_conditional_git_ignores_worktree_hooks_rewrites_and_ambient_config(

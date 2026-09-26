@@ -43,6 +43,10 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
+class LocalRequestRefusal(ValueError):
+    """A deterministic request-size refusal before network I/O."""
+
+
 @contextmanager
 def _deadline(seconds: int):
     # urllib's socket timeout is per I/O; on non-main threads there is no
@@ -88,11 +92,21 @@ class HTTPSForgejoTransport:
     def request(self, method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
         if method not in {"GET", "POST"} or not path.startswith("/repos/") or ".." in path or "#" in path:
             raise ValueError("unsupported forge request")
+        # PR requests are flat strings. Bound each value before json.dumps can
+        # allocate a body proportional to an untrusted title or description.
+        if body is not None:
+            if any(
+                not isinstance(value, str) or len(value[: self.max_bytes + 1].encode("utf-8")) > self.max_bytes
+                for value in body.values()
+            ):
+                raise LocalRequestRefusal("forge HTTP request exceeds safe limit")
+            data = json.dumps(dict(body)).encode("utf-8")
+            if len(data) > self.max_bytes:
+                raise LocalRequestRefusal("forge HTTP request exceeds safe limit")
+        else:
+            data = None
         try:
             with _deadline(self.timeout):
-                data = json.dumps(dict(body)).encode("utf-8") if body is not None else None
-                if data is not None and len(data) > self.max_bytes:
-                    raise ValueError("forge HTTP request exceeds safe limit")
                 secret = self.token()
                 if not secret or "\n" in secret or "\r" in secret:
                     raise ValueError("invalid forge credential")
@@ -129,7 +143,7 @@ def run_git_bounded(
     argv: list[str], cwd: Path, env: dict[str, str], timeout: int, max_bytes: int
 ) -> subprocess.CompletedProcess[str]:
     with subprocess.Popen(  # noqa: S603 - caller supplies fixed binary and controlled arguments/environment.
-        argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+        argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, start_new_session=True
     ) as process:
         if process.stdout is None or process.stderr is None:
             raise OSError("Git output pipes unavailable")
@@ -154,7 +168,10 @@ def run_git_bounded(
                                 raise OverflowError("Git output limit exceeded")
                 process.wait(timeout=max(0, deadline - time.monotonic()))
             except BaseException:
-                process.kill()
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 process.wait()
                 raise
         return subprocess.CompletedProcess(
@@ -199,9 +216,8 @@ class ConditionalGitTransport:
         objects = source / "objects"
         if not objects.is_dir() or (objects / "info" / "alternates").exists() or (source / "commondir").exists():
             raise ValueError("object source indirection forbidden")
-        for current, directories, files in os.walk(source, followlinks=False):
-            if any((Path(current) / entry).is_symlink() for entry in [*directories, *files]):
-                raise ValueError("symlink in object source forbidden")
+        if any(path.is_symlink() for path in (source / "HEAD", source / "refs", objects, objects / "info")):
+            raise ValueError("symlink in object source forbidden")
         self.repository = repository
         self.remote_url = remote_url
         self.object_source = source
@@ -269,11 +285,7 @@ class ConditionalGitTransport:
                     != self.source_identity
                     or (source / "commondir").exists()
                     or (objects / "info" / "alternates").exists()
-                    or any(
-                        (Path(current) / entry).is_symlink()
-                        for current, dirs, files in os.walk(source)
-                        for entry in [*dirs, *files]
-                    )
+                    or any(path.is_symlink() for path in (source / "HEAD", source / "refs", objects, objects / "info"))
                 ):
                     return EffectStatus.UNKNOWN
                 env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(objects)
@@ -324,4 +336,8 @@ class ConditionalGitTransport:
         ):
             return EffectStatus.ACCEPTED
         rejected = f"!\t{sha}:{ref}\t[rejected] (stale info)"
-        return EffectStatus.STALE if lines == [rejected] and pushed.returncode != 0 else EffectStatus.UNKNOWN
+        return (
+            EffectStatus.STALE
+            if pushed.returncode != 0 and lines == [f"To {self.remote_url}", rejected, "Done"]
+            else EffectStatus.UNKNOWN
+        )

@@ -10,6 +10,7 @@ import pytest
 
 from creatidy_kernel.adapters.fake_forge import FakeForge, SyntheticForgeTransport
 from creatidy_kernel.adapters.forgejo import ForgejoForge
+from creatidy_kernel.adapters.forgejo_transport import LocalRequestRefusal
 from creatidy_kernel.core.execution import OperationKey
 from creatidy_kernel.core.forge import (
     CheckResult,
@@ -23,8 +24,10 @@ from creatidy_kernel.core.forge import (
 from creatidy_kernel.ports.forge import Forge
 
 REPO = Reference("forgejo:team/project")
-BASE = Reference("forgejo:base1")
-HEAD = Reference("forgejo:head1")
+BASE = Reference("forgejo:" + "b" * 40)
+HEAD = Reference("forgejo:" + "a" * 40)
+NEXT_HEAD = Reference("forgejo:" + "c" * 40)
+MOVED_BASE = "d" * 40
 
 
 @pytest.fixture(params=["fake", "forgejo"])
@@ -50,7 +53,7 @@ def operation(action: str, *, attempts: int = 1, key: str | None = None) -> Effe
         action,
         "feature",
         expected=HEAD if action == "push" else None,
-        revision=Reference("forgejo:head2") if action == "push" else HEAD,
+        revision=NEXT_HEAD if action == "push" else HEAD,
         base_branch="develop" if action in {"pr", "branch"} else None,
         base_revision=BASE if action in {"pr", "branch"} else None,
         title="Patch" if action == "pr" else None,
@@ -138,6 +141,15 @@ def test_branch_creation_and_reconcile_lost_push(
     assert transport.pushes == 1
 
 
+def test_invalid_branch_replay_rejected_before_dispatch(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    _, transport, _ = boundary
+    with pytest.raises(ForgeConflict, match="expect absence"):
+        replace(operation("branch", attempts=2), branch="new", expected=HEAD)
+    assert transport.pushes == 0
+
+
 def test_lost_branch_reply_with_moved_source_remains_unknown(
     boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
 ) -> None:
@@ -146,7 +158,7 @@ def test_lost_branch_reply_with_moved_source_remains_unknown(
     permitted.append(effect)
     transport.lost_reply = True
     assert forge.apply(effect).status is EffectStatus.UNKNOWN
-    transport.branches["develop"] = "base2"
+    transport.branches["develop"] = MOVED_BASE
     assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
     replay = replace(effect, delivery_attempts=2)
     permitted.append(replay)
@@ -191,10 +203,10 @@ def test_stale_rejected_uncertain_and_inaccessible(
     forge, transport, permitted = boundary
     effect = operation("pr")
     permitted.append(effect)
-    transport.branches["develop"] = "base2"
+    transport.branches["develop"] = MOVED_BASE
     assert forge.apply(effect).status is EffectStatus.STALE
     assert transport.posts == 0
-    transport.branches["develop"] = "base1"
+    transport.branches["develop"] = BASE.value.removeprefix("forgejo:")
     transport.domain_rejection = True
     assert forge.apply(effect).status is EffectStatus.REJECTED
     transport.domain_rejection = False
@@ -241,6 +253,15 @@ def test_repository_identity_absence_classes(boundary: tuple[Forge, SyntheticFor
     assert forge.identity(REPO).presence is Presence.ABSENT
     transport.forbidden = True
     assert forge.identity(REPO).presence is Presence.INACCESSIBLE
+
+
+def test_forgejo_authentication_failure_is_inaccessible() -> None:
+    transport = SyntheticForgeTransport(REPO)
+    forge = ForgejoForge(transport, transport, lambda _effect: True)
+    with patch.object(transport, "request", return_value=(401, {"message": "unauthorized"})):
+        assert forge.identity(REPO).presence is Presence.INACCESSIBLE
+        assert forge.branch(REPO, "feature").presence is Presence.INACCESSIBLE
+        assert forge.change(REPO, Reference(f"{REPO.value}#1")).presence is Presence.INACCESSIBLE
 
 
 @pytest.mark.parametrize("suffix", ["", "0", "01", "-1", "abc", "1x", "١"])
@@ -303,10 +324,10 @@ def test_branch_source_stale_and_pr_key_conflict(
     forge, transport, permitted = boundary
     creation = replace(operation("branch"), branch="new")
     permitted.append(creation)
-    transport.branches["develop"] = "newbase"
+    transport.branches["develop"] = MOVED_BASE
     assert forge.apply(creation).status is EffectStatus.STALE
     assert "new" not in transport.branches
-    transport.branches["develop"] = "base1"
+    transport.branches["develop"] = BASE.value.removeprefix("forgejo:")
     effect = operation("pr")
     permitted.append(effect)
     assert forge.apply(effect).status is EffectStatus.ACCEPTED
@@ -320,8 +341,16 @@ def test_reconcile_scans_later_page(boundary: tuple[Forge, SyntheticForgeTranspo
         transport.pulls.append(
             {
                 "number": number,
-                "head": {"sha": "head1", "ref": "feature", "repo": {"full_name": "team/project"}},
-                "base": {"sha": "base1", "ref": "develop", "repo": {"full_name": "team/project"}},
+                "head": {
+                    "sha": HEAD.value.removeprefix("forgejo:"),
+                    "ref": "feature",
+                    "repo": {"full_name": "team/project"},
+                },
+                "base": {
+                    "sha": BASE.value.removeprefix("forgejo:"),
+                    "ref": "develop",
+                    "repo": {"full_name": "team/project"},
+                },
                 "title": "Unrelated",
                 "body": "not this effect",
             }
@@ -338,6 +367,55 @@ def test_reconcile_scans_later_page(boundary: tuple[Forge, SyntheticForgeTranspo
     assert transport.posts == 1
 
 
+@pytest.mark.parametrize("conflict_first", [False, True])
+@pytest.mark.parametrize("across_page", [False, True])
+def test_duplicate_marker_never_reconciles(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], conflict_first: bool, across_page: bool
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    assert forge.apply(effect).status is EffectStatus.ACCEPTED
+    conflict = {
+        **transport.pulls[0],
+        "number": 2,
+        "title": "Conflicting effect",
+    }
+    if across_page:
+        unrelated = {**transport.pulls[0], "number": 3, "body": "unrelated"}
+        transport.pulls.append(unrelated)
+    if conflict_first:
+        transport.pulls.insert(0, conflict)
+    else:
+        transport.pulls.append(conflict)
+    assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+
+
+def test_fake_reconciliation_limit_never_accepts_partial_scan() -> None:
+    transport = SyntheticForgeTransport(REPO)
+    forge = FakeForge(transport, lambda _effect: True, max_reconcile_pulls=1)
+    effect = operation("pr")
+    assert forge.apply(effect).status is EffectStatus.ACCEPTED
+    transport.pulls.append({**transport.pulls[0], "number": 2})
+    assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+
+
+def test_pr_local_request_refusal_is_rejected_without_post() -> None:
+    transport = SyntheticForgeTransport(REPO)
+    forge = ForgejoForge(transport, transport, lambda _effect: True)
+    effect = operation("pr")
+    original = transport.request
+
+    def refused(method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
+        if method == "POST":
+            raise LocalRequestRefusal("request exceeds safe limit")
+        return original(method, path, body)
+
+    with patch.object(transport, "request", side_effect=refused):
+        assert forge.apply(effect).status is EffectStatus.REJECTED
+    assert transport.posts == 0
+
+
 def test_server_cap_does_not_hide_later_pr() -> None:
     transport = SyntheticForgeTransport(REPO, page_size=1)
     forge = ForgejoForge(transport, transport, lambda _effect: True, page_size=30)
@@ -346,8 +424,16 @@ def test_server_cap_does_not_hide_later_pr() -> None:
         transport.pulls.append(
             {
                 "number": number,
-                "head": {"sha": "head1", "ref": "feature", "repo": {"full_name": "team/project"}},
-                "base": {"sha": "base1", "ref": "develop", "repo": {"full_name": "team/project"}},
+                "head": {
+                    "sha": HEAD.value.removeprefix("forgejo:"),
+                    "ref": "feature",
+                    "repo": {"full_name": "team/project"},
+                },
+                "base": {
+                    "sha": BASE.value.removeprefix("forgejo:"),
+                    "ref": "develop",
+                    "repo": {"full_name": "team/project"},
+                },
                 "title": "Other",
                 "body": "other",
             }
@@ -366,8 +452,16 @@ def test_reconciliation_budgets_and_malformed_pages_fail_closed() -> None:
     transport.pulls.append(
         {
             "number": 1,
-            "head": {"sha": "head1", "ref": "feature", "repo": {"full_name": "team/project"}},
-            "base": {"sha": "base1", "ref": "develop", "repo": {"full_name": "team/project"}},
+            "head": {
+                "sha": HEAD.value.removeprefix("forgejo:"),
+                "ref": "feature",
+                "repo": {"full_name": "team/project"},
+            },
+            "base": {
+                "sha": BASE.value.removeprefix("forgejo:"),
+                "ref": "develop",
+                "repo": {"full_name": "team/project"},
+            },
             "title": "Other",
             "body": "other",
         }
@@ -386,7 +480,7 @@ def test_reconciliation_budgets_and_malformed_pages_fail_closed() -> None:
     assert transport.posts == 1
 
 
-@pytest.mark.parametrize("budget,accepted", [(2, False), (3, False), (4, True)])
+@pytest.mark.parametrize("budget,accepted", [(3, False), (4, False), (5, True)])
 def test_reconciliation_counts_all_auth_reads(budget: int, accepted: bool) -> None:
     transport = SyntheticForgeTransport(REPO)
     effect = operation("pr")
@@ -418,8 +512,8 @@ def test_forgejo_read_failure_and_wrong_change_are_unknown() -> None:
     transport.pulls.append(
         {
             "number": 2,
-            "head": {"sha": "head1", "ref": "feature"},
-            "base": {"sha": "base1", "ref": "develop"},
+            "head": {"sha": HEAD.value.removeprefix("forgejo:"), "ref": "feature"},
+            "base": {"sha": BASE.value.removeprefix("forgejo:"), "ref": "develop"},
         }
     )
     with patch.object(transport, "request", return_value=(200, transport.pulls[0])):

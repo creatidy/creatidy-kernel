@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from typing import Protocol, cast
 from urllib.parse import quote
 
+from creatidy_kernel.adapters.forgejo_transport import LocalRequestRefusal
 from creatidy_kernel.core.forge import (
     CheckResult,
     Effect,
@@ -104,7 +105,7 @@ class ForgejoForge(Forge):
     def identity(self, repository: Reference) -> Observation:
         path = f"/repos/{self._repo(repository)}"
         status, payload = self._read(path)
-        if status == 403:
+        if status in {401, 403}:
             return Observation(Presence.INACCESSIBLE)
         if status == 404 and self.http.authoritative_absence(path):
             return Observation(Presence.ABSENT)
@@ -122,7 +123,7 @@ class ForgejoForge(Forge):
     def branch(self, repository: Reference, branch: str) -> Observation:
         path = f"/repos/{self._repo(repository)}/branches/{quote(branch, safe='')}"
         status, payload = self._read(path)
-        if status == 403:
+        if status in {401, 403}:
             return Observation(Presence.INACCESSIBLE)
         if status == 404 and self.http.authoritative_absence(path):
             return Observation(Presence.ABSENT)
@@ -148,7 +149,7 @@ class ForgejoForge(Forge):
         number = suffix
         path = f"/repos/{self._repo(repository)}/pulls/{number}"
         status, payload = self._read(path)
-        if status == 403:
+        if status in {401, 403}:
             return Observation(Presence.INACCESSIBLE)
         if status == 404 and self.http.authoritative_absence(path):
             return Observation(Presence.ABSENT)
@@ -297,6 +298,8 @@ class ForgejoForge(Forge):
                 f"/repos/{self._repo(effect.repository)}/pulls",
                 {"head": effect.branch, "base": effect.base_branch, "title": effect.title or "", "body": body},
             )
+        except LocalRequestRefusal:
+            return Receipt(EffectStatus.REJECTED, effect.operation, reason="local request limit")
         except OSError:
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
         if status == 403 or status == 422:
@@ -340,6 +343,7 @@ class ForgejoForge(Forge):
         cursor: str | None = None
         seen: set[str] = set()
         requests = 0
+        candidate: Reference | None = None
         for _ in range(self.max_reconcile_pages):
             if requests >= self.max_reconcile_requests:
                 return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted")
@@ -367,6 +371,8 @@ class ForgejoForge(Forge):
                     return Receipt(EffectStatus.UNKNOWN, effect.operation)
                 expected_body = f"{effect.body or ''}\n\n{marker}"
                 if marker in str(data.get("body", "")):
+                    if candidate is not None:
+                        return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="duplicate key")
                     try:
                         head_ref = _object(data.get("head")).get("ref")
                         base_ref = _object(data.get("base")).get("ref")
@@ -378,27 +384,27 @@ class ForgejoForge(Forge):
                         or (head_ref != effect.branch or base_ref != effect.base_branch)
                     ):
                         return Receipt(EffectStatus.UNKNOWN, effect.operation, item.reference, "conflicting key")
-                    if item.head == effect.revision and item.base == effect.base_revision:
-                        if effect.base_branch is None:
-                            return Receipt(EffectStatus.UNKNOWN, effect.operation)
-                        if requests >= self.max_reconcile_requests:
-                            return Receipt(
-                                EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted"
-                            )
-                        base = self.branch(effect.repository, effect.base_branch)
-                        requests += 1
-                        if requests >= self.max_reconcile_requests:
-                            return Receipt(
-                                EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted"
-                            )
-                        head = self.branch(effect.repository, effect.branch)
-                        requests += 1
-                        if base.revision != effect.base_revision or head.revision != effect.revision:
-                            return Receipt(EffectStatus.UNKNOWN, effect.operation, item.reference, "head/base moved")
-                        return Receipt(EffectStatus.ACCEPTED, effect.operation, item.reference)
-                    return Receipt(EffectStatus.UNKNOWN, effect.operation, item.reference, "changed PR subject")
+                    if item.head != effect.revision or item.base != effect.base_revision:
+                        return Receipt(EffectStatus.UNKNOWN, effect.operation, item.reference, "changed PR subject")
+                    candidate = item.reference
             if page.next_cursor is None:
-                return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="absence is not authoritative")
+                if not page.complete or candidate is None or effect.base_branch is None:
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="scan incomplete or no candidate")
+                if requests >= self.max_reconcile_requests:
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted")
+                base = self.branch(effect.repository, effect.base_branch)
+                requests += 1
+                if requests >= self.max_reconcile_requests:
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted")
+                head = self.branch(effect.repository, effect.branch)
+                requests += 1
+                if (
+                    base.presence is not Presence.FOUND
+                    or head.presence is not Presence.FOUND
+                    or (base.revision != effect.base_revision or head.revision != effect.revision)
+                ):
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation, candidate, "head/base moved")
+                return Receipt(EffectStatus.ACCEPTED, effect.operation, candidate)
             if page.next_cursor in seen or page.next_cursor == cursor:
                 return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="repeated page cursor")
             seen.add(page.next_cursor)

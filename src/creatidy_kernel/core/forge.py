@@ -103,6 +103,8 @@ class Effect:
             raise ForgeConflict("durably claimed delivery required")
         if self.revision is None or (self.action == "push" and self.expected is None):
             raise ForgeConflict("exact revision and push expected-old required")
+        if self.action == "branch" and self.expected is not None:
+            raise ForgeConflict("new branch must expect absence")
         if self.action in {"branch", "pr"} and (not self.base_branch or not self.base_revision):
             raise ForgeConflict("branch or PR requires exact source/base")
         if self.action == "pr" and not self.title:

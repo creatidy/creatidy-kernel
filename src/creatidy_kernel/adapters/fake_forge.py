@@ -24,10 +24,10 @@ class SyntheticForgeTransport:
     def __init__(self, repository: Reference, *, page_size: int = 2) -> None:
         self.repository = repository
         self.page_size = page_size
-        self.branches: dict[str, str] = {"develop": "base1", "feature": "head1"}
+        self.branches: dict[str, str] = {"develop": "b" * 40, "feature": "a" * 40}
         self.pulls: list[dict[str, object]] = []
         self.statuses: list[dict[str, object]] = []
-        self.status_revision = "head1"
+        self.status_revision = "a" * 40
         self.forbidden = False
         self.lost_reply = False
         self.domain_rejection = False
@@ -116,9 +116,14 @@ class SyntheticForgeTransport:
 class FakeForge(Forge):
     """Models forge state without HTTP or the Forgejo adapter's payload mapping."""
 
-    def __init__(self, transport: SyntheticForgeTransport, authorize: Callable[[Effect], bool]) -> None:
+    def __init__(
+        self, transport: SyntheticForgeTransport, authorize: Callable[[Effect], bool], *, max_reconcile_pulls: int = 600
+    ) -> None:
+        if max_reconcile_pulls <= 0:
+            raise ValueError("reconciliation limit must be positive")
         self.transport = transport
         self.authorize = authorize
+        self.max_reconcile_pulls = max_reconcile_pulls
 
     def capabilities(self) -> frozenset[str]:
         return frozenset({"identity", "branch", "change", "checks", "branch_create", "conditional_push", "pr"})
@@ -331,10 +336,15 @@ class FakeForge(Forge):
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
         if self.identity(effect.repository).presence is not Presence.FOUND:
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
+        if len(self.transport.pulls) > self.max_reconcile_pulls:
+            return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted")
         marker = effect_marker(effect.operation)
+        candidate: Reference | None = None
         for pull in self.transport.pulls:
             if marker not in str(pull.get("body", "")):
                 continue
+            if candidate is not None:
+                return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="duplicate key")
             try:
                 observation = self._pull(effect.repository, pull)
             except ValueError:
@@ -350,9 +360,14 @@ class FakeForge(Forge):
                 or cast(dict[str, object], base).get("ref") != effect.base_branch
                 or observation.head != effect.revision
                 or observation.base != effect.base_revision
-                or self.branch(effect.repository, effect.base_branch or "").revision != effect.base_revision
-                or self.branch(effect.repository, effect.branch).revision != effect.revision
             ):
                 return Receipt(EffectStatus.UNKNOWN, effect.operation, observation.reference)
-            return Receipt(EffectStatus.ACCEPTED, effect.operation, observation.reference)
-        return Receipt(EffectStatus.UNKNOWN, effect.operation)
+            candidate = observation.reference
+        if candidate is None:
+            return Receipt(EffectStatus.UNKNOWN, effect.operation)
+        if (
+            self.branch(effect.repository, effect.base_branch or "").revision != effect.base_revision
+            or self.branch(effect.repository, effect.branch).revision != effect.revision
+        ):
+            return Receipt(EffectStatus.UNKNOWN, effect.operation, candidate, "head/base moved")
+        return Receipt(EffectStatus.ACCEPTED, effect.operation, candidate)
