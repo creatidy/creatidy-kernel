@@ -4,6 +4,8 @@
 Run only in a trusted controller with scoped credentials; never in a worker.
 """
 
+import base64
+import binascii
 import json
 import os
 import re
@@ -22,7 +24,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from creatidy_kernel.adapters.forge_refs import ForgeBinding, https_origin, oid, repository_path, valid_branch
+from creatidy_kernel.adapters.forge_refs import (
+    AGIT_OPTION_LIMIT,
+    AGitPush,
+    ForgeBinding,
+    https_origin,
+    oid,
+    repository_path,
+    valid_branch,
+)
 from creatidy_kernel.core.forge import EffectStatus, ForgeConflict, Reference, UnsupportedForge
 
 
@@ -214,6 +224,7 @@ class ConditionalGitTransport:
     """Push from an isolated bare repository, never loading workload Git configuration."""
 
     supports_conditional_push = True
+    supports_agit = True
 
     def __init__(
         self,
@@ -365,6 +376,116 @@ class ConditionalGitTransport:
             if pushed.returncode != 0 and lines == [f"To {self.remote_url}", rejected, "Done"]
             else EffectStatus.UNKNOWN
         )
+
+    def create_agit_pr(
+        self, repository: Reference, base: str, topic: str, revision: Reference, title: str, description: str
+    ) -> AGitPush:
+        if repository != self.repository:
+            raise ForgeConflict("repository outside configured Git remote")
+        valid_branch(base)
+        if re.fullmatch(r"kernel-pr-[0-9a-f]{32}", topic) is None:
+            raise ForgeConflict("invalid durable AGit topic")
+        sha = revision.value.removeprefix("forgejo:")
+        if not revision.value.startswith("forgejo:") or not _valid_oid(sha):
+            raise ForgeConflict("revision must be a full Git object ID")
+        if not title or any(ord(char) < 32 or ord(char) == 127 for char in title):
+            raise ForgeConflict("AGit title must be one line without control characters")
+        if not description.startswith("{base64}") or len(description) + len(title) > AGIT_OPTION_LIMIT:
+            return AGitPush(EffectStatus.REJECTED, reason="local request limit")
+        try:
+            base64.b64decode(description.removeprefix("{base64}"), validate=True)
+        except (ValueError, binascii.Error):
+            return AGitPush(EffectStatus.REJECTED, reason="invalid AGit description")
+        ref = f"refs/for/{base}"
+        with tempfile.TemporaryDirectory(prefix="forge-agit-") as directory:
+            root = Path(directory)
+            env = {
+                "HOME": directory,
+                "XDG_CONFIG_HOME": directory,
+                "PATH": "/usr/bin:/bin",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+            if self.askpass is not None:
+                env["GIT_ASKPASS"] = str(self.askpass)
+
+            def run_git(argv: list[str]) -> subprocess.CompletedProcess[str]:
+                return run_git_bounded(argv, root, env, self.timeout, self.max_output_bytes)
+
+            try:
+                source = self.object_source
+                objects = source / "objects"
+                if (
+                    source.is_symlink()
+                    or any(parent.is_symlink() for parent in source.parents)
+                    or (source.stat().st_dev, source.stat().st_ino, objects.stat().st_dev, objects.stat().st_ino)
+                    != self.source_identity
+                    or (source / "commondir").exists()
+                    or (objects / "info" / "alternates").exists()
+                    or any(path.is_symlink() for path in (source / "HEAD", source / "refs", objects, objects / "info"))
+                ):
+                    return AGitPush(EffectStatus.UNKNOWN)
+                env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(objects)
+                initialized = run_git([self.git_binary, "init", "--bare", "--template=", str(root / "repo")])
+                if initialized.returncode != 0:
+                    return AGitPush(EffectStatus.UNKNOWN)
+                checked = run_git([self.git_binary, "check-ref-format", ref])
+                if checked.returncode != 0:
+                    raise ForgeConflict("invalid AGit ref")
+                kind = run_git([self.git_binary, f"--git-dir={root / 'repo'}", "cat-file", "-t", sha])
+                if kind.returncode != 0 or kind.stdout != "commit\n":
+                    return AGitPush(EffectStatus.UNKNOWN)
+                pushed = run_git(
+                    [
+                        self.git_binary,
+                        f"--git-dir={root / 'repo'}",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-c",
+                        "credential.helper=",
+                        "-c",
+                        "http.followRedirects=false",
+                        "push",
+                        "--porcelain",
+                        "-o",
+                        f"topic={topic}",
+                        "-o",
+                        f"title={title}",
+                        "-o",
+                        f"description={description}",
+                        "--",
+                        self.remote_url,
+                        f"{sha}:{ref}",
+                    ]
+                )
+            except (OSError, TimeoutError, subprocess.TimeoutExpired, OverflowError):
+                return AGitPush(EffectStatus.UNKNOWN)
+        # Forgejo v15 proc-receive reports a new PR's alternate refs/pull/N/head
+        # with zero old-oid; Git renders that report as [new reference]. Updates
+        # report nonzero old-oid and must never be adopted as creations.
+        if pushed.returncode != 0:
+            if "permission denied" in pushed.stderr.lower() or "not allowed" in pushed.stderr.lower():
+                return AGitPush(EffectStatus.REJECTED, reason="permission denied")
+            if "agit" in pushed.stderr.lower() and "disabled" in pushed.stderr.lower():
+                return AGitPush(EffectStatus.REJECTED, reason="AGit unsupported")
+            return AGitPush(EffectStatus.UNKNOWN)
+        lines = pushed.stdout.splitlines()
+        if len(lines) != 3 or lines[0] != f"To {self.remote_url}" or lines[2] != "Done":
+            return AGitPush(EffectStatus.UNKNOWN, reason="AGit domain receipt absent or ambiguous")
+        created = re.fullmatch(
+            rf"\*\t{re.escape(sha)}:refs/pull/([1-9][0-9]{{0,17}})/head\t\[new reference\]", lines[1]
+        )
+        if created is None:
+            updated = re.fullmatch(
+                rf"[ +]\t{re.escape(sha)}:refs/pull/[1-9][0-9]{{0,17}}/head\t"
+                r"[0-9a-f]{7,64}\.\.{1,2}[0-9a-f]{7,64}(?: \(forced update\))?",
+                lines[1],
+            )
+            if updated is not None:
+                return AGitPush(EffectStatus.REJECTED, reason="AGit topic collision or update")
+            return AGitPush(EffectStatus.UNKNOWN, reason="AGit domain receipt absent or ambiguous")
+        return AGitPush(EffectStatus.ACCEPTED, Reference(f"forgejo:{self.binding.repository}#{created.group(1)}"))
 
 
 def _valid_oid(value: str) -> bool:
