@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from creatidy_kernel.adapters.fake_forge import FakeForge, SyntheticForgeTransport
+from creatidy_kernel.adapters.forge_refs import pr_payload
 from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.forgejo_transport import LocalRequestRefusal
 from creatidy_kernel.core.execution import OperationKey
@@ -42,7 +43,7 @@ def boundary(request: pytest.FixtureRequest) -> tuple[Forge, SyntheticForgeTrans
     forge: Forge = (
         FakeForge(transport, authorize)
         if request.param == "fake"
-        else ForgejoForge(transport, transport, authorize, page_size=2)
+        else ForgejoForge(transport, transport, authorize, page_size=2, isolation=transport)
     )
     return forge, transport, permitted
 
@@ -56,7 +57,7 @@ def operation(action: str, *, attempts: int = 1, key: str | None = None) -> Effe
         expected=HEAD if action == "push" else None,
         revision=NEXT_HEAD if action == "push" else HEAD,
         base_branch="develop" if action in {"pr", "branch"} else None,
-        base_revision=BASE if action in {"pr", "branch"} else None,
+        base_revision=BASE if action == "branch" else None,
         title="Patch" if action == "pr" else None,
         fence=1,
         delivery_attempts=attempts,
@@ -191,7 +192,6 @@ def test_wrong_revision_provider_rejected_before_effect(
         ("push", "expected"),
         ("branch", "base_revision"),
         ("pr", "revision"),
-        ("pr", "base_revision"),
     ],
 )
 def test_malformed_same_provider_effect_rejected_before_dispatch(
@@ -256,7 +256,7 @@ def test_malformed_branch_revision_never_supports_pr_receipt(
 @pytest.mark.parametrize("side", ["head", "base"])
 def test_malformed_pr_post_response_never_accepted(side: str) -> None:
     transport = SyntheticForgeTransport(REPO)
-    forge = ForgejoForge(transport, transport, lambda _effect: True)
+    forge = ForgejoForge(transport, transport, lambda _effect: True, isolation=transport)
     original = transport.request
 
     def corrupted(method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
@@ -275,7 +275,7 @@ def test_malformed_pr_post_response_never_accepted(side: str) -> None:
 @pytest.mark.parametrize("number", [0, True, -1, 10**18, "1"])
 def test_invalid_pr_number_never_supplies_receipt(number: object) -> None:
     transport = SyntheticForgeTransport(REPO)
-    forge = ForgejoForge(transport, transport, lambda _effect: True)
+    forge = ForgejoForge(transport, transport, lambda _effect: True, isolation=transport)
     original = transport.request
 
     def corrupted(method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
@@ -380,12 +380,175 @@ def test_pr_artifact_not_merge_and_replay(boundary: tuple[Forge, SyntheticForgeT
     assert receipt.status is EffectStatus.ACCEPTED and receipt.reference is not None
     assert forge.change(REPO, receipt.reference).head == HEAD
     assert len(transport.pulls) == 1 and transport.posts == 1
+    snapshot = pr_payload(effect, transport.max_bytes)[0]
+    assert transport.pulls[0]["head"] == {"sha": "a" * 40, "ref": snapshot, "repo": {"full_name": "team/project"}}
+    assert snapshot != effect.branch
     assert "merge" not in forge.capabilities()
     retry = replace(effect, delivery_attempts=2)
     permitted.append(retry)
     assert forge.apply(retry).status is EffectStatus.UNKNOWN
     assert forge.reconcile(effect, receipt.reference).status is EffectStatus.ACCEPTED
     assert transport.posts == 1
+
+
+def test_pr_mutable_branch_movement_does_not_block_exact_snapshot(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    transport.branches["feature"] = "c" * 40
+    receipt = forge.apply(effect)
+    assert receipt.status is EffectStatus.ACCEPTED
+    assert receipt.reference is not None
+    assert forge.change(REPO, receipt.reference).head == HEAD
+    assert transport.branches["feature"] == "c" * 40
+    assert forge.reconcile(effect, receipt.reference).status is EffectStatus.ACCEPTED
+
+
+def test_pr_snapshot_contention_fails_without_post(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    transport.contend_snapshot = True
+    with pytest.raises(ForgeConflict, match="snapshot namespace"):
+        forge.apply(effect)
+    assert transport.posts == 0
+
+
+def test_pr_base_revision_cannot_be_part_of_effect_authority() -> None:
+    with pytest.raises(ForgeConflict, match="observation only"):
+        replace(operation("pr"), base_revision=BASE)
+
+
+def test_lost_pr_post_reply_releases_guard_but_does_not_retry(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    snapshot = pr_payload(effect, transport.max_bytes)[0]
+    with transport.hold(REPO, snapshot):
+        assert transport.compare_and_push(REPO, snapshot, None, HEAD) is EffectStatus.ACCEPTED
+    transport.lost_reply = True
+    assert forge.apply(effect).status is EffectStatus.UNKNOWN
+    assert transport.posts == 1 and len(transport.pulls) == 1
+    assert transport.branches[snapshot] == HEAD.value.removeprefix("forgejo:")
+    with transport.hold(REPO, snapshot):
+        pass
+    replay = replace(effect, delivery_attempts=2)
+    permitted.append(replay)
+    assert forge.apply(replay).status is EffectStatus.UNKNOWN
+    assert transport.posts == 1 and len(transport.pulls) == 1
+
+
+def test_pr_snapshot_mutation_during_post_is_authority_failure(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    transport.tamper_snapshot_on_post = True
+    with pytest.raises(ForgeConflict, match="head"):
+        forge.apply(effect)
+    assert transport.posts == 1
+
+
+def test_pr_valid_but_wrong_response_head_is_authority_failure(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    if isinstance(forge, ForgejoForge):
+        original = transport.request
+
+        def wrong_head(method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
+            status, payload = original(method, path, body)
+            if method == "POST" and status == 201 and isinstance(payload, dict):
+                head = cast(dict[str, object], payload).get("head")
+                assert isinstance(head, dict)
+                cast(dict[str, object], head)["sha"] = "c" * 40
+            return status, cast(object, payload)
+
+        with patch.object(transport, "request", side_effect=wrong_head):
+            with pytest.raises(ForgeConflict, match="authorized head"):
+                forge.apply(effect)
+    else:
+        transport.tamper_snapshot_on_post = True
+        with pytest.raises(ForgeConflict, match="authorized head"):
+            forge.apply(effect)
+    assert transport.posts == 1
+
+
+def test_pr_base_movement_during_post_is_provenance(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    transport.move_base_on_post = True
+    receipt = forge.apply(effect)
+    assert receipt.status is EffectStatus.ACCEPTED
+    assert receipt.observed_base == Reference(f"forgejo:{MOVED_BASE}")
+    assert receipt.reference is not None
+    assert forge.reconcile(effect, receipt.reference).observed_base == receipt.observed_base
+
+
+def test_pr_requires_server_enforced_isolation_before_write() -> None:
+    transport = SyntheticForgeTransport(REPO)
+    forge = ForgejoForge(transport, transport, lambda _effect: True)
+    assert "pr" not in forge.capabilities()
+    with pytest.raises(UnsupportedForge, match="pr unsupported"):
+        forge.apply(operation("pr"))
+    assert transport.posts == transport.pushes == 0
+
+
+def test_unavailable_reads_and_out_of_binding_observations(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, _ = boundary
+    foreign = Reference("forgejo:other/project")
+    for observe in (
+        lambda: forge.identity(foreign),
+        lambda: forge.branch(foreign, "feature"),
+        lambda: forge.change(foreign, Reference(f"{foreign.value}#1")),
+        lambda: forge.checks(foreign, HEAD),
+        lambda: forge.changes(foreign),
+    ):
+        with pytest.raises(ForgeConflict):
+            observe()
+    transport.supports_reads = False
+    for observe in (
+        lambda: forge.identity(REPO),
+        lambda: forge.branch(REPO, "feature"),
+        lambda: forge.change(REPO, Reference(f"{REPO.value}#1")),
+        lambda: forge.checks(REPO, HEAD),
+        lambda: forge.changes(REPO),
+    ):
+        with pytest.raises(UnsupportedForge):
+            observe()
+
+
+@pytest.mark.parametrize("field", ["operation_id", "effect_key", "request_digest", "title", "body"])
+def test_pr_oversized_input_rejected_before_marker_or_io(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], field: str
+) -> None:
+    forge, transport, permitted = boundary
+    transport.max_bytes = 256
+    effect = operation("pr")
+    if field in {"title", "body"}:
+        effect = replace(effect, **{field: "x" * 100_000})
+    else:
+        key = effect.operation
+        effect = replace(effect, operation=replace(key, **{field: "x" * 100_000}))
+    permitted.append(effect)
+    with patch("creatidy_kernel.adapters.forge_refs.effect_marker") as marker:
+        assert forge.apply(effect).status is EffectStatus.REJECTED
+        marker.assert_not_called()
+    assert transport.posts == transport.pushes == 0
 
 
 def test_stale_rejected_uncertain_and_inaccessible(
@@ -395,20 +558,22 @@ def test_stale_rejected_uncertain_and_inaccessible(
     effect = operation("pr")
     permitted.append(effect)
     transport.branches["develop"] = MOVED_BASE
-    assert forge.apply(effect).status is EffectStatus.STALE
-    assert transport.posts == 0
+    moved = forge.apply(effect)
+    assert moved.status is EffectStatus.ACCEPTED
+    assert moved.observed_base == Reference(f"forgejo:{MOVED_BASE}")
+    assert transport.posts == 1
     transport.branches["develop"] = BASE.value.removeprefix("forgejo:")
     transport.domain_rejection = True
     assert forge.apply(effect).status is EffectStatus.REJECTED
     transport.domain_rejection = False
     transport.lost_reply = True
     assert forge.apply(effect).status is EffectStatus.UNKNOWN
-    assert transport.posts == 2
+    assert transport.posts == 3
     assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
     replay = replace(effect, delivery_attempts=2)
     permitted.append(replay)
     assert forge.apply(replay).status is EffectStatus.UNKNOWN
-    assert transport.posts == 2
+    assert transport.posts == 3
     transport.forbidden = True
     assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
 
@@ -487,7 +652,7 @@ def test_missing_pr_number_and_invalid_check_ids_fail_closed(
 )
 def test_pr_post_status_is_endpoint_specific(status: int, expected: EffectStatus) -> None:
     transport = SyntheticForgeTransport(REPO)
-    forge = ForgejoForge(transport, transport, lambda _effect: True)
+    forge = ForgejoForge(transport, transport, lambda _effect: True, isolation=transport)
     original = transport.request
 
     def respond(method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
@@ -685,7 +850,7 @@ def test_known_reference_does_not_depend_on_list_size() -> None:
 
 def test_pr_local_request_refusal_is_rejected_without_post() -> None:
     transport = SyntheticForgeTransport(REPO)
-    forge = ForgejoForge(transport, transport, lambda _effect: True)
+    forge = ForgejoForge(transport, transport, lambda _effect: True, isolation=transport)
     effect = operation("pr")
     original = transport.request
 
@@ -701,7 +866,7 @@ def test_pr_local_request_refusal_is_rejected_without_post() -> None:
 
 def test_server_cap_does_not_hide_later_pr() -> None:
     transport = SyntheticForgeTransport(REPO, page_size=1)
-    forge = ForgejoForge(transport, transport, lambda _effect: True, page_size=30)
+    forge = ForgejoForge(transport, transport, lambda _effect: True, page_size=30, isolation=transport)
     effect = operation("pr")
     for number in (1, 2):
         transport.pulls.append(
@@ -731,7 +896,7 @@ def test_server_cap_does_not_hide_later_pr() -> None:
 
 def test_malformed_pages_do_not_supply_reconciliation_evidence() -> None:
     transport = SyntheticForgeTransport(REPO, page_size=1)
-    forge = ForgejoForge(transport, transport, lambda _effect: True)
+    forge = ForgejoForge(transport, transport, lambda _effect: True, isolation=transport)
     effect = operation("pr")
     transport.pulls.append(
         {
@@ -762,7 +927,7 @@ def test_malformed_pages_do_not_supply_reconciliation_evidence() -> None:
 def test_known_reference_reads_only_exact_pr_and_branches() -> None:
     transport = SyntheticForgeTransport(REPO)
     effect = operation("pr")
-    creator = ForgejoForge(transport, transport, lambda _effect: True)
+    creator = ForgejoForge(transport, transport, lambda _effect: True, isolation=transport)
     receipt = creator.apply(effect)
     assert receipt.status is EffectStatus.ACCEPTED and receipt.reference is not None
     seen: list[str] = []
@@ -776,14 +941,13 @@ def test_known_reference_reads_only_exact_pr_and_branches() -> None:
         assert creator.reconcile(effect, receipt.reference).status is EffectStatus.ACCEPTED
     assert seen == [
         "/repos/team/project/pulls/1",
-        "/repos/team/project/branches/develop",
-        "/repos/team/project/branches/feature",
+        f"/repos/team/project/branches/{pr_payload(effect, transport.max_bytes)[0].replace('/', '%2F')}",
     ]
 
 
 def test_forgejo_read_failure_and_wrong_change_are_unknown() -> None:
     transport = SyntheticForgeTransport(REPO)
-    forge = ForgejoForge(transport, transport, lambda _effect: True)
+    forge = ForgejoForge(transport, transport, lambda _effect: True, isolation=transport)
     with patch.object(transport, "request", side_effect=OSError("lost read reply")):
         assert forge.identity(REPO).presence is Presence.UNKNOWN
         assert forge.branch(REPO, "develop").presence is Presence.UNKNOWN

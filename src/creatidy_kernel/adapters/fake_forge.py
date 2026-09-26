@@ -2,10 +2,18 @@
 """Independent in-memory Forge and synthetic HTTP/Git fixtures."""
 
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from typing import cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from creatidy_kernel.adapters.forge_refs import ForgeBinding, oid, positive_id, repository_path, valid_branch
+from creatidy_kernel.adapters.forge_refs import (
+    ForgeBinding,
+    oid,
+    positive_id,
+    pr_payload,
+    repository_path,
+    valid_branch,
+)
 from creatidy_kernel.adapters.forge_refs import number as _number
 from creatidy_kernel.core.forge import (
     CheckResult,
@@ -18,7 +26,6 @@ from creatidy_kernel.core.forge import (
     Receipt,
     Reference,
     UnsupportedForge,
-    effect_marker,
 )
 from creatidy_kernel.ports.forge import Forge
 
@@ -42,6 +49,26 @@ class SyntheticForgeTransport:
         self.supports_reads = True
         self.supports_pr = True
         self.supports_conditional_push = True
+        self.supports_write_once = True
+        self.max_bytes = 1_000_000
+        self._held_snapshot: str | None = None
+        self.contend_snapshot = False
+        self.tamper_snapshot_on_post = False
+        self.move_base_on_post = False
+
+    @contextmanager
+    def hold(self, repository: Reference, branch: str):
+        if repository != self.repository or not branch.startswith("kernel/snapshots/"):
+            raise ForgeConflict("snapshot outside isolation binding")
+        if not self.supports_write_once:
+            raise UnsupportedForge("snapshot isolation unavailable")
+        if self._held_snapshot is not None:
+            raise UnsupportedForge("snapshot isolation already occupied")
+        self._held_snapshot = branch
+        try:
+            yield
+        finally:
+            self._held_snapshot = None
 
     def authoritative_absence(self, path: str) -> bool:
         return self.direct_absence and not self.forbidden
@@ -49,8 +76,18 @@ class SyntheticForgeTransport:
     def compare_and_push(
         self, repository: Reference, branch: str, expected: Reference | None, revision: Reference
     ) -> EffectStatus:
-        if repository != self.repository or self.forbidden:
+        if repository != self.repository:
+            raise ForgeConflict("repository outside configured Git remote")
+        if self.forbidden:
             return EffectStatus.UNKNOWN
+        if branch.startswith("kernel/snapshots/"):
+            if self._held_snapshot != branch or expected is not None:
+                raise UnsupportedForge("snapshot requires exclusive absent-target creation")
+            if self.contend_snapshot:
+                self.branches[branch] = "c" * 40
+                return EffectStatus.STALE
+            if branch in self.branches:
+                return EffectStatus.STALE
         old = self.branches.get(branch)
         if old != (expected.value.removeprefix("forgejo:") if expected else None):
             return EffectStatus.STALE
@@ -87,6 +124,10 @@ class SyntheticForgeTransport:
             return (200, matching[0]) if matching else (404, {})
         if method == "POST" and route == ["pulls"] and body is not None:
             self.posts += 1
+            if self.move_base_on_post:
+                self.branches[str(body["base"])] = "d" * 40
+            if self.tamper_snapshot_on_post:
+                self.branches[str(body["head"])] = "c" * 40
             if self.domain_rejection:
                 return 422, {"message": "rejected"}
             head = self.branches.get(str(body["head"]))
@@ -137,12 +178,27 @@ class FakeForge(Forge):
             capabilities.add("conditional_push")
             if self.transport.supports_reads:
                 capabilities.add("branch_create")
-        if self.transport.supports_reads and self.transport.supports_pr:
+        if (
+            self.transport.supports_reads
+            and self.transport.supports_pr
+            and self.transport.supports_conditional_push
+            and self.transport.supports_write_once
+        ):
             capabilities.add("pr")
         return frozenset(capabilities)
 
-    def identity(self, repository: Reference) -> Observation:
+    def _repo(self, repository: Reference) -> None:
         repository_path(repository)
+        if repository != self.transport.repository:
+            raise ForgeConflict("repository outside configured forge binding")
+
+    def _require_reads(self) -> None:
+        if not self.transport.supports_reads:
+            raise UnsupportedForge("forge reads unsupported")
+
+    def identity(self, repository: Reference) -> Observation:
+        self._require_reads()
+        self._repo(repository)
         if self.transport.forbidden:
             return Observation(Presence.INACCESSIBLE)
         if self.transport.repository_missing:
@@ -152,7 +208,8 @@ class FakeForge(Forge):
         return Observation(Presence.FOUND, repository)
 
     def branch(self, repository: Reference, branch: str) -> Observation:
-        repository_path(repository)
+        self._require_reads()
+        self._repo(repository)
         valid_branch(branch)
         if self.identity(repository).presence is not Presence.FOUND:
             return Observation(self.identity(repository).presence)
@@ -164,7 +221,8 @@ class FakeForge(Forge):
         return Observation(Presence.ABSENT if self.transport.direct_absence else Presence.UNKNOWN)
 
     def change(self, repository: Reference, change: Reference) -> Observation:
-        repository_path(repository)
+        self._require_reads()
+        self._repo(repository)
         suffix = change.value.removeprefix(f"{repository.value}#")
         if not change.value.startswith(f"{repository.value}#") or not _number(suffix):
             raise ForgeConflict("change does not belong to repository")
@@ -209,7 +267,8 @@ class FakeForge(Forge):
     def _page(
         self, repository: Reference, records: list[dict[str, object]], cursor: str | None
     ) -> tuple[list[dict[str, object]], str | None, bool]:
-        repository_path(repository)
+        self._require_reads()
+        self._repo(repository)
         if self.identity(repository).presence is not Presence.FOUND:
             return [], None, False
         if cursor is not None and not _number(cursor):
@@ -227,6 +286,8 @@ class FakeForge(Forge):
             return Page((), None, False)
 
     def checks(self, repository: Reference, revision: Reference, cursor: str | None = None) -> Page:
+        self._require_reads()
+        self._repo(repository)
         self._revision(revision)
         records, next_cursor, complete = self._page(
             repository,
@@ -262,7 +323,7 @@ class FakeForge(Forge):
         return Page(tuple(checks), next_cursor, complete)
 
     def _authorized(self, effect: Effect) -> None:
-        repository_path(effect.repository)
+        self._repo(effect.repository)
         valid_branch(effect.branch)
         if effect.base_branch is not None:
             valid_branch(effect.base_branch)
@@ -317,42 +378,53 @@ class FakeForge(Forge):
             ):
                 return Receipt(EffectStatus.UNKNOWN, effect.operation, effect.revision)
             return Receipt(EffectStatus.ACCEPTED, effect.operation, effect.revision)
+        try:
+            snapshot, body, _ = pr_payload(effect, self.transport.max_bytes)
+        except ValueError:
+            return Receipt(EffectStatus.REJECTED, effect.operation, reason="local request limit")
         base = self.branch(effect.repository, effect.base_branch or "")
-        head = self.branch(effect.repository, effect.branch)
-        if base.presence is not Presence.FOUND or head.presence is not Presence.FOUND:
+        if base.presence is not Presence.FOUND:
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
-        if base.revision != effect.base_revision or head.revision != effect.revision:
-            return Receipt(EffectStatus.STALE, effect.operation)
-        self.transport.posts += 1
-        if self.transport.domain_rejection or self.transport.forbidden:
-            return Receipt(EffectStatus.REJECTED, effect.operation)
-        marker = effect_marker(effect.operation)
-        record: dict[str, object] = {
-            "number": len(self.transport.pulls) + 1,
-            "head": {
-                "sha": effect.revision.value.removeprefix("forgejo:"),
-                "ref": effect.branch,
-                "repo": {"full_name": effect.repository.value.removeprefix("forgejo:")},
-            },
-            "base": {
-                "sha": effect.base_revision.value.removeprefix("forgejo:") if effect.base_revision else "",
-                "ref": effect.base_branch,
-                "repo": {"full_name": effect.repository.value.removeprefix("forgejo:")},
-            },
-            "title": effect.title,
-            "body": f"{effect.body or ''}\n\n{marker}",
-        }
-        self.transport.pulls.append(record)
-        if self.transport.lost_reply:
-            self.transport.lost_reply = False
-            return Receipt(EffectStatus.UNKNOWN, effect.operation)
-        pull = self._pull(effect.repository, record)
-        if (
-            self.branch(effect.repository, effect.base_branch or "").revision != effect.base_revision
-            or self.branch(effect.repository, effect.branch).revision != effect.revision
-        ):
-            return Receipt(EffectStatus.UNKNOWN, effect.operation, pull.reference)
-        return Receipt(EffectStatus.ACCEPTED, effect.operation, pull.reference)
+        with self.transport.hold(effect.repository, snapshot):
+            current = self.branch(effect.repository, snapshot)
+            if current.presence is Presence.FOUND and current.revision != effect.revision:
+                raise ForgeConflict("snapshot head differs")
+            if current.presence is not Presence.FOUND:
+                status = self.transport.compare_and_push(effect.repository, snapshot, None, effect.revision)
+                if status is EffectStatus.STALE:
+                    raise ForgeConflict("snapshot namespace occupied")
+                if status is not EffectStatus.ACCEPTED:
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation)
+            if self.branch(effect.repository, snapshot).revision != effect.revision:
+                raise ForgeConflict("snapshot head differs")
+            try:
+                status, record = self.transport.request(
+                    "POST",
+                    f"/repos/{self.transport.binding.repository}/pulls",
+                    {"head": snapshot, "base": effect.base_branch or "", "title": effect.title or "", "body": body},
+                )
+            except OSError:
+                return Receipt(EffectStatus.UNKNOWN, effect.operation)
+            if status in {403, 409, 413, 422, 423}:
+                return Receipt(EffectStatus.REJECTED, effect.operation)
+            if status != 201 or not isinstance(record, dict):
+                return Receipt(EffectStatus.UNKNOWN, effect.operation)
+            data = cast(dict[str, object], record)
+            pull = self._pull(effect.repository, data)
+            head_data, base_data = data.get("head"), data.get("base")
+            if (
+                pull.head != effect.revision
+                or not isinstance(head_data, dict)
+                or cast(dict[str, object], head_data).get("ref") != snapshot
+                or not isinstance(base_data, dict)
+                or cast(dict[str, object], base_data).get("ref") != effect.base_branch
+                or data.get("body") != body
+                or data.get("title") != effect.title
+            ):
+                raise ForgeConflict("PR response differs from authorized head or base identity")
+            if self.branch(effect.repository, snapshot).revision != effect.revision:
+                raise ForgeConflict("snapshot head moved during PR creation")
+            return Receipt(EffectStatus.ACCEPTED, effect.operation, pull.reference, observed_base=pull.base)
 
     def reconcile(self, effect: Effect, known_reference: Reference | None = None) -> Receipt:
         self._authorized(effect)
@@ -360,6 +432,10 @@ class FakeForge(Forge):
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
         if known_reference is None:
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
+        try:
+            snapshot, body, _ = pr_payload(effect, self.transport.max_bytes)
+        except ValueError:
+            return Receipt(EffectStatus.REJECTED, effect.operation, reason="local request limit")
         suffix = known_reference.value.removeprefix(f"{effect.repository.value}#")
         if not known_reference.value.startswith(f"{effect.repository.value}#") or not _number(suffix):
             raise ForgeConflict("change does not belong to repository")
@@ -375,23 +451,22 @@ class FakeForge(Forge):
             head = pull.get("head")
             base = pull.get("base")
             if (
-                observation.reference != known_reference
-                or pull.get("body") != f"{effect.body or ''}\n\n{effect_marker(effect.operation)}"
-                or pull.get("title") != effect.title
-                or not isinstance(head, dict)
+                not isinstance(head, dict)
                 or not isinstance(base, dict)
-                or cast(dict[str, object], head).get("ref") != effect.branch
+                or cast(dict[str, object], head).get("ref") != snapshot
                 or cast(dict[str, object], base).get("ref") != effect.base_branch
                 or observation.head != effect.revision
-                or observation.base != effect.base_revision
+            ):
+                raise ForgeConflict("PR head or base identity differs from authorized effect")
+            if (
+                observation.reference != known_reference
+                or pull.get("body") != body
+                or pull.get("title") != effect.title
             ):
                 return Receipt(EffectStatus.UNKNOWN, effect.operation)
-            if (
-                self.branch(effect.repository, effect.base_branch or "").revision != effect.base_revision
-                or self.branch(effect.repository, effect.branch).revision != effect.revision
-            ):
-                return Receipt(EffectStatus.UNKNOWN, effect.operation, known_reference, "head/base moved")
-            return Receipt(EffectStatus.ACCEPTED, effect.operation, known_reference)
+            if self.branch(effect.repository, snapshot).revision != effect.revision:
+                raise ForgeConflict("snapshot head moved")
+            return Receipt(EffectStatus.ACCEPTED, effect.operation, known_reference, observed_base=observation.base)
         return Receipt(EffectStatus.UNKNOWN, effect.operation)
 
 

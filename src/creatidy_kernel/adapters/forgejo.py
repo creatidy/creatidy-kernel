@@ -6,10 +6,18 @@ predicate. Neither HTTP success nor a locally cached key establishes acceptance.
 """
 
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from typing import Protocol, cast
 from urllib.parse import quote
 
-from creatidy_kernel.adapters.forge_refs import ForgeBinding, oid, positive_id, repository_path, valid_branch
+from creatidy_kernel.adapters.forge_refs import (
+    ForgeBinding,
+    oid,
+    positive_id,
+    pr_payload,
+    repository_path,
+    valid_branch,
+)
 from creatidy_kernel.adapters.forge_refs import number as valid_number
 from creatidy_kernel.adapters.forgejo_transport import LocalRequestRefusal
 from creatidy_kernel.core.forge import (
@@ -23,13 +31,13 @@ from creatidy_kernel.core.forge import (
     Receipt,
     Reference,
     UnsupportedForge,
-    effect_marker,
 )
 from creatidy_kernel.ports.forge import Forge
 
 
 class HTTPTransport(Protocol):
     binding: ForgeBinding
+    max_bytes: int
 
     @property
     def supports_reads(self) -> bool: ...
@@ -51,6 +59,15 @@ class GitTransport(Protocol):
     def compare_and_push(
         self, repository: Reference, branch: str, expected: Reference | None, revision: Reference
     ) -> EffectStatus: ...
+
+
+class SnapshotIsolation(Protocol):
+    """Trusted server-enforced exclusive write-once namespace, held through PR verification."""
+
+    binding: ForgeBinding
+    supports_write_once: bool
+
+    def hold(self, repository: Reference, branch: str) -> AbstractContextManager[None]: ...
 
 
 def _object(payload: object) -> dict[str, object]:
@@ -77,16 +94,20 @@ class ForgejoForge(Forge):
         authorize: Callable[[Effect], bool],
         *,
         page_size: int = 30,
+        isolation: SnapshotIsolation | None = None,
     ) -> None:
         if page_size <= 0:
             raise ValueError("page size must be positive")
         if http.binding != git.binding:
             raise ForgeConflict("HTTP and Git forge bindings differ")
+        if isolation is not None and isolation.binding != http.binding:
+            raise ForgeConflict("snapshot isolation binding differs")
         self.binding = http.binding
         self.http = http
         self.git = git
         self.authorize = authorize
         self.page_size = page_size
+        self.isolation = isolation
 
     def capabilities(self) -> frozenset[str]:
         capabilities: set[str] = set()
@@ -96,7 +117,13 @@ class ForgejoForge(Forge):
             capabilities.add("conditional_push")
             if self.http.supports_reads:
                 capabilities.add("branch_create")
-        if self.http.supports_reads and self.http.supports_pr:
+        if (
+            self.http.supports_reads
+            and self.http.supports_pr
+            and self.git.supports_conditional_push
+            and self.isolation is not None
+            and self.isolation.supports_write_once
+        ):
             capabilities.add("pr")
         return frozenset(capabilities)
 
@@ -317,21 +344,41 @@ class ForgejoForge(Forge):
             ):
                 return Receipt(EffectStatus.UNKNOWN, effect.operation, effect.revision, "source moved after effect")
             return Receipt(status, effect.operation, effect.revision if status is EffectStatus.ACCEPTED else None)
-        if effect.base_branch is None or effect.base_revision is None:
-            raise ForgeConflict("PR base required")
+        if effect.base_branch is None or self.isolation is None:
+            raise UnsupportedForge("PR snapshot isolation unavailable")
+        try:
+            snapshot, body, _ = pr_payload(effect, self.http.max_bytes)
+        except ValueError:
+            return Receipt(EffectStatus.REJECTED, effect.operation, reason="local request limit")
         base = self.branch(effect.repository, effect.base_branch)
-        head = self.branch(effect.repository, effect.branch)
-        if base.presence is not Presence.FOUND or head.presence is not Presence.FOUND:
-            return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="head/base not observable")
-        if base.revision != effect.base_revision or head.revision != effect.revision:
-            return Receipt(EffectStatus.STALE, effect.operation)
-        marker = effect_marker(effect.operation)
-        body = f"{effect.body or ''}\n\n{marker}"
+        if base.presence is not Presence.FOUND:
+            return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="base not observable")
+        with self.isolation.hold(effect.repository, snapshot):
+            return self._create_pr(effect, snapshot, body)
+
+    def _create_pr(self, effect: Effect, snapshot: str, body: str) -> Receipt:
+        if effect.revision is None:
+            raise ForgeConflict("revision required")
+        snapshot_before = self.branch(effect.repository, snapshot)
+        if snapshot_before.presence is Presence.FOUND:
+            if snapshot_before.revision != effect.revision:
+                raise ForgeConflict("snapshot head differs from accepted candidate")
+        else:
+            try:
+                created = self.git.compare_and_push(effect.repository, snapshot, None, effect.revision)
+            except OSError:
+                created = EffectStatus.UNKNOWN
+            if created is EffectStatus.STALE:
+                raise ForgeConflict("snapshot namespace occupied")
+            if created is not EffectStatus.ACCEPTED:
+                return Receipt(EffectStatus.UNKNOWN, effect.operation)
+        if self.branch(effect.repository, snapshot).revision != effect.revision:
+            raise ForgeConflict("snapshot head differs from accepted candidate")
         try:
             status, payload = self._request(
                 "POST",
                 f"/repos/{self._repo(effect.repository)}/pulls",
-                {"head": effect.branch, "base": effect.base_branch, "title": effect.title or "", "body": body},
+                {"head": snapshot, "base": effect.base_branch or "", "title": effect.title or "", "body": body},
             )
         except LocalRequestRefusal:
             return Receipt(EffectStatus.REJECTED, effect.operation, reason="local request limit")
@@ -347,18 +394,16 @@ class ForgejoForge(Forge):
             if (
                 data.get("body") != body
                 or data.get("title") != effect.title
-                or _object(data.get("head")).get("ref") != effect.branch
+                or _object(data.get("head")).get("ref") != snapshot
                 or _object(data.get("base")).get("ref") != effect.base_branch
                 or observed.head != effect.revision
-                or observed.base != effect.base_revision
             ):
-                return Receipt(EffectStatus.UNKNOWN, effect.operation)
-            if (
-                self.branch(effect.repository, effect.base_branch).revision != effect.base_revision
-                or self.branch(effect.repository, effect.branch).revision != effect.revision
-            ):
-                return Receipt(EffectStatus.UNKNOWN, effect.operation, observed.reference, "head/base moved")
-            return Receipt(EffectStatus.ACCEPTED, effect.operation, observed.reference)
+                raise ForgeConflict("PR response differs from authorized head or base identity")
+            if self.branch(effect.repository, snapshot).revision != effect.revision:
+                raise ForgeConflict("snapshot head moved during PR creation")
+            return Receipt(EffectStatus.ACCEPTED, effect.operation, observed.reference, observed_base=observed.base)
+        except ForgeConflict:
+            raise
         except (ValueError, TypeError):
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
 
@@ -368,6 +413,10 @@ class ForgejoForge(Forge):
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
         if known_reference is None:
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
+        try:
+            snapshot, body, _ = pr_payload(effect, self.http.max_bytes)
+        except ValueError:
+            return Receipt(EffectStatus.REJECTED, effect.operation, reason="local request limit")
         prefix = f"{effect.repository.value}#"
         suffix = known_reference.value.removeprefix(prefix)
         if not known_reference.value.startswith(prefix) or not valid_number(suffix):
@@ -379,20 +428,17 @@ class ForgejoForge(Forge):
             data = _object(payload)
             observed = self._change_observation(effect.repository, data)
             if (
-                observed.reference != known_reference
-                or observed.head != effect.revision
-                or observed.base != effect.base_revision
-                or _object(data.get("head")).get("ref") != effect.branch
+                observed.head != effect.revision
+                or _object(data.get("head")).get("ref") != snapshot
                 or _object(data.get("base")).get("ref") != effect.base_branch
-                or data.get("title") != effect.title
-                or data.get("body") != f"{effect.body or ''}\n\n{effect_marker(effect.operation)}"
             ):
+                raise ForgeConflict("PR head or base identity differs from authorized effect")
+            if observed.reference != known_reference or data.get("title") != effect.title or data.get("body") != body:
                 return Receipt(EffectStatus.UNKNOWN, effect.operation)
+        except ForgeConflict:
+            raise
         except (ValueError, TypeError):
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
-        if (
-            self.branch(effect.repository, effect.base_branch or "").revision != effect.base_revision
-            or self.branch(effect.repository, effect.branch).revision != effect.revision
-        ):
-            return Receipt(EffectStatus.UNKNOWN, effect.operation, known_reference, "head/base moved")
-        return Receipt(EffectStatus.ACCEPTED, effect.operation, known_reference)
+        if self.branch(effect.repository, snapshot).revision != effect.revision:
+            raise ForgeConflict("snapshot head moved")
+        return Receipt(EffectStatus.ACCEPTED, effect.operation, known_reference, observed_base=observed.base)

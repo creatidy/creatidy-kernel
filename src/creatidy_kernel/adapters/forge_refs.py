@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Adapter-boundary syntax shared by fake and controlled Forgejo transports."""
 
+import hashlib
 import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from creatidy_kernel.core.forge import ForgeConflict, Reference
+from creatidy_kernel.core.forge import Effect, ForgeConflict, Reference, effect_marker
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,3 +88,22 @@ def positive_id(value: object) -> bool:
 
 def number(value: str) -> bool:
     return 0 < len(value) <= 18 and value.isascii() and value.isdigit() and value[0] != "0"
+
+
+def pr_payload(effect: Effect, max_bytes: int) -> tuple[str, str, str]:
+    """Bound input before marker encoding, hashing or body concatenation."""
+    fields = (
+        effect.operation.operation_id,
+        effect.operation.effect_key,
+        effect.operation.request_digest,
+        effect.title or "",
+        effect.body or "",
+    )
+    if any(len(value) > max_bytes // 8 or len(value) * 4 > max_bytes for value in fields):
+        raise ValueError("PR input exceeds local request limit")
+    marker = effect_marker(effect.operation)
+    body = f"{effect.body or ''}\n\n{marker}"
+    if len(body.encode("utf-8")) + len((effect.title or "").encode("utf-8")) > max_bytes // 2:
+        raise ValueError("PR body exceeds local request limit")
+    snapshot = "kernel/snapshots/" + hashlib.sha256(marker.encode("ascii")).hexdigest()
+    return snapshot, body, marker

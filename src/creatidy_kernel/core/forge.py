@@ -77,6 +77,7 @@ class Receipt:
     operation: OperationKey
     reference: Reference | None = None
     reason: str | None = None
+    observed_base: Reference | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,8 +106,12 @@ class Effect:
             raise ForgeConflict("exact revision and push expected-old required")
         if self.action == "branch" and self.expected is not None:
             raise ForgeConflict("new branch must expect absence")
-        if self.action in {"branch", "pr"} and (not self.base_branch or not self.base_revision):
-            raise ForgeConflict("branch or PR requires exact source/base")
+        if self.action == "branch" and (not self.base_branch or not self.base_revision):
+            raise ForgeConflict("branch requires exact source")
+        if self.action == "pr" and not self.base_branch:
+            raise ForgeConflict("PR requires base branch")
+        if self.action == "pr" and self.base_revision is not None:
+            raise ForgeConflict("PR base revision is observation only, not authority")
         if self.action == "pr" and not self.title:
             raise ForgeConflict("PR requires title")
 
