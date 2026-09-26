@@ -73,6 +73,9 @@ def _deadline(seconds: int):
 
 
 class HTTPSForgejoTransport:
+    supports_reads = True
+    supports_pr = True
+
     def __init__(
         self, api_url: str, token: Callable[[], str], *, timeout: int = 15, max_bytes: int = 1_000_000
     ) -> None:
@@ -190,6 +193,8 @@ def run_git_bounded(
 class ConditionalGitTransport:
     """Push from an isolated bare repository, never loading workload Git configuration."""
 
+    supports_conditional_push = True
+
     def __init__(
         self,
         repository: Reference,
@@ -257,10 +262,10 @@ class ConditionalGitTransport:
             raise ForgeConflict("invalid Git branch")
         sha = revision.value.removeprefix("forgejo:")
         old = expected.value.removeprefix("forgejo:") if expected else ""
-        if not revision.value.startswith("forgejo:") or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
+        if not revision.value.startswith("forgejo:") or not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", sha):
             raise ForgeConflict("revision must be a full Git object ID")
         if expected is not None and (
-            not expected.value.startswith("forgejo:") or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", old)
+            not expected.value.startswith("forgejo:") or not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", old)
         ):
             raise ForgeConflict("expected-old must be a full Git object ID")
         ref = f"refs/heads/{branch}"

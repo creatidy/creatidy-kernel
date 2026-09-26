@@ -19,6 +19,7 @@ from creatidy_kernel.core.forge import (
     ForgeConflict,
     Presence,
     Reference,
+    UnsupportedForge,
     effect_marker,
 )
 from creatidy_kernel.ports.forge import Forge
@@ -84,13 +85,13 @@ def test_observations_and_pagination(boundary: tuple[Forge, SyntheticForgeTransp
     assert len(second.items) == 1 and not second.complete
     assert second.items[0].check_result is CheckResult.PENDING
     assert forge.checks(REPO, HEAD, second.next_cursor).complete
-    assert forge.checks(REPO, Reference("forgejo:other")).items == ()
+    assert forge.checks(REPO, Reference("forgejo:" + "d" * 40)).items == ()
     transport.forbidden = True
     assert forge.identity(REPO).presence is Presence.INACCESSIBLE
     assert not forge.changes(REPO).complete
 
 
-@pytest.mark.parametrize("cursor", ["invalid", "0", "01", "-1", "١"])
+@pytest.mark.parametrize("cursor", ["invalid", "0", "01", "-1", "١", "9" * 5000])
 def test_invalid_pagination_cursor_is_incomplete(
     boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], cursor: str
 ) -> None:
@@ -182,6 +183,118 @@ def test_wrong_revision_provider_rejected_before_effect(
         forge.checks(REPO, Reference("github:head1"))
 
 
+@pytest.mark.parametrize("invalid", ["short", "g" * 40, "a" * 39, "a" * 41, "a" * 65, "a" * 40 + "/x"])
+@pytest.mark.parametrize(
+    "action,field",
+    [
+        ("push", "revision"),
+        ("push", "expected"),
+        ("branch", "base_revision"),
+        ("pr", "revision"),
+        ("pr", "base_revision"),
+    ],
+)
+def test_malformed_same_provider_effect_rejected_before_dispatch(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], invalid: str, action: str, field: str
+) -> None:
+    forge, transport, permitted = boundary
+    effect = replace(operation(action), **{field: Reference(f"forgejo:{invalid}")})
+    permitted.append(effect)
+    with pytest.raises(ForgeConflict, match="full Git object ID"):
+        forge.apply(effect)
+    with pytest.raises(ForgeConflict, match="full Git object ID"):
+        forge.reconcile(effect)
+    assert transport.pushes == transport.posts == 0
+    with pytest.raises(ForgeConflict, match="full Git object ID"):
+        forge.checks(REPO, Reference(f"forgejo:{invalid}"))
+
+
+@pytest.mark.parametrize("length", [40, 64])
+def test_uppercase_full_oid_is_valid(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], length: int
+) -> None:
+    forge, transport, _ = boundary
+    sha = "A" * length
+    transport.branches["feature"] = sha
+    assert forge.branch(REPO, "feature").revision == Reference(f"forgejo:{sha}")
+
+
+@pytest.mark.parametrize("side", ["head", "base"])
+def test_malformed_pr_revision_is_unknown_not_accepted(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], side: str
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    receipt = forge.apply(effect)
+    assert receipt.status is EffectStatus.ACCEPTED and receipt.reference is not None
+    subject = transport.pulls[0][side]
+    assert isinstance(subject, dict)
+    subject["sha"] = "not-an-oid"
+    assert forge.change(REPO, receipt.reference).presence is Presence.UNKNOWN
+    assert not forge.changes(REPO).complete
+    assert forge.reconcile(effect, receipt.reference).status is EffectStatus.UNKNOWN
+
+
+def test_malformed_branch_revision_never_supports_pr_receipt(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    effect = replace(operation("pr"), revision=Reference("forgejo:bad"))
+    transport.branches["feature"] = "bad"
+    assert forge.branch(REPO, "feature").presence is Presence.UNKNOWN
+    permitted.append(effect)
+    with pytest.raises(ForgeConflict):
+        forge.apply(effect)
+    assert transport.posts == 0
+
+
+@pytest.mark.parametrize("side", ["head", "base"])
+def test_malformed_pr_post_response_never_accepted(side: str) -> None:
+    transport = SyntheticForgeTransport(REPO)
+    forge = ForgejoForge(transport, transport, lambda _effect: True)
+    original = transport.request
+
+    def corrupted(method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
+        status, payload = original(method, path, body)
+        if method == "POST" and status == 201 and isinstance(payload, dict):
+            subject = cast(dict[str, object], payload).get(side)
+            assert isinstance(subject, dict)
+            cast(dict[str, object], subject)["sha"] = "bad"
+        return status, cast(object, payload)
+
+    with patch.object(transport, "request", side_effect=corrupted):
+        assert forge.apply(operation("pr")).status is EffectStatus.UNKNOWN
+    assert transport.posts == 1
+
+
+@pytest.mark.parametrize(
+    "attribute,missing", [("supports_pr", {"pr"}), ("supports_conditional_push", {"branch_create", "conditional_push"})]
+)
+def test_unsupported_transport_capabilities_fail_without_effects(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], attribute: str, missing: set[str]
+) -> None:
+    forge, transport, permitted = boundary
+    setattr(transport, attribute, False)
+    assert not (missing & forge.capabilities())
+    assert forge.identity(REPO).presence is Presence.FOUND
+    assert forge.branch(REPO, "feature").revision == HEAD
+    for action, capability in (("branch", "branch_create"), ("push", "conditional_push"), ("pr", "pr")):
+        effect = replace(operation(action), branch="new") if action == "branch" else operation(action)
+        permitted.append(effect)
+        if capability in missing:
+            with pytest.raises(UnsupportedForge):
+                forge.apply(effect)
+            with pytest.raises(UnsupportedForge):
+                forge.reconcile(effect)
+    assert transport.pushes == transport.posts == 0
+
+
+def test_supported_transport_capabilities(boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]]) -> None:
+    forge, _, _ = boundary
+    assert {"identity", "branch", "change", "checks", "branch_create", "conditional_push", "pr"} == forge.capabilities()
+
+
 def test_pr_artifact_not_merge_and_replay(boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]]) -> None:
     forge, transport, permitted = boundary
     effect = operation("pr")
@@ -269,7 +382,7 @@ def test_forgejo_authentication_failure_is_inaccessible() -> None:
         assert forge.change(REPO, Reference(f"{REPO.value}#1")).presence is Presence.INACCESSIBLE
 
 
-@pytest.mark.parametrize("suffix", ["", "0", "01", "-1", "abc", "1x", "١"])
+@pytest.mark.parametrize("suffix", ["", "0", "01", "-1", "abc", "1x", "١", "9" * 5000])
 def test_malformed_change_id_rejected(
     boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], suffix: str
 ) -> None:
@@ -279,7 +392,13 @@ def test_malformed_change_id_rejected(
 
 
 @pytest.mark.parametrize(
-    "reference", ["forgejo:other/project#1", "forgejo:team/project#01", "forgejo:team/project#abc"]
+    "reference",
+    [
+        "forgejo:other/project#1",
+        "forgejo:team/project#01",
+        "forgejo:team/project#abc",
+        "forgejo:team/project#" + "9" * 5000,
+    ],
 )
 def test_pr_reconciliation_rejects_foreign_or_malformed_reference(
     boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], reference: str

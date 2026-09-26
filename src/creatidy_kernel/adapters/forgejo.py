@@ -5,6 +5,7 @@ The caller must durably claim the Operation and supply a trusted authorization
 predicate. Neither HTTP success nor a locally cached key establishes acceptance.
 """
 
+import re
 from collections.abc import Callable, Mapping
 from typing import Protocol, cast
 from urllib.parse import quote
@@ -27,6 +28,9 @@ from creatidy_kernel.ports.forge import Forge
 
 
 class HTTPTransport(Protocol):
+    supports_reads: bool
+    supports_pr: bool
+
     def request(self, method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]: ...
 
     def authoritative_absence(self, path: str) -> bool: ...
@@ -34,6 +38,8 @@ class HTTPTransport(Protocol):
 
 class GitTransport(Protocol):
     """Atomic expected-old ref update; never an unconditional push."""
+
+    supports_conditional_push: bool
 
     def compare_and_push(
         self, repository: Reference, branch: str, expected: Reference | None, revision: Reference
@@ -56,6 +62,16 @@ def _field(payload: dict[str, object], name: str) -> str:
     return value
 
 
+def _oid(value: str) -> str:
+    if re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", value) is None:
+        raise ValueError("invalid Git object ID")
+    return value
+
+
+def _number(value: str) -> bool:
+    return 0 < len(value) <= 18 and value.isascii() and value.isdigit() and value[0] != "0"
+
+
 class ForgejoForge(Forge):
     def __init__(
         self,
@@ -73,7 +89,16 @@ class ForgejoForge(Forge):
         self.page_size = page_size
 
     def capabilities(self) -> frozenset[str]:
-        return frozenset({"identity", "branch", "change", "checks", "branch_create", "conditional_push", "pr"})
+        capabilities: set[str] = set()
+        if self.http.supports_reads:
+            capabilities.update({"identity", "branch", "change", "checks"})
+        if self.git.supports_conditional_push:
+            capabilities.add("conditional_push")
+            if self.http.supports_reads:
+                capabilities.add("branch_create")
+        if self.http.supports_reads and self.http.supports_pr:
+            capabilities.add("pr")
+        return frozenset(capabilities)
 
     def _repo(self, reference: Reference) -> str:
         if not reference.value.startswith("forgejo:"):
@@ -87,7 +112,11 @@ class ForgejoForge(Forge):
     def _revision(reference: Reference) -> str:
         if not reference.value.startswith("forgejo:"):
             raise ForgeConflict("wrong revision provider")
-        return reference.value.removeprefix("forgejo:")
+        value = reference.value.removeprefix("forgejo:")
+        try:
+            return _oid(value)
+        except ValueError as error:
+            raise ForgeConflict("revision must be a full Git object ID") from error
 
     def _request(self, method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
         return self.http.request(method, path, body)
@@ -129,7 +158,7 @@ class ForgejoForge(Forge):
             data = _object(payload)
             commit = _object(data.get("commit"))
             name = _field(data, "name")
-            revision = _field(commit, "id")
+            revision = _oid(_field(commit, "id"))
             reference = Reference(f"forgejo:{revision}")
         except ValueError:
             return Observation(Presence.UNKNOWN)
@@ -140,7 +169,7 @@ class ForgejoForge(Forge):
     def change(self, repository: Reference, change: Reference) -> Observation:
         prefix = f"{repository.value}#"
         suffix = change.value.removeprefix(prefix)
-        if not change.value.startswith(prefix) or not suffix.isascii() or not suffix.isdigit() or suffix[0] == "0":
+        if not change.value.startswith(prefix) or not _number(suffix):
             raise ForgeConflict("change does not belong to repository")
         number = suffix
         path = f"/repos/{self._repo(repository)}/pulls/{number}"
@@ -173,12 +202,12 @@ class ForgejoForge(Forge):
         return Observation(
             Presence.FOUND,
             Reference(f"{repository.value}#{number}"),
-            base=Reference(f"forgejo:{_field(base, 'sha')}"),
-            head=Reference(f"forgejo:{_field(head, 'sha')}"),
+            base=Reference(f"forgejo:{_oid(_field(base, 'sha'))}"),
+            head=Reference(f"forgejo:{_oid(_field(head, 'sha'))}"),
         )
 
     def _page(self, repository: Reference, path: str, cursor: str | None, *, subject: Reference | None = None) -> Page:
-        if cursor is not None and (not cursor.isascii() or not cursor.isdigit() or cursor[0] == "0"):
+        if cursor is not None and not _number(cursor):
             return Page((), None, False)
         try:
             page = 1 if cursor is None else int(cursor)
@@ -331,12 +360,7 @@ class ForgejoForge(Forge):
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
         prefix = f"{effect.repository.value}#"
         suffix = known_reference.value.removeprefix(prefix)
-        if (
-            not known_reference.value.startswith(prefix)
-            or not suffix.isascii()
-            or not suffix.isdigit()
-            or suffix[0] == "0"
-        ):
+        if not known_reference.value.startswith(prefix) or not _number(suffix):
             raise ForgeConflict("change does not belong to repository")
         status, payload = self._read(f"/repos/{self._repo(effect.repository)}/pulls/{suffix}")
         if status != 200:

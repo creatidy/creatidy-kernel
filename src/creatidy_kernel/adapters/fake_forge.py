@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent in-memory Forge and synthetic HTTP/Git fixtures."""
 
+import re
 from collections.abc import Callable, Mapping
 from typing import cast
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -15,6 +16,7 @@ from creatidy_kernel.core.forge import (
     Presence,
     Receipt,
     Reference,
+    UnsupportedForge,
     effect_marker,
 )
 from creatidy_kernel.ports.forge import Forge
@@ -35,6 +37,9 @@ class SyntheticForgeTransport:
         self.posts = 0
         self.direct_absence = False
         self.repository_missing = False
+        self.supports_reads = True
+        self.supports_pr = True
+        self.supports_conditional_push = True
 
     def authoritative_absence(self, path: str) -> bool:
         return self.direct_absence and not self.forbidden
@@ -74,6 +79,8 @@ class SyntheticForgeTransport:
         if method == "GET" and route == ["pulls"]:
             return self._paged(self.pulls, uri.query)
         if method == "GET" and len(route) == 2 and route[0] == "pulls":
+            if not _number(route[1]):
+                return 404, {}
             matching = [pull for pull in self.pulls if pull["number"] == int(route[1])]
             return (200, matching[0]) if matching else (404, {})
         if method == "POST" and route == ["pulls"] and body is not None:
@@ -121,7 +128,16 @@ class FakeForge(Forge):
         self.authorize = authorize
 
     def capabilities(self) -> frozenset[str]:
-        return frozenset({"identity", "branch", "change", "checks", "branch_create", "conditional_push", "pr"})
+        capabilities: set[str] = set()
+        if self.transport.supports_reads:
+            capabilities.update({"identity", "branch", "change", "checks"})
+        if self.transport.supports_conditional_push:
+            capabilities.add("conditional_push")
+            if self.transport.supports_reads:
+                capabilities.add("branch_create")
+        if self.transport.supports_reads and self.transport.supports_pr:
+            capabilities.add("pr")
+        return frozenset(capabilities)
 
     def identity(self, repository: Reference) -> Observation:
         if self.transport.forbidden:
@@ -137,17 +153,14 @@ class FakeForge(Forge):
             return Observation(self.identity(repository).presence)
         sha = self.transport.branches.get(branch)
         if sha:
+            if not _valid_oid(sha):
+                return Observation(Presence.UNKNOWN)
             return Observation(Presence.FOUND, revision=Reference(f"forgejo:{sha}"))
         return Observation(Presence.ABSENT if self.transport.direct_absence else Presence.UNKNOWN)
 
     def change(self, repository: Reference, change: Reference) -> Observation:
         suffix = change.value.removeprefix(f"{repository.value}#")
-        if (
-            not change.value.startswith(f"{repository.value}#")
-            or not suffix.isascii()
-            or not suffix.isdigit()
-            or suffix[0] == "0"
-        ):
+        if not change.value.startswith(f"{repository.value}#") or not _number(suffix):
             raise ForgeConflict("change does not belong to repository")
         if self.identity(repository).presence is not Presence.FOUND:
             return Observation(self.identity(repository).presence)
@@ -170,7 +183,12 @@ class FakeForge(Forge):
             raise ValueError("pull repository differs")
         head_sha = cast(dict[str, object], head).get("sha")
         base_sha = cast(dict[str, object], base).get("sha")
-        if not isinstance(head_sha, str) or not isinstance(base_sha, str):
+        if (
+            not isinstance(head_sha, str)
+            or not isinstance(base_sha, str)
+            or not _valid_oid(head_sha)
+            or not _valid_oid(base_sha)
+        ):
             raise ValueError("invalid synthetic revisions")
         return Observation(
             Presence.FOUND,
@@ -184,7 +202,7 @@ class FakeForge(Forge):
     ) -> tuple[list[dict[str, object]], str | None, bool]:
         if self.identity(repository).presence is not Presence.FOUND:
             return [], None, False
-        if cursor is not None and (not cursor.isascii() or not cursor.isdigit() or cursor[0] == "0"):
+        if cursor is not None and not _number(cursor):
             return [], None, False
         page = 1 if cursor is None else int(cursor)
         size = self.transport.page_size
@@ -242,11 +260,17 @@ class FakeForge(Forge):
             self._revision(effect.expected)
         if effect.base_revision is not None:
             self._revision(effect.base_revision)
+        required = {"branch": "branch_create", "push": "conditional_push", "pr": "pr"}[effect.action]
+        if required not in self.capabilities():
+            raise UnsupportedForge(f"{required} unsupported")
 
     @staticmethod
     def _revision(reference: Reference | None) -> None:
-        if reference is not None and not reference.value.startswith("forgejo:"):
-            raise ForgeConflict("wrong revision provider")
+        if reference is not None:
+            if not reference.value.startswith("forgejo:"):
+                raise ForgeConflict("wrong revision provider")
+            if not _valid_oid(reference.value.removeprefix("forgejo:")):
+                raise ForgeConflict("revision must be a full Git object ID")
 
     def apply(self, effect: Effect) -> Receipt:
         self._authorized(effect)
@@ -324,12 +348,7 @@ class FakeForge(Forge):
         if known_reference is None:
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
         suffix = known_reference.value.removeprefix(f"{effect.repository.value}#")
-        if (
-            not known_reference.value.startswith(f"{effect.repository.value}#")
-            or not suffix.isascii()
-            or not suffix.isdigit()
-            or suffix[0] == "0"
-        ):
+        if not known_reference.value.startswith(f"{effect.repository.value}#") or not _number(suffix):
             raise ForgeConflict("change does not belong to repository")
         if self.change(effect.repository, known_reference).presence is not Presence.FOUND:
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
@@ -361,3 +380,11 @@ class FakeForge(Forge):
                 return Receipt(EffectStatus.UNKNOWN, effect.operation, known_reference, "head/base moved")
             return Receipt(EffectStatus.ACCEPTED, effect.operation, known_reference)
         return Receipt(EffectStatus.UNKNOWN, effect.operation)
+
+
+def _valid_oid(value: str) -> bool:
+    return re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", value) is not None
+
+
+def _number(value: str) -> bool:
+    return 0 < len(value) <= 18 and value.isascii() and value.isdigit() and value[0] != "0"
