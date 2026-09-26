@@ -157,3 +157,13 @@ def test_workspace_policy_escape_and_honest_trust_mode() -> None:
     assert workspace.reconcile(handle.key).presence is Presence.UNKNOWN
     with pytest.raises(ExecutionConflict):
         workspace.materialize(handle.key, handle.spec)
+
+
+def test_partial_workspace_launch_is_unknown_not_safe_to_replace() -> None:
+    workspace, _, request, _ = setup()
+    workspace.fail_next_materialize()
+    with pytest.raises(ExecutionConflict, match="partial workspace launch"):
+        workspace.materialize("ws-partial", request.workspace.spec)
+    assert workspace.reconcile("ws-partial").presence is Presence.UNKNOWN
+    with pytest.raises(ExecutionConflict, match="without reconciliation"):
+        workspace.materialize("ws-partial", request.workspace.spec)

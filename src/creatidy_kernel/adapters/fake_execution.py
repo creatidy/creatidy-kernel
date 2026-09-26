@@ -33,6 +33,11 @@ class FakeWorkspace(Workspace):
         self._handles: dict[str, WorkspaceHandle] = {}
         self._manifests: dict[str, ArtifactManifest] = {}
         self._lost: set[str] = set()
+        self._partial_launch = False
+
+    def fail_next_materialize(self) -> None:
+        """Simulate a launch whose workspace outcome cannot be proven absent."""
+        self._partial_launch = True
 
     def materialize(self, key: str, spec: WorkspaceSpec) -> WorkspaceHandle:
         if spec.trust_mode is not TrustMode.TRUSTED_DEVELOPMENT:
@@ -46,6 +51,10 @@ class FakeWorkspace(Workspace):
             return existing
         if key in self._lost:
             raise ExecutionConflict("lost workspace cannot be replaced without reconciliation")
+        if self._partial_launch:
+            self._partial_launch = False
+            self._lost.add(key)
+            raise ExecutionConflict("partial workspace launch has an unknown outcome")
         handle = WorkspaceHandle(key, spec)
         self._handles[key] = handle
         self._manifests[key] = ArtifactManifest(key, ())

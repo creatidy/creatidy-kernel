@@ -28,6 +28,8 @@ class Runtime(Protocol):
 
 
 class Workspace(Protocol):
+    """Real adapters enforce workspace lifetime; the fake models only worker-scope expiry."""
+
     def materialize(self, key: str, spec: WorkspaceSpec) -> WorkspaceHandle: ...
 
     def collect(self, handle: WorkspaceHandle) -> ArtifactManifest: ...

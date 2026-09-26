@@ -8,6 +8,8 @@ from creatidy_kernel.core.domain import AttemptSpec
 
 
 class AuthorityBroker(Protocol):
+    """Real adapters must consume grants durably with Operation intent; the fake does not."""
+
     def issue(self, principal: Principal, grant: AuthorityGrant) -> AuthorityGrant: ...
 
     def revoke(self, principal: Principal, grant_id: str) -> AuthorityGrant: ...

@@ -137,3 +137,22 @@ def test_effect_replay_conflict_and_invalid_grant(tmp_path: Path) -> None:
         broker.issue(Principal("owner-1", "owner"), bounded)
     with pytest.raises(AuthorityDenied):
         replace(bounded, paths=frozenset({tmp_path.parent / "outside"}))
+
+
+def test_symlinked_allowed_path_cannot_escape_grant_root(tmp_path: Path) -> None:
+    (tmp_path / "work").mkdir()
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-grant"
+    outside.mkdir()
+    (tmp_path / "work" / "link").symlink_to(outside, target_is_directory=True)
+    spec = attempt()
+    broker = FakeAuthorityBroker()
+    bounded = replace(grant(tmp_path, spec), paths=frozenset({tmp_path / "work" / "link"}))
+    broker.issue(Principal("owner-1", "owner"), bounded)
+    with pytest.raises(AuthorityDenied, match="path"):
+        broker.check(
+            Principal(spec.attempt_id, "worker"),
+            bounded.grant_id,
+            spec,
+            intent(path=Path("work/link/file")),
+            1,
+        )

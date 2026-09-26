@@ -88,6 +88,10 @@ def check_scope(grant: AuthorityGrant, attempt: AttemptSpec, intent: OperationIn
     if intent.path is not None:
         if intent.path.is_absolute() or ".." in intent.path.parts:
             raise AuthorityDenied("absolute or traversing path")
+        root = grant.root.resolve()
         target = (grant.root / intent.path).resolve()
-        if not any(target.is_relative_to(allowed) for allowed in grant.paths):
+        if not target.is_relative_to(root) or not any(
+            allowed.resolve().is_relative_to(root) and target.is_relative_to(allowed.resolve())
+            for allowed in grant.paths
+        ):
             raise AuthorityDenied("path exceeds grant or follows escaping symlink")
