@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Offline conformance for the fake and Forgejo reference adapter."""
 
+from collections.abc import Mapping
 from dataclasses import replace
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -9,7 +11,15 @@ import pytest
 from creatidy_kernel.adapters.fake_forge import FakeForge, SyntheticForgeTransport
 from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.core.execution import OperationKey
-from creatidy_kernel.core.forge import CheckResult, Effect, EffectStatus, ForgeConflict, Presence, Reference
+from creatidy_kernel.core.forge import (
+    CheckResult,
+    Effect,
+    EffectStatus,
+    ForgeConflict,
+    Presence,
+    Reference,
+    effect_marker,
+)
 from creatidy_kernel.ports.forge import Forge
 
 REPO = Reference("forgejo:team/project")
@@ -68,8 +78,9 @@ def test_observations_and_pagination(boundary: tuple[Forge, SyntheticForgeTransp
     assert first.items[0].check_context == "unit" and first.items[0].check_result is CheckResult.PASSED
     assert first.items[1].check_result is CheckResult.FAILED
     second = forge.checks(REPO, HEAD, first.next_cursor)
-    assert len(second.items) == 1 and second.complete
+    assert len(second.items) == 1 and not second.complete
     assert second.items[0].check_result is CheckResult.PENDING
+    assert forge.checks(REPO, HEAD, second.next_cursor).complete
     assert forge.checks(REPO, Reference("forgejo:other")).items == ()
     transport.forbidden = True
     assert forge.identity(REPO).presence is Presence.INACCESSIBLE
@@ -197,6 +208,76 @@ def test_unknown_absence_never_proves_safe_pr_retry(
     assert transport.posts == 0
 
 
+def test_direct_absence_is_explicit_and_never_retries_uncertain_pr(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    assert forge.change(REPO, Reference(f"{REPO.value}#99")).presence is Presence.UNKNOWN
+    transport.direct_absence = True
+    assert forge.branch(REPO, "missing").presence is Presence.ABSENT
+    assert forge.change(REPO, Reference(f"{REPO.value}#99")).presence is Presence.ABSENT
+    replay = replace(operation("pr"), delivery_attempts=2)
+    permitted.append(replay)
+    assert forge.apply(replay).status is EffectStatus.UNKNOWN
+    assert transport.posts == 0
+    transport.forbidden = True
+    assert forge.change(REPO, Reference(f"{REPO.value}#99")).presence is Presence.INACCESSIBLE
+
+
+@pytest.mark.parametrize("suffix", ["", "0", "01", "-1", "abc", "1x", "١"])
+def test_malformed_change_id_rejected(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], suffix: str
+) -> None:
+    forge, _, _ = boundary
+    with pytest.raises(ForgeConflict):
+        forge.change(REPO, Reference(f"{REPO.value}#{suffix}"))
+
+
+def test_canonical_marker_does_not_confuse_colon_keys(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    first = replace(operation("pr"), operation=OperationKey("op-one", "a:b", "c"))
+    other = replace(operation("pr"), operation=OperationKey("op-two", "a", "b:c"), delivery_attempts=2)
+    assert effect_marker(first.operation) != effect_marker(other.operation)
+    permitted.extend((first, other))
+    assert forge.apply(first).status is EffectStatus.ACCEPTED
+    assert forge.apply(other).status is EffectStatus.UNKNOWN
+    assert transport.posts == 1
+
+
+@pytest.mark.parametrize("side", ["head", "base"])
+@pytest.mark.parametrize("identity", [None, "other/project"])
+def test_pr_identity_fails_closed_on_post_and_reconcile(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], side: str, identity: str | None
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation("pr")
+    permitted.append(effect)
+    original = transport.request
+
+    def corrupted(method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
+        status, payload = original(method, path, body)
+        if status in {200, 201} and "/pulls" in path and isinstance(payload, dict):
+            data = cast(dict[str, object], payload)
+            subject = data.get(side)
+            assert isinstance(subject, dict)
+            cast(dict[str, object], subject)["repo"] = {"full_name": identity} if identity is not None else None
+        return status, cast(object, payload)
+
+    if isinstance(forge, ForgejoForge):
+        with patch.object(transport, "request", side_effect=corrupted):
+            assert forge.apply(effect).status is EffectStatus.UNKNOWN
+            assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+    else:
+        assert forge.apply(effect).status is EffectStatus.ACCEPTED
+        subject = transport.pulls[0][side]
+        assert isinstance(subject, dict)
+        subject["repo"] = {"full_name": identity} if identity is not None else None
+        assert forge.change(REPO, Reference(f"{REPO.value}#1")).presence is Presence.UNKNOWN
+        assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+
+
 def test_branch_source_stale_and_pr_key_conflict(
     boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
 ) -> None:
@@ -220,8 +301,8 @@ def test_reconcile_scans_later_page(boundary: tuple[Forge, SyntheticForgeTranspo
         transport.pulls.append(
             {
                 "number": number,
-                "head": {"sha": "head1", "ref": "feature"},
-                "base": {"sha": "base1", "ref": "develop"},
+                "head": {"sha": "head1", "ref": "feature", "repo": {"full_name": "team/project"}},
+                "base": {"sha": "base1", "ref": "develop", "repo": {"full_name": "team/project"}},
                 "title": "Unrelated",
                 "body": "not this effect",
             }
@@ -235,6 +316,53 @@ def test_reconcile_scans_later_page(boundary: tuple[Forge, SyntheticForgeTranspo
     receipt = forge.apply(replay)
     assert receipt.status is EffectStatus.ACCEPTED
     assert receipt.reference == Reference("forgejo:team/project#3")
+    assert transport.posts == 1
+
+
+def test_server_cap_does_not_hide_later_pr() -> None:
+    transport = SyntheticForgeTransport(REPO, page_size=1)
+    forge = ForgejoForge(transport, transport, lambda _effect: True, page_size=30)
+    effect = operation("pr")
+    for number in (1, 2):
+        transport.pulls.append(
+            {
+                "number": number,
+                "head": {"sha": "head1", "ref": "feature", "repo": {"full_name": "team/project"}},
+                "base": {"sha": "base1", "ref": "develop", "repo": {"full_name": "team/project"}},
+                "title": "Other",
+                "body": "other",
+            }
+        )
+    first = forge.changes(REPO)
+    assert len(first.items) == 1 and not first.complete and first.next_cursor == "2"
+    assert forge.apply(effect).status is EffectStatus.ACCEPTED
+    assert forge.reconcile(effect).status is EffectStatus.ACCEPTED
+    assert forge.changes(REPO, "4").complete
+
+
+def test_reconciliation_budgets_and_malformed_pages_fail_closed() -> None:
+    transport = SyntheticForgeTransport(REPO, page_size=1)
+    forge = ForgejoForge(transport, transport, lambda _effect: True, max_reconcile_pages=1)
+    effect = operation("pr")
+    transport.pulls.append(
+        {
+            "number": 1,
+            "head": {"sha": "head1", "ref": "feature", "repo": {"full_name": "team/project"}},
+            "base": {"sha": "base1", "ref": "develop", "repo": {"full_name": "team/project"}},
+            "title": "Other",
+            "body": "other",
+        }
+    )
+    assert forge.apply(effect).status is EffectStatus.ACCEPTED
+    assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+    limited = ForgejoForge(transport, transport, lambda _effect: True, max_reconcile_requests=1)
+    assert limited.reconcile(effect).status is EffectStatus.UNKNOWN
+    assert forge.changes(REPO, "invalid").complete is False
+    assert forge.changes(REPO, "0").complete is False
+    repeated = ForgejoForge(transport, transport, lambda _effect: True)
+    page = repeated.changes(REPO)
+    with patch.object(repeated, "changes", return_value=replace(page, items=(), next_cursor="1")):
+        assert repeated.reconcile(effect).status is EffectStatus.UNKNOWN
     assert transport.posts == 1
 
 

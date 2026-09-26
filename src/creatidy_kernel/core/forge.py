@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Provider-neutral forge values. A receipt is not Program acceptance."""
 
+import base64
+import json
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -105,3 +107,10 @@ class Effect:
             raise ForgeConflict("branch or PR requires exact source/base")
         if self.action == "pr" and not self.title:
             raise ForgeConflict("PR requires title")
+
+
+def effect_marker(operation: OperationKey) -> str:
+    """Unambiguous, comment-safe encoding of the complete operation identity."""
+    fields = [operation.operation_id, operation.effect_key, operation.request_digest]
+    encoded = base64.urlsafe_b64encode(json.dumps(fields, separators=(",", ":")).encode()).decode().rstrip("=")
+    return f"<!-- forge-effect:{encoded} -->"

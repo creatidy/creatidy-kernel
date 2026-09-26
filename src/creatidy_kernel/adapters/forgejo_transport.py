@@ -50,6 +50,10 @@ class HTTPSForgejoTransport:
         self.max_bytes = max_bytes
         self.opener = build_opener(_NoRedirect())
 
+    def authoritative_absence(self, path: str) -> bool:
+        # Forgejo can conceal permission failures as 404; HTTP status alone is not proof.
+        return False
+
     def request(self, method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
         if method not in {"GET", "POST"} or not path.startswith("/repos/") or ".." in path or "#" in path:
             raise ValueError("unsupported forge request")
@@ -191,5 +195,5 @@ class ConditionalGitTransport:
                 return EffectStatus.UNKNOWN
         if pushed.returncode == 0:
             return EffectStatus.ACCEPTED
-        output = pushed.stdout + pushed.stderr
-        return EffectStatus.STALE if "stale info" in output else EffectStatus.UNKNOWN
+        rejected = f"!\t{sha}:{ref}\t[rejected] (stale info)"
+        return EffectStatus.STALE if pushed.stdout.splitlines() == [rejected] else EffectStatus.UNKNOWN

@@ -15,6 +15,7 @@ from creatidy_kernel.core.forge import (
     Presence,
     Receipt,
     Reference,
+    effect_marker,
 )
 from creatidy_kernel.ports.forge import Forge
 
@@ -32,6 +33,10 @@ class SyntheticForgeTransport:
         self.domain_rejection = False
         self.pushes = 0
         self.posts = 0
+        self.direct_absence = False
+
+    def authoritative_absence(self, path: str) -> bool:
+        return self.direct_absence and not self.forbidden
 
     def compare_and_push(
         self, repository: Reference, branch: str, expected: Reference | None, revision: Reference
@@ -78,8 +83,16 @@ class SyntheticForgeTransport:
                 return 422, {"message": "missing branch"}
             pull: dict[str, object] = {
                 "number": len(self.pulls) + 1,
-                "head": {"sha": head, "ref": body["head"]},
-                "base": {"sha": base, "ref": body["base"]},
+                "head": {
+                    "sha": head,
+                    "ref": body["head"],
+                    "repo": {"full_name": self.repository.value.removeprefix("forgejo:")},
+                },
+                "base": {
+                    "sha": base,
+                    "ref": body["base"],
+                    "repo": {"full_name": self.repository.value.removeprefix("forgejo:")},
+                },
                 "body": body["body"],
                 "title": body["title"],
             }
@@ -93,7 +106,7 @@ class SyntheticForgeTransport:
     def _paged(self, records: list[dict[str, object]], query: str) -> tuple[int, object]:
         parameters = parse_qs(query)
         page = int(parameters.get("page", ["1"])[0])
-        limit = int(parameters.get("limit", [str(self.page_size)])[0])
+        limit = min(int(parameters.get("limit", [str(self.page_size)])[0]), self.page_size)
         return 200, records[(page - 1) * limit : page * limit]
 
 
@@ -120,17 +133,26 @@ class FakeForge(Forge):
         sha = self.transport.branches.get(branch)
         if sha:
             return Observation(Presence.FOUND, revision=Reference(f"forgejo:{sha}"))
-        return Observation(Presence.UNKNOWN)
+        return Observation(Presence.ABSENT if self.transport.direct_absence else Presence.UNKNOWN)
 
     def change(self, repository: Reference, change: Reference) -> Observation:
-        if not change.value.startswith(f"{repository.value}#"):
+        suffix = change.value.removeprefix(f"{repository.value}#")
+        if (
+            not change.value.startswith(f"{repository.value}#")
+            or not suffix.isascii()
+            or not suffix.isdigit()
+            or suffix[0] == "0"
+        ):
             raise ForgeConflict("change does not belong to repository")
         if self.identity(repository).presence is not Presence.FOUND:
             return Observation(self.identity(repository).presence)
         for pull in self.transport.pulls:
             if change == Reference(f"{repository.value}#{pull['number']}"):
-                return self._pull(repository, pull)
-        return Observation(Presence.UNKNOWN)
+                try:
+                    return self._pull(repository, pull)
+                except ValueError:
+                    return Observation(Presence.UNKNOWN)
+        return Observation(Presence.ABSENT if self.transport.direct_absence else Presence.UNKNOWN)
 
     @staticmethod
     def _pull(repository: Reference, pull: dict[str, object]) -> Observation:
@@ -138,6 +160,9 @@ class FakeForge(Forge):
         base = pull.get("base")
         if not isinstance(head, dict) or not isinstance(base, dict):
             raise ValueError("invalid synthetic pull")
+        repo = {"full_name": repository.value.removeprefix("forgejo:")}
+        if cast(dict[str, object], head).get("repo") != repo or cast(dict[str, object], base).get("repo") != repo:
+            raise ValueError("pull repository differs")
         head_sha = cast(dict[str, object], head).get("sha")
         base_sha = cast(dict[str, object], base).get("sha")
         if not isinstance(head_sha, str) or not isinstance(base_sha, str):
@@ -159,7 +184,7 @@ class FakeForge(Forge):
             raise ValueError("invalid cursor")
         size = self.transport.page_size
         items = records[(page - 1) * size : page * size]
-        return items, str(page + 1) if len(items) == size else None, len(items) < size
+        return items, str(page + 1) if items else None, not items
 
     def changes(self, repository: Reference, cursor: str | None = None) -> Page:
         records, next_cursor, complete = self._page(repository, self.transport.pulls, cursor)
@@ -259,13 +284,18 @@ class FakeForge(Forge):
         self.transport.posts += 1
         if self.transport.domain_rejection or self.transport.forbidden:
             return Receipt(EffectStatus.REJECTED, effect.operation)
-        marker = f"<!-- forge-effect:{effect.operation.effect_key}:{effect.operation.request_digest} -->"
+        marker = effect_marker(effect.operation)
         record: dict[str, object] = {
             "number": len(self.transport.pulls) + 1,
-            "head": {"sha": effect.revision.value.removeprefix("forgejo:"), "ref": effect.branch},
+            "head": {
+                "sha": effect.revision.value.removeprefix("forgejo:"),
+                "ref": effect.branch,
+                "repo": {"full_name": effect.repository.value.removeprefix("forgejo:")},
+            },
             "base": {
                 "sha": effect.base_revision.value.removeprefix("forgejo:") if effect.base_revision else "",
                 "ref": effect.base_branch,
+                "repo": {"full_name": effect.repository.value.removeprefix("forgejo:")},
             },
             "title": effect.title,
             "body": f"{effect.body or ''}\n\n{marker}",
@@ -296,11 +326,14 @@ class FakeForge(Forge):
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
         if self.identity(effect.repository).presence is not Presence.FOUND:
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
-        marker = f"<!-- forge-effect:{effect.operation.effect_key}:{effect.operation.request_digest} -->"
+        marker = effect_marker(effect.operation)
         for pull in self.transport.pulls:
             if marker not in str(pull.get("body", "")):
                 continue
-            observation = self._pull(effect.repository, pull)
+            try:
+                observation = self._pull(effect.repository, pull)
+            except ValueError:
+                return Receipt(EffectStatus.UNKNOWN, effect.operation)
             head = pull.get("head")
             base = pull.get("base")
             if (

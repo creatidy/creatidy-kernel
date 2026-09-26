@@ -20,12 +20,15 @@ from creatidy_kernel.core.forge import (
     Receipt,
     Reference,
     UnsupportedForge,
+    effect_marker,
 )
 from creatidy_kernel.ports.forge import Forge
 
 
 class HTTPTransport(Protocol):
     def request(self, method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]: ...
+
+    def authoritative_absence(self, path: str) -> bool: ...
 
 
 class GitTransport(Protocol):
@@ -60,13 +63,17 @@ class ForgejoForge(Forge):
         authorize: Callable[[Effect], bool],
         *,
         page_size: int = 30,
+        max_reconcile_pages: int = 20,
+        max_reconcile_requests: int = 100,
     ) -> None:
-        if page_size <= 0:
-            raise ValueError("page size must be positive")
+        if min(page_size, max_reconcile_pages, max_reconcile_requests) <= 0:
+            raise ValueError("page size and reconciliation limits must be positive")
         self.http = http
         self.git = git
         self.authorize = authorize
         self.page_size = page_size
+        self.max_reconcile_pages = max_reconcile_pages
+        self.max_reconcile_requests = max_reconcile_requests
 
     def capabilities(self) -> frozenset[str]:
         return frozenset({"identity", "branch", "change", "checks", "branch_create", "conditional_push", "pr"})
@@ -110,9 +117,12 @@ class ForgejoForge(Forge):
         return Observation(Presence.FOUND, repository)
 
     def branch(self, repository: Reference, branch: str) -> Observation:
-        status, payload = self._read(f"/repos/{self._repo(repository)}/branches/{quote(branch, safe='')}")
+        path = f"/repos/{self._repo(repository)}/branches/{quote(branch, safe='')}"
+        status, payload = self._read(path)
         if status == 403:
             return Observation(Presence.INACCESSIBLE)
+        if status == 404 and self.http.authoritative_absence(path):
+            return Observation(Presence.ABSENT)
         if status != 200:
             return Observation(Presence.UNKNOWN)
         try:
@@ -129,12 +139,16 @@ class ForgejoForge(Forge):
 
     def change(self, repository: Reference, change: Reference) -> Observation:
         prefix = f"{repository.value}#"
-        if not change.value.startswith(prefix) or not change.value[len(prefix) :].isdigit():
+        suffix = change.value.removeprefix(prefix)
+        if not change.value.startswith(prefix) or not suffix.isascii() or not suffix.isdigit() or suffix[0] == "0":
             raise ForgeConflict("change does not belong to repository")
-        number = change.value[len(prefix) :]
-        status, payload = self._read(f"/repos/{self._repo(repository)}/pulls/{number}")
+        number = suffix
+        path = f"/repos/{self._repo(repository)}/pulls/{number}"
+        status, payload = self._read(path)
         if status == 403:
             return Observation(Presence.INACCESSIBLE)
+        if status == 404 and self.http.authoritative_absence(path):
+            return Observation(Presence.ABSENT)
         if status != 200:
             return Observation(Presence.UNKNOWN)
         try:
@@ -147,6 +161,12 @@ class ForgejoForge(Forge):
     def _change_observation(repository: Reference, data: dict[str, object]) -> Observation:
         head = _object(data.get("head"))
         base = _object(data.get("base"))
+        expected_repo = repository.value.removeprefix("forgejo:")
+        if (
+            _field(_object(head.get("repo")), "full_name") != expected_repo
+            or _field(_object(base.get("repo")), "full_name") != expected_repo
+        ):
+            raise ValueError("pull request repository differs")
         number = data.get("number")
         if not isinstance(number, int) or number <= 0:
             raise ValueError("invalid pull request number")
@@ -158,9 +178,12 @@ class ForgejoForge(Forge):
         )
 
     def _page(self, repository: Reference, path: str, cursor: str | None, *, subject: Reference | None = None) -> Page:
-        page = 1 if cursor is None else int(cursor)
-        if page < 1:
-            raise ValueError("invalid page cursor")
+        if cursor is not None and (not cursor.isascii() or not cursor.isdigit() or cursor[0] == "0"):
+            return Page((), None, False)
+        try:
+            page = 1 if cursor is None else int(cursor)
+        except (TypeError, ValueError):
+            return Page((), None, False)
         separator = "&" if "?" in path else "?"
         status, payload = self._read(
             f"/repos/{self._repo(repository)}/{path}{separator}page={page}&limit={self.page_size}"
@@ -196,8 +219,8 @@ class ForgejoForge(Forge):
                     items.append(self._change_observation(repository, data))
         except (ValueError, TypeError):
             return Page((), None, False)
-        # A short page is only a pagination endpoint, never proof of remote absence.
-        return Page(tuple(items), str(page + 1) if len(items) == self.page_size else None, len(items) < self.page_size)
+        # Servers may cap below the requested limit. Only an empty page ends this scan.
+        return Page(tuple(items), str(page + 1) if items else None, not items)
 
     def changes(self, repository: Reference, cursor: str | None = None) -> Page:
         return self._page(repository, "pulls?state=all", cursor)
@@ -263,7 +286,7 @@ class ForgejoForge(Forge):
             return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="head/base not observable")
         if base.revision != effect.base_revision or head.revision != effect.revision:
             return Receipt(EffectStatus.STALE, effect.operation)
-        marker = f"<!-- forge-effect:{effect.operation.effect_key}:{effect.operation.request_digest} -->"
+        marker = effect_marker(effect.operation)
         body = f"{effect.body or ''}\n\n{marker}"
         try:
             status, payload = self._request(
@@ -310,23 +333,34 @@ class ForgejoForge(Forge):
                     return Receipt(EffectStatus.UNKNOWN, effect.operation, effect.revision, "source moved")
                 return Receipt(EffectStatus.ACCEPTED, effect.operation, effect.revision)
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
-        marker = f"<!-- forge-effect:{effect.operation.effect_key}:{effect.operation.request_digest} -->"
+        marker = effect_marker(effect.operation)
         cursor: str | None = None
-        while True:
+        seen: set[str] = set()
+        requests = 0
+        for _ in range(self.max_reconcile_pages):
+            if requests >= self.max_reconcile_requests:
+                return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted")
             page = self.changes(effect.repository, cursor)
+            requests += 1
             if not page.complete and page.next_cursor is None:
                 return Receipt(EffectStatus.UNKNOWN, effect.operation)
             for item in page.items:
                 if item.reference is None:
-                    continue
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation)
+                if requests >= self.max_reconcile_requests:
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="reconciliation budget exhausted")
                 status, payload = self._read(
                     f"/repos/{self._repo(effect.repository)}/pulls/{item.reference.value.rsplit('#', 1)[-1]}"
                 )
+                requests += 1
                 if status != 200:
                     return Receipt(EffectStatus.UNKNOWN, effect.operation)
                 try:
                     data = _object(payload)
+                    observed = self._change_observation(effect.repository, data)
                 except ValueError:
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation)
+                if observed.reference != item.reference or observed.head != item.head or observed.base != item.base:
                     return Receipt(EffectStatus.UNKNOWN, effect.operation)
                 expected_body = f"{effect.body or ''}\n\n{marker}"
                 if marker in str(data.get("body", "")):
@@ -353,4 +387,8 @@ class ForgejoForge(Forge):
                     return Receipt(EffectStatus.UNKNOWN, effect.operation, item.reference, "changed PR subject")
             if page.next_cursor is None:
                 return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="absence is not authoritative")
+            if page.next_cursor in seen or page.next_cursor == cursor:
+                return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="repeated page cursor")
+            seen.add(page.next_cursor)
             cursor = page.next_cursor
+        return Receipt(EffectStatus.UNKNOWN, effect.operation, reason="reconciliation page budget exhausted")

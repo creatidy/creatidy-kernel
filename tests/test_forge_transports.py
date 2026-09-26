@@ -84,10 +84,14 @@ def test_conditional_git_creation_stale_and_uncertainty(tmp_path: Path) -> None:
             CompletedProcess([], 0, "", ""),
             CompletedProcess([], 0, "", ""),
         ]
-        run.side_effect = [*setup, CompletedProcess([], 1, "!\t[rejected] (stale info)", "")]
+        run.side_effect = [*setup, CompletedProcess([], 1, f"!\t{SHA}:refs/heads/new\t[rejected] (stale info)\n", "")]
         assert transport.compare_and_push(REPO, "new", None, Reference(f"forgejo:{SHA}")) is EffectStatus.STALE
         assert "--force-with-lease=refs/heads/new:" in run.call_args.args[0]
         run.side_effect = [*setup, CompletedProcess([], 1, "", "connection closed")]
+        assert transport.compare_and_push(REPO, "new", None, Reference(f"forgejo:{SHA}")) is EffectStatus.UNKNOWN
+        run.side_effect = [*setup, CompletedProcess([], 1, "", "remote: stale info")]
+        assert transport.compare_and_push(REPO, "new", None, Reference(f"forgejo:{SHA}")) is EffectStatus.UNKNOWN
+        run.side_effect = [*setup, CompletedProcess([], 1, f"!\t{SHA}:refs/heads/other\t[rejected] (stale info)", "")]
         assert transport.compare_and_push(REPO, "new", None, Reference(f"forgejo:{SHA}")) is EffectStatus.UNKNOWN
     with pytest.raises(ForgeConflict):
         transport.compare_and_push(REPO, "--delete", None, Reference(f"forgejo:{SHA}"))
