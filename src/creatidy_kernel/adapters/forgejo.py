@@ -352,7 +352,10 @@ class ForgejoForge(Forge):
                 effect.operation,
                 reason=created.reason,
             )
-        return self.reconcile(effect, created.reference)
+        receipt = self.reconcile(effect, created.reference)
+        if receipt.status is EffectStatus.UNKNOWN:
+            return Receipt(EffectStatus.UNKNOWN, effect.operation, created.reference, reason=receipt.reason)
+        return receipt
 
     def reconcile(self, effect: Effect, known_reference: Reference | None = None) -> Receipt:
         self._authorized(effect)
@@ -372,20 +375,21 @@ class ForgejoForge(Forge):
             raise ForgeConflict("change does not belong to repository")
         status, payload = self._read(f"/repos/{self._repo(effect.repository)}/pulls/{suffix}")
         if status != 200:
-            return Receipt(EffectStatus.UNKNOWN, effect.operation)
+            return Receipt(EffectStatus.UNKNOWN, effect.operation, known_reference)
         try:
             data = _object(payload)
             observed = self._change_observation(effect.repository, data)
             if (
-                observed.head != effect.revision
-                or _object(data.get("head")).get("ref") != f"refs/pull/{suffix}/head"
+                _object(data.get("head")).get("ref") != f"refs/pull/{suffix}/head"
                 or _object(data.get("base")).get("ref") != effect.base_branch
             ):
                 raise ForgeConflict("PR head or base identity differs from authorized effect")
             if observed.reference != known_reference or data.get("title") != effect.title or data.get("body") != body:
-                return Receipt(EffectStatus.UNKNOWN, effect.operation)
+                return Receipt(EffectStatus.UNKNOWN, effect.operation, known_reference)
+            if observed.head != effect.revision:
+                return Receipt(EffectStatus.STALE, effect.operation, known_reference, "PR head moved", observed.base)
         except ForgeConflict:
             raise
         except (ValueError, TypeError):
-            return Receipt(EffectStatus.UNKNOWN, effect.operation)
+            return Receipt(EffectStatus.UNKNOWN, effect.operation, known_reference)
         return Receipt(EffectStatus.ACCEPTED, effect.operation, known_reference, observed_base=observed.base)

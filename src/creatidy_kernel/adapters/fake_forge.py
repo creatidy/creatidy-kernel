@@ -390,7 +390,10 @@ class FakeForge(Forge):
                 effect.operation,
                 reason=result.reason,
             )
-        return self.reconcile(effect, result.reference)
+        receipt = self.reconcile(effect, result.reference)
+        if receipt.status is EffectStatus.UNKNOWN:
+            return Receipt(EffectStatus.UNKNOWN, effect.operation, result.reference, reason=receipt.reason)
+        return receipt
 
     def reconcile(self, effect: Effect, known_reference: Reference | None = None) -> Receipt:
         self._authorized(effect)
@@ -408,14 +411,14 @@ class FakeForge(Forge):
         if not known_reference.value.startswith(f"{effect.repository.value}#") or not _number(suffix):
             raise ForgeConflict("change does not belong to repository")
         if self.change(effect.repository, known_reference).presence is not Presence.FOUND:
-            return Receipt(EffectStatus.UNKNOWN, effect.operation)
+            return Receipt(EffectStatus.UNKNOWN, effect.operation, known_reference)
         for pull in self.transport.pulls:
             if pull.get("number") != int(suffix):
                 continue
             try:
                 observation = self._pull(effect.repository, pull)
             except ValueError:
-                return Receipt(EffectStatus.UNKNOWN, effect.operation)
+                return Receipt(EffectStatus.UNKNOWN, effect.operation, known_reference)
             head = pull.get("head")
             base = pull.get("base")
             if (
@@ -423,7 +426,6 @@ class FakeForge(Forge):
                 or not isinstance(base, dict)
                 or cast(dict[str, object], head).get("ref") != f"refs/pull/{suffix}/head"
                 or cast(dict[str, object], base).get("ref") != effect.base_branch
-                or observation.head != effect.revision
             ):
                 raise ForgeConflict("PR head or base identity differs from authorized effect")
             if (
@@ -432,9 +434,11 @@ class FakeForge(Forge):
                 or pull.get("title") != effect.title
                 or pull.get("topic") != topic
             ):
-                return Receipt(EffectStatus.UNKNOWN, effect.operation)
+                return Receipt(EffectStatus.UNKNOWN, effect.operation, known_reference)
+            if observation.head != effect.revision:
+                return Receipt(EffectStatus.STALE, effect.operation, known_reference, "PR head moved", observation.base)
             return Receipt(EffectStatus.ACCEPTED, effect.operation, known_reference, observed_base=observation.base)
-        return Receipt(EffectStatus.UNKNOWN, effect.operation)
+        return Receipt(EffectStatus.UNKNOWN, effect.operation, known_reference)
 
 
 def _valid_oid(value: str) -> bool:

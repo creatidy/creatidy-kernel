@@ -305,9 +305,11 @@ def test_readback_mismatch_never_acknowledges(
         subject["ref"] = "other"
     else:
         pull[mutation] = 2 if mutation == "number" else "other"
-    if mutation in {"head", "head_ref", "base_ref"}:
+    if mutation in {"head_ref", "base_ref"}:
         with pytest.raises(ForgeConflict):
             forge.reconcile(effect, accepted.reference)
+    elif mutation == "head":
+        assert forge.reconcile(effect, accepted.reference).status is EffectStatus.STALE
     else:
         assert forge.reconcile(effect, accepted.reference).status is not EffectStatus.ACCEPTED
 
@@ -324,8 +326,8 @@ def test_later_head_movement_invalidates_exact_head_evidence(
     assert isinstance(head, dict)
     head["sha"] = "c" * 40
     assert forge.change(REPO, receipt.reference).head == NEXT_HEAD
-    with pytest.raises(ForgeConflict, match="head"):
-        forge.reconcile(effect, receipt.reference)
+    stale = forge.reconcile(effect, receipt.reference)
+    assert stale.status is EffectStatus.STALE and stale.reference == receipt.reference
 
 
 def test_head_movement_before_creation_readback_never_acknowledges(
@@ -335,10 +337,35 @@ def test_head_movement_before_creation_readback_never_acknowledges(
     effect = operation()
     permitted.append(effect)
     transport.tamper_head_on_push = True
-    with pytest.raises(ForgeConflict, match="head"):
-        forge.apply(effect)
+    receipt = forge.apply(effect)
+    assert receipt.status is EffectStatus.STALE and receipt.reference == Reference(f"{REPO.value}#1")
     assert transport.pushes == 1
     assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+
+
+def test_creation_receipt_retains_recovery_handle_when_readback_is_unavailable(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    effect = operation()
+    permitted.append(effect)
+    if isinstance(forge, ForgejoForge):
+        original = transport.request
+
+        def unavailable(method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
+            if method == "GET" and "/pulls/" in path:
+                return 503, {}
+            return original(method, path, body)
+
+        with patch.object(transport, "request", side_effect=unavailable):
+            receipt = forge.apply(effect)
+    else:
+        with patch.object(forge, "change", return_value=Observation(Presence.UNKNOWN)):
+            receipt = forge.apply(effect)
+    assert receipt.status is EffectStatus.UNKNOWN
+    assert receipt.reference == Reference(f"{REPO.value}#1")
+    assert transport.pushes == 1
+    assert forge.reconcile(effect, receipt.reference).status is EffectStatus.ACCEPTED
 
 
 @pytest.mark.parametrize("title", ["first\nsecond", "embedded\x00null", "first\rsecond"])
@@ -408,6 +435,20 @@ def test_new_topic_is_random_collision_resistant_and_not_reused() -> None:
         assert len(topic) == len(TOPIC)
         assert topic.startswith("kernel-pr-")
         int(topic.removeprefix("kernel-pr-"), 16)
+
+
+def test_completed_agit_topic_is_not_reused_for_another_operation(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    first = operation()
+    permitted.append(first)
+    assert forge.apply(first).status is EffectStatus.ACCEPTED
+    transport.pulls.clear()  # A closed PR is no longer an open-topic match at the forge.
+    second = replace(first, operation=OperationKey("new-op", "new-effect", "new-digest"))
+    permitted.append(second)
+    assert forge.apply(second).status is EffectStatus.REJECTED
+    assert transport.pushes == 1
 
 
 def test_check_observations_fail_closed(boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]]) -> None:

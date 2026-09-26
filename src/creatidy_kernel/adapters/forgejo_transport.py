@@ -464,13 +464,25 @@ class ConditionalGitTransport:
         # Forgejo v15 proc-receive reports a new PR's alternate refs/pull/N/head
         # with zero old-oid; Git renders that report as [new reference]. Updates
         # report nonzero old-oid and must never be adopted as creations.
-        if pushed.returncode != 0:
-            if "permission denied" in pushed.stderr.lower() or "not allowed" in pushed.stderr.lower():
-                return AGitPush(EffectStatus.REJECTED, reason="permission denied")
-            if "agit" in pushed.stderr.lower() and "disabled" in pushed.stderr.lower():
-                return AGitPush(EffectStatus.REJECTED, reason="AGit unsupported")
-            return AGitPush(EffectStatus.UNKNOWN)
         lines = pushed.stdout.splitlines()
+        if pushed.returncode != 0:
+            rejection = (
+                re.fullmatch(rf"!\t{re.escape(sha)}:{re.escape(ref)}\t\[remote rejected\] \(([^\r\n]+)\)", lines[1])
+                if len(lines) == 3 and lines[0] == f"To {self.remote_url}" and lines[2] == "Done"
+                else None
+            )
+            reason = rejection.group(1) if rejection is not None else pushed.stderr
+            if reason == "The new commit is the same as the old commit" or reason.startswith(
+                "Updates were rejected because"
+            ):
+                return AGitPush(EffectStatus.REJECTED, reason="AGit topic collision or update")
+            if "permission denied" in reason.lower() or "not allowed" in reason.lower():
+                return AGitPush(EffectStatus.REJECTED, reason="permission denied")
+            if "agit" in reason.lower() and ("disabled" in reason.lower() or "unsupported" in reason.lower()):
+                return AGitPush(EffectStatus.REJECTED, reason="AGit unsupported")
+            if rejection is not None:
+                return AGitPush(EffectStatus.REJECTED, reason="AGit domain rejected")
+            return AGitPush(EffectStatus.UNKNOWN)
         if len(lines) != 3 or lines[0] != f"To {self.remote_url}" or lines[2] != "Done":
             return AGitPush(EffectStatus.UNKNOWN, reason="AGit domain receipt absent or ambiguous")
         created = re.fullmatch(

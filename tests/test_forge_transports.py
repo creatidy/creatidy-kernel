@@ -328,6 +328,26 @@ def test_agit_exact_sha_push_and_domain_receipt(tmp_path: Path) -> None:
             ).reason
             == "AGit unsupported"
         )
+        for message, expected in (
+            ("The new commit is the same as the old commit", "AGit topic collision or update"),
+            (
+                "Updates were rejected because the tip of your current branch is behind its remote counterpart.",
+                "AGit topic collision or update",
+            ),
+            ("User 'author' is not allowed to push to repository 'team/project'.", "permission denied"),
+            ("AGit disabled", "AGit unsupported"),
+            ("The target branch already contains this commit", "AGit domain rejected"),
+        ):
+            rejected = (
+                f"To https://forge.invalid/team/project.git\n!\t{SHA}:{ref}\t[remote rejected] ({message})\nDone\n"
+            )
+            run.side_effect = [*setup, CompletedProcess([], 1, rejected, "")]
+            assert (
+                transport.create_agit_pr(
+                    REPO, "develop", TOPIC, Reference(f"forgejo:{SHA}"), "Authorized title", description
+                ).reason
+                == expected
+            )
 
 
 def test_agit_invalid_topic_and_missing_commit_before_network(tmp_path: Path) -> None:
