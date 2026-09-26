@@ -106,8 +106,9 @@ duplicate either procedure here.
    (task-level configuration valid and explicit Agent Manager resolution equivalent to
    `Resolved models: - <session>: <M> (<P_AFTER_EXISTING_PROVIDER_ADAPTER>) · <V>` matches the actual
    dispatched Router-eligible model/variant and provider after the documented adapter);
-   reviewer session completed; and verdict obtained for the frozen HEAD. A harness fallback must
-   match the eligible alternative actually dispatched, not be mislabeled as the primary selection.
+   reviewer session completed; and substantive verdict obtained for the frozen HEAD from `/review-pr`'s
+   `### Overall Recommendation`, independently of Forgejo's persisted review state. A harness fallback
+   must match the eligible alternative actually dispatched, not be mislabeled as the primary selection.
    Request acceptance, `action=list` session/state, prompt text, and reviewer self-report are not
    model-resolution evidence. If resolution is absent or mismatched, mark review `NOT_RUN`; do not
    increment the valid review counter or remediation budget. Inspect the payload against the actual
@@ -126,23 +127,30 @@ After **each valid, completed full review**, persist a concise numbered entry on
 or PR: review cycle number; exact reviewed HEAD; review profile and monotone capability floor; route
 selected and dispatched identities (including adapter/fallback status); Router catalog/policy
 versions and degraded flag when present; reviewer session/task ID; dispatch-verification state;
-independent review reference and verdict (`APPROVE`, `REQUEST_CHANGES`, or `COMMENT`); concise
-blocker IDs/titles; remediation status (`none`, `pending`, or `done`); resulting HEAD if changed; and
-`remediation_used / 10`. Do not record quota snapshots or transcripts. Update or append a linked
-remediation entry immediately after pushing a changed HEAD, so a fresh session can reconstruct both
-the count and next review subject. Preserve prior entries and finding identities; reconcile an
-interrupted or inconsistent ledger before continuing. No prompts, chain-of-thought, or transcripts.
+independent review reference; `substantive_verdict` (`APPROVE`, `REQUEST_CHANGES`, or `COMMENT`)
+from `### Overall Recommendation`; actual `forgejo_review_state` (`APPROVED`, `REQUEST_CHANGES`,
+or `COMMENT`); `platform_approval_recorded` (true only for persisted `APPROVED`); blocking finding
+count and concise blocker IDs/titles; `platform_identity_limitation` when the shared PR-author
+account prevents equivalent formal submission; remediation status (`none`, `pending`, or `done`);
+resulting HEAD if changed; and `remediation_used / 10`. Do not record quota snapshots or transcripts.
+Update or append a linked remediation entry immediately after pushing a changed HEAD, so a fresh
+session can reconstruct both the count and next review subject. Preserve prior entries and finding
+identities without rewriting historical review records; reconcile an interrupted or inconsistent
+ledger before continuing. No prompts, chain-of-thought, or transcripts.
 
-- Initial review and every fresh review cost **zero** remediation cycles. A `REQUEST_CHANGES` verdict
-  costs **one** only when valid in-scope findings lead to implementation changes; several findings
-  fixed together cost one. Invalid, duplicate, out-of-scope findings and dispatch failures cost zero.
+- Initial review and every fresh review cost **zero** remediation cycles. A substantive
+  `REQUEST_CHANGES` verdict costs **one** only when valid in-scope findings lead to implementation
+  changes; several findings fixed together cost one. Invalid, duplicate, out-of-scope findings and
+  dispatch failures cost zero.
 - Validate blockers against the frozen HEAD, selected issue, and accepted architecture. For valid
   in-scope blockers, amend the **same** branch and PR, increment once for that changed HEAD, run the
   repository-required validation, push, update the ledger, then dispatch a **new** independent
   reviewer for a full review of the new exact HEAD. Do not create issues for ordinary blockers.
   Record useful out-of-scope findings only as candidates for later owner triage; do not implement
-  them here. `COMMENT` is not approval; resolve its actionable uncertainty without treating it as
-  remediation unless a valid in-scope change is made, and obtain a conclusive fresh review.
+  them here. A substantive `COMMENT` is not approval; resolve its actionable uncertainty without
+  treating it as remediation unless a valid in-scope change is made, and obtain a conclusive fresh
+  review. Do not derive the substantive verdict solely from `forgejo_review_state` or infer `APPROVE`
+  from arbitrary comment text.
 - Do not point-patch indefinitely. If a fundamental defect recurs, fixes oscillate, a domain/model
   inconsistency appears, or resolution seems to change the issue contract or accepted architecture,
   freeze the exact HEAD/base, derive architecture/security requirements, and make a **new**
@@ -155,20 +163,31 @@ interrupted or inconsistent ledger before continuing. No prompts, chain-of-thoug
   scope or change acceptance criteria to obtain approval. A material owner authority, architecture,
   security/privacy, scope, or policy decision stops delivery; an ordinary defect does not.
 - After the tenth remediation, obtain the required fresh review of its changed HEAD. If it does not
-  approve, stop at `10 / 10` with `REMEDIATION_BUDGET_EXHAUSTED`. Never start an eleventh change or
-  extend the budget autonomously. A later reviewer/session/HEAD never resets the count.
+  receive substantive `APPROVE`, stop at `10 / 10` with `REMEDIATION_BUDGET_EXHAUSTED`. Never start
+  an eleventh change or extend the budget autonomously. A later reviewer/session/HEAD never resets
+  the count.
 
 ## Finish
 
-`APPROVE` alone is insufficient. For the **exact approved HEAD**, verify repository-required local
-validation, green required Forgejo CI, issue acceptance criteria, and no unresolved blocking review
-finding. If the HEAD moved, repeat the fresh full review and required checks; do not reuse approval.
+For the **exact frozen HEAD**, require verified independent dispatch, a completed fresh full review
+with `substantive_verdict == APPROVE`, zero unresolved blocking findings, repository-required local
+validation, green required Forgejo CI, and satisfied issue acceptance criteria. A formal Forgejo
+`APPROVED` state is additional evidence when available, not intrinsically required here. If Forgejo
+persists `COMMENT` solely because the configured reviewer identity authored the PR, preserve the
+substantive `APPROVE`, record `forgejo_review_state = COMMENT`, `platform_approval_recorded = false`,
+and the known shared-identity limitation verified from the PR author and platform rejection evidence;
+continue the readiness evaluation. This is not `REVIEW_INFRASTRUCTURE_BLOCKED`. Do not infer
+substantive `APPROVE` from an arbitrary `COMMENT` body.
+If an observed repository/branch-protection policy explicitly requires formal platform approval,
+report that concrete merge requirement separately; do not assume it from an inaccessible rule.
+Owner merge authority remains separate. If the HEAD moved, repeat the fresh full review and required
+checks; do not reuse its verdict.
 If required evidence is temporarily unavailable, diagnose it and do not claim readiness or invent a
 human gate. After bounded corrected attempts to obtain required verification evidence fail, record
 the precise blocker and use `REVIEW_INFRASTRUCTURE_BLOCKED`. End with exactly one of:
 
-- `READY_FOR_OWNER_MERGE`: exact-HEAD approval and all final evidence verified; do not merge.
-- `REMEDIATION_BUDGET_EXHAUSTED`: 10/10 and no approval, with remaining blockers identified.
+- `READY_FOR_OWNER_MERGE`: exact-HEAD substantive `APPROVE` and all final evidence verified; do not merge.
+- `REMEDIATION_BUDGET_EXHAUSTED`: 10/10 and no substantive `APPROVE`, with remaining blockers identified.
 - `REVIEW_INFRASTRUCTURE_BLOCKED`: bounded corrected attempts could not obtain a valid independent
   review or its required verification evidence.
 - `GENUINE_OWNER_DECISION_REQUIRED`: a material decision outside this issue's granted scope.
