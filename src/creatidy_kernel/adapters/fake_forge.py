@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Independent in-memory Forge and synthetic HTTP/Git fixtures."""
 
-import re
 from collections.abc import Callable, Mapping
 from typing import cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from creatidy_kernel.adapters.forge_refs import repository_path, valid_branch
+from creatidy_kernel.adapters.forge_refs import ForgeBinding, oid, positive_id, repository_path, valid_branch
+from creatidy_kernel.adapters.forge_refs import number as _number
 from creatidy_kernel.core.forge import (
     CheckResult,
     Effect,
@@ -25,6 +25,7 @@ from creatidy_kernel.ports.forge import Forge
 
 class SyntheticForgeTransport:
     def __init__(self, repository: Reference, *, page_size: int = 2) -> None:
+        self.binding = ForgeBinding("https://synthetic.invalid", repository_path(repository))
         self.repository = repository
         self.page_size = page_size
         self.branches: dict[str, str] = {"develop": "b" * 40, "feature": "a" * 40}
@@ -82,7 +83,7 @@ class SyntheticForgeTransport:
         if method == "GET" and len(route) == 2 and route[0] == "pulls":
             if not _number(route[1]):
                 return 404, {}
-            matching = [pull for pull in self.pulls if pull["number"] == int(route[1])]
+            matching = [pull for pull in self.pulls if pull.get("number") == int(route[1])]
             return (200, matching[0]) if matching else (404, {})
         if method == "POST" and route == ["pulls"] and body is not None:
             self.posts += 1
@@ -170,7 +171,7 @@ class FakeForge(Forge):
         if self.identity(repository).presence is not Presence.FOUND:
             return Observation(self.identity(repository).presence)
         for pull in self.transport.pulls:
-            if change == Reference(f"{repository.value}#{pull['number']}"):
+            if change.value == f"{repository.value}#{pull.get('number')}":
                 try:
                     return self._pull(repository, pull)
                 except ValueError:
@@ -187,7 +188,7 @@ class FakeForge(Forge):
         if cast(dict[str, object], head).get("repo") != repo or cast(dict[str, object], base).get("repo") != repo:
             raise ValueError("pull repository differs")
         number = pull.get("number")
-        if type(number) is not int or not _number(str(number)):
+        if not positive_id(number):
             raise ValueError("invalid pull request number")
         head_sha = cast(dict[str, object], head).get("sha")
         base_sha = cast(dict[str, object], base).get("sha")
@@ -236,8 +237,7 @@ class FakeForge(Forge):
         for data in records:
             check_id, context, status = (data.get(name) for name in ("id", "context", "status"))
             if (
-                not isinstance(check_id, int)
-                or check_id <= 0
+                not positive_id(check_id)
                 or not isinstance(context, str)
                 or not context
                 or not isinstance(status, str)
@@ -396,8 +396,8 @@ class FakeForge(Forge):
 
 
 def _valid_oid(value: str) -> bool:
-    return re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", value) is not None
-
-
-def _number(value: str) -> bool:
-    return 0 < len(value) <= 18 and value.isascii() and value.isdigit() and value[0] != "0"
+    try:
+        oid(value)
+        return True
+    except ValueError:
+        return False

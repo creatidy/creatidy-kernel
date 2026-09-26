@@ -22,20 +22,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from creatidy_kernel.adapters.forge_refs import repository_path, valid_branch
-from creatidy_kernel.core.forge import EffectStatus, ForgeConflict, Reference
+from creatidy_kernel.adapters.forge_refs import ForgeBinding, https_origin, oid, repository_path, valid_branch
+from creatidy_kernel.core.forge import EffectStatus, ForgeConflict, Reference, UnsupportedForge
 
 
 def _https(url: str) -> None:
     parsed = urlsplit(url)
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-        or parsed.query
-        or parsed.fragment
-    ):
+    https_origin(url)
+    if not parsed.path.startswith("/"):
         raise ValueError("forge transport requires an HTTPS URL without embedded credentials")
 
 
@@ -53,10 +47,10 @@ def _deadline(seconds: int):
     # urllib's socket timeout is per I/O; on non-main threads there is no
     # interruptible total deadline, so never claim one there.
     if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
-        raise OSError("total HTTP deadline unsupported in this context")
+        raise UnsupportedForge("total HTTP deadline unsupported in this context")
     previous = signal.getsignal(signal.SIGALRM)
     if signal.getitimer(signal.ITIMER_REAL)[0] > 0:
-        raise OSError("total HTTP deadline unavailable with active alarm")
+        raise UnsupportedForge("total HTTP deadline unavailable with active alarm")
 
     def expired(_signum: int, _frame: object) -> None:
         raise TimeoutError("forge HTTP operation deadline exceeded")
@@ -74,28 +68,59 @@ def _deadline(seconds: int):
 
 
 class HTTPSForgejoTransport:
-    supports_reads = True
-    supports_pr = True
-
     def __init__(
-        self, api_url: str, token: Callable[[], str], *, timeout: int = 15, max_bytes: int = 1_000_000
+        self,
+        api_url: str,
+        repository: Reference,
+        token: Callable[[], str],
+        *,
+        timeout: int = 15,
+        max_bytes: int = 1_000_000,
     ) -> None:
         _https(api_url)
-        if not api_url.rstrip("/").endswith("/api/v1") or timeout <= 0 or max_bytes <= 0:
+        origin = https_origin(api_url)
+        if urlsplit(api_url).path != "/api/v1" or timeout <= 0 or max_bytes <= 0:
             raise ValueError("Forgejo API v1 URL and finite limits required")
-        self.api_url = api_url.rstrip("/")
+        self.binding = ForgeBinding(origin, repository_path(repository))
+        self.api_url = f"{origin}/api/v1"
         self.token = token
         self.timeout = timeout
         self.max_bytes = max_bytes
         self.opener = build_opener(_NoRedirect())
+
+    @property
+    def supports_reads(self) -> bool:
+        return self._deadline_available()
+
+    @property
+    def supports_pr(self) -> bool:
+        return self._deadline_available()
+
+    @staticmethod
+    def _deadline_available() -> bool:
+        return (
+            callable(getattr(signal, "setitimer", None))
+            and threading.current_thread() is threading.main_thread()
+            and signal.getitimer(signal.ITIMER_REAL)[0] == 0
+        )
 
     def authoritative_absence(self, path: str) -> bool:
         # Forgejo can conceal permission failures as 404; HTTP status alone is not proof.
         return False
 
     def request(self, method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
-        if method not in {"GET", "POST"} or not path.startswith("/repos/") or ".." in path or "#" in path:
+        prefix = f"/repos/{self.binding.repository}"
+        if (
+            method not in {"GET", "POST"}
+            or not path.startswith(prefix)
+            or path[len(prefix) : len(prefix) + 1] not in {"", "/", "?"}
+            or ".." in path
+            or "#" in path
+            or len(path) > 1024
+        ):
             raise ValueError("unsupported forge request")
+        if not self._deadline_available():
+            raise UnsupportedForge("total HTTP deadline unavailable")
         # PR requests are flat strings. Bound each value before json.dumps can
         # allocate a body proportional to an untrusted title or description.
         if body is not None:
@@ -136,7 +161,7 @@ class HTTPSForgejoTransport:
                     raise OSError("forge HTTP response exceeds safe limit")
                 try:
                     payload: object = json.loads(content) if content else None
-                except (UnicodeDecodeError, json.JSONDecodeError):
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
                     payload = None
         except (URLError, TimeoutError) as error:
             raise OSError("forge HTTP outcome unknown") from error
@@ -171,18 +196,12 @@ def run_git_bounded(
                             if sum(len(part) for part in output.values()) > max_bytes:
                                 raise OverflowError("Git output limit exceeded")
                 process.wait(timeout=max(0, deadline - time.monotonic()))
-                if process.returncode != 0:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-            except BaseException:
+            finally:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 process.wait()
-                raise
         return subprocess.CompletedProcess(
             argv,
             process.returncode,
@@ -208,8 +227,9 @@ class ConditionalGitTransport:
     ) -> None:
         _https(remote_url)
         repo_path = repository_path(repository)
-        if remote_url.rstrip("/").split("/", 3)[-1].removesuffix(".git") != repo_path:
+        if urlsplit(remote_url).path != f"/{repo_path}.git":
             raise ForgeConflict("remote URL must bind the exact repository")
+        self.binding = ForgeBinding(https_origin(remote_url), repo_path)
         if timeout <= 0 or max_output_bytes <= 0:
             raise ValueError("finite Git limits required")
         # This must be a controller-owned, non-worker-writable bare repository.
@@ -259,11 +279,9 @@ class ConditionalGitTransport:
         valid_branch(branch)
         sha = revision.value.removeprefix("forgejo:")
         old = expected.value.removeprefix("forgejo:") if expected else ""
-        if not revision.value.startswith("forgejo:") or not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", sha):
+        if not revision.value.startswith("forgejo:") or not _valid_oid(sha):
             raise ForgeConflict("revision must be a full Git object ID")
-        if expected is not None and (
-            not expected.value.startswith("forgejo:") or not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", old)
-        ):
+        if expected is not None and (not expected.value.startswith("forgejo:") or not _valid_oid(old)):
             raise ForgeConflict("expected-old must be a full Git object ID")
         ref = f"refs/heads/{branch}"
         with tempfile.TemporaryDirectory(prefix="forge-push-") as directory:
@@ -347,3 +365,11 @@ class ConditionalGitTransport:
             if pushed.returncode != 0 and lines == [f"To {self.remote_url}", rejected, "Done"]
             else EffectStatus.UNKNOWN
         )
+
+
+def _valid_oid(value: str) -> bool:
+    try:
+        oid(value)
+        return True
+    except ValueError:
+        return False

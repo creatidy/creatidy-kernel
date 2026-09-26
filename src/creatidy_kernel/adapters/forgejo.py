@@ -5,12 +5,12 @@ The caller must durably claim the Operation and supply a trusted authorization
 predicate. Neither HTTP success nor a locally cached key establishes acceptance.
 """
 
-import re
 from collections.abc import Callable, Mapping
 from typing import Protocol, cast
 from urllib.parse import quote
 
-from creatidy_kernel.adapters.forge_refs import repository_path, valid_branch
+from creatidy_kernel.adapters.forge_refs import ForgeBinding, oid, positive_id, repository_path, valid_branch
+from creatidy_kernel.adapters.forge_refs import number as valid_number
 from creatidy_kernel.adapters.forgejo_transport import LocalRequestRefusal
 from creatidy_kernel.core.forge import (
     CheckResult,
@@ -29,8 +29,13 @@ from creatidy_kernel.ports.forge import Forge
 
 
 class HTTPTransport(Protocol):
-    supports_reads: bool
-    supports_pr: bool
+    binding: ForgeBinding
+
+    @property
+    def supports_reads(self) -> bool: ...
+
+    @property
+    def supports_pr(self) -> bool: ...
 
     def request(self, method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]: ...
 
@@ -41,6 +46,7 @@ class GitTransport(Protocol):
     """Atomic expected-old ref update; never an unconditional push."""
 
     supports_conditional_push: bool
+    binding: ForgeBinding
 
     def compare_and_push(
         self, repository: Reference, branch: str, expected: Reference | None, revision: Reference
@@ -63,16 +69,6 @@ def _field(payload: dict[str, object], name: str) -> str:
     return value
 
 
-def _oid(value: str) -> str:
-    if re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", value) is None:
-        raise ValueError("invalid Git object ID")
-    return value
-
-
-def _number(value: str) -> bool:
-    return 0 < len(value) <= 18 and value.isascii() and value.isdigit() and value[0] != "0"
-
-
 class ForgejoForge(Forge):
     def __init__(
         self,
@@ -84,6 +80,9 @@ class ForgejoForge(Forge):
     ) -> None:
         if page_size <= 0:
             raise ValueError("page size must be positive")
+        if http.binding != git.binding:
+            raise ForgeConflict("HTTP and Git forge bindings differ")
+        self.binding = http.binding
         self.http = http
         self.git = git
         self.authorize = authorize
@@ -102,7 +101,10 @@ class ForgejoForge(Forge):
         return frozenset(capabilities)
 
     def _repo(self, reference: Reference) -> str:
-        return repository_path(reference)
+        path = repository_path(reference)
+        if path != self.binding.repository:
+            raise ForgeConflict("repository outside configured forge binding")
+        return path
 
     @staticmethod
     def _revision(reference: Reference) -> str:
@@ -110,7 +112,7 @@ class ForgejoForge(Forge):
             raise ForgeConflict("wrong revision provider")
         value = reference.value.removeprefix("forgejo:")
         try:
-            return _oid(value)
+            return oid(value)
         except ValueError as error:
             raise ForgeConflict("revision must be a full Git object ID") from error
 
@@ -124,6 +126,7 @@ class ForgejoForge(Forge):
             return 0, None
 
     def identity(self, repository: Reference) -> Observation:
+        self._require_reads()
         path = f"/repos/{self._repo(repository)}"
         status, payload = self._read(path)
         if status in {401, 403}:
@@ -142,6 +145,7 @@ class ForgejoForge(Forge):
         return Observation(Presence.FOUND, repository)
 
     def branch(self, repository: Reference, branch: str) -> Observation:
+        self._require_reads()
         valid_branch(branch)
         path = f"/repos/{self._repo(repository)}/branches/{quote(branch, safe='')}"
         status, payload = self._read(path)
@@ -155,7 +159,7 @@ class ForgejoForge(Forge):
             data = _object(payload)
             commit = _object(data.get("commit"))
             name = _field(data, "name")
-            revision = _oid(_field(commit, "id"))
+            revision = oid(_field(commit, "id"))
             reference = Reference(f"forgejo:{revision}")
         except ValueError:
             return Observation(Presence.UNKNOWN)
@@ -164,9 +168,10 @@ class ForgejoForge(Forge):
         return Observation(Presence.FOUND, revision=reference)
 
     def change(self, repository: Reference, change: Reference) -> Observation:
+        self._require_reads()
         prefix = f"{repository.value}#"
         suffix = change.value.removeprefix(prefix)
-        if not change.value.startswith(prefix) or not _number(suffix):
+        if not change.value.startswith(prefix) or not valid_number(suffix):
             raise ForgeConflict("change does not belong to repository")
         number = suffix
         path = f"/repos/{self._repo(repository)}/pulls/{number}"
@@ -194,17 +199,18 @@ class ForgejoForge(Forge):
         ):
             raise ValueError("pull request repository differs")
         number = data.get("number")
-        if type(number) is not int or not _number(str(number)):
+        if not positive_id(number):
             raise ValueError("invalid pull request number")
         return Observation(
             Presence.FOUND,
             Reference(f"{repository.value}#{number}"),
-            base=Reference(f"forgejo:{_oid(_field(base, 'sha'))}"),
-            head=Reference(f"forgejo:{_oid(_field(head, 'sha'))}"),
+            base=Reference(f"forgejo:{oid(_field(base, 'sha'))}"),
+            head=Reference(f"forgejo:{oid(_field(head, 'sha'))}"),
         )
 
     def _page(self, repository: Reference, path: str, cursor: str | None, *, subject: Reference | None = None) -> Page:
-        if cursor is not None and not _number(cursor):
+        self._require_reads()
+        if cursor is not None and not valid_number(cursor):
             return Page((), None, False)
         try:
             page = 1 if cursor is None else int(cursor)
@@ -224,7 +230,7 @@ class ForgejoForge(Forge):
                 data = _object(entry)
                 if subject is not None:
                     check_id = data.get("id")
-                    if not isinstance(check_id, int) or check_id <= 0:
+                    if not positive_id(check_id):
                         raise ValueError("invalid check identity")
                     status_value = _field(data, "status")
                     result = {
@@ -255,6 +261,10 @@ class ForgejoForge(Forge):
         return self._page(
             repository, f"commits/{quote(self._revision(revision), safe='')}/statuses", cursor, subject=revision
         )
+
+    def _require_reads(self) -> None:
+        if not self.http.supports_reads:
+            raise UnsupportedForge("forge reads unsupported")
 
     def _authorized(self, effect: Effect) -> None:
         self._repo(effect.repository)
@@ -327,7 +337,7 @@ class ForgejoForge(Forge):
             return Receipt(EffectStatus.REJECTED, effect.operation, reason="local request limit")
         except OSError:
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
-        if status == 403 or status == 422:
+        if status in {403, 409, 413, 422, 423}:
             return Receipt(EffectStatus.REJECTED, effect.operation)
         if status != 201:
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
@@ -360,7 +370,7 @@ class ForgejoForge(Forge):
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
         prefix = f"{effect.repository.value}#"
         suffix = known_reference.value.removeprefix(prefix)
-        if not known_reference.value.startswith(prefix) or not _number(suffix):
+        if not known_reference.value.startswith(prefix) or not valid_number(suffix):
             raise ForgeConflict("change does not belong to repository")
         status, payload = self._read(f"/repos/{self._repo(effect.repository)}/pulls/{suffix}")
         if status != 200:

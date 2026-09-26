@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -14,13 +15,15 @@ from unittest.mock import patch
 
 import pytest
 
+from creatidy_kernel.adapters.fake_forge import SyntheticForgeTransport
+from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.forgejo_transport import (
     ConditionalGitTransport,
     HTTPSForgejoTransport,
     LocalRequestRefusal,
     run_git_bounded,
 )
-from creatidy_kernel.core.forge import EffectStatus, ForgeConflict, Reference
+from creatidy_kernel.core.forge import EffectStatus, ForgeConflict, Reference, UnsupportedForge
 
 REPO = Reference("forgejo:team/project")
 SHA = "a" * 40
@@ -41,8 +44,8 @@ class Response(BytesIO):
 
 def test_https_transport_stays_on_configured_origin_and_bounds_payload() -> None:
     with pytest.raises(ValueError):
-        HTTPSForgejoTransport("http://forge.invalid/api/v1", lambda: "token")
-    transport = HTTPSForgejoTransport("https://forge.invalid/api/v1", lambda: "scoped", max_bytes=100)
+        HTTPSForgejoTransport("http://forge.invalid/api/v1", REPO, lambda: "token")
+    transport = HTTPSForgejoTransport("https://forge.invalid/api/v1", REPO, lambda: "scoped", max_bytes=100)
     with patch.object(transport.opener, "open", return_value=Response(b'{"full_name":"team/project"}')) as opened:
         assert transport.request("GET", "/repos/team/project") == (200, {"full_name": "team/project"})
         sent = opened.call_args.args[0]
@@ -65,7 +68,7 @@ def test_https_total_deadline_interrupts_trickling_response() -> None:
             while True:
                 time.sleep(0.1)
 
-    transport = HTTPSForgejoTransport("https://forge.invalid/api/v1", lambda: "scoped", timeout=1)
+    transport = HTTPSForgejoTransport("https://forge.invalid/api/v1", REPO, lambda: "scoped", timeout=1)
     start = time.monotonic()
     with patch.object(transport.opener, "open", return_value=Trickling()):
         with pytest.raises(OSError, match="outcome unknown"):
@@ -74,13 +77,62 @@ def test_https_total_deadline_interrupts_trickling_response() -> None:
 
 
 def test_oversized_pr_is_refused_before_serialization_credentials_or_network() -> None:
-    transport = HTTPSForgejoTransport("https://forge.invalid/api/v1", lambda: "scoped", max_bytes=64)
+    transport = HTTPSForgejoTransport("https://forge.invalid/api/v1", REPO, lambda: "scoped", max_bytes=64)
     with patch("creatidy_kernel.adapters.forgejo_transport.json.dumps") as serialize:
         with patch.object(transport.opener, "open") as opened:
             with pytest.raises(LocalRequestRefusal):
                 transport.request("POST", "/repos/team/project/pulls", {"body": "x" * 100_000})
             serialize.assert_not_called()
             opened.assert_not_called()
+
+
+def test_binding_requires_same_origin_and_repository(tmp_path: Path) -> None:
+    source = bare(tmp_path)
+    http = HTTPSForgejoTransport("https://LOCALHOST:443/api/v1", REPO, lambda: "secret")
+    git = ConditionalGitTransport(REPO, "https://localhost/team/project.git", source)
+    assert http.binding == git.binding
+    assert ForgejoForge(http, git, lambda _effect: False).capabilities()
+    assert ConditionalGitTransport(REPO, "https://localhost:8443/team/project.git", source).binding != git.binding
+    for remote in ("https://localhost:8443/team/project.git", "https://other.invalid/team/project.git"):
+        with pytest.raises(ForgeConflict, match="bindings"):
+            ForgejoForge(http, ConditionalGitTransport(REPO, remote, source), lambda _effect: True)
+    with pytest.raises(ForgeConflict, match="bindings"):
+        ForgejoForge(http, SyntheticForgeTransport(REPO), lambda _effect: True)
+    with pytest.raises(ValueError):
+        HTTPSForgejoTransport("https://localhost:bad/api/v1", REPO, lambda: "secret")
+
+
+def test_http_deadline_preflight_without_token_or_network(tmp_path: Path) -> None:
+    calls: list[str] = []
+    transport = HTTPSForgejoTransport("https://localhost:8443/api/v1", REPO, lambda: calls.append("token") or "secret")
+    git = ConditionalGitTransport(REPO, "https://localhost:8443/team/project.git", bare(tmp_path))
+    forge = ForgejoForge(transport, git, lambda _effect: True)
+
+    def checked_worker() -> None:
+        assert not transport.supports_reads and not transport.supports_pr
+        assert "pr" not in forge.capabilities() and "identity" not in forge.capabilities()
+        with pytest.raises(UnsupportedForge):
+            forge.identity(REPO)
+        with pytest.raises(UnsupportedForge):
+            transport.request("GET", "/repos/team/project")
+        with pytest.raises(UnsupportedForge):
+            transport.request("POST", "/repos/team/project/pulls", {"title": "test"})
+
+    with patch.object(transport.opener, "open") as opened:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(checked_worker).result(timeout=3)
+        assert not calls
+        opened.assert_not_called()
+    with patch("creatidy_kernel.adapters.forgejo_transport.signal.setitimer", new=None):
+        assert not transport.supports_reads
+
+
+@pytest.mark.parametrize("error", [RecursionError("deep"), ValueError("number")])
+def test_bounded_json_parser_errors_are_malformed(error: Exception) -> None:
+    transport = HTTPSForgejoTransport("https://localhost/api/v1", REPO, lambda: "secret")
+    with patch.object(transport.opener, "open", return_value=Response(b"{}")):
+        with patch("creatidy_kernel.adapters.forgejo_transport.json.loads", side_effect=error):
+            assert transport.request("GET", "/repos/team/project") == (200, None)
 
 
 def test_conditional_git_push_uses_single_expected_old_ref(tmp_path: Path) -> None:
@@ -337,6 +389,20 @@ def test_completed_git_failure_kills_descendant_with_closed_output(tmp_path: Pat
     )
     result = run_git_bounded([sys.executable, "-c", parent], tmp_path, {"PATH": os.environ["PATH"]}, 2, 100)
     assert result.returncode == 1
+    time.sleep(1.6)
+    assert not marker.exists()
+
+
+def test_completed_git_success_kills_descendant_with_closed_output(tmp_path: Path) -> None:
+    marker = tmp_path / "child-survived"
+    child = "import pathlib,time,sys; time.sleep(1.5); pathlib.Path(sys.argv[1]).touch()"
+    parent = (
+        "import subprocess,sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}, {str(marker)!r}], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); sys.exit(0)"
+    )
+    result = run_git_bounded([sys.executable, "-c", parent], tmp_path, {"PATH": os.environ["PATH"]}, 2, 100)
+    assert result.returncode == 0
     time.sleep(1.6)
     assert not marker.exists()
 

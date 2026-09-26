@@ -2,8 +2,39 @@
 """Adapter-boundary syntax shared by fake and controlled Forgejo transports."""
 
 import re
+from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from creatidy_kernel.core.forge import ForgeConflict, Reference
+
+
+@dataclass(frozen=True, slots=True)
+class ForgeBinding:
+    origin: str
+    repository: str
+
+
+def https_origin(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+        host = parsed.hostname
+    except ValueError as error:
+        raise ValueError("invalid HTTPS forge origin") from error
+    if (
+        parsed.scheme != "https"
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not re.fullmatch(r"[A-Za-z0-9.:-]+", host)
+    ):
+        raise ValueError("invalid HTTPS forge origin")
+    if port is not None and port == 0:
+        raise ValueError("invalid HTTPS forge port")
+    authority = f"[{host.lower()}]" if ":" in host else host.lower()
+    return f"https://{authority}{f':{port}' if port not in (None, 443) else ''}"
 
 
 def repository_path(reference: Reference) -> str:
@@ -11,8 +42,16 @@ def repository_path(reference: Reference) -> str:
         raise ForgeConflict("wrong forge provider")
     path = reference.value.removeprefix("forgejo:")
     parts = path.split("/")
-    if len(parts) != 2 or any(
-        part in {"", ".", ".."} or re.fullmatch(r"[A-Za-z0-9._~-]+", part) is None for part in parts
+    if (
+        len(path) > 255
+        or len(parts) != 2
+        or any(
+            len(part) > 128
+            or part in {"", ".", ".."}
+            or ".." in part
+            or re.fullmatch(r"[A-Za-z0-9._~-]+", part) is None
+            for part in parts
+        )
     ):
         raise ForgeConflict("invalid repository handle")
     return path
@@ -22,7 +61,8 @@ def valid_branch(branch: str) -> None:
     # Mirror check-ref-format --branch at the boundary; the Git transport still
     # runs Git's own check before pushing.
     if (
-        not branch
+        len(branch) > 255
+        or not branch
         or branch == "@"
         or branch.startswith("-")
         or branch.endswith(("/", "."))
@@ -33,3 +73,17 @@ def valid_branch(branch: str) -> None:
         or any(part in {"", ".", ".."} or part.startswith(".") or part.endswith(".lock") for part in branch.split("/"))
     ):
         raise ForgeConflict("invalid Git branch")
+
+
+def oid(value: str) -> str:
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None:
+        raise ValueError("invalid Git object ID")
+    return value
+
+
+def positive_id(value: object) -> bool:
+    return type(value) is int and 0 < value < 10**18
+
+
+def number(value: str) -> bool:
+    return 0 < len(value) <= 18 and value.isascii() and value.isdigit() and value[0] != "0"

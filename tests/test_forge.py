@@ -210,13 +210,17 @@ def test_malformed_same_provider_effect_rejected_before_dispatch(
 
 
 @pytest.mark.parametrize("length", [40, 64])
-def test_uppercase_full_oid_is_valid(
+def test_uppercase_full_oid_is_not_canonical(
     boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], length: int
 ) -> None:
-    forge, transport, _ = boundary
+    forge, transport, permitted = boundary
     sha = "A" * length
     transport.branches["feature"] = sha
-    assert forge.branch(REPO, "feature").revision == Reference(f"forgejo:{sha}")
+    assert forge.branch(REPO, "feature").presence is Presence.UNKNOWN
+    effect = replace(operation("pr"), revision=Reference(f"forgejo:{sha}"))
+    permitted.append(effect)
+    with pytest.raises(ForgeConflict, match="full Git object ID"):
+        forge.apply(effect)
 
 
 @pytest.mark.parametrize("side", ["head", "base"])
@@ -453,6 +457,57 @@ def test_forgejo_authentication_failure_is_inaccessible() -> None:
         assert forge.identity(REPO).presence is Presence.INACCESSIBLE
         assert forge.branch(REPO, "feature").presence is Presence.INACCESSIBLE
         assert forge.change(REPO, Reference(f"{REPO.value}#1")).presence is Presence.INACCESSIBLE
+
+
+def test_missing_pr_number_and_invalid_check_ids_fail_closed(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, _ = boundary
+    transport.pulls.append({"head": {}, "base": {}})
+    assert forge.change(REPO, Reference(f"{REPO.value}#1")).presence is Presence.UNKNOWN
+    assert not forge.changes(REPO).complete
+    for invalid in (True, False, 0, -1, 10**18, "1"):
+        transport.statuses[:] = [{"id": invalid, "context": "unit", "status": "success"}]
+        assert forge.checks(REPO, HEAD).items == ()
+        assert not forge.checks(REPO, HEAD).complete
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [
+        (403, EffectStatus.REJECTED),
+        (409, EffectStatus.REJECTED),
+        (413, EffectStatus.REJECTED),
+        (422, EffectStatus.REJECTED),
+        (423, EffectStatus.REJECTED),
+        (401, EffectStatus.UNKNOWN),
+        (429, EffectStatus.UNKNOWN),
+        (500, EffectStatus.UNKNOWN),
+    ],
+)
+def test_pr_post_status_is_endpoint_specific(status: int, expected: EffectStatus) -> None:
+    transport = SyntheticForgeTransport(REPO)
+    forge = ForgejoForge(transport, transport, lambda _effect: True)
+    original = transport.request
+
+    def respond(method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
+        if method == "POST":
+            return status, {}
+        return original(method, path, body)
+
+    with patch.object(transport, "request", side_effect=respond):
+        assert forge.apply(operation("pr")).status is expected
+    assert transport.posts == 0
+
+
+@pytest.mark.parametrize("invalid", ["team/pro..ject", "team/" + "x" * 256])
+def test_finite_repository_codec_rejects_before_io(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], invalid: str
+) -> None:
+    forge, transport, _ = boundary
+    with pytest.raises(ForgeConflict):
+        forge.identity(Reference(f"forgejo:{invalid}"))
+    assert transport.posts == transport.pushes == 0
 
 
 @pytest.mark.parametrize("suffix", ["", "0", "01", "-1", "abc", "1x", "١", "9" * 5000])
