@@ -26,6 +26,7 @@ class SyntheticForgeTransport:
         self.branches: dict[str, str] = {"develop": "base1", "feature": "head1"}
         self.pulls: list[dict[str, object]] = []
         self.statuses: list[dict[str, object]] = []
+        self.status_revision = "head1"
         self.forbidden = False
         self.lost_reply = False
         self.domain_rejection = False
@@ -61,7 +62,7 @@ class SyntheticForgeTransport:
             sha = self.branches.get(route[1])
             return (200, {"name": route[1], "commit": {"id": sha}}) if sha else (404, {})
         if method == "GET" and len(route) == 3 and route[0] == "commits" and route[2] == "statuses":
-            return self._paged(self.statuses, uri.query)
+            return self._paged(self.statuses if route[1] == self.status_revision else [], uri.query)
         if method == "GET" and route == ["pulls"]:
             return self._paged(self.pulls, uri.query)
         if method == "GET" and len(route) == 2 and route[0] == "pulls":
@@ -168,20 +169,22 @@ class FakeForge(Forge):
             return Page((), None, False)
 
     def checks(self, repository: Reference, revision: Reference, cursor: str | None = None) -> Page:
-        records, next_cursor, complete = self._page(repository, self.transport.statuses, cursor)
+        self._revision(revision)
+        records, next_cursor, complete = self._page(
+            repository,
+            self.transport.statuses if revision.value == f"forgejo:{self.transport.status_revision}" else [],
+            cursor,
+        )
         checks: list[Observation] = []
         for data in records:
-            check_id, sha, context, status = (data.get(name) for name in ("id", "sha", "context", "status"))
+            check_id, context, status = (data.get(name) for name in ("id", "context", "status"))
             if (
                 not isinstance(check_id, int)
                 or check_id <= 0
-                or not isinstance(sha, str)
-                or not sha
                 or not isinstance(context, str)
                 or not context
                 or not isinstance(status, str)
                 or not status
-                or Reference(f"forgejo:{sha}") != revision
             ):
                 return Page((), None, False)
             result = {
@@ -204,6 +207,16 @@ class FakeForge(Forge):
     def _authorized(self, effect: Effect) -> None:
         if effect.repository != self.transport.repository or not self.authorize(effect):
             raise ForgeConflict("exact forge effect was not authorized")
+        self._revision(effect.revision)
+        if effect.expected is not None:
+            self._revision(effect.expected)
+        if effect.base_revision is not None:
+            self._revision(effect.base_revision)
+
+    @staticmethod
+    def _revision(reference: Reference | None) -> None:
+        if reference is not None and not reference.value.startswith("forgejo:"):
+            raise ForgeConflict("wrong revision provider")
 
     def apply(self, effect: Effect) -> Receipt:
         self._authorized(effect)
@@ -274,6 +287,11 @@ class FakeForge(Forge):
         if effect.action != "pr":
             branch = self.branch(effect.repository, effect.branch)
             if branch.presence is Presence.FOUND and branch.revision == effect.revision:
+                if effect.action == "branch" and (
+                    effect.base_branch is None
+                    or self.branch(effect.repository, effect.base_branch).revision != effect.base_revision
+                ):
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation, effect.revision, "source moved")
                 return Receipt(EffectStatus.ACCEPTED, effect.operation, effect.revision)
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
         if self.identity(effect.repository).presence is not Presence.FOUND:

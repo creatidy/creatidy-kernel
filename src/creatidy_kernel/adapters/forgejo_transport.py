@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -86,9 +87,11 @@ class HTTPSForgejoTransport:
 
 
 class ConditionalGitTransport:
-    """One-ref expected-old push; failure without a stale lease marker is uncertain."""
+    """Push from an isolated bare repository, never loading workload Git configuration."""
 
-    def __init__(self, repository: Reference, remote_url: str, worktree: Path, *, timeout: int = 60) -> None:
+    def __init__(
+        self, repository: Reference, remote_url: str, worktree: Path, *, timeout: int = 60, askpass: Path | None = None
+    ) -> None:
         _https(remote_url)
         repo_path = repository.value.removeprefix("forgejo:")
         if (
@@ -102,6 +105,15 @@ class ConditionalGitTransport:
         self.remote_url = remote_url
         self.worktree = worktree
         self.timeout = timeout
+        # The caller supplies a trusted executable which obtains a scoped credential
+        # outside the worktree. Never inherit Git's ambient credential helpers.
+        if askpass is not None and (
+            not askpass.is_absolute() or not askpass.is_file() or not os.access(askpass, os.X_OK)
+        ):
+            raise ValueError("askpass must be a trusted absolute executable")
+        if askpass is not None and askpass.resolve().is_relative_to(worktree.resolve()):
+            raise ValueError("askpass cannot be controlled by the worktree")
+        self.askpass = askpass
         binary = shutil.which("git")
         if binary is None or not Path(binary).is_absolute():
             raise ValueError("absolute Git executable required")
@@ -114,15 +126,6 @@ class ConditionalGitTransport:
             raise ForgeConflict("repository outside configured Git remote")
         if branch.startswith("-"):
             raise ForgeConflict("invalid Git branch")
-        result = subprocess.run(  # noqa: S603 - fixed executable/argv; branch is checked as a ref before push.
-            [self.git_binary, "check-ref-format", "--branch", branch],
-            cwd=self.worktree,
-            capture_output=True,
-            check=False,
-            timeout=self.timeout,
-        )
-        if result.returncode != 0:
-            raise ForgeConflict("invalid Git branch")
         sha = revision.value.removeprefix("forgejo:")
         old = expected.value.removeprefix("forgejo:") if expected else ""
         if not revision.value.startswith("forgejo:") or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
@@ -132,27 +135,60 @@ class ConditionalGitTransport:
         ):
             raise ForgeConflict("expected-old must be a full Git object ID")
         ref = f"refs/heads/{branch}"
-        argv = [
-            self.git_binary,
-            "push",
-            "--porcelain",
-            f"--force-with-lease={ref}:{old}",
-            "--",
-            self.remote_url,
-            f"{sha}:{ref}",
-        ]
-        try:
-            pushed = subprocess.run(  # noqa: S603 - one exact ref and expected-old CAS; no shell.
-                argv,
-                cwd=self.worktree,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=self.timeout,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return EffectStatus.UNKNOWN
+        with tempfile.TemporaryDirectory(prefix="forge-push-") as directory:
+            root = Path(directory)
+            env = {
+                "HOME": directory,
+                "XDG_CONFIG_HOME": directory,
+                "PATH": "/usr/bin:/bin",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+            if self.askpass is not None:
+                env["GIT_ASKPASS"] = str(self.askpass)
+
+            def run_git(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(  # noqa: S603 - fixed Git binary, controlled arguments and environment.
+                    argv, cwd=cwd, capture_output=True, text=True, check=False, timeout=self.timeout, env=env
+                )
+
+            # This read-only discovery does not execute hooks; no worktree config is
+            # used by the push itself, including includeIf, url rewrites or helpers.
+            try:
+                objects = run_git(
+                    [self.git_binary, "rev-parse", "--path-format=absolute", "--git-path", "objects"], self.worktree
+                )
+                if objects.returncode != 0 or not Path(objects.stdout.strip()).is_dir():
+                    return EffectStatus.UNKNOWN
+                initialized = run_git([self.git_binary, "init", "--bare", "--template=", str(root / "repo")], root)
+                if initialized.returncode != 0:
+                    return EffectStatus.UNKNOWN
+                checked = run_git([self.git_binary, "check-ref-format", "--branch", branch], root)
+                if checked.returncode != 0:
+                    raise ForgeConflict("invalid Git branch")
+                env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = objects.stdout.strip()
+                pushed = run_git(
+                    [
+                        self.git_binary,
+                        f"--git-dir={root / 'repo'}",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-c",
+                        "credential.helper=",
+                        "-c",
+                        "http.followRedirects=false",
+                        "push",
+                        "--porcelain",
+                        f"--force-with-lease={ref}:{old}",
+                        "--",
+                        self.remote_url,
+                        f"{sha}:{ref}",
+                    ],
+                    root,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return EffectStatus.UNKNOWN
         if pushed.returncode == 0:
             return EffectStatus.ACCEPTED
         output = pushed.stdout + pushed.stderr

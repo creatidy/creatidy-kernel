@@ -57,9 +57,9 @@ def test_observations_and_pagination(boundary: tuple[Forge, SyntheticForgeTransp
     assert forge.branch(REPO, "missing").presence is Presence.UNKNOWN
     transport.statuses.extend(
         [
-            {"id": 1, "sha": "head1", "context": "unit", "status": "success"},
-            {"id": 2, "sha": "head1", "context": "lint", "status": "failure"},
-            {"id": 3, "sha": "head1", "context": "review", "status": "pending"},
+            {"id": 1, "context": "unit", "status": "success"},
+            {"id": 2, "context": "lint", "status": "failure"},
+            {"id": 3, "context": "review", "status": "pending"},
         ]
     )
     first = forge.checks(REPO, HEAD)
@@ -70,6 +70,7 @@ def test_observations_and_pagination(boundary: tuple[Forge, SyntheticForgeTransp
     second = forge.checks(REPO, HEAD, first.next_cursor)
     assert len(second.items) == 1 and second.complete
     assert second.items[0].check_result is CheckResult.PENDING
+    assert forge.checks(REPO, Reference("forgejo:other")).items == ()
     transport.forbidden = True
     assert forge.identity(REPO).presence is Presence.INACCESSIBLE
     assert not forge.changes(REPO).complete
@@ -77,13 +78,10 @@ def test_observations_and_pagination(boundary: tuple[Forge, SyntheticForgeTransp
 
 def test_check_observations_fail_closed(boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]]) -> None:
     forge, transport, _ = boundary
-    transport.statuses.append({"id": 1, "sha": "head1", "context": "scan", "status": "error"})
+    transport.statuses.append({"id": 1, "context": "scan", "status": "error"})
     assert forge.checks(REPO, HEAD).items[0].check_result is CheckResult.ERROR
     transport.statuses[0]["status"] = "unexpected"
     assert forge.checks(REPO, HEAD).items[0].check_result is CheckResult.UNKNOWN
-    transport.statuses[0]["sha"] = "other"
-    assert not forge.checks(REPO, HEAD).complete
-    transport.statuses[0]["sha"] = "head1"
     del transport.statuses[0]["context"]
     assert not forge.checks(REPO, HEAD).complete
 
@@ -118,6 +116,38 @@ def test_branch_creation_and_reconcile_lost_push(
     permitted.append(replay)
     assert forge.apply(replay).status is EffectStatus.ACCEPTED
     assert transport.pushes == 1
+
+
+def test_lost_branch_reply_with_moved_source_remains_unknown(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]],
+) -> None:
+    forge, transport, permitted = boundary
+    effect = replace(operation("branch"), branch="new")
+    permitted.append(effect)
+    transport.lost_reply = True
+    assert forge.apply(effect).status is EffectStatus.UNKNOWN
+    transport.branches["develop"] = "base2"
+    assert forge.reconcile(effect).status is EffectStatus.UNKNOWN
+    replay = replace(effect, delivery_attempts=2)
+    permitted.append(replay)
+    assert forge.apply(replay).status is EffectStatus.UNKNOWN
+    assert transport.pushes == 1
+
+
+@pytest.mark.parametrize("action,field", [("push", "revision"), ("push", "expected"), ("branch", "base_revision")])
+def test_wrong_revision_provider_rejected_before_effect(
+    boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]], action: str, field: str
+) -> None:
+    forge, transport, permitted = boundary
+    effect = replace(operation(action), **{field: Reference("github:head1")})
+    permitted.append(effect)
+    with pytest.raises(ForgeConflict, match="revision provider"):
+        forge.apply(effect)
+    assert transport.pushes == 0
+    with pytest.raises(ForgeConflict, match="revision provider"):
+        forge.reconcile(effect)
+    with pytest.raises(ForgeConflict, match="revision provider"):
+        forge.checks(REPO, Reference("github:head1"))
 
 
 def test_pr_artifact_not_merge_and_replay(boundary: tuple[Forge, SyntheticForgeTransport, list[Effect]]) -> None:

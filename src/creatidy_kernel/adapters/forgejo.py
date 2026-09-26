@@ -187,12 +187,10 @@ class ForgejoForge(Forge):
                     check = Observation(
                         Presence.FOUND,
                         Reference(f"{repository.value}@{check_id}"),
-                        revision=Reference(f"forgejo:{_field(data, 'sha')}"),
+                        revision=subject,
                         check_context=_field(data, "context"),
                         check_result=result,
                     )
-                    if check.revision != subject:
-                        raise ValueError("check subject differs")
                     items.append(check)
                 else:
                     items.append(self._change_observation(repository, data))
@@ -305,6 +303,11 @@ class ForgejoForge(Forge):
         if effect.action != "pr":
             observed = self.branch(effect.repository, effect.branch)
             if observed.presence is Presence.FOUND and observed.revision == effect.revision:
+                if effect.action == "branch" and (
+                    effect.base_branch is None
+                    or self.branch(effect.repository, effect.base_branch).revision != effect.base_revision
+                ):
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation, effect.revision, "source moved")
                 return Receipt(EffectStatus.ACCEPTED, effect.operation, effect.revision)
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
         marker = f"<!-- forge-effect:{effect.operation.effect_key}:{effect.operation.request_digest} -->"
