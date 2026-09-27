@@ -41,6 +41,8 @@ jobs:
           CREATIDY_TEST_STORAGE_DIR: ${{ github.workspace }}/.ci-sqlite-storage
         run: make check
       - name: Built-package gate
+        env:
+          CREATIDY_TEST_STORAGE_DIR: ${{ github.workspace }}/.ci-sqlite-storage
         run: make package-check
       - name: Dependency vulnerability audit
         run: make audit

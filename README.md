@@ -6,8 +6,8 @@ Creatidy Kernel is the foundation of a local-first, provider-neutral control pla
 software engineering. It is for individual developers and small teams with limited AI budgets,
 premium-model quota and human attention.
 
-**Status: deterministic K1 domain, K2A/K2B durable persistence, synthetic K3 execution boundaries,
-and bounded Forge and Codex Runtime adapters, not an autonomous Program engine.**
+**Status: deterministic domain, durable persistence, bounded Forge and Codex Runtime adapters,
+and an offline two-node CLI reference flow, not a general autonomous Program engine.**
 The code includes immutable Program intent, legal domain commands, single-controller SQLite history
 and rebuildable projections, an external-operation journal/outbox with a synthetic effect seam and
 content-addressed artifacts, plus a replaceable resource allocator. Synthetic Runtime, Workspace and
@@ -21,7 +21,7 @@ Operation claim, pinned Codex version and matching generated-schema method inven
 inputs and workspace collection. The native handshake does not advertise supported methods. Unknown
 starts cannot be retried blindly; an accepted thread/turn handle must be stored before waiting, and missing
 recovery or generated-turn identity remains unknown. It neither isolates hostile workers nor accepts
-their results. The package does not schedule or autonomously execute Programs on its own.
+their results. The package does not schedule arbitrary Programs on its own.
 The PR effect uses Forgejo AGit to submit the authorized full commit SHA to the target base with a
 fresh Operation topic. It requires a validated creation receipt and an authoritative read-back of
 the PR's repository, base branch and current exact head; an uncertain push is not retried blindly.
@@ -89,6 +89,65 @@ SQLite persistence tests require a verified native local Linux filesystem. They 
 directory by default; if it is on a rejected filesystem, set `CREATIDY_TEST_STORAGE_DIR` to a
 directory on a supported native mount. CI selects a dedicated directory under the checkout; the
 adapter verifies its topology before opening SQLite.
+
+## Reference CLI
+
+The installed `creatidy-kernel` command delegates lifecycle decisions to a shared application layer.
+The default scenario is entirely offline: a durable deterministic runtime produces two small Git
+commits in a disposable local repository, controller-owned checks verify exact content, and the
+Forgejo adapter creates a synthetic PR against a durable local forge fixture. This is not a live
+Forgejo PR or paid model call, and deterministic verification is not an independent model review.
+
+```sh
+uv run --locked creatidy-kernel reference --data-dir /path/on/native-disk/reference --approve
+uv run --locked creatidy-kernel export --data-dir /path/on/native-disk/reference
+```
+
+`--approve` explicitly authorizes only this fixed two-node scenario. The first accepted artifact is
+an explicit input to the second WorkUnit. Reusing the same data directory resumes or inspects that
+same Program rather than starting another one. The SQLite filesystem restrictions above apply.
+The JSON export contains Attempt and operation identities, acceptance/evidence bindings and unknown
+resource consumption; unknown usage is not reported as zero. Local records remain user-owned.
+
+For recovery exercises, add `--fault commit`, `--fault send`, or `--fault receipt`, then repeat the
+command without `--fault`. Delivery intent, a committed delivery claim, a runtime receipt, and
+engineering acceptance remain distinct. An uncertain effect is reconciled before any retry; a lost
+PR reply without a recoverable reference remains unknown rather than creating a replacement PR.
+`lost-context` exercises unavailable runtime recovery; `pr-commit`, `pr-send`, and `pr-receipt`
+exercise the separate PR delivery boundaries. These faults operate only on the offline fixture.
+
+The reference uses **trusted-development mode**, not a sandbox. Its local synthetic runtime has no
+provider or owner credentials. Same-UID live workers must not be presented as isolated from control
+state or owner secrets. No reference command can merge or deploy.
+
+The supplementary live composition is `run_live_reference` in
+`creatidy_kernel.adapters.reference_live`, not a default CLI mode. It requires explicit owner and
+trusted-development acknowledgments, a version-pinned `CodexConnection` with finite RPC timeouts,
+a `FixedAllocator` allocation, and a scoped `ForgejoForge` supplied by the trusted caller. It does
+not load credentials. Use a disposable account/repository without broad owner credentials.
+
+Before opting in, create a controller-owned bare `object_source` outside the worker workspace and
+configure `ConditionalGitTransport` to use that same directory. Seed the disposable remote
+`develop` branch with the deterministic empty commit produced by `reference_commit(object_source,
+b"")`; the runner verifies the base and never initializes or updates the remote base itself. Accepted
+commit objects are reconstructed from verified durable bytes in the bare source before AGit delivery.
+This setup is deliberately specific to the reference scenario, not a general repository importer.
+
+The owner supplies an absolute deadline no more than one hour ahead and an observation budget of
+1-100. Both are pinned across restarts, with at most two runtime Attempts. Bounded exit requests
+cancellation but does not assert that a remote worker has stopped. These limits are not a provider-side
+hard monetary/token quota. Verification failures pause this reference, whose remediation budget is
+zero. The live composition is covered by native-shaped offline fixtures; no live paid-provider or
+remote-Forgejo execution is claimed by the offline suite.
+
+Runtime requests carry requested identity only. Acceptance requires matching runtime-resolved
+identity evidence, retained durably for the exact operation/accepted handle. A receipt-only Codex
+restart cannot reconstruct that resolution from a native thread read: without previously stored
+resolution evidence it reports `identity_unavailable` and cannot accept a candidate. Unknown
+generated-turn attestation remains distinct from verified configuration resolution. Cancellation has
+its own durable operation; once delivery is claimed, restarts observe the target without blindly
+reissuing the interrupt. Exports distinguish uncertain cancellation delivery from an observed terminal
+target, neither of which grants engineering acceptance.
 
 ## Architecture Decisions
 
