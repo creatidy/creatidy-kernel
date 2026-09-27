@@ -284,6 +284,18 @@ def reference_export(store: SQLiteProgramStore) -> dict[str, object]:
         except OperationConflict:
             entry["identity"] = None
         if program.state(attempt.spec.work_unit_id).status is WorkUnitStatus.SATISFIED:
+            identity = entry["identity"]
+            allocation = cast(dict[str, object], json.loads(store.artifact(operation.operation_id, "allocation")))
+            if not isinstance(identity, dict):
+                raise ValueError("accepted result lacks durable runtime identity evidence")
+            identity = cast(dict[str, object], identity)
+            if (
+                identity.get("requested") != allocation["model_id"]
+                or identity.get("resolved") != allocation["model_id"]
+                or identity.get("observed") not in (None, allocation["model_id"])
+                or identity.get("agent_definition_version") != attempt.spec.agent_definition_reference
+            ):
+                raise ValueError("accepted result lacks matching runtime identity evidence")
             accepted = reference_request(store, f"acceptance:{attempt.spec.attempt_id}")
             entry["verification"] = json.loads(store.artifact(str(accepted["operation"]), str(accepted["name"])))
         rejected: list[object] = []
@@ -313,6 +325,16 @@ def reference_export(store: SQLiteProgramStore) -> dict[str, object]:
         "unknowns": ["runtime usage is unavailable"],
         "automatic_merge": False,
         "automatic_deploy": False,
+        "cancellations": [
+            {
+                "operation": asdict(cancellation),
+                "target_terminal": store.operation(
+                    str(reference_request(store, cancellation.operation_id)["operation"])
+                ).status
+                == "terminal",
+            }
+            for cancellation in store.operations("cancel:")
+        ],
     }
     try:
         result["pr"] = json.loads(store.artifact("reference:pr", "export"))
@@ -393,6 +415,7 @@ def run_reference(directory: Path, *, owner_approved: bool, fault: str | None = 
                 result["condition"] = status
                 return result
         accepted = reference_request(store, "acceptance:reference:second")
+        reference_export(store)  # Validate retained acceptance evidence before any PR effect.
         receipt = deliver_reference_pr(
             store,
             repository_path=repository,

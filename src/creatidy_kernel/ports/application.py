@@ -5,7 +5,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 from creatidy_kernel.core.domain import (
     AttemptSpec,
@@ -120,7 +120,6 @@ def advance_work_unit(
     store.finalize_artifact(operation_id, "allocation", allocation_bytes)
     store.finalize_artifact(operation_id, "context", context)
     key = OperationKey(operation_id, operation.effect_key, operation.request_digest)
-    fresh_dispatch = False
     fault("commit")
     if operation.status in {"dispatched", "unknown"}:
         if operation.lease_until is not None and now < operation.lease_until:
@@ -148,11 +147,10 @@ def advance_work_unit(
             context_ref,
             allocation_ref,
             "owner-approved-reference",
-            RuntimeIdentity(allocation.model_id, allocation.model_id, None, "reference:v1"),
+            RuntimeIdentity(allocation.model_id, None, None, "reference:v1"),
             fence,
         )
         handle = runtime.start(request)
-        fresh_dispatch = True
         fault("send")
         store.record_transport(operation_id, fence, True)
         operation = store.observe(operation_id, fence, f"accepted:{handle}", "accepted", reference=handle)
@@ -167,18 +165,45 @@ def advance_work_unit(
         context_ref,
         allocation_ref,
         "owner-approved-reference",
-        RuntimeIdentity(allocation.model_id, allocation.model_id, None, "reference:v1"),
+        RuntimeIdentity(allocation.model_id, None, None, "reference:v1"),
         operation.fence,
     )
     if restore is not None:
         restore(request, handle)
     observation = runtime.observe(handle, now=now)
-    if fresh_dispatch:
-        store.finalize_artifact(operation_id, "identity", manifest_bytes(asdict(observation.identity)))
     observation_data = manifest_bytes(asdict(observation))
     store.finalize_artifact(
         operation_id, f"observation:{hashlib.sha256(observation_data).hexdigest()}", observation_data
     )
+    identity = observation.identity
+    if (
+        observation.handle != handle
+        or identity.requested != allocation.model_id
+        or identity.agent_definition_version != attempt.agent_definition_reference
+        or identity.resolved not in (None, allocation.model_id)
+        or identity.observed not in (None, allocation.model_id)
+    ):
+        return "identity_unavailable"
+    persisted_identity = store.find_artifact(operation_id, "identity")
+    if persisted_identity is None:
+        if identity.resolved is None:
+            return "identity_unavailable"
+        store.finalize_artifact(operation_id, "identity", manifest_bytes(asdict(identity)))
+    else:
+        # The immutable Operation owns the accepted handle and its original runtime
+        # resolution. A restored adapter's unknown identity cannot erase that fact.
+        raw: object = json.loads(persisted_identity)
+        if not isinstance(raw, dict):
+            return "identity_unavailable"
+        recorded = cast(dict[str, object], raw)
+        if (
+            set(recorded) != {"requested", "resolved", "observed", "agent_definition_version"}
+            or recorded["requested"] != allocation.model_id
+            or recorded["resolved"] != allocation.model_id
+            or recorded["observed"] not in (None, allocation.model_id)
+            or recorded["agent_definition_version"] != attempt.agent_definition_reference
+        ):
+            return "identity_unavailable"
     if observation.activity is not Activity.TERMINAL:
         return observation.activity.value
     candidate = runtime.candidate(handle)

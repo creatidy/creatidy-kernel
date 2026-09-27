@@ -8,6 +8,7 @@ not hostile-worker isolation. A connection's RPC timeout must be finite as well.
 
 import hashlib
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from creatidy_kernel.adapters.codex_runtime import CodexConnection, CodexInputs, CodexRuntime
@@ -27,6 +28,7 @@ from creatidy_kernel.adapters.reference_forge import deliver_reference_pr
 from creatidy_kernel.adapters.sqlite_store import OperationConflict, ProgramNotFound, SQLiteProgramStore
 from creatidy_kernel.core.domain import ActivateProgram, ProgramStatus, WorkUnitStatus
 from creatidy_kernel.core.execution import (
+    Activity,
     Artifact,
     ArtifactManifest,
     Candidate,
@@ -179,6 +181,7 @@ def run_live_reference(
             ]
             if not pending:
                 accepted = reference_request(store, "acceptance:reference:second")
+                reference_export(store)  # Refuse legacy acceptance with incomplete identity evidence.
                 published = reference_commit(object_source, b"")
                 for node in ("first", "second"):
                     published = reference_commit(
@@ -230,9 +233,9 @@ def run_live_reference(
                 now=int(time.time()),
                 restore=restore,
             )
-            if status in {"unknown", "rejected"}:
+            if status in {"unknown", "rejected", "identity_unavailable"}:
                 break
-        if status not in {"unknown", "rejected"}:
+        if status not in {"unknown", "rejected", "identity_unavailable"}:
             status = "budget_exhausted"
         for attempt in store.load("reference").attempts:
             operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
@@ -254,11 +257,37 @@ def run_live_reference(
                     str(attempt.spec.context_reference),
                     str(attempt.spec.allocation_reference),
                     "owner-approved-reference",
-                    RuntimeIdentity(allocation.model_id, allocation.model_id, None, "reference:v1"),
+                    RuntimeIdentity(allocation.model_id, None, None, "reference:v1"),
                     operation.fence,
                 )
                 runtime.restore(request, operation.accepted_reference)
-                runtime.cancel(operation.accepted_reference)
+                cancellation_id = f"cancel:{attempt.spec.attempt_id}"
+                cancellation = store.intent(
+                    cancellation_id,
+                    cancellation_id,
+                    {"operation": operation.operation_id, "handle": operation.accepted_reference},
+                )
+                if cancellation.attempts == 0:
+                    fence = store.claim(cancellation_id, now=int(time.time()), lease_seconds=1)
+                    # The adapter cannot prove interrupt delivery, even when the RPC returns.
+                    store.observe(cancellation_id, fence, f"uncertain:{cancellation_id}", "unknown")
+                    runtime.cancel(operation.accepted_reference)
+                observation = runtime.observe(operation.accepted_reference, now=int(time.time()))
+                observation_data = manifest_bytes(asdict(observation))
+                store.finalize_artifact(
+                    cancellation_id,
+                    f"observation:{hashlib.sha256(observation_data).hexdigest()}",
+                    observation_data,
+                )
+                if observation.activity is Activity.TERMINAL:
+                    # A terminal target is evidence of stopping, not of interrupt delivery or acceptance.
+                    store.observe(
+                        operation.operation_id,
+                        operation.fence,
+                        f"terminal:{operation.operation_id}",
+                        "terminal",
+                        reference=operation.accepted_reference,
+                    )
         store.intent(
             "interruption:live-budget",
             "interruption:live-budget",

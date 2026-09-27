@@ -140,6 +140,15 @@ hard monetary/token quota. Verification failures pause this reference, whose rem
 zero. The live composition is covered by native-shaped offline fixtures; no live paid-provider or
 remote-Forgejo execution is claimed by the offline suite.
 
+Runtime requests carry requested identity only. Acceptance requires matching runtime-resolved
+identity evidence, retained durably for the exact operation/accepted handle. A receipt-only Codex
+restart cannot reconstruct that resolution from a native thread read: without previously stored
+resolution evidence it reports `identity_unavailable` and cannot accept a candidate. Unknown
+generated-turn attestation remains distinct from verified configuration resolution. Cancellation has
+its own durable operation; once delivery is claimed, restarts observe the target without blindly
+reissuing the interrupt. Exports distinguish uncertain cancellation delivery from an observed terminal
+target, neither of which grants engineering acceptance.
+
 ## Architecture Decisions
 
 | Contract | Document |

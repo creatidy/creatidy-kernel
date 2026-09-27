@@ -738,6 +738,13 @@ class SQLiteProgramStore:
         return f"sha256:{digest}"
 
     def artifact(self, operation_id: str, name: str) -> bytes:
+        data = self.find_artifact(operation_id, name)
+        if data is None:
+            raise OperationConflict("unknown artifact reference")
+        return data
+
+    def find_artifact(self, operation_id: str, name: str) -> bytes | None:
+        """Read optional durable evidence without hiding a corrupt or missing blob."""
         self._assert_writer_thread()
         with self._gate:
             row = self._connection.execute(
@@ -745,7 +752,7 @@ class SQLiteProgramStore:
                 (operation_id, name),
             ).fetchone()
             if row is None:
-                raise OperationConflict("unknown artifact reference")
+                return None
             blob = self._artifact_directory / cast(str, row["digest"])
             self._verify_blob(blob, cast(str, row["digest"]), cast(int, row["size"]))
             return blob.read_bytes()
