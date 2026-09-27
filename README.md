@@ -17,6 +17,11 @@ requires an existing sandbox and scoped credentials. The Forgejo reference adapt
 HTTPS and conditional Git transports for trusted-controller use; if explicitly configured and invoked,
 these can contact Forgejo and perform authorized branch, push and PR effects. The package does not
 run live agents, schedule or autonomously execute Programs or invoke these transports on its own.
+The PR effect uses Forgejo AGit to submit the authorized full commit SHA to the target base with a
+fresh Operation topic. It requires a validated creation receipt and an authoritative read-back of
+the PR's repository, base branch and current exact head; an uncertain push is not retried blindly.
+This is not a merge or deployment capability. The AGit creation mechanism is covered by synthetic
+adapter conformance, not a claimed live integration test.
 
 The SQLite adapter accepts databases only in an existing data directory validated as one supported
 native local Linux filesystem mount. The database and its WAL/SHM/journal siblings must share that

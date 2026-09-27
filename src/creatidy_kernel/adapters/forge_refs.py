@@ -1,12 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """Adapter-boundary syntax shared by fake and controlled Forgejo transports."""
 
-import hashlib
+import base64
 import re
+import secrets
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from creatidy_kernel.core.forge import Effect, ForgeConflict, Reference, effect_marker
+from creatidy_kernel.core.forge import Effect, EffectStatus, ForgeConflict, Reference, effect_marker
+
+AGIT_OPTION_LIMIT = 32768
+
+
+@dataclass(frozen=True, slots=True)
+class AGitPush:
+    status: EffectStatus
+    reference: Reference | None = None
+    reason: str | None = None
+
+
+def fresh_agit_topic() -> str:
+    """Generate once, before persisting the authorized Operation intent."""
+    return f"kernel-pr-{secrets.token_hex(16)}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +107,7 @@ def number(value: str) -> bool:
 
 def pr_payload(effect: Effect, max_bytes: int) -> tuple[str, str, str]:
     """Bound input before marker encoding, hashing or body concatenation."""
+    max_bytes = min(max_bytes, AGIT_OPTION_LIMIT)
     fields = (
         effect.operation.operation_id,
         effect.operation.effect_key,
@@ -105,5 +121,11 @@ def pr_payload(effect: Effect, max_bytes: int) -> tuple[str, str, str]:
     body = f"{effect.body or ''}\n\n{marker}"
     if len(body.encode("utf-8")) + len((effect.title or "").encode("utf-8")) > max_bytes // 2:
         raise ValueError("PR body exceeds local request limit")
-    snapshot = "kernel/snapshots/" + hashlib.sha256(marker.encode("ascii")).hexdigest()
-    return snapshot, body, marker
+    if re.fullmatch(r"kernel-pr-[0-9a-f]{32}", effect.branch) is None:
+        raise ForgeConflict("PR topic must be a durable fresh 128-bit Operation topic")
+    if any(ord(char) < 32 or ord(char) == 127 for char in effect.title or ""):
+        raise ForgeConflict("AGit title must be one line without control characters")
+    description = "{base64}" + base64.b64encode(body.encode("utf-8")).decode("ascii")
+    if len(description.encode("ascii")) + len((effect.title or "").encode("utf-8")) > max_bytes:
+        raise ValueError("AGit push options exceed local request limit")
+    return effect.branch, body, description

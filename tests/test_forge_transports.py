@@ -16,6 +16,7 @@ from unittest.mock import patch
 import pytest
 
 from creatidy_kernel.adapters.fake_forge import SyntheticForgeTransport
+from creatidy_kernel.adapters.forge_refs import pr_payload
 from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.forgejo_transport import (
     ConditionalGitTransport,
@@ -23,11 +24,13 @@ from creatidy_kernel.adapters.forgejo_transport import (
     LocalRequestRefusal,
     run_git_bounded,
 )
-from creatidy_kernel.core.forge import EffectStatus, ForgeConflict, Reference, UnsupportedForge
+from creatidy_kernel.core.execution import OperationKey
+from creatidy_kernel.core.forge import Effect, EffectStatus, ForgeConflict, Reference, UnsupportedForge
 
 REPO = Reference("forgejo:team/project")
 SHA = "a" * 40
 OLD = "b" * 40
+TOPIC = "kernel-pr-" + "1" * 32
 
 
 def bare(tmp_path: Path) -> Path:
@@ -240,6 +243,130 @@ def test_conditional_git_creation_stale_and_uncertainty(tmp_path: Path) -> None:
         ConditionalGitTransport(REPO, "https://forge.invalid/other/repo.git", transport.object_source)
     with pytest.raises(ForgeConflict, match="full Git object ID"):
         transport.compare_and_push(REPO, "new", None, Reference("forgejo:short"))
+
+
+def test_agit_exact_sha_push_and_domain_receipt(tmp_path: Path) -> None:
+    transport = ConditionalGitTransport(REPO, "https://forge.invalid/team/project.git", bare(tmp_path))
+    effect = Effect(
+        OperationKey("op", "key", "digest"),
+        REPO,
+        "pr",
+        TOPIC,
+        revision=Reference(f"forgejo:{SHA}"),
+        base_branch="develop",
+        title="Authorized title",
+        body="multiline\nbody",
+        fence=1,
+        delivery_attempts=1,
+    )
+    _, body, description = pr_payload(effect, 1_000_000)
+    assert description.startswith("{base64}") and "\n" not in description
+    assert "multiline\nbody" in body
+    setup = [CompletedProcess([], 0, "", ""), CompletedProcess([], 0, "", ""), CompletedProcess([], 0, "commit\n", "")]
+    ref = "refs/for/develop"
+    output = f"To https://forge.invalid/team/project.git\n*\t{SHA}:refs/pull/42/head\t[new reference]\nDone\n"
+    with patch("creatidy_kernel.adapters.forgejo_transport.run_git_bounded") as run:
+        run.side_effect = [*setup, CompletedProcess([], 0, output, "")]
+        result = transport.create_agit_pr(
+            REPO, "develop", TOPIC, Reference(f"forgejo:{SHA}"), "Authorized title", description
+        )
+        assert result.status is EffectStatus.ACCEPTED
+        assert result.reference == Reference("forgejo:team/project#42")
+        argv = run.call_args.args[0]
+        assert argv[-3:] == ["--", "https://forge.invalid/team/project.git", f"{SHA}:{ref}"]
+        assert "HEAD" not in argv and "--force" not in argv and "--force-with-lease" not in argv
+        assert "-o" in argv and f"description={description}" in argv and "title=Authorized title" in argv
+        assert f"topic={TOPIC}" in argv
+        for porcelain in (
+            f"To https://forge.invalid/team/project.git\n*\t{SHA}:{ref}\t[new reference]\nDone\n",
+            f"To https://forge.invalid/team/project.git\n*\t{SHA}:refs/pull/42/head\t[new branch]\nDone\n",
+            f"To https://forge.invalid/team/project.git\n*\t{SHA}:refs/pull/42/head\t[new reference]\n"
+            f"*\t{SHA}:refs/pull/43/head\t[new reference]\nDone\n",
+        ):
+            run.side_effect = [*setup, CompletedProcess([], 0, porcelain, "")]
+            assert (
+                transport.create_agit_pr(
+                    REPO, "develop", TOPIC, Reference(f"forgejo:{SHA}"), "Authorized title", description
+                ).status
+                is EffectStatus.UNKNOWN
+            )
+        run.side_effect = [
+            *setup,
+            CompletedProcess(
+                [],
+                0,
+                f"To https://forge.invalid/team/project.git\n*\t{SHA}:{ref}\t[new reference]\nDone\n",
+                "remote: Create a new pull request for 'develop':\n"
+                "remote: https://forge.invalid/team/project/pulls/42\n",
+            ),
+        ]
+        assert (
+            transport.create_agit_pr(
+                REPO, "develop", TOPIC, Reference(f"forgejo:{SHA}"), "Authorized title", description
+            ).status
+            is EffectStatus.UNKNOWN
+        )
+        update = f"To https://forge.invalid/team/project.git\n \t{SHA}:refs/pull/42/head\t{OLD[:7]}..{SHA[:7]}\nDone\n"
+        run.side_effect = [*setup, CompletedProcess([], 0, update, "")]
+        assert (
+            transport.create_agit_pr(
+                REPO, "develop", TOPIC, Reference(f"forgejo:{SHA}"), "Authorized title", description
+            ).status
+            is EffectStatus.REJECTED
+        )
+        run.side_effect = [*setup, CompletedProcess([], 1, "", "remote: permission denied")]
+        assert (
+            transport.create_agit_pr(
+                REPO, "develop", TOPIC, Reference(f"forgejo:{SHA}"), "Authorized title", description
+            ).reason
+            == "permission denied"
+        )
+        run.side_effect = [*setup, CompletedProcess([], 1, "", "remote: AGit disabled")]
+        assert (
+            transport.create_agit_pr(
+                REPO, "develop", TOPIC, Reference(f"forgejo:{SHA}"), "Authorized title", description
+            ).reason
+            == "AGit unsupported"
+        )
+        for message, expected in (
+            ("The new commit is the same as the old commit", "AGit topic collision or update"),
+            (
+                "Updates were rejected because the tip of your current branch is behind its remote counterpart.",
+                "AGit topic collision or update",
+            ),
+            ("User 'author' is not allowed to push to repository 'team/project'.", "permission denied"),
+            ("AGit disabled", "AGit unsupported"),
+            ("The target branch already contains this commit", "AGit domain rejected"),
+        ):
+            rejected = (
+                f"To https://forge.invalid/team/project.git\n!\t{SHA}:{ref}\t[remote rejected] ({message})\nDone\n"
+            )
+            run.side_effect = [*setup, CompletedProcess([], 1, rejected, "")]
+            assert (
+                transport.create_agit_pr(
+                    REPO, "develop", TOPIC, Reference(f"forgejo:{SHA}"), "Authorized title", description
+                ).reason
+                == expected
+            )
+
+
+def test_agit_invalid_topic_and_missing_commit_before_network(tmp_path: Path) -> None:
+    transport = ConditionalGitTransport(REPO, "https://forge.invalid/team/project.git", bare(tmp_path))
+    with pytest.raises(ForgeConflict, match="topic"):
+        transport.create_agit_pr(REPO, "develop", "reused", Reference(f"forgejo:{SHA}"), "Patch", "{base64}YQ==")
+    with patch("creatidy_kernel.adapters.forgejo_transport.run_git_bounded") as run:
+        run.side_effect = [
+            CompletedProcess([], 0, "", ""),
+            CompletedProcess([], 0, "", ""),
+            CompletedProcess([], 1, "", "missing"),
+        ]
+        assert (
+            transport.create_agit_pr(
+                REPO, "develop", TOPIC, Reference(f"forgejo:{SHA}"), "Patch", "{base64}YQ=="
+            ).status
+            is EffectStatus.UNKNOWN
+        )
+        assert run.call_count == 3
 
 
 @pytest.mark.parametrize(
