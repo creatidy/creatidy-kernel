@@ -38,6 +38,7 @@ from creatidy_kernel.core.domain import (
     ProgramSpec,
     ProgramStatus,
 )
+from creatidy_kernel.ports.program_store import OperationRecord
 
 SCHEMA_VERSION = 2
 _APPLICATION_ID = 0x43544B31
@@ -100,20 +101,6 @@ class OperationConflict(SQLiteStoreError):
 
 
 _OBSERVATION_KINDS = frozenset({"accepted", "rejected", "running", "waiting", "terminal", "unknown"})
-
-
-@dataclass(frozen=True, slots=True)
-class OperationRecord:
-    operation_id: str
-    effect_key: str
-    request_digest: str
-    request_json: str
-    fence: int
-    lease_until: int | None
-    status: str
-    accepted_reference: str | None
-    retry_proof: str | None
-    attempts: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,6 +504,13 @@ class SQLiteProgramStore:
                     )
                 )
             )
+
+    def operations(self, prefix: str = "") -> tuple[OperationRecord, ...]:
+        """Return stable operation identities for bounded application recovery/export."""
+        self._assert_writer_thread()
+        with self._gate:
+            rows = self._connection.execute("SELECT operation_id FROM operations ORDER BY operation_id").fetchall()
+            return tuple(self.operation(row["operation_id"]) for row in rows if row["operation_id"].startswith(prefix))
 
     def claim(self, operation_id: str, *, now: int, lease_seconds: int) -> int:
         """Durably record the attempt before the caller can invoke the fake effect seam."""
