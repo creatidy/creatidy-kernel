@@ -7,7 +7,7 @@ software engineering. It is for individual developers and small teams with limit
 premium-model quota and human attention.
 
 **Status: deterministic K1 domain, K2A/K2B durable persistence, synthetic K3 execution boundaries,
-and a bounded Forge port/reference adapter, not an autonomous Program engine.**
+and bounded Forge and Codex Runtime adapters, not an autonomous Program engine.**
 The code includes immutable Program intent, legal domain commands, single-controller SQLite history
 and rebuildable projections, an external-operation journal/outbox with a synthetic effect seam and
 content-addressed artifacts, plus a replaceable resource allocator. Synthetic Runtime, Workspace and
@@ -15,8 +15,13 @@ authority fixtures exercise execution and candidate submission without a live ha
 trusted-development mode is not an OS/container security boundary for hostile code; real isolation
 requires an existing sandbox and scoped credentials. The Forgejo reference adapter includes optional
 HTTPS and conditional Git transports for trusted-controller use; if explicitly configured and invoked,
-these can contact Forgejo and perform authorized branch, push and PR effects. The package does not
-run live agents, schedule or autonomously execute Programs or invoke these transports on its own.
+these can contact Forgejo and perform authorized branch, push and PR effects. The optional Codex
+app-server adapter starts a native thread and turn only when a trusted caller supplies a durable
+Operation claim, pinned Codex version and matching generated-schema method inventory, resolved
+inputs and workspace collection. The native handshake does not advertise supported methods. Unknown
+starts cannot be retried blindly; an accepted thread/turn handle must be stored before waiting, and missing
+recovery or generated-turn identity remains unknown. It neither isolates hostile workers nor accepts
+their results. The package does not schedule or autonomously execute Programs on its own.
 The PR effect uses Forgejo AGit to submit the authorized full commit SHA to the target base with a
 fresh Operation topic. It requires a validated creation receipt and an authoritative read-back of
 the PR's repository, base branch and current exact head; an uncertain push is not retried blindly.

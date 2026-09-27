@@ -1,0 +1,290 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Opt-in Codex app-server stdio transport for a trusted controller only.
+
+The caller owns durable operation identity and reconciliation. A failed request
+can have taken effect remotely; this transport never retries it.
+"""
+
+import json
+import os
+import re
+import selectors
+import signal
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import cast
+
+
+class CodexRPCError(RuntimeError):
+    """A correlated native JSON-RPC domain error."""
+
+
+class CodexStdio:
+    def __init__(
+        self,
+        command: tuple[str, ...],
+        expected_version: str,
+        timeout: int = 15,
+        max_bytes: int = 1_000_000,
+        schema_methods: frozenset[str] = frozenset(),
+        schema_version: str | None = None,
+    ) -> None:
+        if (
+            len(command) != 2
+            or not Path(command[0]).is_absolute()
+            or command[1] != "app-server"
+            or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.+-]+)?", expected_version) is None
+            or type(timeout) is not int
+            or timeout <= 0
+            or type(max_bytes) is not int
+            or max_bytes <= 0
+            or type(schema_methods) is not frozenset
+            or any(type(method) is not str or not method for method in schema_methods)
+            or (schema_methods and schema_version != expected_version)
+        ):
+            raise ValueError("absolute Codex app-server command, pinned version and finite limits required")
+        self.timeout = timeout
+        self.max_bytes = max_bytes
+        self._lock = threading.Lock()
+        self._pending = bytearray()
+        self._notifications: list[dict[str, object]] = []
+        self._notification_bytes = 0
+        self._next_id = 1
+        self._process: subprocess.Popen[bytes] | None = None
+        self._version = expected_version
+        # initialize supplies no native method inventory. A trusted caller must
+        # supply the method inventory from the schema generated for this binary.
+        self._methods = schema_methods
+
+        version_process = subprocess.Popen(  # noqa: S603 - explicit trusted absolute executable, no shell.
+            (command[0], "--version"), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True
+        )
+        try:
+            output = self._version_output(version_process)
+        finally:
+            self._stop(version_process)
+        if output != f"codex-cli {expected_version}" and output != f"codex {expected_version}":
+            raise ValueError("Codex executable version does not match expected_version")
+
+        try:
+            self._process = subprocess.Popen(  # noqa: S603 - explicit trusted absolute executable, no shell.
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self._exchange(
+                "initialize",
+                {"clientInfo": {"name": "creatidy_kernel", "title": "Creatidy Kernel", "version": "0.0.1"}},
+            )
+            self._send({"method": "initialized", "params": {}}, time.monotonic() + self.timeout)
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def version(self) -> str:
+        return self._version
+
+    @property
+    def methods(self) -> frozenset[str]:
+        return self._methods
+
+    def _stop(self, process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=self.timeout)
+        else:
+            process.wait()
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.stdout is not None:
+            process.stdout.close()
+
+    def _version_output(self, process: subprocess.Popen[bytes]) -> str:
+        if process.stdout is None:
+            raise OSError("Codex version output unavailable")
+        deadline = time.monotonic() + self.timeout
+        data = bytearray()
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise TimeoutError("Codex version check timed out")
+                chunk = os.read(process.stdout.fileno(), min(8192, self.max_bytes + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > self.max_bytes:
+                    raise OverflowError("Codex version output exceeds limit")
+        process.wait(timeout=max(0, deadline - time.monotonic()))
+        if process.returncode != 0:
+            raise OSError("Codex version check failed")
+        return data.decode("utf-8").strip()
+
+    def _send(self, message: dict[str, object], deadline: float) -> None:
+        process = self._process
+        if process is None or process.stdin is None:
+            raise OSError("Codex transport closed")
+        data = json.dumps(message, allow_nan=False, separators=(",", ":")).encode("utf-8") + b"\n"
+        if len(data) > self.max_bytes:
+            raise ValueError("Codex request exceeds limit")
+        fd = process.stdin.fileno()
+        os.set_blocking(fd, False)
+        with selectors.DefaultSelector() as selector:
+            selector.register(fd, selectors.EVENT_WRITE)
+            view = memoryview(data)
+            while view:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise TimeoutError("Codex request write timed out")
+                try:
+                    count = os.write(fd, view)
+                except BlockingIOError:
+                    continue
+                view = view[count:]
+
+    def _read_line(self, deadline: float) -> bytes:
+        process = self._process
+        if process is None or process.stdout is None:
+            raise OSError("Codex transport closed")
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while b"\n" not in self._pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise TimeoutError("Codex response timed out")
+                chunk = os.read(process.stdout.fileno(), min(8192, self.max_bytes + 1 - len(self._pending)))
+                if not chunk:
+                    raise OSError("Codex stdout closed before response")
+                self._pending.extend(chunk)
+                if len(self._pending) > self.max_bytes:
+                    raise OverflowError("Codex response exceeds limit")
+            line, _, rest = self._pending.partition(b"\n")
+            self._pending = bytearray(rest)
+            return bytes(line)
+
+    def _decode(self, line: bytes) -> dict[str, object]:
+        message: object = json.loads(line)
+        if not isinstance(message, dict):
+            raise OSError("invalid Codex JSON-RPC message")
+        obj = cast(dict[object, object], message)
+        if not all(isinstance(key, str) for key in obj):
+            raise OSError("invalid Codex JSON-RPC message")
+        obj = cast(dict[str, object], message)
+        if "jsonrpc" in obj and obj["jsonrpc"] != "2.0":
+            raise OSError("invalid Codex JSON-RPC version")
+        return obj
+
+    def _buffer_notification(self, obj: dict[str, object], size: int) -> None:
+        if not isinstance(obj.get("method"), str) or "id" in obj:
+            raise OSError("unsupported Codex server request")
+        self._notification_bytes += size
+        if self._notification_bytes > self.max_bytes:
+            raise OverflowError("Codex notification buffer exceeds limit")
+        self._notifications.append(obj)
+
+    def _exchange(self, method: str, params: dict[str, object]) -> dict[str, object]:
+        identifier = self._next_id
+        self._next_id += 1
+        deadline = time.monotonic() + self.timeout
+        self._send({"method": method, "id": identifier, "params": params}, deadline)
+        consumed = 0
+        while True:
+            line = self._read_line(deadline)
+            consumed += len(line) + 1
+            if consumed > self.max_bytes:
+                raise OverflowError("Codex exchange exceeds limit")
+            obj = self._decode(line)
+            if "method" in obj:
+                self._buffer_notification(obj, len(line) + 1)
+                continue
+            if type(obj.get("id")) is not int or obj["id"] != identifier:
+                raise OSError("uncorrelated Codex response")
+            if "error" in obj:
+                error = obj["error"]
+                if not isinstance(error, dict):
+                    raise OSError("invalid Codex RPC error")
+                error_obj = cast(dict[str, object], error)
+                if type(error_obj.get("code")) is not int or not isinstance(error_obj.get("message"), str):
+                    raise OSError("invalid Codex RPC error")
+                raise CodexRPCError(f"Codex RPC error {error_obj['code']}: {error_obj['message']}")
+            result = obj.get("result")
+            if not isinstance(result, dict):
+                raise OSError("invalid Codex RPC result")
+            return cast(dict[str, object], result)
+
+    def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+        if not method or method in {"initialize", "initialized"}:
+            raise ValueError("invalid Codex request")
+        with self._lock:
+            if self._process is None:
+                raise OSError("Codex transport closed; reconcile before another request")
+            try:
+                return self._exchange(method, params)
+            except CodexRPCError:
+                raise
+            except (ValueError, TypeError) as error:
+                if isinstance(error, (json.JSONDecodeError, UnicodeError)):
+                    self._close_unlocked()
+                # Local encoding/size refusal occurs before writing any bytes.
+                raise
+            except BaseException:
+                self._close_unlocked()
+                raise
+
+    def notifications(self) -> tuple[dict[str, object], ...]:
+        with self._lock:
+            process = self._process
+            if process is not None and process.stdout is not None:
+                try:
+                    with selectors.DefaultSelector() as selector:
+                        selector.register(process.stdout, selectors.EVENT_READ)
+                        deadline = time.monotonic() + self.timeout
+                        received = 0
+                        while selector.select(0):
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError("Codex notification drain timed out")
+                            chunk = os.read(
+                                process.stdout.fileno(), min(8192, self.max_bytes + 1 - received - len(self._pending))
+                            )
+                            if not chunk:
+                                raise OSError("Codex stdout closed")
+                            received += len(chunk)
+                            self._pending.extend(chunk)
+                            if received + len(self._pending) > self.max_bytes:
+                                raise OverflowError("Codex response exceeds limit")
+                    while b"\n" in self._pending:
+                        line, _, rest = self._pending.partition(b"\n")
+                        self._pending = bytearray(rest)
+                        self._buffer_notification(self._decode(bytes(line)), len(line) + 1)
+                except BaseException:
+                    self._close_unlocked()
+                    raise
+            messages = tuple(self._notifications)
+            self._notifications.clear()
+            self._notification_bytes = 0
+            return messages
+
+    def _close_unlocked(self) -> None:
+        process, self._process = self._process, None
+        if process is not None:
+            self._stop(process)
+
+    def close(self) -> None:
+        with self._lock:
+            self._close_unlocked()
