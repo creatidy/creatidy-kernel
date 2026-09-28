@@ -88,3 +88,95 @@ def test_cli_resumes_after_runtime_fault(
     assert recovered["status"] == "completed"
     assert len(recovered["attempts"]) == 2
     assert recovered["interruptions"][0]["boundary"] == boundary
+
+
+def test_cli_dogfood_requires_complete_live_configuration(capsys: pytest.CaptureFixture[str]) -> None:
+    with patch.dict("os.environ", {}, clear=True):
+        assert (
+            main(
+                [
+                    "dogfood",
+                    "run",
+                    "--data-dir",
+                    "state",
+                    "--repo",
+                    "/var/empty/repo",
+                    "--approve",
+                    "--trusted-development",
+                ]
+            )
+            == 1
+        )
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "missing: CREATIDY_DOGFOOD" in output.err
+
+
+def test_cli_dogfood_does_not_invent_approval(capsys: pytest.CaptureFixture[str]) -> None:
+    environment = {
+        "CREATIDY_DOGFOOD_ROUTER_URL": "https://router.invalid",
+        "CREATIDY_DOGFOOD_RUNTIME_BINDING": "zai/glm-5.3",
+        "CREATIDY_DOGFOOD_CODEX_BIN": "/usr/local/bin/codex",
+        "CREATIDY_DOGFOOD_CODEX_VERSION": "0.45.0",
+        "CREATIDY_DOGFOOD_FORGE_API": "https://forge.invalid/api/v1",
+        "CREATIDY_DOGFOOD_FORGE_REMOTE": "https://forge.invalid/BioMedical-IT/scarcity-router.git",
+        "CREATIDY_DOGFOOD_FORGE_TOKEN": "synthetic-token",
+    }
+    with patch.dict("os.environ", environment, clear=True):
+        assert main(["dogfood", "run", "--data-dir", "state", "--repo", "/var/empty/repo"]) == 1
+    output = capsys.readouterr()
+    assert "--approve" in output.err
+
+
+def test_cli_dogfood_status_reports_missing_database(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["dogfood", "status", "--data-dir", str(tmp_path / "none")]) == 1
+    assert "dogfood database does not exist" in capsys.readouterr().err
+
+
+def test_cli_dogfood_run_prints_lifecycle(sqlite_tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from test_dogfood import ALLOCATION, FixtureConnection, deflake_edit, fixture_task, make_forge, make_source
+
+    from creatidy_kernel.adapters.dogfood import DogfoodLiveComponents, DogfoodTaskSpec
+    from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
+    from creatidy_kernel.adapters.reference import reference_git
+
+    source = make_source(sqlite_tmp_path)
+    base = reference_git(source, "rev-parse", "refs/heads/develop")
+    forge, _transport = make_forge(base)
+    connection = FixtureConnection(deflake_edit)
+    components = DogfoodLiveComponents(
+        allocator=FixedAllocator(ALLOCATION),
+        connection_factory=lambda: connection,
+        forge_factory=lambda _directory: forge,
+    )
+
+    def task(expected_base_sha: str | None = None) -> DogfoodTaskSpec:
+        return fixture_task(expected_base_sha=expected_base_sha)
+
+    tasks = {"143": task}
+    control = sqlite_tmp_path / "control"
+    with (
+        patch("creatidy_kernel.adapters.cli.compose_dogfood_live", return_value=components),
+        patch("creatidy_kernel.adapters.cli.DOGFOOD_TASKS", tasks),
+    ):
+        assert (
+            main(
+                [
+                    "dogfood",
+                    "run",
+                    "--data-dir",
+                    str(control),
+                    "--repo",
+                    str(source),
+                    "--task",
+                    "143",
+                    "--approve",
+                    "--trusted-development",
+                ]
+            )
+            == 0
+        )
+    output = capsys.readouterr().out
+    assert "task admitted: owner-approved frozen dogfood task" in output
+    assert "NO MERGE / NO DEPLOY" in output
+    assert "condition=accepted" in output

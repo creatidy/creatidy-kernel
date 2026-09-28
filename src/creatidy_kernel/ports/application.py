@@ -81,6 +81,7 @@ def advance_work_unit(
     now: int,
     fault: Callable[[str], None] = lambda _: None,
     restore: Callable[[ExecutionRequest, str], None] | None = None,
+    artifact_path: str = "result.txt",
 ) -> str:
     """Perform at most one dispatch/observation, never retry an uncertain effect blindly.
 
@@ -303,7 +304,7 @@ def advance_work_unit(
         )
     unit = program.spec.work_unit(unit_id)
     proposal = CandidateResult(
-        f"candidate:{attempt_id}", candidate, tuple((name, "result.txt") for name in sorted(unit.outputs))
+        f"candidate:{attempt_id}", candidate, tuple((name, artifact_path) for name in sorted(unit.outputs))
     )
     result = verify_candidate(
         program,

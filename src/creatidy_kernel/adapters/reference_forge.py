@@ -62,6 +62,10 @@ def deliver_reference_pr(
     forge: Forge | None = None,
     repository: Reference = SYNTHETIC_REPOSITORY,
     base_branch: str = "develop",
+    operation_id: str = PR_OPERATION,
+    schema: str = "reference-pr-v1",
+    title: str = "Bounded two-node reference result",
+    body: str | None = None,
 ) -> dict[str, object]:
     """Called by the trusted application only after exact-head acceptance.
 
@@ -74,16 +78,18 @@ def deliver_reference_pr(
         raise ForgeConflict("PR creation requires an accepted-result reference")
     if forge is None and repository != SYNTHETIC_REPOSITORY:
         raise ForgeConflict("synthetic forge cannot represent a live repository")
+    if body is None:
+        body = f"Accepted result: {acceptance_reference}. No merge or deployment authorized."
     mode = "synthetic" if forge is None else "live"
     request: dict[str, object]
     try:
-        operation = store.operation(PR_OPERATION)
+        operation = store.operation(operation_id)
         request = cast(dict[str, object], json.loads(operation.request_json)["request"])
     except OperationConflict as error:
         if str(error) != "unknown operation":
             raise
         request = {
-            "schema": "reference-pr-v1",
+            "schema": schema,
             "mode": mode,
             "repository": repository.value,
             "head": head,
@@ -91,7 +97,7 @@ def deliver_reference_pr(
             "acceptance_reference": acceptance_reference,
             "topic": fresh_agit_topic(),
         }
-        operation = store.intent(PR_OPERATION, PR_OPERATION, request)
+        operation = store.intent(operation_id, operation_id, request)
     expected = (mode, repository.value, head, base_branch, acceptance_reference)
     if (
         tuple(request.get(key) for key in ("mode", "repository", "head", "base_branch", "acceptance_reference"))
@@ -100,7 +106,7 @@ def deliver_reference_pr(
         raise ForgeConflict("PR request differs from the durable accepted subject")
     result: dict[str, object] = {
         "mode": mode,
-        "operation_id": PR_OPERATION,
+        "operation_id": operation_id,
         "head": head,
         "status": operation.status,
         "reference": operation.accepted_reference,
@@ -112,8 +118,8 @@ def deliver_reference_pr(
     now = int(time.time())
     first_delivery = operation.attempts == 0
     if first_delivery:
-        store.claim(PR_OPERATION, now=now, lease_seconds=1)
-        operation = store.operation(PR_OPERATION)
+        store.claim(operation_id, now=now, lease_seconds=1)
+        operation = store.operation(operation_id)
     effect = Effect(
         OperationKey(operation.operation_id, operation.effect_key, operation.request_digest),
         repository,
@@ -121,8 +127,8 @@ def deliver_reference_pr(
         str(request["topic"]),
         revision=Reference(f"forgejo:{head}"),
         base_branch=base_branch,
-        title="Bounded two-node reference result",
-        body=f"Accepted result: {acceptance_reference}. No merge or deployment authorized.",
+        title=title,
+        body=body,
         fence=operation.fence,
         delivery_attempts=operation.attempts,
     )
@@ -138,27 +144,27 @@ def deliver_reference_pr(
             if fault == "pr-send":
                 return {**result, "status": "unknown", "interrupted": "pr-send"}
             if receipt.reference is not None:
-                store.finalize_artifact(PR_OPERATION, "known-reference", receipt.reference.value.encode())
+                store.finalize_artifact(operation_id, "known-reference", receipt.reference.value.encode())
             if receipt.status is EffectStatus.ACCEPTED and receipt.reference is not None:
                 store.observe(
-                    PR_OPERATION,
+                    operation_id,
                     operation.fence,
                     "reference:pr:accepted",
                     "accepted",
                     reference=receipt.reference.value,
                 )
             elif receipt.status in {EffectStatus.REJECTED, EffectStatus.STALE}:
-                store.observe(PR_OPERATION, operation.fence, "reference:pr:rejected", "rejected")
+                store.observe(operation_id, operation.fence, "reference:pr:rejected", "rejected")
             else:
-                store.observe(PR_OPERATION, operation.fence, "reference:pr:unknown", "unknown")
+                store.observe(operation_id, operation.fence, "reference:pr:unknown", "unknown")
         else:
-            known = _artifact(store, PR_OPERATION, "known-reference")
+            known = _artifact(store, operation_id, "known-reference")
             reference = operation.accepted_reference or (known.decode() if known is not None else None)
             receipt = forge.reconcile(effect, Reference(reference) if reference else None)
             if operation.status in {"dispatched", "unknown"} and (operation.lease_until or 0) <= now:
                 recovered = receipt.status is EffectStatus.ACCEPTED and receipt.reference is not None
                 store.reconcile(
-                    PR_OPERATION,
+                    operation_id,
                     operation.fence,
                     "found" if recovered else "unknown",
                     now=now,
@@ -166,7 +172,7 @@ def deliver_reference_pr(
                     reference=receipt.reference.value if recovered and receipt.reference is not None else None,
                     matched_digest=operation.request_digest if recovered else None,
                 )
-        return _result(result, receipt, fault, store.operation(PR_OPERATION).status)
+        return _result(result, receipt, fault, store.operation(operation_id).status)
 
 
 def _result(original: dict[str, object], receipt: Receipt, fault: str | None, durable_status: str) -> dict[str, object]:

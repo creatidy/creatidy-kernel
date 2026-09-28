@@ -29,8 +29,11 @@ from creatidy_kernel.ports.execution import Runtime
 
 
 class CodexConnection(Protocol):
-    version: str
-    methods: frozenset[str]
+    @property
+    def version(self) -> str: ...
+
+    @property
+    def methods(self) -> frozenset[str]: ...
 
     def request(self, method: str, params: dict[str, object]) -> dict[str, object]: ...
 
