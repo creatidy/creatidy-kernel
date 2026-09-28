@@ -156,6 +156,9 @@ target, neither of which grants engineering acceptance.
 `POST /v1/select` (machine-interface v1 with D-057 explicit effort). Configure a bare Router
 origin and exact supported Runtime bindings; an optional bearer credential travels only in the
 request header. Non-loopback traffic requires verified HTTPS, and redirects are refused. The
+echoed-credential check is deliberately conservative: use an opaque secret, not a public model
+name, effort label or short common string that may also occur in legitimate decision text. A
+response containing the configured credential is refused, never persisted as provenance. The
 adapter maps the bounded reference capability/context request to public hard requirements;
 unsupported capability identifiers fail explicitly. It never ranks alternatives or falls back to
 FixedAllocator. A valid selection is independently checked against the configured Runtime's exact
@@ -180,6 +183,10 @@ requires a controller-configured `supported_efforts` set of `(provider, model, e
 evidenced against the pinned native runtime version, not inferred from the recommendation.
 Codex receives explicit thread configuration and turn effort, verifies its thread configuration
 receipt, and retains resolved evidence separately from unknown generated-turn attestation.
+The native handle and its configuration snapshot are published together before the runtime
+receipt is accepted. Recovery replays that durable snapshot if a process stops before receipt
+acceptance or before the separate identity artifact is published. Known later observations must
+not contradict the original resolution, including when Allocation effort was unconfigured.
 `run_reference(..., allocator=...)` supports offline substitution; `run_live_reference` accepts
 exactly one `allocation` or `allocator`. Native-shaped tests prove the two-WorkUnit flow without
 paid inference; the CLI remains fixed/offline by default. Program acceptance and the separate AGit

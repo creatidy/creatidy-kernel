@@ -39,6 +39,7 @@ from creatidy_kernel.core.verification import (
 from creatidy_kernel.ports.allocation import (
     decode_allocation,
     decode_identity,
+    decode_runtime_receipt,
     encode_allocation,
     identity_matches,
     is_legacy_allocation,
@@ -148,6 +149,25 @@ def advance_work_unit(
     operation = store.operation(operation_id)
     key = OperationKey(operation_id, operation.effect_key, operation.request_digest)
     fault("commit")
+    receipt_identity: RuntimeIdentity | None = None
+    receipt = store.find_artifact(operation_id, "runtime-receipt")
+    if receipt is not None:
+        receipt_handle, receipt_fence, receipt_identity = decode_runtime_receipt(receipt)
+        if (
+            receipt_fence != operation.fence
+            or operation.accepted_reference not in (None, receipt_handle)
+            or not identity_matches(
+                receipt_identity, allocation, attempt.agent_definition_reference, require_resolved=False, legacy=legacy
+            )
+        ):
+            raise ValueError("runtime receipt differs from original execution")
+        if operation.accepted_reference is None:
+            if operation.status not in {"dispatched", "unknown"} or operation.retry_proof is not None:
+                raise ValueError("runtime receipt has no matching delivery")
+            store.record_transport(operation_id, receipt_fence, True)
+            operation = store.observe(
+                operation_id, receipt_fence, f"accepted:{receipt_handle}", "accepted", reference=receipt_handle
+            )
     if operation.status in {"dispatched", "unknown"}:
         if operation.lease_until is not None and now < operation.lease_until:
             return "waiting"
@@ -187,6 +207,20 @@ def advance_work_unit(
         )
         handle = runtime.start(request)
         fault("send")
+        # Publish the native handle and configuration together before accepting
+        # the receipt. A process crash cannot retain one while losing the other.
+        started = runtime.observe(handle, now=now)
+        if started.handle != handle or not identity_matches(
+            started.identity, allocation, attempt.agent_definition_reference, require_resolved=False, legacy=legacy
+        ):
+            return "identity_unavailable"
+        receipt_identity = started.identity
+        store.finalize_artifact(
+            operation_id,
+            "runtime-receipt",
+            manifest_bytes({"version": 1, "handle": handle, "fence": fence, "identity": asdict(receipt_identity)}),
+        )
+        fault("receipt-evidence")
         store.record_transport(operation_id, fence, True)
         operation = store.observe(operation_id, fence, f"accepted:{handle}", "accepted", reference=handle)
         fault("receipt")
@@ -220,16 +254,24 @@ def advance_work_unit(
     )
     identity = observation.identity
     if observation.handle != handle or not identity_matches(
-        identity, allocation, attempt.agent_definition_reference, require_resolved=False, legacy=legacy
+        identity,
+        allocation,
+        attempt.agent_definition_reference,
+        require_resolved=False,
+        legacy=legacy,
+        recorded=receipt_identity,
     ):
         return "identity_unavailable"
     persisted_identity = store.find_artifact(operation_id, "identity")
     if persisted_identity is None:
+        original = (
+            receipt_identity if receipt_identity is not None and receipt_identity.resolved is not None else identity
+        )
         if not identity_matches(
-            identity, allocation, attempt.agent_definition_reference, require_resolved=True, legacy=legacy
+            original, allocation, attempt.agent_definition_reference, require_resolved=True, legacy=legacy
         ):
             return "identity_unavailable"
-        store.finalize_artifact(operation_id, "identity", manifest_bytes(asdict(identity)))
+        store.finalize_artifact(operation_id, "identity", manifest_bytes(asdict(original)))
     else:
         # The immutable Operation owns the accepted handle and its original runtime
         # resolution. A restored adapter's unknown identity cannot erase that fact.
@@ -239,6 +281,13 @@ def advance_work_unit(
             return "identity_unavailable"
         if not identity_matches(
             recorded, allocation, attempt.agent_definition_reference, require_resolved=True, legacy=legacy
+        ) or not identity_matches(
+            identity,
+            allocation,
+            attempt.agent_definition_reference,
+            require_resolved=False,
+            legacy=legacy,
+            recorded=recorded,
         ):
             return "identity_unavailable"
     if observation.activity is not Activity.TERMINAL:

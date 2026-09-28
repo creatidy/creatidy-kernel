@@ -57,7 +57,7 @@ def live_scenario(directory: Path) -> tuple[Connection, Callable[[], dict[str, o
     return connection, run
 
 
-def test_codex_receipt_crash_cannot_accept_without_resolved_identity(
+def test_codex_receipt_crash_recovers_original_resolution_before_identity_publication(
     sqlite_tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -94,11 +94,47 @@ def test_codex_receipt_crash_cannot_accept_without_resolved_identity(
     with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
         assert store.operation("runtime:reference:first").accepted_reference == "codex:thread-1:turn-1"
         assert store.find_artifact("runtime:reference:first", "identity") is None
+        assert store.find_artifact("runtime:reference:first", "runtime-receipt") is not None
     result = run()
-    assert result["condition"] == "identity_unavailable"
-    assert result["status"] == "active" and result["accepted"] == []
+    assert result["status"] == "completed"
+    assert connection.starts == 2
+    identity = cast(dict[str, object], cast(list[dict[str, object]], result["attempts"])[0]["identity"])
+    assert identity["resolved"] == "model" and identity["observed"] is None
+
+
+def test_legacy_native_receipt_without_resolution_evidence_still_fails_closed(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("creatidy_kernel.adapters.reference_live.time.time", lambda: 10)
+    connection, run = live_scenario(sqlite_tmp_path)
+    observe = SQLiteProgramStore.observe
+
+    def crash_after_receipt(
+        store: SQLiteProgramStore,
+        operation_id: str,
+        fence: int,
+        observation_id: str,
+        kind: str,
+        *,
+        reference: str | None = None,
+    ) -> OperationRecord:
+        result = observe(store, operation_id, fence, observation_id, kind, reference=reference)
+        if kind == "accepted":
+            raise ReferenceInterrupted("legacy receipt without configuration")
+        return result
+
+    with patch.object(SQLiteProgramStore, "observe", crash_after_receipt):
+        with pytest.raises(ReferenceInterrupted):
+            run()
+    find = SQLiteProgramStore.find_artifact
+
+    def legacy_artifacts(store: SQLiteProgramStore, operation_id: str, name: str) -> bytes | None:
+        return None if name == "runtime-receipt" else find(store, operation_id, name)
+
+    with patch.object(SQLiteProgramStore, "find_artifact", legacy_artifacts):
+        result = run()
+    assert result["condition"] == "identity_unavailable" and result["accepted"] == []
     assert connection.starts == 1
-    assert cast(list[dict[str, object]], result["attempts"])[0]["identity"] is None
 
 
 def test_codex_restart_uses_original_durable_resolution_not_a_guessed_model(

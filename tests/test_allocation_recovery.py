@@ -38,6 +38,7 @@ from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, Re
 from creatidy_kernel.ports.allocation import (
     decode_allocation,
     decode_identity,
+    decode_runtime_receipt,
     encode_allocation,
     identity_matches,
     is_legacy_allocation,
@@ -149,7 +150,9 @@ def step(
     )
 
 
-@pytest.mark.parametrize("fault", ["prepared", "allocation", "artifacts", "started", "commit", "send", "receipt"])
+@pytest.mark.parametrize(
+    "fault", ["prepared", "allocation", "artifacts", "started", "commit", "send", "receipt-evidence", "receipt"]
+)
 @pytest.mark.parametrize("replacement", [None, replace(SELECTED, model_id="different", reasoning_effort="low")])
 def test_every_committed_boundary_recovers_without_selection(
     sqlite_tmp_path: Path,
@@ -436,3 +439,59 @@ def test_allocation_codec_and_identity_default_effort() -> None:
     )
     assert identity_matches(identity, allocation, "reference:v1", require_resolved=True)
     assert decode_identity(manifest_bytes(asdict(identity))) == identity
+
+
+@pytest.mark.parametrize("value", ["", " ", 1, False, {}, []])
+def test_unconfigured_effort_still_requires_well_formed_identity(value: object) -> None:
+    selected = replace(SELECTED, reasoning_effort=None)
+    identity = RuntimeIdentity(
+        "model",
+        "model",
+        None,
+        "reference:v1",
+        requested_provider="provider",
+        resolved_provider="provider",
+        resolved_effort=cast(str, value),
+    )
+    assert not identity_matches(identity, selected, "reference:v1", require_resolved=True)
+
+
+def test_unconfigured_effort_does_not_allow_changed_resolution_or_observation(sqlite_tmp_path: Path) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
+        initial(store)
+        selected = replace(SELECTED, reasoning_effort=None)
+        runtime = RecordingRuntime()
+        runtime.override = RuntimeIdentity(
+            "model",
+            "model",
+            None,
+            "reference:v1",
+            requested_provider="provider",
+            resolved_provider="provider",
+            resolved_effort="high",
+        )
+        assert step(store, CountingAllocator(selected), runtime) == "running"
+        original = store.artifact(OPERATION, "identity")
+        runtime.override = replace(runtime.override, resolved_effort=None)
+        assert step(store, CountingAllocator(None), runtime) == "running"
+        unknown = runtime.override
+        assert unknown is not None
+        for change in ({"resolved_effort": "low"}, {"observed_effort": "low"}):
+            runtime.override = replace(unknown, **change)
+            assert step(store, CountingAllocator(None), runtime) == "identity_unavailable"
+            assert store.artifact(OPERATION, "identity") == original
+
+
+@pytest.mark.parametrize(
+    "field,value", [("version", True), ("version", 2), ("fence", 0), ("fence", False), ("handle", ""), ("identity", {})]
+)
+def test_runtime_receipt_codec_fails_closed(field: str, value: object) -> None:
+    document: dict[str, object] = {
+        "version": 1,
+        "handle": "native-handle",
+        "fence": 1,
+        "identity": asdict(RuntimeIdentity("model", None, None, "reference:v1")),
+    }
+    document[field] = value
+    with pytest.raises(ValueError):
+        decode_runtime_receipt(manifest_bytes(document))

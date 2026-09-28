@@ -168,6 +168,23 @@ def decode_identity(data: bytes) -> RuntimeIdentity:
     )
 
 
+def decode_runtime_receipt(data: bytes) -> tuple[str, int, RuntimeIdentity]:
+    """The native handle and configuration snapshot are one durable publication."""
+    payload = _object(data)
+    if (
+        set(payload) != {"version", "handle", "fence", "identity"}
+        or type(payload["version"]) is not int
+        or payload["version"] != 1
+        or type(payload["handle"]) is not str
+        or not payload["handle"].strip()
+        or type(payload["fence"]) is not int
+        or payload["fence"] <= 0
+    ):
+        raise ValueError("invalid durable runtime receipt")
+    identity = decode_identity(json.dumps(payload["identity"], allow_nan=False).encode())
+    return payload["handle"], payload["fence"], identity
+
+
 def identity_matches(
     identity: RuntimeIdentity,
     allocation: Allocation,
@@ -175,11 +192,18 @@ def identity_matches(
     *,
     require_resolved: bool,
     legacy: bool = False,
+    recorded: RuntimeIdentity | None = None,
 ) -> bool:
     """Unknown observations stay unknown; selected config requires actual resolution evidence."""
     legacy = legacy and all(
         value is None for value in (allocation.reasoning_effort, allocation.variant, allocation.decision_provenance)
     )
+    if any(
+        type(value) is not str or not value.strip()
+        for key, value in asdict(identity).items()
+        if value is not None or key in {"requested", "agent_definition_version"}
+    ):
+        return False
     if (
         identity.requested != allocation.model_id
         or identity.agent_definition_version != agent_definition
@@ -194,8 +218,30 @@ def identity_matches(
     ):
         return False
     effort = allocation.reasoning_effort
-    return effort is None or (
+    if effort is not None and not (
         identity.resolved_effort in (None, effort)
         and identity.observed_effort in (None, effort)
         and (not require_resolved or identity.resolved_effort == effort)
-    )
+    ):
+        return False
+    if (
+        identity.resolved_effort is not None
+        and identity.observed_effort is not None
+        and identity.resolved_effort != identity.observed_effort
+    ):
+        return False
+    if recorded is not None:
+        for current, original in (
+            ((identity.resolved, identity.observed), (recorded.resolved, recorded.observed)),
+            (
+                (identity.resolved_provider, identity.observed_provider),
+                (recorded.resolved_provider, recorded.observed_provider),
+            ),
+            (
+                (identity.resolved_effort, identity.observed_effort),
+                (recorded.resolved_effort, recorded.observed_effort),
+            ),
+        ):
+            if any(left != right for left in current for right in original if left is not None and right is not None):
+                return False
+    return True

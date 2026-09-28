@@ -25,6 +25,7 @@ from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.domain import DomainCommandType, Program
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable
+from creatidy_kernel.ports.program_store import OperationRecord
 
 pytest_plugins = ["test_sqlite_store"]
 
@@ -172,21 +173,51 @@ def test_router_native_two_work_unit_proof(sqlite_tmp_path: Path, monkeypatch: p
 
 
 @pytest.mark.parametrize("router_change", ["outage", "different"])
+@pytest.mark.parametrize("boundary", ["receipt-evidence", "receipt", "identity"])
 def test_restart_uses_original_native_allocation_without_router(
-    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, router_change: str
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, router_change: str, boundary: str
 ) -> None:
     recommendations, connection, transport, run = scenario(sqlite_tmp_path, monkeypatch)
     finalize = SQLiteProgramStore.finalize_artifact
 
     def crash_after_identity(store: SQLiteProgramStore, operation: str, name: str, data: bytes) -> str:
         result = finalize(store, operation, name, data)
-        if operation == "runtime:reference:first" and name == "identity":
+        if operation == "runtime:reference:first" and (
+            (boundary == "identity" and name == "identity")
+            or (boundary == "receipt-evidence" and name == "runtime-receipt")
+        ):
             raise ReferenceInterrupted("native configuration evidence is durable")
         return result
 
-    with patch.object(SQLiteProgramStore, "finalize_artifact", crash_after_identity):
+    observe = SQLiteProgramStore.observe
+
+    def crash_after_receipt(
+        store: SQLiteProgramStore,
+        operation_id: str,
+        fence: int,
+        observation_id: str,
+        kind: str,
+        *,
+        reference: str | None = None,
+    ) -> OperationRecord:
+        result = observe(store, operation_id, fence, observation_id, kind, reference=reference)
+        if boundary == "receipt" and operation_id == "runtime:reference:first" and kind == "accepted":
+            raise ReferenceInterrupted("receipt accepted before identity artifact publication")
+        return result
+
+    with (
+        patch.object(SQLiteProgramStore, "finalize_artifact", crash_after_identity),
+        patch.object(SQLiteProgramStore, "observe", crash_after_receipt),
+    ):
         with pytest.raises(ReferenceInterrupted):
             run()
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
+        assert store.find_artifact("runtime:reference:first", "runtime-receipt") is not None
+        if boundary != "identity":
+            assert store.find_artifact("runtime:reference:first", "identity") is None
+        assert (store.operation("runtime:reference:first").accepted_reference is None) == (
+            boundary == "receipt-evidence"
+        )
     before = cast(list[dict[str, object]], export_reference(sqlite_tmp_path)["attempts"])[0]["allocation"]
     assert recommendations.calls == connection.starts == connection.turns == 1
     if router_change == "outage":
