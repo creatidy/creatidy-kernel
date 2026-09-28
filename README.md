@@ -7,7 +7,8 @@ software engineering. It is for individual developers and small teams with limit
 premium-model quota and human attention.
 
 **Status: deterministic domain, durable persistence, bounded Forge and Codex Runtime adapters,
-and an offline two-node CLI reference flow, not a general autonomous Program engine.**
+an offline two-node CLI reference flow, and an experimental owner-approved dogfood path for one
+frozen real task, not a general autonomous Program engine.**
 The code includes immutable Program intent, legal domain commands, single-controller SQLite history
 and rebuildable projections, an external-operation journal/outbox with a synthetic effect seam and
 content-addressed artifacts, plus a replaceable resource allocator. Synthetic Runtime, Workspace and
@@ -133,6 +134,47 @@ configure `ConditionalGitTransport` to use that same directory. Seed the disposa
 b"")`; the runner verifies the base and never initializes or updates the remote base itself. Accepted
 commit objects are reconstructed from verified durable bytes in the bare source before AGit delivery.
 This setup is deliberately specific to the reference scenario, not a general repository importer.
+
+## Dogfood CLI (experimental, owner-approved)
+
+`creatidy-kernel dogfood` is the D1-02 experimental entry point for one frozen, controller-owned
+task contract. It composes the existing allocator, Codex runtime, controller-owned Git candidate,
+bounded verification and AGit delivery into a single supported path. It is **not** a general
+`run issue` feature and never merges or deploys.
+
+```sh
+uv run --locked creatidy-kernel dogfood run \
+  --data-dir /path/on/native-disk/dogfood \
+  --repo /path/to/scarcity-router-checkout \
+  --task 143 --approve --trusted-development
+uv run --locked creatidy-kernel dogfood status --data-dir /path/on/native-disk/dogfood
+uv run --locked creatidy-kernel dogfood export --data-dir /path/on/native-disk/dogfood
+```
+
+The frozen task `143` represents `BioMedical-IT/scarcity-router#143`. The exact base is
+established once from the source checkout (`refs/remotes/origin/<branch>`, falling back to
+`refs/heads/<branch>`) or pinned with `--expected-base <sha>`, then durably frozen; the owner
+checkout is only ever read, and a later run reuses the frozen base even if the source branch
+moves. Work happens in a disposable controller-owned clone; the controller itself creates the
+candidate commit from the workspace tree. Changed paths must stay inside the frozen allowed set,
+trusted argv-only verification commands run in the candidate workspace with bounded capture and
+timeouts, and deterministic structural checks reject obvious test weakening with the semantic
+residue explicitly deferred to independent review. After verification the workspace must be
+Git-clean with respect to all non-ignored state: tracked mutations and non-ignored untracked
+paths both reject the candidate, while ignored cache artifacts remain ignored by Git.
+
+Live composition requires documented environment configuration
+(`CREATIDY_DOGFOOD_ROUTER_URL`, optional `CREATIDY_DOGFOOD_ROUTER_KEY`,
+`CREATIDY_DOGFOOD_RUNTIME_BINDING`, `CREATIDY_DOGFOOD_CODEX_BIN`,
+`CREATIDY_DOGFOOD_CODEX_VERSION`, `CREATIDY_DOGFOOD_FORGE_API`,
+`CREATIDY_DOGFOOD_FORGE_REMOTE`, `CREATIDY_DOGFOOD_FORGE_TOKEN`, optional
+`CREATIDY_DOGFOOD_FORGE_ASKPASS`). Credentials are read only from the environment; they are never
+task data, evidence, log output, or command-line arguments. The Codex app-server subprocesses run
+with a closed controller-built operational environment (`HOME`, `PATH`, locale and temp entries
+only); the controller environment — including every dogfood credential and unrelated owner
+secret — is never inherited by the coding runtime. The coding runtime runs in
+**trusted-development** Codex workspace-write mode; hostile-worker isolation is not attested.
+An uncertain dispatch or PR delivery stays unknown until reconciled; nothing is blindly retried.
 
 The owner supplies an absolute deadline no more than one hour ahead and an observation budget of
 1-100. Both are pinned across restarts, with at most two runtime Attempts. Bounded exit requests

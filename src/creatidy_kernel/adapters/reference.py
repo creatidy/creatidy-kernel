@@ -59,34 +59,77 @@ def reference_request(store: SQLiteProgramStore, operation: str) -> dict[str, ob
     return cast(dict[str, object], raw["request"])
 
 
-def reference_git(repository: Path, *arguments: str, data: bytes | None = None) -> str:
+def reference_git(
+    repository: Path,
+    *arguments: str,
+    data: bytes | None = None,
+    author: tuple[str, str] | None = None,
+    index_file: str | None = None,
+    timeout: int = 10,
+) -> str:
+    return cast(
+        str,
+        _reference_git_raw(
+            repository, arguments, data=data, author=author, index_file=index_file, timeout=timeout, raw=False
+        ),
+    )
+
+
+def reference_git_bytes(
+    repository: Path,
+    *arguments: str,
+    data: bytes | None = None,
+    author: tuple[str, str] | None = None,
+    index_file: str | None = None,
+    timeout: int = 10,
+) -> bytes:
+    return cast(
+        bytes,
+        _reference_git_raw(
+            repository, arguments, data=data, author=author, index_file=index_file, timeout=timeout, raw=True
+        ),
+    )
+
+
+def _reference_git_raw(
+    repository: Path,
+    arguments: tuple[str, ...],
+    *,
+    data: bytes | None,
+    author: tuple[str, str] | None,
+    index_file: str | None,
+    timeout: int,
+    raw: bool,
+) -> str | bytes:
+    identity = author if author is not None else ("Reference", "reference@example.invalid")
     environment = {
         "PATH": os.defpath,
         "HOME": str(repository),
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_AUTHOR_NAME": "Reference",
-        "GIT_AUTHOR_EMAIL": "reference@example.invalid",
-        "GIT_COMMITTER_NAME": "Reference",
-        "GIT_COMMITTER_EMAIL": "reference@example.invalid",
+        "GIT_AUTHOR_NAME": identity[0],
+        "GIT_AUTHOR_EMAIL": identity[1],
+        "GIT_COMMITTER_NAME": identity[0],
+        "GIT_COMMITTER_EMAIL": identity[1],
         "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
         "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
     }
+    if index_file is not None:
+        environment["GIT_INDEX_FILE"] = index_file
     executable = shutil.which("git", path=os.defpath)
     if executable is None:
         raise RuntimeError("Git is required for the disposable reference repository")
-    return (
-        subprocess.run(  # noqa: S603 - fixed Git executable and controller-built arguments; no shell.
-            [executable, "-C", str(repository), *arguments],
-            input=data,
-            capture_output=True,  # noqa: S603
-            check=True,
-            timeout=10,
-            env=environment,
-        )
-        .stdout.decode()
-        .strip()
+    completed = subprocess.run(  # noqa: S603 - fixed Git executable and controller-built arguments; no shell.
+        [executable, "-C", str(repository), *arguments],
+        input=data,
+        capture_output=True,  # noqa: S603
+        check=True,
+        timeout=timeout,
+        env=environment,
     )
+    if raw:
+        return completed.stdout
+    return completed.stdout.decode().strip()
 
 
 def reference_commit(repository: Path, content: bytes, parent: str | None = None) -> str:

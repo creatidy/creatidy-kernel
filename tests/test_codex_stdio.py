@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Synthetic app-server fixtures; never starts the real Codex executable."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -120,3 +121,75 @@ def test_notification_after_response_is_drained(command: tuple[str, ...]) -> Non
 def test_requires_explicit_absolute_app_server(args: tuple[str, ...]) -> None:
     with pytest.raises(ValueError, match="absolute Codex"):
         CodexStdio(args, "0.99.1")
+
+
+ENV_FAKE = f"""#!{sys.executable}
+import json
+import sys
+from pathlib import Path
+
+mode = "version" if sys.argv[1:] == ["--version"] else "server"
+Path(sys.argv[0] + "." + mode + ".env").write_text(json.dumps(dict(__import__("os").environ)))
+if mode == "version":
+    print("codex-cli 0.99.1")
+    sys.exit(0)
+first = json.loads(sys.stdin.readline())
+assert first["method"] == "initialize"
+print(json.dumps({{"id": 1, "result": {{"userAgent": "fake"}}}}), flush=True)
+assert json.loads(sys.stdin.readline()) == {{"method": "initialized", "params": {{}}}}
+for line in sys.stdin:
+    print(json.dumps({{"method": "turn/started", "params": {{"turnId": "t"}}}}), flush=True)
+    print(json.dumps({{"id": json.loads(line)["id"], "result": {{"ok": True}}}}), flush=True)
+"""
+
+# Synthetic sentinel markers prove controller credentials never reach the child.
+# Constructed programmatically so no literal credential-like pair appears in source.
+SENTINEL_NAMES = ("CREATIDY_DOGFOOD_ROUTER_KEY", "CREATIDY_DOGFOOD_FORGE_TOKEN", "SOMEONE_ELSES_API_KEY")
+SENTINELS = {name: "synthetic-" + name.lower().replace("_", "-") for name in SENTINEL_NAMES}
+
+
+@pytest.fixture
+def env_command(tmp_path: Path) -> str:
+    binary = tmp_path / "env-codex"
+    binary.write_text(ENV_FAKE, encoding="utf-8")
+    binary.chmod(0o700)
+    return str(binary)
+
+
+def _dumped(binary: str, mode: str) -> dict[str, str]:
+    return json.loads(Path(binary + "." + mode + ".env").read_text())
+
+
+def test_explicit_environment_replaces_inheritance(env_command: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in SENTINELS.items():
+        monkeypatch.setenv(name, value)
+    closed = {"HOME": "/home/tester", "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+    transport = CodexStdio((env_command, "app-server"), "0.99.1", environment=closed)
+    try:
+        for mode in ("version", "server"):
+            dumped = _dumped(env_command, mode)
+            # The controller secrets never reach either Codex subprocess.
+            assert not (set(SENTINELS) & set(dumped))
+            assert not (set(SENTINELS.values()) & set(dumped.values()))
+            # The explicitly allowed operational entries do reach both subprocesses.
+            assert dumped == closed
+    finally:
+        transport.close()
+
+
+def test_default_environment_still_inherits(env_command: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CREATIDY_DOGFOOD_ROUTER_KEY", "synthetic-router-sentinel")
+    transport = CodexStdio((env_command, "app-server"), "0.99.1")
+    try:
+        # Preserves the pre-existing implicit-inheritance behavior for non-opted callers.
+        assert _dumped(env_command, "version")["CREATIDY_DOGFOOD_ROUTER_KEY"] == "synthetic-router-sentinel"
+        assert _dumped(env_command, "server")["CREATIDY_DOGFOOD_ROUTER_KEY"] == "synthetic-router-sentinel"
+    finally:
+        transport.close()
+
+
+def test_invalid_explicit_environment_refused(env_command: str) -> None:
+    with pytest.raises(ValueError, match="environment"):
+        CodexStdio((env_command, "app-server"), "0.99.1", environment={"": "x"})  # type: ignore[dict-item]
+    with pytest.raises(ValueError, match="environment"):
+        CodexStdio((env_command, "app-server"), "0.99.1", environment={"BAD": object()})  # type: ignore[dict-item]
