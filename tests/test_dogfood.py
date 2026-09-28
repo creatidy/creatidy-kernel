@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """D1-02 dogfood composition proof: real Git fixtures, native-shaped fakes, no paid calls."""
 
+import json
 import os
 import sys
 import time
@@ -11,7 +12,9 @@ from typing import cast
 import pytest
 
 from creatidy_kernel.adapters.codex_runtime import CodexRejected
+from creatidy_kernel.adapters.codex_stdio import CodexStdio
 from creatidy_kernel.adapters.dogfood import (
+    CODEX_METHODS,
     DOGFOOD_TASKS,
     DogfoodInterrupted,
     DogfoodTaskSpec,
@@ -28,6 +31,7 @@ from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.scarcity_router import ScarcityRouterAllocator
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.core.execution import UnsupportedExecution
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.ports.forge import Forge
@@ -37,7 +41,11 @@ pytest_plugins = ["test_sqlite_store"]
 
 REPOSITORY = Reference("forgejo:BioMedical-IT/scarcity-router")
 ALLOCATION = Allocation("codex", "zai", "glm-5.3", frozenset({"reference"}), 128, "fixture selection")
+EFFORT_ALLOCATION = Allocation("codex", "zai", "glm-5.3", frozenset({"reference"}), 128, "fixture selection", "low")
 
+# The frozen assertions mirror the real Scarcity Router source forms at the D1-03
+# verified base (59538e9): the bystander ownership assertion is the reversed-argument
+# form self.assertEqual([], bystander.cancels) (tests/test_e2e_execution.py:908).
 BASE_TEST_FILE = """import time
 import unittest
 
@@ -77,7 +85,7 @@ class CancellationTests(unittest.TestCase):
             except (TimeoutError, OSError):
                 continue
         self.assertTrue(worker.cancels, "cancel never reached the worker")
-        self.assertEqual(bystander.cancels, [])
+        self.assertEqual([], bystander.cancels)
 
     def test_scenario_11_cancel_reaches_exactly_the_owning_worker(self):
         worker, bystander, raw = self._scenario()
@@ -90,7 +98,7 @@ class CancellationTests(unittest.TestCase):
             except (TimeoutError, OSError):
                 continue
         self.assertTrue(worker.cancels, "cancel never reached the worker")
-        self.assertEqual(bystander.cancels, [])
+        self.assertEqual([], bystander.cancels)
 
 
 class StableTests(unittest.TestCase):
@@ -155,9 +163,10 @@ class FixtureConnection:
     version = "1.2.3"
     methods = frozenset({"thread/start", "turn/start", "thread/read", "turn/interrupt"})
 
-    def __init__(self, edit: Callable[[Path], None], *, provider: str = "zai") -> None:
+    def __init__(self, edit: Callable[[Path], None], *, provider: str = "zai", effort: str | None = None) -> None:
         self.edit = edit
         self.provider = provider
+        self.effort = effort
         self.starts = 0
         self.status = "completed"
         self.cwd: str | None = None
@@ -166,7 +175,14 @@ class FixtureConnection:
         if method == "thread/start":
             self.starts += 1
             self.cwd = str(params["cwd"])
-            return {"thread": {"id": f"thread-{self.starts}"}, "model": "glm-5.3", "modelProvider": self.provider}
+            receipt: dict[str, object] = {
+                "thread": {"id": f"thread-{self.starts}"},
+                "model": "glm-5.3",
+                "modelProvider": self.provider,
+            }
+            if self.effort is not None:
+                receipt["reasoningEffort"] = self.effort
+            return receipt
         if method == "turn/start":
             self.edit(Path(str(self.cwd)))
             return {"turn": {"id": f"turn-{self.starts}"}}
@@ -201,6 +217,7 @@ def run(
     base: str | None = None,
     allocation: Allocation | None = ALLOCATION,
     allocator: ResourceAllocator | None = None,
+    supported_efforts: frozenset[tuple[str, str, str]] = frozenset(),
     fault: str | None = None,
 ) -> dict[str, object]:
     if forge is None:
@@ -217,6 +234,7 @@ def run(
         allocation=allocation,
         allocator=allocator,
         forge_factory=lambda _directory: forge,
+        supported_efforts=supported_efforts,
         fault=fault,
     )
 
@@ -342,9 +360,13 @@ def _edit_weaken_ownership(path: Path) -> None:
     _rewrite(
         path,
         lambda text: text.replace(
-            "self.assertEqual(bystander.cancels, [])", "self.assertEqual(bystander.cancels, bystander.cancels)"
+            "self.assertEqual([], bystander.cancels)", "self.assertEqual(bystander.cancels, bystander.cancels)"
         ),
     )
+
+
+def _edit_remove_bystander_assertion(path: Path) -> None:
+    _rewrite(path, lambda text: text.replace("        self.assertEqual([], bystander.cancels)\n", ""))
 
 
 def _edit_large_sleep(path: Path) -> None:
@@ -365,6 +387,7 @@ STRUCTURAL_EDITS: list[tuple[str, Callable[[Path], None]]] = [
     ("skip-decorator", _edit_skip),
     ("assertion-removed", _edit_remove_assertion),
     ("ownership-weakened", _edit_weaken_ownership),
+    ("bystander-assertion-removed", _edit_remove_bystander_assertion),
     ("large-sleep", _edit_large_sleep),
     ("scenario-renamed", _edit_rename_scenario),
 ]
@@ -657,6 +680,12 @@ def test_frozen_task_registry_and_validation() -> None:
     assert task.verification[1].repeats == 8
     assert task.verification[2].argv == ("make", "check")
     assert task.expected_base_sha is None  # the live run freezes the then-current develop
+    # The frozen tokens are the real assertion-bearing source forms verified by the
+    # D1-03 preflight against Scarcity Router 59538e9 (test_e2e_execution.py:875,906,908).
+    assert task.structural.required_tokens == (
+        "assertTrue(worker.cancels",
+        "assertEqual([], bystander.cancels)",
+    )
     with pytest.raises(ValueError):
         VerificationCommand((), 10)
     with pytest.raises(ValueError):
@@ -695,17 +724,222 @@ def test_live_composition_requires_complete_environment() -> None:
     task = DOGFOOD_TASKS["143"]()
     with pytest.raises(ValueError, match="missing"):
         compose_dogfood_live({}, task)
-    environment = {
-        "CREATIDY_DOGFOOD_ROUTER_URL": "https://router.invalid",
-        "CREATIDY_DOGFOOD_RUNTIME_BINDING": "zai/glm-5.3",
-        "CREATIDY_DOGFOOD_CODEX_BIN": "/usr/local/bin/codex",
-        "CREATIDY_DOGFOOD_CODEX_VERSION": "0.45.0",
-        "CREATIDY_DOGFOOD_FORGE_API": "https://forge.invalid/api/v1",
-        "CREATIDY_DOGFOOD_FORGE_REMOTE": "https://forge.invalid/BioMedical-IT/scarcity-router.git",
-        "CREATIDY_DOGFOOD_FORGE_TOKEN": "synthetic-token",
-    }
-    components = compose_dogfood_live(environment, task)
+    components = compose_dogfood_live(live_environment("zai/glm-5.3"), task)
     assert isinstance(components.allocator, ScarcityRouterAllocator)
+
+
+LIVE_ENVIRONMENT = {
+    "CREATIDY_DOGFOOD_ROUTER_URL": "https://router.invalid",
+    "CREATIDY_DOGFOOD_CODEX_BIN": "/usr/local/bin/codex",
+    "CREATIDY_DOGFOOD_CODEX_VERSION": "0.45.0",
+    "CREATIDY_DOGFOOD_FORGE_API": "https://forge.invalid/api/v1",
+    "CREATIDY_DOGFOOD_FORGE_REMOTE": "https://forge.invalid/BioMedical-IT/scarcity-router.git",
+    "CREATIDY_DOGFOOD_FORGE_TOKEN": "synthetic-token",
+}
+
+
+def live_environment(binding: str) -> dict[str, str]:
+    environment = dict(LIVE_ENVIRONMENT)
+    environment["CREATIDY_DOGFOOD_RUNTIME_BINDING"] = binding
+    return environment
+
+
+# Native-shaped fake Codex app-server: version probe plus initialize/initialized only.
+# It never serves thread/start or turn/start, so no test can perform inference.
+FAKE_CODEX = f"""#!{sys.executable}
+import json
+import sys
+
+if sys.argv[1:] == ['--version']:
+    print('codex-cli __CODEX_VERSION__')
+    sys.exit(0)
+assert sys.argv[1:] == ['app-server']
+first = json.loads(sys.stdin.readline())
+assert first['method'] == 'initialize' and first['id'] == 1
+print(json.dumps({{'id': 1, 'result': {{'userAgent': 'fake'}}}}), flush=True)
+assert json.loads(sys.stdin.readline()) == {{'method': 'initialized', 'params': {{}}}}
+"""
+
+
+def _write_fake_codex(directory: Path, version: str) -> Path:
+    binary = directory / "fake-codex"
+    binary.write_text(FAKE_CODEX.replace("__CODEX_VERSION__", version))
+    binary.chmod(0o700)
+    return binary
+
+
+def test_live_connection_factory_pins_schema_version_to_codex_version(sqlite_tmp_path: Path) -> None:
+    version = "0.155.0-alpha.16.3"
+    environment = live_environment("zai/glm-5.3/low")
+    environment["CREATIDY_DOGFOOD_CODEX_BIN"] = str(_write_fake_codex(sqlite_tmp_path, version))
+    environment["CREATIDY_DOGFOOD_CODEX_VERSION"] = version
+    components = compose_dogfood_live(environment, fixture_task())
+    connection = components.connection_factory()
+    assert isinstance(connection, CodexStdio)
+    try:
+        # A non-empty schema_methods inventory constructs only when the schema pin
+        # equals the expected version; the pinned pair is exactly the env version.
+        assert connection.version == version
+        assert connection.methods == CODEX_METHODS
+    finally:
+        connection.close()
+
+
+def test_live_connection_factory_fails_closed_on_version_disagreement(sqlite_tmp_path: Path) -> None:
+    environment = live_environment("zai/glm-5.3/low")
+    environment["CREATIDY_DOGFOOD_CODEX_BIN"] = str(_write_fake_codex(sqlite_tmp_path, "0.155.0-alpha.16.3"))
+    environment["CREATIDY_DOGFOOD_CODEX_VERSION"] = "0.155.0-alpha.16.4"
+    components = compose_dogfood_live(environment, fixture_task())
+    with pytest.raises(ValueError, match="version"):
+        components.connection_factory()
+
+
+EFFORT_BINDING_CASES: list[tuple[str, frozenset[tuple[str, str, str]]]] = [
+    ("zai/glm-5.3/low", frozenset({("zai", "glm-5.3", "low")})),
+    ("zai/glm-5.3/none", frozenset({("zai", "glm-5.3", "none")})),
+    ("zai/glm-5.3", frozenset()),
+]
+
+
+@pytest.mark.parametrize(("binding", "expected"), EFFORT_BINDING_CASES)
+def test_supported_efforts_come_only_from_the_controller_runtime_binding(
+    binding: str, expected: frozenset[tuple[str, str, str]]
+) -> None:
+    components = compose_dogfood_live(live_environment(binding), DOGFOOD_TASKS["143"]())
+    # "none" is a literal effort string; only an absent third component is null and
+    # manufactures no evidence.
+    assert components.supported_efforts == expected
+
+
+def _selection_document(provider: str, model: str, effort: str | None) -> bytes:
+    document = {
+        "schema_version": 1,
+        "decision": {
+            "evaluated_at": "2026-09-28T08:00:00Z",
+            "requirement": {
+                "task_level": "L0",
+                "capability_minima": {},
+                "hard_constraints": {"minimum_input_context_tokens": 128, "requires_tool_use": True},
+            },
+            "catalog_version": 1,
+            "catalog_updated_on": "2026-09-28",
+            "selector_mode": "balanced",
+            "resource_policy_version": 1,
+            "selected": {
+                "identity": {"provider": provider, "model": model, "variant": "opaque-configuration"},
+                "display_name": "Synthetic public candidate",
+                "reasoning_effort": effort,
+                "eligible": True,
+                "degraded": False,
+                "capability_margin": 0,
+                "scarcity_assessment": {
+                    "state": "unknown",
+                    "label": "unknown",
+                    "applicable_scopes": [],
+                    "reason_codes": ["capacity_bindings_unknown"],
+                },
+            },
+            "alternatives": [],
+            "excluded": [],
+            "closest_candidates": [],
+            "recoverable_candidates": [],
+            "degraded": False,
+            "reason_codes": ["selected_balanced"],
+            "preference_order": [],
+        },
+    }
+    return json.dumps(document).encode()
+
+
+def _stub_router_selection(monkeypatch: pytest.MonkeyPatch, provider: str, model: str, effort: str | None) -> None:
+    raw = _selection_document(provider, model, effort)
+
+    def exchange(_self: ScarcityRouterAllocator, _requirement: dict[str, object]) -> bytes:
+        return raw
+
+    monkeypatch.setattr(ScarcityRouterAllocator, "_exchange", exchange)
+
+
+DOGFOOD_RESOURCE_REQUEST = ResourceRequest("change", frozenset({"reference"}), 128)
+
+
+def test_matching_router_selection_becomes_executable_with_controller_evidence(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    components = compose_dogfood_live(live_environment("zai/glm-5.3/low"), fixture_task())
+    _stub_router_selection(monkeypatch, "zai", "glm-5.3", "low")
+    allocation = components.allocator.select(DOGFOOD_RESOURCE_REQUEST)
+    assert (allocation.provider_id, allocation.model_id, allocation.reasoning_effort) == ("zai", "glm-5.3", "low")
+    assert ("zai", "glm-5.3", "low") in components.supported_efforts
+    connection = FixtureConnection(deflake_edit, effort="low")
+    result = run(
+        sqlite_tmp_path / "control",
+        source,
+        connection,
+        task=fixture_task(repeats=1),
+        allocation=allocation,
+        supported_efforts=components.supported_efforts,
+    )
+    assert result["condition"] == "accepted"
+    assert connection.starts == 1
+
+
+def test_router_selection_outside_the_controller_binding_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    components = compose_dogfood_live(live_environment("zai/glm-5.3/low"), fixture_task())
+    _stub_router_selection(monkeypatch, "zai", "glm-5.3", "high")
+    with pytest.raises(AllocationUnavailable, match="incompatible"):
+        components.allocator.select(DOGFOOD_RESOURCE_REQUEST)
+
+
+def test_router_selection_cannot_manufacture_effort_support(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The controller binding carries no explicit effort; the Router returns one.
+    components = compose_dogfood_live(live_environment("zai/glm-5.3"), fixture_task())
+    assert components.supported_efforts == frozenset()
+    _stub_router_selection(monkeypatch, "zai", "glm-5.3", "low")
+    with pytest.raises(AllocationUnavailable, match="incompatible"):
+        components.allocator.select(DOGFOOD_RESOURCE_REQUEST)
+
+
+def test_explicit_effort_without_trusted_support_fails_closed_before_dispatch(sqlite_tmp_path: Path) -> None:
+    source = make_source(sqlite_tmp_path)
+    connection = FixtureConnection(deflake_edit, effort="low")
+    with pytest.raises(UnsupportedExecution, match="trusted support"):
+        run(
+            sqlite_tmp_path / "control",
+            source,
+            connection,
+            task=fixture_task(repeats=1),
+            allocation=EFFORT_ALLOCATION,
+        )
+    assert connection.starts == 0
+
+
+def test_recovery_and_router_provenance_do_not_expand_effort_trust(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    components = compose_dogfood_live(live_environment("zai/glm-5.3/low"), fixture_task())
+    _stub_router_selection(monkeypatch, "zai", "glm-5.3", "low")
+    allocation = components.allocator.select(DOGFOOD_RESOURCE_REQUEST)
+    assert allocation.decision_provenance is not None  # Router output alone is never evidence.
+    with pytest.raises(DogfoodInterrupted):
+        run(
+            control,
+            source,
+            FixtureConnection(deflake_edit, effort="low"),
+            task=fixture_task(repeats=1),
+            allocation=allocation,
+            supported_efforts=components.supported_efforts,
+            fault="allocation",
+        )
+    # Recovery without the controller's support evidence: neither the durable mode
+    # record nor the allocation's Router provenance expands trusted support.
+    strict = FixtureConnection(deflake_edit, effort="low")
+    with pytest.raises(UnsupportedExecution, match="trusted support"):
+        run(control, source, strict, task=fixture_task(repeats=1), allocation=allocation)
+    assert strict.starts == 0
 
 
 def test_codex_environment_is_closed_and_secret_free(monkeypatch: pytest.MonkeyPatch) -> None:

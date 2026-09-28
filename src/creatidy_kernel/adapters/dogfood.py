@@ -279,7 +279,9 @@ def scarcity_router_143_task(expected_base_sha: str | None = None) -> DogfoodTas
             ),
             # Assertion-bearing tokens, not bare attribute mentions: the D1-03 spec
             # constructor must re-verify these exact forms against the actual base file.
-            required_tokens=("assertTrue(worker.cancels", "assertEqual(bystander.cancels, [])"),
+            # The bystander token matches the argument order in the real source form
+            # self.assertEqual([], bystander.cancels) (D1-03 preflight, SR 59538e9).
+            required_tokens=("assertTrue(worker.cancels", "assertEqual([], bystander.cancels)"),
             forbidden_added_patterns=(
                 r"@\s*(?:unittest\.)?skip(?:If|Unless)?\b",
                 r"@pytest\.mark\.(?:skip|xfail)",
@@ -1118,6 +1120,9 @@ class DogfoodLiveComponents:
     allocator: ResourceAllocator
     connection_factory: Callable[[], CodexConnection]
     forge_factory: Callable[[Path], Forge]
+    # Trusted Runtime effort-support evidence derived from the same controller-owned
+    # runtime binding that constrains Router allocation; never Router-derived.
+    supported_efforts: frozenset[tuple[str, str, str]]
 
 
 def _live_binding(raw: str) -> Allocation:
@@ -1173,6 +1178,7 @@ def compose_dogfood_live(environ: Mapping[str, str], task: DogfoodTaskSpec) -> D
             (codex_bin, "app-server"),
             codex_version,
             schema_methods=CODEX_METHODS,
+            schema_version=codex_version,
             environment=codex_environment(os.environ),
         )
 
@@ -1185,4 +1191,17 @@ def compose_dogfood_live(environ: Mapping[str, str], task: DogfoodTaskSpec) -> D
             lambda proposed: proposed.repository == repository,
         )
 
-    return DogfoodLiveComponents(allocator, connection_factory, forge_factory)
+    return DogfoodLiveComponents(
+        allocator,
+        connection_factory,
+        forge_factory,
+        # One controller-side authority: the parsed runtime binding both constrains
+        # Router allocation and proves Runtime effort support for its exact tuple.
+        # A binding without an explicit effort manufactures no evidence; null stays
+        # null and is never coerced to the literal effort string "none".
+        (
+            frozenset({(binding.provider_id, binding.model_id, binding.reasoning_effort)})
+            if binding.reasoning_effort is not None
+            else frozenset()
+        ),
+    )
