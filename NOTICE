@@ -1,0 +1,18 @@
+Creatidy Kernel
+
+The recommendation transport in
+src/creatidy_kernel/adapters/scarcity_router.py contains material adapted from
+Scarcity Router, licensed under the Apache License, Version 2.0.
+
+Source repository: https://forgejo.creatidy.com/BioMedical-IT/scarcity-router
+Public mirror: https://github.com/creatidy/scarcity-router
+Source revision: 81b8e6393a1b2df8a6c7a9c6c3dcb8a7f6884e4e
+Source files: scarcity_router/remote.py; scarcity_router/selection_app.py
+
+Modified for Kernel's recommendation-only ResourceAllocator: narrowed to
+selection, removed Router implementation dependencies, added Kernel allocation
+mapping and configured runtime compatibility, and strengthened untrusted JSON,
+response bounds, schema validation and safe-error handling. Synthetic tests
+adapt the public wire-contract cases, not Router's implementation or policy.
+The upstream snapshot has no separate NOTICE file. The complete Apache-2.0
+license is distributed in LICENSE. No endorsement by upstream is implied.

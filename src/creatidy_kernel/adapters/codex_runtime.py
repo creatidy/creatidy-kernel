@@ -20,6 +20,7 @@ from creatidy_kernel.core.execution import (
     Lookup,
     OperationKey,
     Presence,
+    RuntimeIdentity,
     RuntimeObservation,
     TrustMode,
     UnsupportedExecution,
@@ -52,6 +53,7 @@ class CodexInputs:
     provider: str
     sandbox: str = "workspace-write"
     approval_policy: str = "never"
+    reasoning_effort: str | None = None
 
 
 @dataclass(slots=True)
@@ -64,6 +66,8 @@ class _Run:
     terminal: bool = False
     terminal_status: str | None = None
     identity_model: str | None = None
+    identity_provider: str | None = None
+    identity_effort: str | None = None
     candidate: Candidate | None = None
 
     @property
@@ -71,6 +75,18 @@ class _Run:
         if self.thread is None or self.turn is None:
             return None
         return f"codex:{self.thread}:{self.turn}"
+
+    @property
+    def identity(self) -> RuntimeIdentity:
+        return replace(
+            self.request.identity,
+            resolved=self.identity_model,
+            resolved_provider=self.identity_provider,
+            resolved_effort=self.identity_effort,
+            observed=None,
+            observed_provider=None,
+            observed_effort=None,
+        )
 
 
 def _object(value: object) -> dict[str, object]:
@@ -101,17 +117,28 @@ class CodexRuntime(Runtime):
         authorize: Callable[[ExecutionRequest], bool],
         collect: Callable[[ExecutionRequest], Candidate | None],
         freshness: int = 30,
+        supported_efforts: frozenset[tuple[str, str, str]] = frozenset(),
     ) -> None:
         if not version or connection.version != version or freshness <= 0:
             raise UnsupportedExecution("Codex version mismatch or invalid freshness contract")
         required = {"thread/start", "turn/start", "thread/read", "turn/interrupt"}
         if not required <= connection.methods:
             raise UnsupportedExecution("Codex version lacks required native methods")
+        if type(supported_efforts) is not frozenset or any(
+            type(binding) is not tuple
+            or len(binding) != 3
+            or any(type(value) is not str or not value.strip() for value in binding)
+            for binding in supported_efforts
+        ):
+            raise ValueError("supported efforts must be immutable provider/model/effort bindings")
         self.connection = connection
         self.resolve = resolve
         self.authorize = authorize
         self.collect = collect
         self.freshness = freshness
+        # Trusted support evidence for this pinned connection version, never a
+        # vocabulary inferred from an allocator's requested configuration.
+        self.supported_efforts = supported_efforts
         self._by_key: dict[str, _Run] = {}
         self._by_handle: dict[str, _Run] = {}
 
@@ -133,7 +160,30 @@ class CodexRuntime(Runtime):
             raise UnsupportedExecution("Codex cannot enforce workspace network or mount grants")
         if inputs.sandbox != "workspace-write" or inputs.approval_policy != "never":
             raise UnsupportedExecution("unsupported Codex permission configuration")
-        if request.identity.observed is not None:
+        if request.allocation is not None and (
+            request.allocation.runtime_id != "codex"
+            or request.allocation.provider_id != inputs.provider
+            or request.allocation.model_id != inputs.model
+            or request.allocation.reasoning_effort != inputs.reasoning_effort
+        ):
+            raise ExecutionConflict("configured Codex runtime/provider/model/effort differs from Allocation")
+        if request.identity.requested_provider not in {None, inputs.provider} or (
+            request.identity.requested_effort != inputs.reasoning_effort
+        ):
+            raise ExecutionConflict("configured Codex inputs differ from requested identity")
+        if (
+            inputs.reasoning_effort is not None
+            and (inputs.provider, inputs.model, inputs.reasoning_effort) not in self.supported_efforts
+        ):
+            raise UnsupportedExecution("Codex provider/model reasoning effort has no trusted support binding")
+        if any(
+            value is not None
+            for value in (
+                request.identity.observed,
+                request.identity.observed_provider,
+                request.identity.observed_effort,
+            )
+        ):
             raise UnsupportedExecution("app-server does not attest generated-turn identity")
         return inputs
 
@@ -152,25 +202,36 @@ class CodexRuntime(Runtime):
         run = _Run(request, uncertain=True)
         self._by_key[key] = run
         try:
-            response = self.connection.request(
-                "thread/start",
-                {
-                    "model": inputs.model,
-                    "modelProvider": inputs.provider,
-                    "cwd": inputs.cwd,
-                    "sandbox": inputs.sandbox,
-                    "approvalPolicy": inputs.approval_policy,
-                },
-            )
+            thread_params: dict[str, object] = {
+                "model": inputs.model,
+                "modelProvider": inputs.provider,
+                "cwd": inputs.cwd,
+                "sandbox": inputs.sandbox,
+                "approvalPolicy": inputs.approval_policy,
+            }
+            if inputs.reasoning_effort is not None:
+                thread_params["config"] = {"model_reasoning_effort": inputs.reasoning_effort}
+            response = self.connection.request("thread/start", thread_params)
             run.thread = _field(_object(response.get("thread")), "id")
             resolved = _field(response, "model")
             provider = _field(response, "modelProvider")
             if resolved != inputs.model or provider != inputs.provider:
                 raise CodexRejected("resolved model/provider does not match requested allocation")
+            effort = response.get("reasoningEffort")
+            if effort is not None and (type(effort) is not str or not effort.strip()):
+                raise CodexRejected("invalid app-server reasoningEffort")
+            if inputs.reasoning_effort is not None and effort != inputs.reasoning_effort:
+                raise CodexRejected("resolved reasoning effort does not match requested allocation")
             run.identity_model = resolved
-            turn = self.connection.request(
-                "turn/start", {"threadId": run.thread, "input": [{"type": "text", "text": inputs.prompt}]}
-            )
+            run.identity_provider = provider
+            run.identity_effort = effort
+            turn_params: dict[str, object] = {
+                "threadId": run.thread,
+                "input": [{"type": "text", "text": inputs.prompt}],
+            }
+            if inputs.reasoning_effort is not None:
+                turn_params["effort"] = inputs.reasoning_effort
+            turn = self.connection.request("turn/start", turn_params)
             run.turn = _field(_object(turn.get("turn")), "id")
         except (OSError, TimeoutError, CodexRejected):
             # A domain error might be definitive for one RPC, but thread creation or a
@@ -234,9 +295,8 @@ class CodexRuntime(Runtime):
                 activity = Activity.TERMINAL
             elif status == "inProgress":
                 activity = Activity.TERMINAL if run.terminal else Activity.RUNNING
-        identity = replace(run.request.identity, resolved=run.identity_model, observed=None)
         return RuntimeObservation(
-            handle, activity, now, now + self.freshness if state else now, identity, run.cancelled
+            handle, activity, now, now + self.freshness if state else now, run.identity, run.cancelled
         )
 
     def candidate(self, handle: str) -> Candidate | None:
@@ -276,7 +336,7 @@ class CodexRuntime(Runtime):
             Activity.TERMINAL if run.terminal else Activity.UNKNOWN,
             0,
             0,
-            replace(run.request.identity, resolved=run.identity_model, observed=None),
+            run.identity,
             True,
         )
 

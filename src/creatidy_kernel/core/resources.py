@@ -36,6 +36,8 @@ class Allocation:
     context_tokens: int
     rationale: str
     reasoning_effort: str | None = None
+    variant: str | None = None
+    decision_provenance: str | None = None
 
     def __post_init__(self) -> None:
         if any(
@@ -47,6 +49,9 @@ class Allocation:
             type(self.reasoning_effort) is not str or not self.reasoning_effort.strip()
         ):
             raise ValueError("reasoning_effort must be nonempty when specified")
+        for value in (self.variant, self.decision_provenance):
+            if value is not None and (type(value) is not str or not value.strip()):
+                raise ValueError("optional allocation evidence must be nonempty when specified")
         _validate_limits(self.capabilities, self.context_tokens)
 
 

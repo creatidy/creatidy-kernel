@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import cast
 
@@ -40,9 +40,11 @@ from creatidy_kernel.core.execution import (
     WorkspaceHandle,
     WorkspaceSpec,
 )
-from creatidy_kernel.core.resources import Allocation
+from creatidy_kernel.core.resources import Allocation, AllocationUnavailable
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
+from creatidy_kernel.ports.allocation import decode_identity, identity_matches, is_legacy_allocation, load_allocation
 from creatidy_kernel.ports.application import Collection, advance_work_unit, manifest_bytes
+from creatidy_kernel.ports.resources import ResourceAllocator
 
 POLICY = VerificationPolicy(PolicyReference("reference", "1", "reference-checks:v1"), ("exact-content",), False)
 EXPECTED = {"first": b"first\n", "second": b"first\nsecond\n"}
@@ -155,6 +157,8 @@ class DurableReferenceRuntime:
     def start(self, request: ExecutionRequest) -> str:
         if self.lost:
             raise RuntimeError("runtime context unavailable")
+        if request.allocation is not None and request.allocation.runtime_id != "fake":
+            raise AllocationUnavailable("allocation does not support the synthetic reference runtime")
         unit = request.attempt.work_unit_id
         content = b"first\n"
         if unit == "second":
@@ -174,6 +178,7 @@ class DurableReferenceRuntime:
                 "attempt": request.attempt.attempt_id,
                 "spec": request.attempt.digest,
                 "workspace": request.workspace.key,
+                "identity": asdict(request.identity),
             },
         )
         self.store.finalize_artifact(request.operation.operation_id, "output", content)
@@ -191,12 +196,29 @@ class DurableReferenceRuntime:
         return Lookup(Presence.FOUND, operation.operation_id)
 
     def observe(self, handle: str, *, now: int) -> RuntimeObservation:
+        record = reference_request(self.store, handle)
+        identity = (
+            decode_identity(manifest_bytes(record["identity"]))
+            if "identity" in record
+            else RuntimeIdentity("deterministic", None, None, "reference:v1")
+        )
+        if not self.lost:
+            # The deterministic fake records exactly the configuration it executed.
+            identity = replace(
+                identity,
+                resolved=identity.requested,
+                observed=identity.requested,
+                resolved_provider=identity.requested_provider,
+                observed_provider=identity.requested_provider,
+                resolved_effort=identity.requested_effort,
+                observed_effort=identity.requested_effort,
+            )
         return RuntimeObservation(
             handle,
             Activity.UNKNOWN if self.lost else Activity.TERMINAL,
             now,
             now,
-            RuntimeIdentity("deterministic", "deterministic", "deterministic", "reference:v1"),
+            identity,
             False,
         )
 
@@ -279,21 +301,23 @@ def reference_export(store: SQLiteProgramStore) -> dict[str, object]:
                 "source": "synthetic-not-metered" if mode == "offline" else "codex-usage-unavailable",
             },
         }
+        allocation = load_allocation(store, attempt.spec)
+        allocation_data = asdict(allocation)
+        allocation_data["capabilities"] = sorted(allocation.capabilities)
+        entry["allocation"] = allocation_data
         try:
             entry["identity"] = json.loads(store.artifact(operation.operation_id, "identity"))
         except OperationConflict:
             entry["identity"] = None
         if program.state(attempt.spec.work_unit_id).status is WorkUnitStatus.SATISFIED:
-            identity = entry["identity"]
-            allocation = cast(dict[str, object], json.loads(store.artifact(operation.operation_id, "allocation")))
-            if not isinstance(identity, dict):
+            if not isinstance(entry["identity"], dict):
                 raise ValueError("accepted result lacks durable runtime identity evidence")
-            identity = cast(dict[str, object], identity)
-            if (
-                identity.get("requested") != allocation["model_id"]
-                or identity.get("resolved") != allocation["model_id"]
-                or identity.get("observed") not in (None, allocation["model_id"])
-                or identity.get("agent_definition_version") != attempt.spec.agent_definition_reference
+            if not identity_matches(
+                decode_identity(store.artifact(operation.operation_id, "identity")),
+                allocation,
+                str(attempt.spec.agent_definition_reference),
+                require_resolved=True,
+                legacy=is_legacy_allocation(store.artifact(operation.operation_id, "allocation")),
             ):
                 raise ValueError("accepted result lacks matching runtime identity evidence")
             accepted = reference_request(store, f"acceptance:{attempt.spec.attempt_id}")
@@ -306,7 +330,7 @@ def reference_export(store: SQLiteProgramStore) -> dict[str, object]:
         entry["rejections"] = rejected
         attempts.append(entry)
     interruptions: list[dict[str, object]] = []
-    for boundary in ("commit", "send", "receipt", "live-budget"):
+    for boundary in ("prepared", "allocation", "artifacts", "started", "commit", "send", "receipt", "live-budget"):
         try:
             interruptions.append(reference_request(store, f"interruption:{boundary}"))
         except OperationConflict:
@@ -351,19 +375,42 @@ def export_reference(directory: Path) -> dict[str, object]:
         return reference_export(store)
 
 
-def run_reference(directory: Path, *, owner_approved: bool, fault: str | None = None) -> dict[str, object]:
+def run_reference(
+    directory: Path,
+    *,
+    owner_approved: bool,
+    fault: str | None = None,
+    allocator: ResourceAllocator | None = None,
+) -> dict[str, object]:
     if owner_approved is not True:
         raise ValueError("explicit owner approval is required")
-    if fault not in {None, "commit", "send", "receipt", "lost-context", "pr-commit", "pr-send", "pr-receipt"}:
+    if fault not in {
+        None,
+        "prepared",
+        "allocation",
+        "artifacts",
+        "started",
+        "commit",
+        "send",
+        "receipt",
+        "lost-context",
+        "pr-commit",
+        "pr-send",
+        "pr-receipt",
+    }:
         raise ValueError("unsupported reference fault")
     directory = directory.resolve()
     if (directory / "kernel.sqlite3").exists() and not (directory / "runtime.sqlite3").exists():
         raise RuntimeError("external runtime journal missing; effect presence is unknown")
     repository = prepare_reference_directory(directory)
     base = reference_commit(repository, b"")
-    allocator = FixedAllocator(
-        Allocation(
-            "fake", "local", "deterministic", frozenset({"reference"}), 128, "owner-configured offline reference"
+    allocator = (
+        allocator
+        if allocator is not None
+        else FixedAllocator(
+            Allocation(
+                "fake", "local", "deterministic", frozenset({"reference"}), 128, "owner-configured offline reference"
+            )
         )
     )
     with (

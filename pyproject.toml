@@ -9,7 +9,7 @@ description = "Local-first, provider-neutral engineering Program control-plane f
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 dependencies = []
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
@@ -49,7 +49,7 @@ packages = ["src/creatidy_kernel"]
 [tool.hatch.build.targets.sdist]
 include = [
     "/src", "/tests", "/tools", "/examples", "/docs", "/.forgejo",
-    "/pyproject.toml", "/uv.lock", "/Makefile", "/README.md", "/LICENSE",
+    "/pyproject.toml", "/uv.lock", "/Makefile", "/README.md", "/LICENSE", "/NOTICE",
     "/CONTRIBUTING.md", "/SECURITY.md", "/AGENTS.md", "/.gitignore",
 ]
 

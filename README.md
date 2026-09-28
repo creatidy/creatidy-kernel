@@ -57,8 +57,9 @@ There is no mandatory telemetry. These are architecture commitments, not a claim
 already exist.
 
 [Scarcity Router](https://github.com/creatidy/scarcity-router) independently allocates scarce machine
-intelligence. Kernel will consume it through a small ResourceAllocator port, without embedding its
-policy. Either product remains useful without the other; the example below uses a FixedAllocator.
+intelligence. The optional `ScarcityRouterAllocator` consumes its public recommendation interface
+through the ResourceAllocator port, without embedding its policy or using its execution gateway.
+Either product remains useful without the other; the example below uses a FixedAllocator.
 
 ## Development Authority
 
@@ -123,7 +124,7 @@ state or owner secrets. No reference command can merge or deploy.
 The supplementary live composition is `run_live_reference` in
 `creatidy_kernel.adapters.reference_live`, not a default CLI mode. It requires explicit owner and
 trusted-development acknowledgments, a version-pinned `CodexConnection` with finite RPC timeouts,
-a `FixedAllocator` allocation, and a scoped `ForgejoForge` supplied by the trusted caller. It does
+either a fixed allocation or an external `ResourceAllocator`, and a scoped `ForgejoForge` supplied by the trusted caller. It does
 not load credentials. Use a disposable account/repository without broad owner credentials.
 
 Before opting in, create a controller-owned bare `object_source` outside the worker workspace and
@@ -149,6 +150,41 @@ its own durable operation; once delivery is claimed, restarts observe the target
 reissuing the interrupt. Exports distinguish uncertain cancellation delivery from an observed terminal
 target, neither of which grants engineering acceptance.
 
+## Optional Recommendations
+
+`creatidy_kernel.adapters.scarcity_router.ScarcityRouterAllocator` implements only public
+`POST /v1/select` (machine-interface v1 with D-057 explicit effort). Configure a bare Router
+origin and exact supported Runtime bindings; an optional bearer credential travels only in the
+request header. Non-loopback traffic requires verified HTTPS, and redirects are refused. The
+adapter maps the bounded reference capability/context request to public hard requirements;
+unsupported capability identifiers fail explicitly. It never ranks alternatives or falls back to
+FixedAllocator. A valid selection is independently checked against the configured Runtime's exact
+provider/model/effort support and capability/context limits.
+
+New Attempts preserve provider, model, opaque variant, explicit effort, rationale and canonical
+public decision provenance. `null` effort remains unconfigured; `"none"` remains an actual effort.
+Missing effort, incompatible versions/configurations, no eligible candidate, malformed responses,
+authentication and network failures raise `AllocationUnavailable`. No source/account/access mode,
+quota reservation or guaranteed future capacity is inferred. The transport's source revision,
+reuse decision and modifications are recorded in [the reuse record](docs/architecture/reuse.md)
+and [NOTICE](NOTICE); the Router package is not a runtime dependency.
+
+Preparation atomically binds recoverable allocation/context bytes with the immutable Attempt and
+operation intent, before dispatch. Restart uses those original bytes and reconstructs missing
+artifact publications without calling the allocator. An outage or changed Router recommendation
+cannot change an existing Attempt; a new Attempt is a separate allocation boundary. Corrupt or
+missing durable evidence fails closed rather than triggering re-routing.
+
+The Codex composition receives per-Attempt inputs from that durable Allocation. Explicit effort
+requires a controller-configured `supported_efforts` set of `(provider, model, effort)` tuples,
+evidenced against the pinned native runtime version, not inferred from the recommendation.
+Codex receives explicit thread configuration and turn effort, verifies its thread configuration
+receipt, and retains resolved evidence separately from unknown generated-turn attestation.
+`run_reference(..., allocator=...)` supports offline substitution; `run_live_reference` accepts
+exactly one `allocation` or `allocator`. Native-shaped tests prove the two-WorkUnit flow without
+paid inference; the CLI remains fixed/offline by default. Program acceptance and the separate AGit
+Forge effect are unchanged, and neither path can merge or deploy.
+
 ## Architecture Decisions
 
 | Contract | Document |
@@ -172,4 +208,4 @@ target, neither of which grants engineering acceptance.
 | [0006](docs/adr/0006-context-and-outcomes.md) | Bounded context and user-owned outcome history |
 
 Contributions: [CONTRIBUTING.md](CONTRIBUTING.md). Security: [SECURITY.md](SECURITY.md).
-Licensed under [Apache-2.0](LICENSE). No upstream product implementation source is vendored in A0.
+Licensed under [Apache-2.0](LICENSE). Adapted-source attribution is distributed in [NOTICE](NOTICE).

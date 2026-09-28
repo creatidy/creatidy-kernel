@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from creatidy_kernel.core.domain import AttemptSpec
+from creatidy_kernel.core.resources import Allocation
 
 
 class ExecutionConflict(Exception):
@@ -129,6 +130,12 @@ class RuntimeIdentity:
     resolved: str | None
     observed: str | None
     agent_definition_version: str
+    requested_provider: str | None = None
+    resolved_provider: str | None = None
+    observed_provider: str | None = None
+    requested_effort: str | None = None
+    resolved_effort: str | None = None
+    observed_effort: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +148,7 @@ class ExecutionRequest:
     capability_reference: str
     identity: RuntimeIdentity
     fence: int
+    allocation: Allocation | None = None
 
     def __post_init__(self) -> None:
         if type(self.fence) is not int or self.fence <= 0:
@@ -155,6 +163,15 @@ class ExecutionRequest:
             raise ExecutionConflict("Attempt allocation reference differs")
         if self.attempt.agent_definition_reference != self.identity.agent_definition_version:
             raise ExecutionConflict("Attempt agent definition differs")
+        if self.allocation is not None:
+            if type(self.allocation) is not Allocation:
+                raise ValueError("execution allocation must be an immutable Allocation")
+            if (
+                self.identity.requested != self.allocation.model_id
+                or self.identity.requested_provider != self.allocation.provider_id
+                or self.identity.requested_effort != self.allocation.reasoning_effort
+            ):
+                raise ExecutionConflict("requested identity differs from immutable Allocation")
 
 
 @dataclass(frozen=True, slots=True)

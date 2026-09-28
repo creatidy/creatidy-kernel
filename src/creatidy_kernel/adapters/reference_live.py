@@ -41,8 +41,10 @@ from creatidy_kernel.core.execution import (
 )
 from creatidy_kernel.core.forge import Presence, Reference
 from creatidy_kernel.core.resources import Allocation
+from creatidy_kernel.ports.allocation import load_allocation
 from creatidy_kernel.ports.application import advance_work_unit, manifest_bytes
 from creatidy_kernel.ports.forge import Forge
+from creatidy_kernel.ports.resources import ResourceAllocator
 
 
 def run_live_reference(
@@ -52,22 +54,29 @@ def run_live_reference(
     trusted_development_acknowledged: bool,
     connection: CodexConnection,
     version: str,
-    allocation: Allocation,
+    allocation: Allocation | None = None,
     forge: Forge,
     repository: Reference,
     object_source: Path,
     deadline: int,
     max_observations: int,
+    allocator: ResourceAllocator | None = None,
+    supported_efforts: frozenset[tuple[str, str, str]] = frozenset(),
 ) -> dict[str, object]:
     """Run at most two native turns and bounded observations, interrupt on budget exit.
 
     Supply a version-pinned CodexStdio connection with a finite request timeout and a
     scoped ForgejoForge. Neither a missing reply nor a lost thread is retried. Reuse
-    the same directory, deadline, allocation and adapter bindings for recovery.
+    the same directory, deadline and adapter bindings for recovery. Supply exactly
+    one fixed allocation or external allocator; existing Attempts use durable inputs.
     The owner must seed the disposable remote develop branch with the deterministic
     empty reference commit, and bind ConditionalGitTransport to object_source.
     """
     now = int(time.time())
+    if (allocation is None) == (allocator is None):
+        raise ValueError("supply exactly one allocation or allocator")
+    resource_allocator = FixedAllocator(allocation) if allocation is not None else allocator
+    assert resource_allocator is not None  # noqa: S101 - established by the exclusive input check.
     if owner_approved is not True or trusted_development_acknowledged is not True:
         raise ValueError("explicit owner approval and trusted-development acknowledgment required")
     if (
@@ -100,9 +109,13 @@ def run_live_reference(
                 "max_observations": max_observations,
                 "version": version,
                 "repository": repository.value,
-                "model": allocation.model_id,
-                "provider": allocation.provider_id,
+                **(
+                    {"model": allocation.model_id, "provider": allocation.provider_id}
+                    if allocation is not None
+                    else {"allocator": "external"}
+                ),
                 "object_source": str(object_source),
+                **({"supported_efforts": sorted(supported_efforts)} if supported_efforts else {}),
             },
         )
         try:
@@ -117,6 +130,9 @@ def run_live_reference(
             program = store.admit("reference", "activate", ActivateProgram(program.revision, "owner"))
 
         def resolve(request: ExecutionRequest) -> CodexInputs:
+            selected = request.allocation
+            if selected is None:
+                raise ValueError("native reference requires the durable allocation")
             unit = request.attempt.work_unit_id
             predecessor = ""
             if unit == "second":
@@ -135,8 +151,9 @@ def run_live_reference(
                 str(workspace_path),
                 predecessor + f"Write only result.txt with exactly these UTF-8 bytes: {EXPECTED[unit]!r}. "
                 "Do not access parent directories, credentials, network, or change Git configuration.",
-                allocation.model_id,
-                allocation.provider_id,
+                selected.model_id,
+                selected.provider_id,
+                reasoning_effort=selected.reasoning_effort,
             )
 
         def authorize(request: ExecutionRequest) -> bool:
@@ -165,7 +182,14 @@ def run_live_reference(
                 ArtifactManifest(request.workspace.key, (Artifact("result.txt", digest),)),
             )
 
-        runtime = CodexRuntime(connection, version=version, resolve=resolve, authorize=authorize, collect=collect)
+        runtime = CodexRuntime(
+            connection,
+            version=version,
+            resolve=resolve,
+            authorize=authorize,
+            collect=collect,
+            supported_efforts=supported_efforts,
+        )
 
         def restore(request: ExecutionRequest, handle: str) -> None:
             runtime.restore(request, handle)
@@ -225,7 +249,7 @@ def run_live_reference(
                 store,
                 program,
                 unit,
-                allocator=FixedAllocator(allocation),
+                allocator=resource_allocator,
                 runtime=runtime,
                 workspace=workspace,
                 collector=ReferenceCollector(artifacts, store, workspace_path, base),
@@ -240,6 +264,7 @@ def run_live_reference(
         for attempt in store.load("reference").attempts:
             operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
             if operation.accepted_reference is not None and operation.status != "terminal":
+                selected = load_allocation(store, attempt.spec)
                 request = ExecutionRequest(
                     OperationKey(operation.operation_id, operation.effect_key, operation.request_digest),
                     attempt.spec,
@@ -257,8 +282,16 @@ def run_live_reference(
                     str(attempt.spec.context_reference),
                     str(attempt.spec.allocation_reference),
                     "owner-approved-reference",
-                    RuntimeIdentity(allocation.model_id, None, None, "reference:v1"),
+                    RuntimeIdentity(
+                        selected.model_id,
+                        None,
+                        None,
+                        "reference:v1",
+                        requested_provider=selected.provider_id,
+                        requested_effort=selected.reasoning_effort,
+                    ),
                     operation.fence,
+                    allocation=selected,
                 )
                 runtime.restore(request, operation.accepted_reference)
                 cancellation_id = f"cancel:{attempt.spec.attempt_id}"

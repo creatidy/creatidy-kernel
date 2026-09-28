@@ -2,9 +2,9 @@
 
 Audit date: 2026-09-21/22. This catalogue records reuse decisions, not product endorsements.
 References describe upstream behavior; they do not establish guarantees in this A0 skeleton.
-No upstream product source has been copied into the Kernel. Default-branch snapshots below are
-inspection evidence, not production-tested dependency pins. Licensing was read for repository scope;
-future copying still requires checking the particular file and its notices.
+A0 copied no upstream product source. K8's bounded transport adaptation is recorded below.
+Default-branch snapshots below are inspection evidence, not production-tested dependency pins.
+Licensing was read for repository scope; copying requires checking the particular file and its notices.
 
 ## Agent And Workspace References
 
@@ -72,7 +72,7 @@ In the following table, linked files are pinned to that revision.
 | Subsystem | Chosen approach | Reason |
 | --- | --- | --- |
 | Program/WorkUnit decisions and acceptance | BUILD OUR OWN small domain, using the patterns above | Ownership of bounded Program semantics is central; existing products expose different ticket/harness authority. Not a general workflow engine. Implementation is deferred after the boundary proof. |
-| Resource selection | USE AS-IS Scarcity Router public interface through an adapter later; BUILD OUR OWN tiny FixedAllocator now | Independent products and offline tests need a trivial selection implementation, not a second routing engine. Scarcity adaptation is post-A0. |
+| Resource selection | ADOPT public Scarcity Router recommendation contract; ADAPT its transport in K8; retain tiny FixedAllocator | Independent products and offline tests need replaceable allocation, not a second routing engine. The K8 decision below records exact source and boundaries. |
 | Capability checks and verification policy | BORROW DESIGN; BUILD OUR OWN narrow domain checks later | Required digest-bound consumption and acceptance semantics exceed the audited references. Credential storage, isolation and check tools remain existing components. |
 | Context compilation and local outcomes | BORROW DESIGN; DEFER implementation | Pin sources, separate evidence/verdict, retain unitful observations; no vector platform, evaluation service or analytics engine yet. |
 | Adaptive allocation, distributed controller, UI, release signing | DEFER | Need real usage and the first durable slice before their integration/maintenance cost is justified. |
@@ -85,3 +85,49 @@ are distinct from copied source. Before future source copying, verify the exact 
 license, preserve required notices and modifications, and record origin in attribution and history.
 Unclear licensing means no copy, not a legal research program. Commercial Factory.ai is never a
 source-code donor.
+
+## K8 Recommendation Transport
+
+The bounded K8 check selected **ADAPT**, not a Router package dependency. Source:
+[Scarcity Router](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router) revision
+`81b8e6393a1b2df8a6c7a9c6c3dcb8a7f6884e4e`, `scarcity_router/remote.py` and the
+strict JSON mechanism in `scarcity_router/selection_app.py`, under Apache-2.0.
+`NOTICE` records the modifications and is distributed with the wheel and source archive.
+
+The decision ladder was evaluated narrowly for this integration:
+
+| Option | Decision |
+| --- | --- |
+| ADOPT | Consume public machine-interface v1 plus D-057; do not install the Router package or its MCP/application/selector dependency closure. |
+| VENDOR/COPY | Reject unchanged vendoring: `remote.py` imports Router application parsers and validates only a shallow envelope, not a Kernel Allocation. |
+| PORT | No language port needed: both projects use Python and standard-library HTTP/TLS. |
+| ADAPT | Retain explicit origins, authenticated bearer headers, verified TLS, loopback HTTP, redirect refusal, bounded reads and explicit no-fallback failure; strengthen hostile-response validation. |
+| BUILD | Own only consumed-wire validation, configured Runtime compatibility and Kernel evidence mapping; never a second selector or transport framework. |
+
+Relevant upstream evidence: `tests/test_interfaces_guardrails.py` remote bridge cases,
+`tests/test_control_api.py` authenticated selection, and `tests/test_selector.py`
+`ReasoningEffortSerializationTests`. Kernel uses synthetic public-wire fixtures and its own
+focused transport tests, not upstream's application or live telemetry fixtures. Adaptation must
+not inherit shallow version equality (which accepts booleans/floats), unbounded nested JSON,
+non-finite exponent overflow, raw exception chains or unsupported Runtime assumptions.
+Kernel owns maintenance and security testing of the adapted code; upstream changes require an
+explicit public-contract review rather than automatic dependency updates.
+
+D-057 is an additive public contract: every candidate carries explicit `reasoning_effort`,
+including null for unconfigured, distinct from the configured string `"none"`. It comes from the
+exact selected catalog entry. Opaque variant identifiers remain unrelated to execution effort.
+The recommendation is neither a reservation nor an execution receipt. Kernel does not import
+Router internals, use its gateway, or infer resource/account/access-mode semantics.
+
+### Native Effort Evidence
+
+Codex effort wiring uses the existing native-protocol pin
+`openai/codex@3fd5160cd6c78f2051bb54359d53f09207171733`, not Router internals:
+`codex-rs/app-server-protocol/schema/typescript/v2/ThreadStartParams.ts` (configuration
+overrides), `ThreadStartResponse.ts` (`reasoningEffort`), `TurnStartParams.ts` (`effort`),
+and `Model.ts` (`supportedReasoningEfforts`). The sibling `ReasoningEffort.ts` is a string
+contract, not evidence of universal support for any particular value. The upstream
+`app-server/tests/suite/v2/thread_start.rs` exercises `model_reasoning_effort` and the returned
+configuration. Kernel requires independent, version-bound support supplied by its controller,
+passes exact explicit effort to thread and turn, and rejects a mismatching configuration receipt.
+This is protocol-source and offline fixture evidence, not a live-provider execution claim.

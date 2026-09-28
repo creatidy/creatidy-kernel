@@ -21,6 +21,7 @@ from creatidy_kernel.core.execution import (
     UnsupportedExecution,
     WorkspaceSpec,
 )
+from creatidy_kernel.core.resources import Allocation
 from creatidy_kernel.ports.execution import Runtime
 
 
@@ -34,13 +35,22 @@ class NativeConnection:
         self.fail: str | None = None
         self.missing = False
         self.model = "model-one"
+        self.provider = "provider-one"
+        self.effort: object = None
 
     def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
         self.calls.append((method, params))
         if self.fail == method:
             raise OSError("lost response after delivery")
         if method == "thread/start":
-            return {"thread": {"id": "thread-one"}, "model": self.model, "modelProvider": "provider-one"}
+            # Native response subset from openai/codex@3fd5160cd6c78f2051bb54359d53f09207171733:
+            # codex-rs/app-server-protocol/schema/typescript/v2/ThreadStartResponse.ts.
+            return {
+                "thread": {"id": "thread-one"},
+                "model": self.model,
+                "modelProvider": self.provider,
+                "reasoningEffort": self.effort,
+            }
         if method == "turn/start":
             return {"turn": {"id": "turn-one", "status": "inProgress"}}
         if method == "thread/read":
@@ -216,3 +226,185 @@ def test_capability_and_version_mismatch_fail_before_delivery() -> None:
     with pytest.raises(UnsupportedExecution, match="attest"):
         runtime.start(replace(request, identity=replace(request.identity, observed="self-report")))
     assert connection.calls == []
+
+
+def exact_setup(effort: str | None = "high") -> tuple[NativeConnection, CodexRuntime, ExecutionRequest]:
+    connection, original, request = setup()
+    allocation = Allocation("codex", "provider-one", "model-one", frozenset(), 0, "fixed", effort)
+    request = replace(
+        request,
+        allocation=allocation,
+        identity=replace(request.identity, requested_provider="provider-one", requested_effort=effort),
+    )
+    connection.effort = effort
+    runtime = CodexRuntime(
+        connection,
+        version=connection.version,
+        resolve=lambda value: replace(original.resolve(value), reasoning_effort=effort),
+        authorize=original.authorize,
+        collect=original.collect,
+        supported_efforts=frozenset({("provider-one", "model-one", "high")}),
+    )
+    return connection, runtime, request
+
+
+def test_exact_effort_dispatch_and_native_resolution_remain_distinct_from_observation() -> None:
+    connection, runtime, request = exact_setup()
+    handle = runtime.start(request)
+    assert connection.calls == [
+        (
+            "thread/start",
+            {
+                "model": "model-one",
+                "modelProvider": "provider-one",
+                "cwd": "/sandbox/checkout",
+                "sandbox": "workspace-write",
+                "approvalPolicy": "never",
+                "config": {"model_reasoning_effort": "high"},
+            },
+        ),
+        (
+            "turn/start",
+            {
+                "threadId": "thread-one",
+                "input": [{"type": "text", "text": "Implement the pinned task"}],
+                "effort": "high",
+            },
+        ),
+    ]
+    identity = runtime.observe(handle, now=10).identity
+    assert (identity.requested_provider, identity.resolved_provider, identity.observed_provider) == (
+        "provider-one",
+        "provider-one",
+        None,
+    )
+    assert (identity.requested_effort, identity.resolved_effort, identity.observed_effort) == ("high", "high", None)
+    assert runtime.cancel(handle).identity == identity
+    _, restarted, _ = exact_setup()
+    assert restarted.restore(request, handle).presence is Presence.FOUND
+    restored = restarted.observe(handle, now=11).identity
+    assert restored.requested_provider == "provider-one" and restored.requested_effort == "high"
+    assert restored.resolved is None and restored.resolved_provider is None and restored.resolved_effort is None
+
+
+@pytest.mark.parametrize("field", ["runtime_id", "provider_id", "model_id", "reasoning_effort"])
+def test_exact_allocation_rejects_configured_identity_mismatch_before_delivery(field: str) -> None:
+    connection, runtime, request = exact_setup()
+    assert request.allocation is not None
+    allocation = replace(request.allocation, **{field: "other"})
+    identity = replace(
+        request.identity,
+        requested=allocation.model_id,
+        requested_provider=allocation.provider_id,
+        requested_effort=allocation.reasoning_effort,
+    )
+    request = replace(request, allocation=allocation, identity=identity)
+    with pytest.raises(ExecutionConflict):
+        runtime.start(request)
+    assert connection.calls == []
+
+
+@pytest.mark.parametrize("field", ["requested", "requested_provider", "requested_effort"])
+def test_execution_request_rejects_allocation_identity_mismatch(field: str) -> None:
+    _, _, request = exact_setup()
+    with pytest.raises(ExecutionConflict, match="requested identity"):
+        replace(request, identity=replace(request.identity, **{field: "other"}))
+
+
+@pytest.mark.parametrize("effort", [None, "medium", "", 1, ["high"]])
+def test_explicit_effort_requires_exact_native_resolution_before_turn(effort: object) -> None:
+    connection, runtime, request = exact_setup()
+    connection.effort = effort
+    with pytest.raises(CodexRejected, match="reasoning"):
+        runtime.start(request)
+    assert [method for method, _ in connection.calls] == ["thread/start"]
+    with pytest.raises(ExecutionConflict, match="uncertain"):
+        runtime.start(request)
+
+
+def test_provider_receipt_must_match_exactly_before_turn() -> None:
+    connection, runtime, request = exact_setup()
+    connection.provider = "other-provider"
+    with pytest.raises(CodexRejected, match="model/provider"):
+        runtime.start(request)
+    assert [method for method, _ in connection.calls] == ["thread/start"]
+
+
+@pytest.mark.parametrize(
+    "bindings",
+    [
+        frozenset[tuple[str, str, str]](),
+        frozenset({("provider-one", "model-one", "medium")}),
+        frozenset({("other", "model-one", "high")}),
+        frozenset({("provider-one", "other", "high")}),
+    ],
+)
+def test_effort_support_is_explicit_and_provider_model_specific(bindings: frozenset[tuple[str, str, str]]) -> None:
+    connection, original, request = exact_setup()
+    runtime = CodexRuntime(
+        connection,
+        version=connection.version,
+        resolve=original.resolve,
+        authorize=original.authorize,
+        collect=original.collect,
+        supported_efforts=bindings,
+    )
+    with pytest.raises(UnsupportedExecution, match="trusted support"):
+        runtime.start(request)
+    assert connection.calls == []
+
+
+@pytest.mark.parametrize("resolved", [None, "high"])
+def test_null_effort_preserves_legacy_defaults_without_inventing_evidence(resolved: str | None) -> None:
+    connection, runtime, request = exact_setup(None)
+    connection.effort = resolved
+    handle = runtime.start(request)
+    assert "config" not in connection.calls[0][1]
+    assert "effort" not in connection.calls[1][1]
+    identity = runtime.observe(handle, now=10).identity
+    assert identity.requested_effort is None
+    assert identity.resolved_effort == resolved
+    assert identity.observed_effort is None
+
+
+@pytest.mark.parametrize("field", ["observed_provider", "observed_effort"])
+def test_no_requested_attestation_can_be_fabricated(field: str) -> None:
+    connection, runtime, request = exact_setup()
+    with pytest.raises(UnsupportedExecution, match="attest"):
+        runtime.start(replace(request, identity=replace(request.identity, **{field: "claim"})))
+    assert connection.calls == []
+
+
+def test_selected_effort_cannot_be_silently_omitted_by_input_resolver() -> None:
+    connection, runtime, request = exact_setup()
+    original = runtime.resolve
+
+    def omit_effort(value: ExecutionRequest) -> CodexInputs:
+        return replace(original(value), reasoning_effort=None)
+
+    runtime.resolve = omit_effort
+    with pytest.raises(ExecutionConflict, match="effort"):
+        runtime.start(request)
+    assert connection.calls == []
+
+
+def test_opaque_variant_never_changes_native_effort() -> None:
+    connection, runtime, request = exact_setup()
+    assert request.allocation is not None
+    request = replace(request, allocation=replace(request.allocation, variant="opaque-not-an-effort"))
+    runtime.start(request)
+    assert connection.calls[1][1]["effort"] == "high"
+    assert all("variant" not in params for _, params in connection.calls)
+
+
+def test_requested_resolution_claims_do_not_become_native_evidence_after_restore() -> None:
+    _, runtime, request = exact_setup()
+    request = replace(
+        request,
+        identity=replace(
+            request.identity, resolved="model-one", resolved_provider="provider-one", resolved_effort="high"
+        ),
+    )
+    runtime.restore(request, "codex:thread-one:turn-one")
+    identity = runtime.observe("codex:thread-one:turn-one", now=10).identity
+    assert identity.resolved is None and identity.resolved_provider is None and identity.resolved_effort is None
