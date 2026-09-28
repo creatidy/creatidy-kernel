@@ -5,7 +5,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import Protocol, cast
+from typing import Protocol
 
 from creatidy_kernel.core.domain import (
     AttemptSpec,
@@ -35,6 +35,15 @@ from creatidy_kernel.core.verification import (
     VerificationPolicy,
     admit_accepted,
     verify_candidate,
+)
+from creatidy_kernel.ports.allocation import (
+    decode_allocation,
+    decode_identity,
+    decode_runtime_receipt,
+    encode_allocation,
+    identity_matches,
+    is_legacy_allocation,
+    load_attempt_inputs,
 )
 from creatidy_kernel.ports.execution import Runtime
 from creatidy_kernel.ports.program_store import ApplicationStore
@@ -78,49 +87,87 @@ def advance_work_unit(
     The caller operates in trusted-development mode and supplies pinned workspace,
     verifier and runtime bindings. No worker-provided checks execute here.
     """
+    program = store.load(program.program_id)
     if program.state(unit_id).status is WorkUnitStatus.SATISFIED:
         return "accepted"
     attempt_id = f"{program.program_id}:{unit_id}"
     operation_id = f"runtime:{attempt_id}"
-    allocation = allocator.select(ResourceRequest(unit_id, frozenset({"reference"}), 128))
-    allocation_data = asdict(allocation)
-    allocation_data["capabilities"] = sorted(allocation.capabilities)
-    allocation_bytes = manifest_bytes(allocation_data)
-    allocation_ref = "sha256:" + hashlib.sha256(allocation_bytes).hexdigest()
-    context = manifest_bytes([asdict(item) for item in program.resolved_inputs(unit_id)])
-    context_ref = "sha256:" + hashlib.sha256(context).hexdigest()
-    attempt = AttemptSpec(
-        attempt_id,
-        program.program_id,
-        unit_id,
-        program.spec.revision,
-        program.spec.digest,
-        program.resolved_inputs(unit_id),
-        allocation_ref,
-        "reference:v1",
-        workspace.key,
-        context_ref,
-    )
     if not any(item.spec.attempt_id == attempt_id for item in program.attempts):
-        program = store.admit(
-            program.program_id, f"prepare:{attempt_id}", PrepareAttempt(program.revision, "worker", attempt)
+        allocation = allocator.select(ResourceRequest(unit_id, frozenset({"reference"}), 128))
+        allocation_bytes = encode_allocation(allocation)
+        allocation_ref = "sha256:" + hashlib.sha256(allocation_bytes).hexdigest()
+        context = manifest_bytes([asdict(item) for item in program.resolved_inputs(unit_id)])
+        context_ref = "sha256:" + hashlib.sha256(context).hexdigest()
+        attempt = AttemptSpec(
+            attempt_id,
+            program.program_id,
+            unit_id,
+            program.spec.revision,
+            program.spec.digest,
+            program.resolved_inputs(unit_id),
+            allocation_ref,
+            "reference:v1",
+            workspace.key,
+            context_ref,
         )
-    else:
-        attempt = program.attempt(attempt_id).spec
-    if program.attempt(attempt_id).status is AttemptStatus.PREPARED:
+        fault("selected")
         program = store.admit_with_intent(
             program.program_id,
-            f"start:{attempt_id}",
-            StartAttempt(program.revision, "worker", attempt_id),
+            f"prepare:{attempt_id}",
+            PrepareAttempt(program.revision, "worker", attempt),
             operation_id,
             operation_id,
-            {"attempt": attempt.digest, "workspace": workspace.key},
+            {
+                "version": 1,
+                "attempt": attempt.digest,
+                "workspace": workspace.key,
+                "allocation": allocation_bytes.decode(),
+                "context": context.decode(),
+            },
         )
-    operation = store.operation(operation_id)
+        fault("prepared")
+    attempt = program.attempt(attempt_id).spec
+    if workspace.key != attempt.workspace_reference:
+        raise ValueError("workspace differs from original Attempt")
+    allocation_bytes, context = load_attempt_inputs(store, attempt)
+    allocation = decode_allocation(allocation_bytes)
+    legacy = is_legacy_allocation(allocation_bytes)
+    allocation_ref, context_ref = attempt.allocation_reference, attempt.context_reference
+    if allocation_ref is None or context_ref is None or attempt.agent_definition_reference is None:
+        raise ValueError("Attempt lacks immutable execution references")
     store.finalize_artifact(operation_id, "allocation", allocation_bytes)
+    fault("allocation")
     store.finalize_artifact(operation_id, "context", context)
+    fault("artifacts")
+    if program.attempt(attempt_id).status is AttemptStatus.PREPARED:
+        # Prepare already atomically owns the immutable Operation. Starting changes
+        # only Program state, never the original request or its selection.
+        program = store.admit(
+            program.program_id, f"start:{attempt_id}", StartAttempt(program.revision, "worker", attempt_id)
+        )
+        fault("started")
+    operation = store.operation(operation_id)
     key = OperationKey(operation_id, operation.effect_key, operation.request_digest)
     fault("commit")
+    receipt_identity: RuntimeIdentity | None = None
+    receipt = store.find_artifact(operation_id, "runtime-receipt")
+    if receipt is not None:
+        receipt_handle, receipt_fence, receipt_identity = decode_runtime_receipt(receipt)
+        if (
+            receipt_fence != operation.fence
+            or operation.accepted_reference not in (None, receipt_handle)
+            or not identity_matches(
+                receipt_identity, allocation, attempt.agent_definition_reference, require_resolved=False, legacy=legacy
+            )
+        ):
+            raise ValueError("runtime receipt differs from original execution")
+        if operation.accepted_reference is None:
+            if operation.status not in {"dispatched", "unknown"} or operation.retry_proof is not None:
+                raise ValueError("runtime receipt has no matching delivery")
+            store.record_transport(operation_id, receipt_fence, True)
+            operation = store.observe(
+                operation_id, receipt_fence, f"accepted:{receipt_handle}", "accepted", reference=receipt_handle
+            )
     if operation.status in {"dispatched", "unknown"}:
         if operation.lease_until is not None and now < operation.lease_until:
             return "waiting"
@@ -147,11 +194,33 @@ def advance_work_unit(
             context_ref,
             allocation_ref,
             "owner-approved-reference",
-            RuntimeIdentity(allocation.model_id, None, None, "reference:v1"),
+            RuntimeIdentity(
+                allocation.model_id,
+                None,
+                None,
+                attempt.agent_definition_reference,
+                requested_provider=allocation.provider_id,
+                requested_effort=allocation.reasoning_effort,
+            ),
             fence,
+            allocation,
         )
         handle = runtime.start(request)
         fault("send")
+        # Publish the native handle and configuration together before accepting
+        # the receipt. A process crash cannot retain one while losing the other.
+        started = runtime.observe(handle, now=now)
+        if started.handle != handle or not identity_matches(
+            started.identity, allocation, attempt.agent_definition_reference, require_resolved=False, legacy=legacy
+        ):
+            return "identity_unavailable"
+        receipt_identity = started.identity
+        store.finalize_artifact(
+            operation_id,
+            "runtime-receipt",
+            manifest_bytes({"version": 1, "handle": handle, "fence": fence, "identity": asdict(receipt_identity)}),
+        )
+        fault("receipt-evidence")
         store.record_transport(operation_id, fence, True)
         operation = store.observe(operation_id, fence, f"accepted:{handle}", "accepted", reference=handle)
         fault("receipt")
@@ -165,8 +234,16 @@ def advance_work_unit(
         context_ref,
         allocation_ref,
         "owner-approved-reference",
-        RuntimeIdentity(allocation.model_id, None, None, "reference:v1"),
+        RuntimeIdentity(
+            allocation.model_id,
+            None,
+            None,
+            attempt.agent_definition_reference,
+            requested_provider=allocation.provider_id,
+            requested_effort=allocation.reasoning_effort,
+        ),
         operation.fence,
+        allocation,
     )
     if restore is not None:
         restore(request, handle)
@@ -176,32 +253,41 @@ def advance_work_unit(
         operation_id, f"observation:{hashlib.sha256(observation_data).hexdigest()}", observation_data
     )
     identity = observation.identity
-    if (
-        observation.handle != handle
-        or identity.requested != allocation.model_id
-        or identity.agent_definition_version != attempt.agent_definition_reference
-        or identity.resolved not in (None, allocation.model_id)
-        or identity.observed not in (None, allocation.model_id)
+    if observation.handle != handle or not identity_matches(
+        identity,
+        allocation,
+        attempt.agent_definition_reference,
+        require_resolved=False,
+        legacy=legacy,
+        recorded=receipt_identity,
     ):
         return "identity_unavailable"
     persisted_identity = store.find_artifact(operation_id, "identity")
     if persisted_identity is None:
-        if identity.resolved is None:
+        original = (
+            receipt_identity if receipt_identity is not None and receipt_identity.resolved is not None else identity
+        )
+        if not identity_matches(
+            original, allocation, attempt.agent_definition_reference, require_resolved=True, legacy=legacy
+        ):
             return "identity_unavailable"
-        store.finalize_artifact(operation_id, "identity", manifest_bytes(asdict(identity)))
+        store.finalize_artifact(operation_id, "identity", manifest_bytes(asdict(original)))
     else:
         # The immutable Operation owns the accepted handle and its original runtime
         # resolution. A restored adapter's unknown identity cannot erase that fact.
-        raw: object = json.loads(persisted_identity)
-        if not isinstance(raw, dict):
+        try:
+            recorded = decode_identity(persisted_identity)
+        except ValueError:
             return "identity_unavailable"
-        recorded = cast(dict[str, object], raw)
-        if (
-            set(recorded) != {"requested", "resolved", "observed", "agent_definition_version"}
-            or recorded["requested"] != allocation.model_id
-            or recorded["resolved"] != allocation.model_id
-            or recorded["observed"] not in (None, allocation.model_id)
-            or recorded["agent_definition_version"] != attempt.agent_definition_reference
+        if not identity_matches(
+            recorded, allocation, attempt.agent_definition_reference, require_resolved=True, legacy=legacy
+        ) or not identity_matches(
+            identity,
+            allocation,
+            attempt.agent_definition_reference,
+            require_resolved=False,
+            legacy=legacy,
+            recorded=recorded,
         ):
             return "identity_unavailable"
     if observation.activity is not Activity.TERMINAL:

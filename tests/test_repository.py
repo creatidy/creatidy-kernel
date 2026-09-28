@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_license_and_runtime_dependency_contract() -> None:
     config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert config["project"]["license"] == "Apache-2.0"
-    assert config["project"]["license-files"] == ["LICENSE"]
+    assert config["project"]["license-files"] == ["LICENSE", "NOTICE"]
     assert config["project"]["dependencies"] == []
     assert set(config["build-system"]["requires"]) <= set(config["dependency-groups"]["dev"])
     assert config["tool"]["uv"]["no-build-isolation-package"] == ["creatidy-kernel"]
@@ -20,6 +20,10 @@ def test_license_and_runtime_dependency_contract() -> None:
     assert "Version 2.0, January 2004" in license_text
     assert "END OF TERMS AND CONDITIONS" in license_text
     assert len(license_text) > 10000
+    notice = (ROOT / "NOTICE").read_text(encoding="utf-8")
+    # Public source commit, not a credential.
+    assert "81b8e6393a1b2df8a6c7a9c6c3dcb8a7f6884e4e" in notice  # pragma: allowlist secret
+    assert "scarcity_router/remote.py" in notice
     for path in (ROOT / "src").rglob("*.py"):
         assert path.read_text(encoding="utf-8").startswith("# SPDX-License-Identifier: Apache-2.0"), path
 

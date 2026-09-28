@@ -32,6 +32,9 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
         license_name = next(name for name in names if name.endswith(".dist-info/licenses/LICENSE"))
         if archive.read(license_name) != (ROOT / "LICENSE").read_bytes():
             raise SystemExit("Wheel must include the complete project license")
+        notice_name = next(name for name in names if name.endswith(".dist-info/licenses/NOTICE"))
+        if archive.read(notice_name) != (ROOT / "NOTICE").read_bytes():
+            raise SystemExit("Wheel must include adapted-source attribution")
         if any(not (name.startswith("creatidy_kernel/") or ".dist-info/" in name) for name in names):
             raise SystemExit("Unexpected non-package content in wheel")
         package_bytes = {name: archive.read(name) for name in names if name.startswith("creatidy_kernel/")}
@@ -54,6 +57,7 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
             "-I",
             "-c",
             "from creatidy_kernel.adapters.fixed_allocator import FixedAllocator; "
+            "from creatidy_kernel.adapters.scarcity_router import ScarcityRouterAllocator; "
             "from creatidy_kernel.core.resources import Allocation, ResourceRequest; "
             "a = FixedAllocator(Allocation('runtime', 'local', 'model', frozenset(), 0, 'smoke')); "
             "assert a.select(ResourceRequest('unit', frozenset(), 0)).provider_id == 'local'",

@@ -78,3 +78,23 @@ def test_blank_identity_and_reason_are_rejected() -> None:
         replace(allocation(), rationale=" ")
     with pytest.raises(ValueError, match="reasoning_effort"):
         replace(allocation(), reasoning_effort="")
+
+
+@pytest.mark.parametrize("value", ["", " ", 1, {}, []])
+def test_optional_allocation_evidence_is_immutable_text(value: object) -> None:
+    with pytest.raises(ValueError, match="allocation evidence"):
+        replace(allocation(), variant=cast(str, value))
+    with pytest.raises(ValueError, match="allocation evidence"):
+        replace(allocation(), decision_provenance=cast(str, value))
+
+
+def test_variant_and_reasoning_effort_are_independent_evidence() -> None:
+    selected = replace(
+        allocation(), variant="configuration-a", reasoning_effort="high", decision_provenance='{"version":1}'
+    )
+    assert selected.variant != selected.reasoning_effort
+    assert replace(selected, reasoning_effort=None).variant == "configuration-a"
+    assert replace(selected, reasoning_effort="none").reasoning_effort == "none"
+    field = "decision_provenance"
+    with pytest.raises(FrozenInstanceError):
+        setattr(selected, field, "changed")

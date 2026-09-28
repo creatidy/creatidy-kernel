@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "decision": {
+    "evaluated_at": "2026-09-28T08:00:00Z",
+    "requirement": {
+      "task_level": "L0",
+      "capability_minima": {},
+      "hard_constraints": {"minimum_input_context_tokens": 128, "requires_tool_use": true}
+    },
+    "catalog_version": 1,
+    "catalog_updated_on": "2026-09-28",
+    "selector_mode": "balanced",
+    "resource_policy_version": 1,
+    "selected": {
+      "identity": {"provider": "openai", "model": "fixture-model", "variant": "opaque-configuration"},
+      "display_name": "Synthetic public candidate",
+      "reasoning_effort": "high",
+      "eligible": true,
+      "degraded": true,
+      "capability_margin": 0,
+      "scarcity_assessment": {
+        "state": "unknown",
+        "label": "unknown",
+        "applicable_scopes": [],
+        "reason_codes": ["capacity_bindings_unknown"]
+      },
+      "unknown_capacity_decision": {
+        "mode": "degraded",
+        "eligible_by_unknown_policy": true,
+        "degraded": true,
+        "reason_codes": ["unknown_capacity_degraded"]
+      }
+    },
+    "alternatives": [],
+    "excluded": [],
+    "closest_candidates": [],
+    "recoverable_candidates": [],
+    "degraded": true,
+    "reason_codes": ["selected_balanced", "selected_degraded_capacity"],
+    "preference_order": []
+  }
+}
