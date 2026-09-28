@@ -618,13 +618,17 @@ class DogfoodChecks:
                         self.fault("verification")
             entries = _porcelain(self.workspace)
             mutations = [{"status": status, "path": path} for status, path in entries if status != "??"]
-            confined = sorted(path for status, path in entries if status == "??")
+            untracked = sorted(path for status, path in entries if status == "??")
+            # Every non-ignored Git-visible change after verification fails: the
+            # workspace must be Git-clean with respect to all non-ignored state, so
+            # the recorded evidence depends on the candidate subject alone. Ignored
+            # cache artifacts stay ignored by Git and are not candidate content.
             passed = (
                 all(
                     isinstance(run["exit_code"], int) and run["exit_code"] == 0 and run["timed_out"] is False
                     for run in runs
                 )
-                and not mutations
+                and not entries
             )
             self.lifecycle.append("verification passed" if passed else "verification failed")
             return self._evidence(
@@ -634,9 +638,9 @@ class DogfoodChecks:
                 {
                     "runs": runs,
                     "tracked_mutations_after_verification": mutations,
-                    "confined_untracked_paths": confined,
-                    "subject_note": "acceptance binds to the exact candidate Git subject; "
-                    "confined untracked artifacts do not alter it",
+                    "untracked_paths_after_verification": untracked,
+                    "subject_note": "acceptance binds to the exact candidate Git subject; the workspace "
+                    "must be Git-clean of all non-ignored state after verification",
                 },
             )
         if name == "structural":
@@ -720,7 +724,7 @@ class DogfoodCollector:
             _tree, _head, patch, _paths = _derive_candidate(self.workspace, self.base)
         else:
             # A durable candidate exists: restore the workspace to that exact subject so
-            # confined verification debris can never alter re-derivation.
+            # verification debris can never alter re-derivation.
             head = str(recorded["head"])
             _install_candidate(self.workspace, self.objects, head)
             patch = git_bytes(self.workspace, "diff", "--binary", self.base, head)
@@ -1089,6 +1093,22 @@ LIVE_ENV = {
     "forge_askpass": "CREATIDY_DOGFOOD_FORGE_ASKPASS",
 }
 CODEX_METHODS = frozenset({"thread/start", "turn/start", "thread/read", "turn/interrupt"})
+# The closed set of operational environment entries the Codex app-server may receive.
+# HOME carries Codex's own authenticated configuration directory (~/.codex), which is
+# its existing credential mechanism — no secret is carried in the environment itself.
+# PATH, LANG/LC_ALL and TMPDIR are the operational tool-resolution, locale and temp
+# entries. Everything else in the controller environment, including every dogfood
+# controller credential and unrelated owner secret, is dropped rather than forwarded.
+CODEX_ENVIRONMENT_KEYS = ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR")
+
+
+def codex_environment(environ: Mapping[str, str]) -> dict[str, str]:
+    """Build the closed Codex subprocess environment; never an inheritance pass-through."""
+    environment = {"PATH": environ.get("PATH") or os.defpath}
+    for name in CODEX_ENVIRONMENT_KEYS:
+        if name != "PATH" and environ.get(name):
+            environment[name] = environ[name]
+    return environment
 
 
 @dataclass(frozen=True, slots=True)
@@ -1121,7 +1141,12 @@ def compose_dogfood_live(environ: Mapping[str, str], task: DogfoodTaskSpec) -> D
 
     Credentials are read from the environment when the adapter strictly requires
     them; they are never task data, never Program evidence, never logged, and never
-    embedded in URLs or command-line arguments.
+    embedded in URLs or command-line arguments. The Codex app-server subprocesses
+    receive a closed controller-built operational environment (HOME, PATH, locale,
+    temp) instead of inheriting the controller environment, so dogfood controller
+    credentials and unrelated owner secrets never reach the coding runtime. Codex
+    authentication uses its own HOME-based authenticated configuration, not an
+    environment-carried secret.
     """
     required = [name for key, name in LIVE_ENV.items() if key not in ("router_key", "forge_askpass")]
     missing = [name for name in required if not environ.get(name)]
@@ -1144,7 +1169,12 @@ def compose_dogfood_live(environ: Mapping[str, str], task: DogfoodTaskSpec) -> D
     def connection_factory() -> CodexConnection:
         if not Path(codex_bin).is_absolute():
             raise ValueError("CREATIDY_DOGFOOD_CODEX_BIN must be an absolute executable path")
-        return CodexStdio((codex_bin, "app-server"), codex_version, schema_methods=CODEX_METHODS)
+        return CodexStdio(
+            (codex_bin, "app-server"),
+            codex_version,
+            schema_methods=CODEX_METHODS,
+            environment=codex_environment(os.environ),
+        )
 
     def forge_factory(directory: Path) -> Forge:
         askpass = Path(askpass_raw) if askpass_raw else None

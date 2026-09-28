@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """D1-02 dogfood composition proof: real Git fixtures, native-shaped fakes, no paid calls."""
 
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -121,6 +122,7 @@ def make_source(directory: Path) -> Path:
     (source / "tests" / "__init__.py").write_text("")
     (source / "tests" / "test_e2e_execution.py").write_text(BASE_TEST_FILE)
     (source / "README.md").write_text("fixture repository\n")
+    (source / ".gitignore").write_text("__pycache__/\n*.pyc\n")
     reference_git(source, "add", "-A")
     reference_git(source, "commit", "-m", "fixture base")
     return source
@@ -413,10 +415,74 @@ def test_tracked_mutation_during_verification_rejected(sqlite_tmp_path: Path) ->
     lifecycle = cast(list[str], result["lifecycle"])
     assert "verification failed" in lifecycle
     commands = cast("dict[str, dict[str, object]]", result["verification"])
-    mutations = cast(
-        "list[dict[str, object]]", commands["verification-commands"]["tracked_mutations_after_verification"]
-    )
+    payload = commands["verification-commands"]
+    mutations = cast("list[dict[str, object]]", payload["tracked_mutations_after_verification"])
     assert mutations
+
+
+def test_non_ignored_untracked_litter_during_verification_rejected(sqlite_tmp_path: Path) -> None:
+    source = make_source(sqlite_tmp_path)
+    litter = (
+        sys.executable,
+        "-c",
+        "import pathlib; pathlib.Path('leftover-artifact.txt').write_text('verification residue')",
+    )
+    task = DogfoodTaskSpec(
+        task_id="fixture-littering",
+        forge_repository=REPOSITORY.value,
+        repository_url="https://forge.invalid/BioMedical-IT/scarcity-router",
+        base_branch="develop",
+        instruction="irrelevant",
+        repository_instructions="irrelevant",
+        allowed_paths=frozenset({"tests/test_e2e_execution.py"}),
+        verification=(VerificationCommand(litter, 30),),
+        structural=scarcity_router_143_task().structural,
+    )
+    control = sqlite_tmp_path / "control"
+    result = run(control, source, FixtureConnection(deflake_edit), task=task)
+    # The trusted command exited zero, but the workspace is no longer Git-clean.
+    commands = cast("dict[str, dict[str, object]]", result["verification"])
+    payload = commands["verification-commands"]
+    runs = cast("list[dict[str, object]]", payload["runs"])
+    assert all(run["exit_code"] == 0 for run in runs)
+    assert payload["untracked_paths_after_verification"] == ["leftover-artifact.txt"]
+    assert result["condition"] == "rejected"
+    lifecycle = cast(list[str], result["lifecycle"])
+    assert "verification failed" in lifecycle
+    assert not any(line.startswith("candidate accepted") for line in lifecycle)
+    evidence = export_dogfood(control)
+    assert "acceptance" not in evidence
+    assert "pr" not in evidence
+
+
+def test_ignored_cache_artifacts_do_not_reject_verification(sqlite_tmp_path: Path) -> None:
+    source = make_source(sqlite_tmp_path)
+    cache_maker = (
+        sys.executable,
+        "-c",
+        "import pathlib; pathlib.Path('__pycache__').mkdir(exist_ok=True); "
+        "pathlib.Path('__pycache__/m.cpython-312.pyc').write_text('cache')",
+    )
+    task = DogfoodTaskSpec(
+        task_id="fixture-caching",
+        forge_repository=REPOSITORY.value,
+        repository_url="https://forge.invalid/BioMedical-IT/scarcity-router",
+        base_branch="develop",
+        instruction="irrelevant",
+        repository_instructions="irrelevant",
+        allowed_paths=frozenset({"tests/test_e2e_execution.py"}),
+        verification=(
+            VerificationCommand(cache_maker, 30),
+            VerificationCommand((sys.executable, "-m", "unittest", "tests.test_e2e_execution.CancellationTests"), 60),
+        ),
+        structural=scarcity_router_143_task().structural,
+    )
+    result = run(sqlite_tmp_path / "control", source, FixtureConnection(deflake_edit), task=task)
+    commands = cast("dict[str, dict[str, object]]", result["verification"])
+    payload = commands["verification-commands"]
+    assert payload["tracked_mutations_after_verification"] == []
+    assert payload["untracked_paths_after_verification"] == []
+    assert result["condition"] == "accepted"
 
 
 def test_runtime_identity_mismatch_refuses_and_stays_uncertain(sqlite_tmp_path: Path) -> None:
@@ -640,3 +706,28 @@ def test_live_composition_requires_complete_environment() -> None:
     }
     components = compose_dogfood_live(environment, task)
     assert isinstance(components.allocator, ScarcityRouterAllocator)
+
+
+def test_codex_environment_is_closed_and_secret_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    from creatidy_kernel.adapters.dogfood import codex_environment
+
+    sentinels = {
+        name: "synthetic-" + name.lower().replace("_", "-")
+        for name in ("CREATIDY_DOGFOOD_ROUTER_KEY", "CREATIDY_DOGFOOD_FORGE_TOKEN", "UNRELATED_OWNER_API_KEY")
+    }
+    for name, value in sentinels.items():
+        monkeypatch.setenv(name, value)
+    closed = codex_environment(os.environ)
+    # Controller and unrelated owner secrets never reach the coding runtime.
+    assert not any(
+        name in closed
+        for name in (
+            "CREATIDY_DOGFOOD_ROUTER_KEY",
+            "CREATIDY_DOGFOOD_FORGE_TOKEN",
+            "UNRELATED_OWNER_API_KEY",
+        )
+    )
+    assert "synthetic" not in " ".join(closed.values())
+    # The closed operational set still carries the entries Codex actually needs.
+    assert closed["PATH"] == (os.environ.get("PATH") or os.defpath)
+    assert closed["HOME"] == os.environ["HOME"]

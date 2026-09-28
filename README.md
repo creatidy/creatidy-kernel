@@ -159,8 +159,9 @@ moves. Work happens in a disposable controller-owned clone; the controller itsel
 candidate commit from the workspace tree. Changed paths must stay inside the frozen allowed set,
 trusted argv-only verification commands run in the candidate workspace with bounded capture and
 timeouts, and deterministic structural checks reject obvious test weakening with the semantic
-residue explicitly deferred to independent review. Verification artifacts that stay untracked are
-confined and never change the accepted Git subject; tracked mutations reject the candidate.
+residue explicitly deferred to independent review. After verification the workspace must be
+Git-clean with respect to all non-ignored state: tracked mutations and non-ignored untracked
+paths both reject the candidate, while ignored cache artifacts remain ignored by Git.
 
 Live composition requires documented environment configuration
 (`CREATIDY_DOGFOOD_ROUTER_URL`, optional `CREATIDY_DOGFOOD_ROUTER_KEY`,
@@ -168,7 +169,10 @@ Live composition requires documented environment configuration
 `CREATIDY_DOGFOOD_CODEX_VERSION`, `CREATIDY_DOGFOOD_FORGE_API`,
 `CREATIDY_DOGFOOD_FORGE_REMOTE`, `CREATIDY_DOGFOOD_FORGE_TOKEN`, optional
 `CREATIDY_DOGFOOD_FORGE_ASKPASS`). Credentials are read only from the environment; they are never
-task data, evidence, log output, or command-line arguments. The coding runtime runs in
+task data, evidence, log output, or command-line arguments. The Codex app-server subprocesses run
+with a closed controller-built operational environment (`HOME`, `PATH`, locale and temp entries
+only); the controller environment — including every dogfood credential and unrelated owner
+secret — is never inherited by the coding runtime. The coding runtime runs in
 **trusted-development** Codex workspace-write mode; hostile-worker isolation is not attested.
 An uncertain dispatch or PR delivery stays unknown until reconciled; nothing is blindly retried.
 

@@ -13,6 +13,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 
@@ -30,6 +31,7 @@ class CodexStdio:
         max_bytes: int = 1_000_000,
         schema_methods: frozenset[str] = frozenset(),
         schema_version: str | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         if (
             len(command) != 2
@@ -45,6 +47,19 @@ class CodexStdio:
             or (schema_methods and schema_version != expected_version)
         ):
             raise ValueError("absolute Codex app-server command, pinned version and finite limits required")
+        if environment is not None:
+            # An explicit environment replaces inheritance entirely for BOTH the
+            # version probe and the app-server process; it is never merged with the
+            # controller's ambient environment. Callers that need operational entries
+            # (home/config location, PATH, locale, temp) must supply them explicitly.
+            supplied = dict(environment)
+            if any(type(name) is not str or not name or type(value) is not str for name, value in supplied.items()):
+                raise ValueError("explicit Codex environment must map nonempty names to string values")
+            self._environment: dict[str, str] | None = supplied
+        else:
+            # Preserves the pre-existing implicit-inheritance behavior for callers
+            # that have not opted into an explicit subprocess environment.
+            self._environment = None
         self.timeout = timeout
         self.max_bytes = max_bytes
         self._lock = threading.Lock()
@@ -59,7 +74,11 @@ class CodexStdio:
         self._methods = schema_methods
 
         version_process = subprocess.Popen(  # noqa: S603 - explicit trusted absolute executable, no shell.
-            (command[0], "--version"), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True
+            (command[0], "--version"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=self._environment,
         )
         try:
             output = self._version_output(version_process)
@@ -75,6 +94,7 @@ class CodexStdio:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
+                env=self._environment,
             )
             self._exchange(
                 "initialize",
