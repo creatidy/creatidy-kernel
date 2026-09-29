@@ -1792,6 +1792,11 @@ def _inspect_local_storage(directory: Path, *, database_path: Path | None = None
             os.close(descriptor)
 
 
+def validate_local_storage(directory: Path, *, database_path: Path | None = None) -> str:
+    """Read-only readiness using the same native WAL topology gate as store startup."""
+    return _inspect_local_storage(directory, database_path=database_path).filesystem_type
+
+
 def _fsync_file(path: Path) -> None:
     descriptor = os.open(path, os.O_RDWR)
     try:

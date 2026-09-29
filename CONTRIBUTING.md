@@ -7,7 +7,8 @@ tags. An ordinary contribution does not authorize paid model calls, production a
 
 ## Local Gate
 
-Install Python 3.12+ and uv, then `uv sync --locked`. `make check` runs:
+Install Python 3.12+ and uv, then `uv sync --locked`. `make` (or `make help`) lists development
+targets without running checks or live execution. `make check` runs:
 
 ```sh
 uv lock --check

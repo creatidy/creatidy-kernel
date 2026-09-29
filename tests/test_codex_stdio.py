@@ -144,7 +144,7 @@ for line in sys.stdin:
 
 # Synthetic sentinel markers prove controller credentials never reach the child.
 # Constructed programmatically so no literal credential-like pair appears in source.
-SENTINEL_NAMES = ("CREATIDY_DOGFOOD_ROUTER_KEY", "CREATIDY_DOGFOOD_FORGE_TOKEN", "SOMEONE_ELSES_API_KEY")
+SENTINEL_NAMES = ("CREATIDY_KERNEL_ROUTER_KEY", "CREATIDY_KERNEL_FORGE_TOKEN", "SOMEONE_ELSES_API_KEY")
 SENTINELS = {name: "synthetic-" + name.lower().replace("_", "-") for name in SENTINEL_NAMES}
 
 
@@ -178,12 +178,12 @@ def test_explicit_environment_replaces_inheritance(env_command: str, monkeypatch
 
 
 def test_default_environment_still_inherits(env_command: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CREATIDY_DOGFOOD_ROUTER_KEY", "synthetic-router-sentinel")
+    monkeypatch.setenv("CREATIDY_KERNEL_ROUTER_KEY", "synthetic-router-sentinel")
     transport = CodexStdio((env_command, "app-server"), "0.99.1")
     try:
         # Preserves the pre-existing implicit-inheritance behavior for non-opted callers.
-        assert _dumped(env_command, "version")["CREATIDY_DOGFOOD_ROUTER_KEY"] == "synthetic-router-sentinel"
-        assert _dumped(env_command, "server")["CREATIDY_DOGFOOD_ROUTER_KEY"] == "synthetic-router-sentinel"
+        assert _dumped(env_command, "version")["CREATIDY_KERNEL_ROUTER_KEY"] == "synthetic-router-sentinel"
+        assert _dumped(env_command, "server")["CREATIDY_KERNEL_ROUTER_KEY"] == "synthetic-router-sentinel"
     finally:
         transport.close()
 

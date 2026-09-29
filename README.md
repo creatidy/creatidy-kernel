@@ -7,7 +7,7 @@ software engineering. It is for individual developers and small teams with limit
 premium-model quota and human attention.
 
 **Status: deterministic domain, durable persistence, bounded Forge and Codex Runtime adapters,
-an offline two-node CLI reference flow, and an experimental owner-approved dogfood path for one
+an offline two-node CLI reference flow, and owner-approved bounded task execution for one
 frozen real task, not a general autonomous Program engine.**
 The code includes immutable Program intent, legal domain commands, single-controller SQLite history
 and rebuildable projections, an external-operation journal/outbox with a synthetic effect seam and
@@ -135,58 +135,124 @@ b"")`; the runner verifies the base and never initializes or updates the remote 
 commit objects are reconstructed from verified durable bytes in the bare source before AGit delivery.
 This setup is deliberately specific to the reference scenario, not a general repository importer.
 
-## Dogfood CLI (experimental, owner-approved)
+## Bounded Tasks
 
-`creatidy-kernel dogfood` is the D1-02 experimental entry point for one frozen, controller-owned
-task contract. It composes the existing allocator, Codex runtime, controller-owned Git candidate,
-bounded verification and AGit delivery into a single supported path. It is **not** a general
-`run issue` feature and never merges or deploys.
+`creatidy-kernel task` composes the existing allocator, Codex runtime, controller-owned Git
+candidate, bounded verification and AGit delivery for a frozen, controller-owned task registry.
+The only current real task is `143`, representing `BioMedical-IT/scarcity-router#143`: a test-only
+cancellation-race repair with one allowed changed path, `tests/test_e2e_execution.py`. This is
+**not arbitrary autonomous issue execution**. Issue prose cannot create a task or alter its
+authority. There is no workflow DSL, scheduler or general agent framework, and no automatic merge
+or deployment.
+
+Infrastructure configuration must be provisioned before these commands. The following illustrates
+the public CLI contract, not authorization to perform the first live execution:
+
+**First-live rollout gate:** no real model task is authorized during the coordinated
+[Kernel #37](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/37) and
+[operator #43](https://forgejo.creatidy.com/Infrastructure/creatidy-onprem/issues/43) change.
+Both separate PRs must be owner-merged, then
+[preflight #34](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/34) must produce a fresh
+`READY_FOR_LIVE_TASK` through the new operator surfaces. The first live run remains a separate
+owner-approved step. No agent merge or live rollout is implied by this documentation.
 
 ```sh
-uv run --locked creatidy-kernel dogfood run \
-  --data-dir /path/on/native-disk/dogfood \
-  --repo /path/to/scarcity-router-checkout \
-  --task 143 --approve --trusted-development
-uv run --locked creatidy-kernel dogfood status --data-dir /path/on/native-disk/dogfood
-uv run --locked creatidy-kernel dogfood export --data-dir /path/on/native-disk/dogfood
+uv run --locked creatidy-kernel task preflight \
+  --data-dir /path/on/native-disk/task-state \
+  --repo /path/to/scarcity-router-checkout --task 143 --json
+# Only after separate owner authorization, pin the exact base reported by preflight:
+uv run --locked creatidy-kernel task run \
+  --data-dir /path/on/native-disk/task-state \
+  --repo /path/to/scarcity-router-checkout --task 143 \
+  --expected-base <exact-preflight-sha> --approve --trusted-development
+# Optional: add --deadline UNIX_SECONDS to pin an explicit finite run deadline.
+uv run --locked creatidy-kernel task status --data-dir /path/on/native-disk/task-state
+uv run --locked creatidy-kernel task export --data-dir /path/on/native-disk/task-state
 ```
 
-The frozen task `143` represents `BioMedical-IT/scarcity-router#143`. The exact base is
-established once from the source checkout (`refs/remotes/origin/<branch>`, falling back to
-`refs/heads/<branch>`) or pinned with `--expected-base <sha>`, then durably frozen; the owner
-checkout is only ever read, and a later run reuses the frozen base even if the source branch
-moves. Work happens in a disposable controller-owned clone; the controller itself creates the
-candidate commit from the workspace tree. Changed paths must stay inside the frozen allowed set,
-trusted argv-only verification commands run in the candidate workspace with bounded capture and
-timeouts, and deterministic structural checks reject obvious test weakening with the semantic
-residue explicitly deferred to independent review. After verification the workspace must be
-Git-clean with respect to all non-ignored state: tracked mutations and non-ignored untracked
-paths both reject the candidate, while ignored cache artifacts remain ignored by Git.
+Preflight is quota-free: it validates runtime configuration, source/state suitability, exact base,
+frozen structural assumptions, allowed paths and verification command shapes; probes the pinned
+Codex version/schema and app-server initialization; requests a Router recommendation constrained
+by the controller binding; and checks Forge read/config readiness. It never starts a model thread
+or turn, writes Forge state, or runs the post-candidate eight-repeat verification plan. A blocked
+preflight exits nonzero. Readiness is `READY_FOR_LIVE_TASK`, not owner execution approval, a quota
+reservation or a guarantee that external infrastructure cannot change before dispatch. Human output
+and `--json` are supported. The schema-1 JSON contains `status` (`READY_FOR_LIVE_TASK` or `BLOCKED`),
+`ready`, `task_id`, `task_digest`, `repository`, `exact_base_sha`, `base_ref`, `blockers` and `evidence`.
+Blockers contain a typed `reason` and safe `fields` (key names only). Reasons classify configuration,
+source, state, task baseline, Codex, Router and Forge readiness failures. `inference_performed`,
+`forge_writes_performed` and `execution_authorized` are false. Operators must require both a zero
+exit status and readiness before using `exact_base_sha` for a separately authorized run.
+Initialization does not attest authenticated model execution; the Codex evidence reports
+`authentication_attested: false`. Operator credential provisioning remains a separate prerequisite.
+Preflight does not repair control state: an existing database must be checkpointed with no active
+or unreconciled WAL/SHM/journal sidecars. Such state returns `state_not_ready`; do not delete sidecars
+to force readiness. Offline status/export use the normal store opening/closing path without
+dispatching work. Runtime-effect reconciliation remains owned by the bounded run/recovery path.
 
-Live composition requires documented environment configuration
-(`CREATIDY_DOGFOOD_ROUTER_URL`, optional `CREATIDY_DOGFOOD_ROUTER_KEY`,
-`CREATIDY_DOGFOOD_RUNTIME_BINDING`, `CREATIDY_DOGFOOD_CODEX_BIN`,
-`CREATIDY_DOGFOOD_CODEX_VERSION`, `CREATIDY_DOGFOOD_FORGE_API`,
-`CREATIDY_DOGFOOD_FORGE_REMOTE`, `CREATIDY_DOGFOOD_FORGE_TOKEN`, optional
-`CREATIDY_DOGFOOD_FORGE_ASKPASS`). Credentials are read only from the environment; they are never
-task data, evidence, log output, or command-line arguments. The single parsed
-`CREATIDY_DOGFOOD_RUNTIME_BINDING` (`provider/model[/effort]`) is the controller-owned authority
-for two compatible purposes: it constrains which Router recommendation can become an executable
-Allocation, and its exact `provider/model/effort` tuple supplies the trusted `supported_efforts`
-evidence for the pinned Codex runtime — a binding without an explicit effort provides none, and a
-Router recommendation never creates runtime capability. The Codex app-server subprocesses run
-with a closed controller-built operational environment (`HOME`, `PATH`, locale and temp entries
-only); the controller environment — including every dogfood credential and unrelated owner
-secret — is never inherited by the coding runtime. The coding runtime runs in
-**trusted-development** Codex workspace-write mode; hostile-worker isolation is not attested.
-An uncertain dispatch or PR delivery stays unknown until reconciled; nothing is blindly retried.
+The source checkout is read-only to Kernel. Work happens in a disposable controller-owned clone;
+the controller itself creates the candidate commit from the workspace tree. The base is durably
+frozen, and recovery uses that exact base even if a source branch moves. Changed paths must remain
+inside the task's frozen allowed set. Task-owned argv-only verification runs in the candidate
+workspace with bounded capture/timeouts: the current task has targeted cancellation checks, exactly
+eight repeated targeted runs, and one `make check`. Structural checks reject obvious test weakening;
+semantic residue remains subject to independent review. After verification the workspace must be
+Git-clean for tracked and non-ignored untracked state; ignored cache artifacts remain ignored.
 
-The owner supplies an absolute deadline no more than one hour ahead and an observation budget of
-1-100. Both are pinned across restarts, with at most two runtime Attempts. Bounded exit requests
-cancellation but does not assert that a remote worker has stopped. These limits are not a provider-side
-hard monetary/token quota. Verification failures pause this reference, whose remediation budget is
-zero. The live composition is covered by native-shaped offline fixtures; no live paid-provider or
-remote-Forgejo execution is claimed by the offline suite.
+### Runtime Configuration
+
+Kernel owns one typed, immutable parser for the following neutral infrastructure contract:
+
+| Key | Requirement |
+| --- | --- |
+| `CREATIDY_KERNEL_ROUTER_URL` | Router origin; verified HTTPS, or HTTP on a literal loopback address only |
+| `CREATIDY_KERNEL_ROUTER_KEY` | Optional Router bearer credential |
+| `CREATIDY_KERNEL_RUNTIME_BINDING` | Exact controller assertion `provider/model[/effort]` |
+| `CREATIDY_KERNEL_CODEX_BIN` | Absolute Codex executable path |
+| `CREATIDY_KERNEL_CODEX_VERSION` | Exact pinned Codex version |
+| `CREATIDY_KERNEL_FORGE_API` | HTTPS Forge API URL ending in `/api/v1` |
+| `CREATIDY_KERNEL_FORGE_REMOTE` | HTTPS Git remote on the same origin, matching the exact task repository with `.git` |
+| `CREATIDY_KERNEL_FORGE_TOKEN` | Required scoped Forge credential |
+| `CREATIDY_KERNEL_FORGE_ASKPASS` | Optional absolute Git askpass executable |
+| `CREATIDY_KERNEL_SOURCE_REPOSITORY` | Optional absolute source checkout default for preflight/run |
+| `CREATIDY_KERNEL_STATE_DIRECTORY` | Optional absolute control-state directory default for preflight/run |
+
+The process environment or an explicitly provided mapping feeds the parser, then typed configuration
+feeds live components. Missing/invalid configuration is reported by key name, not value. Credentials
+are excluded from configuration repr, logs and evidence, and are never task data or CLI arguments.
+Explicit `--repo` and `--data-dir` override the optional profile path defaults. Status/export are
+offline state operations: they require `--data-dir` but no runtime credentials or Router access.
+Secret management and deployment are **operator-owned**: public Kernel neither decrypts SOPS nor
+stores owner-specific credentials, paths or deployment details. The concrete onprem operator wrapper
+is planned in a separate repository, consuming this contract rather than duplicating product logic.
+
+Runtime configuration describes executable infrastructure. `TaskSpec` separately owns repository,
+base branch, allowed paths, instructions and acceptance/verification authority. The parsed runtime
+binding constrains which Router recommendation can become an Allocation; its exact configured
+`provider/model/effort` tuple also supplies trusted Codex `supported_efforts`. A binding without
+explicit effort supplies no effort support; null is distinct from the literal effort `"none"`.
+A Router recommendation never creates runtime capability or execution authority.
+
+Codex receives a closed controller-built operational environment (`HOME`, `PATH`, locale and temp
+entries only), derived from the supplied configuration mapping. Controller credentials and unrelated
+ambient secrets are not inherited. Execution requires explicit owner approval and a
+**trusted-development** acknowledgment; workspace-write mode is not hostile-worker isolation.
+Uncertain dispatch or PR delivery remains unknown until reconciled and is never blindly retried.
+
+Provision `HOME` in the supplied mapping as an absolute, existing accessible directory for the
+intended native Codex configuration. `PATH` is the supplied value (absolute, nonempty components)
+or the controller's standard `os.defpath`, not an ambient factory lookup. Optional `LANG` and
+`LC_ALL` must contain no control characters; optional `TMPDIR` must be an absolute, existing writable
+directory. Only supplied `HOME`, `LANG`, `LC_ALL` and `TMPDIR` are copied. The factory never merges
+an unrelated ambient environment; controller-owned verification also uses closed operational values.
+
+`task run --deadline UNIX_SECONDS` pins an absolute deadline no more than one hour ahead; when
+omitted on a fresh run it defaults to 55 minutes ahead. Recovery retains the original deadline,
+within the frozen task's Attempt limit and with zero automatic remediation budget. Application callers retain
+the bounded observation budget of 1-100; the CLI advances the task once per invocation rather than
+running an unbounded polling loop. Bounded exit requests cancellation but does not assert the remote
+worker has stopped. These limits are not provider-side monetary/token quotas. Native-shaped offline
+fixtures cover composition and recovery; the test suite claims no live model or remote-Forge execution.
 
 Runtime requests carry requested identity only. Acceptance requires matching runtime-resolved
 identity evidence, retained durably for the exact operation/accepted handle. A receipt-only Codex
