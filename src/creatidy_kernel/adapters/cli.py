@@ -128,6 +128,7 @@ def _dogfood(args: argparse.Namespace) -> int:
             deadline=deadline,
             allocator=components.allocator,
             forge_factory=components.forge_factory,
+            supported_efforts=components.supported_efforts,
         )
     finally:
         if isinstance(connection, CodexStdio):

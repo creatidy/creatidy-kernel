@@ -134,7 +134,14 @@ def test_cli_dogfood_status_reports_missing_database(tmp_path: Path, capsys: pyt
 
 
 def test_cli_dogfood_run_prints_lifecycle(sqlite_tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    from test_dogfood import ALLOCATION, FixtureConnection, deflake_edit, fixture_task, make_forge, make_source
+    from test_dogfood import (
+        EFFORT_ALLOCATION,
+        FixtureConnection,
+        deflake_edit,
+        fixture_task,
+        make_forge,
+        make_source,
+    )
 
     from creatidy_kernel.adapters.dogfood import DogfoodLiveComponents, DogfoodTaskSpec
     from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
@@ -143,11 +150,14 @@ def test_cli_dogfood_run_prints_lifecycle(sqlite_tmp_path: Path, capsys: pytest.
     source = make_source(sqlite_tmp_path)
     base = reference_git(source, "rev-parse", "refs/heads/develop")
     forge, _transport = make_forge(base)
-    connection = FixtureConnection(deflake_edit)
+    connection = FixtureConnection(deflake_edit, effort="low")
+    # The controller-owned support evidence reaches run_dogfood through the CLI
+    # composition; the explicit-effort allocation is executable only with it.
     components = DogfoodLiveComponents(
-        allocator=FixedAllocator(ALLOCATION),
+        allocator=FixedAllocator(EFFORT_ALLOCATION),
         connection_factory=lambda: connection,
         forge_factory=lambda _directory: forge,
+        supported_efforts=frozenset({("zai", "glm-5.3", "low")}),
     )
 
     def task(expected_base_sha: str | None = None) -> DogfoodTaskSpec:

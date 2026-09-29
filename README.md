@@ -169,7 +169,12 @@ Live composition requires documented environment configuration
 `CREATIDY_DOGFOOD_CODEX_VERSION`, `CREATIDY_DOGFOOD_FORGE_API`,
 `CREATIDY_DOGFOOD_FORGE_REMOTE`, `CREATIDY_DOGFOOD_FORGE_TOKEN`, optional
 `CREATIDY_DOGFOOD_FORGE_ASKPASS`). Credentials are read only from the environment; they are never
-task data, evidence, log output, or command-line arguments. The Codex app-server subprocesses run
+task data, evidence, log output, or command-line arguments. The single parsed
+`CREATIDY_DOGFOOD_RUNTIME_BINDING` (`provider/model[/effort]`) is the controller-owned authority
+for two compatible purposes: it constrains which Router recommendation can become an executable
+Allocation, and its exact `provider/model/effort` tuple supplies the trusted `supported_efforts`
+evidence for the pinned Codex runtime — a binding without an explicit effort provides none, and a
+Router recommendation never creates runtime capability. The Codex app-server subprocesses run
 with a closed controller-built operational environment (`HOME`, `PATH`, locale and temp entries
 only); the controller environment — including every dogfood credential and unrelated owner
 secret — is never inherited by the coding runtime. The coding runtime runs in
