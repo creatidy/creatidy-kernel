@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""D1-02 dogfood composition proof: real Git fixtures, native-shaped fakes, no paid calls."""
+"""Bounded task composition proof: real Git fixtures, native-shaped fakes, no paid calls."""
 
 import json
 import os
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
 
@@ -13,24 +13,28 @@ import pytest
 
 from creatidy_kernel.adapters.codex_runtime import CodexRejected
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
-from creatidy_kernel.adapters.dogfood import (
-    CODEX_METHODS,
-    DOGFOOD_TASKS,
-    DogfoodInterrupted,
-    DogfoodTaskSpec,
-    VerificationCommand,
-    compose_dogfood_live,
-    dogfood_status,
-    export_dogfood,
-    run_dogfood,
-    scarcity_router_143_task,
-)
-from creatidy_kernel.adapters.dogfood import git_text as dogfood_git
 from creatidy_kernel.adapters.fake_forge import SyntheticForgeTransport
 from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.scarcity_router import ScarcityRouterAllocator
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.adapters.task_execution import (
+    CODEX_METHODS,
+    TASKS,
+    LiveTaskComponents,
+    TaskInterrupted,
+    TaskRuntimeConfig,
+    TaskSpec,
+    VerificationCommand,
+    export_task,
+    run_task,
+    scarcity_router_143_task,
+    task_status,
+)
+from creatidy_kernel.adapters.task_execution import (
+    compose_task_live as _compose_task_live,
+)
+from creatidy_kernel.adapters.task_execution import git_text as task_git
 from creatidy_kernel.core.execution import UnsupportedExecution
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
@@ -38,6 +42,11 @@ from creatidy_kernel.ports.forge import Forge
 from creatidy_kernel.ports.resources import ResourceAllocator
 
 pytest_plugins = ["test_sqlite_store"]
+
+
+def compose_task_live(environ: Mapping[str, str], task: TaskSpec) -> LiveTaskComponents:
+    return _compose_task_live(TaskRuntimeConfig.parse(environ), task)
+
 
 REPOSITORY = Reference("forgejo:BioMedical-IT/scarcity-router")
 ALLOCATION = Allocation("codex", "zai", "glm-5.3", frozenset({"reference"}), 128, "fixture selection")
@@ -136,10 +145,10 @@ def make_source(directory: Path) -> Path:
     return source
 
 
-def fixture_task(*, repeats: int = 8, expected_base_sha: str | None = None) -> DogfoodTaskSpec:
+def fixture_task(*, repeats: int = 8, expected_base_sha: str | None = None) -> TaskSpec:
     targeted = (sys.executable, "-m", "unittest", "tests.test_e2e_execution.CancellationTests")
     full = (sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py")
-    return DogfoodTaskSpec(
+    return TaskSpec(
         task_id="fixture-143",
         forge_repository=REPOSITORY.value,
         repository_url="https://forge.invalid/BioMedical-IT/scarcity-router",
@@ -212,7 +221,7 @@ def run(
     source: Path,
     connection: FixtureConnection,
     *,
-    task: DogfoodTaskSpec | None = None,
+    task: TaskSpec | None = None,
     forge: Forge | None = None,
     base: str | None = None,
     allocation: Allocation | None = ALLOCATION,
@@ -222,7 +231,7 @@ def run(
 ) -> dict[str, object]:
     if forge is None:
         forge, _transport = make_forge(base or "0" * 40)
-    return run_dogfood(
+    return run_task(
         control,
         task=task or fixture_task(),
         source_repository=source,
@@ -249,7 +258,7 @@ def test_end_to_end_accepted_with_synthetic_forge(sqlite_tmp_path: Path) -> None
     assert result["condition"] == "accepted"
     head = str(result["head"])
     lifecycle = cast(list[str], result["lifecycle"])
-    assert "task admitted: owner-approved frozen dogfood task" in lifecycle
+    assert "task admitted: owner-approved frozen task" in lifecycle
     assert any(line.startswith("exact base established: ") for line in lifecycle)
     assert "workspace prepared: disposable controller-owned clone at the exact base" in lifecycle
     assert "allocation selected" in lifecycle
@@ -265,9 +274,9 @@ def test_end_to_end_accepted_with_synthetic_forge(sqlite_tmp_path: Path) -> None
     # Exact-subject semantics: the PR head is the accepted candidate, parent is the base.
     assert cast(dict[str, object], transport.pulls[0]["head"])["sha"] == head
     workspace = control / "workspace"
-    assert dogfood_git(workspace, "rev-parse", "HEAD") == head
-    assert dogfood_git(workspace, "rev-parse", head + "^") == base
-    assert dogfood_git(workspace, "diff", "--name-only", base, head) == "tests/test_e2e_execution.py"
+    assert task_git(workspace, "rev-parse", "HEAD") == head
+    assert task_git(workspace, "rev-parse", head + "^") == base
+    assert task_git(workspace, "diff", "--name-only", base, head) == "tests/test_e2e_execution.py"
     # The owner checkout is untouched.
     assert reference_git(source, "rev-parse", "refs/heads/develop") == base
     assert reference_git(source, "status", "--porcelain") == ""
@@ -279,11 +288,11 @@ def test_end_to_end_accepted_with_synthetic_forge(sqlite_tmp_path: Path) -> None
     assert all(run["timed_out"] is False for run in runs)
     structural = commands["structural"]
     assert cast("list[str]", structural["deferred_to_independent_review"])
-    evidence = export_dogfood(control)
+    evidence = export_task(control)
     assert evidence["status"] == "completed"
     assert cast(dict[str, object], evidence["pr"])["status"] == "accepted"
     assert cast(dict[str, object], evidence["candidate"])["head"] == head
-    status = dogfood_status(control)
+    status = task_status(control)
     assert status["accepted"] is True and status["candidate_head"] == head
 
 
@@ -299,7 +308,7 @@ def test_changed_forbidden_path_rejected(sqlite_tmp_path: Path) -> None:
     lifecycle = cast(list[str], result["lifecycle"])
     assert "changed paths rejected: README.md" in lifecycle
     assert not any(line.startswith("PR created") for line in lifecycle)
-    evidence = export_dogfood(sqlite_tmp_path / "control")
+    evidence = export_task(sqlite_tmp_path / "control")
     assert "acceptance" not in evidence
     assert "pr" not in evidence
 
@@ -422,7 +431,7 @@ def test_tracked_mutation_during_verification_rejected(sqlite_tmp_path: Path) ->
         "import pathlib; p = pathlib.Path('tests/test_e2e_execution.py'); "
         "p.write_text(p.read_text() + '# verification touched\\n')",
     )
-    task = DogfoodTaskSpec(
+    task = TaskSpec(
         task_id="fixture-mutating",
         forge_repository=REPOSITORY.value,
         repository_url="https://forge.invalid/BioMedical-IT/scarcity-router",
@@ -450,7 +459,7 @@ def test_non_ignored_untracked_litter_during_verification_rejected(sqlite_tmp_pa
         "-c",
         "import pathlib; pathlib.Path('leftover-artifact.txt').write_text('verification residue')",
     )
-    task = DogfoodTaskSpec(
+    task = TaskSpec(
         task_id="fixture-littering",
         forge_repository=REPOSITORY.value,
         repository_url="https://forge.invalid/BioMedical-IT/scarcity-router",
@@ -473,7 +482,7 @@ def test_non_ignored_untracked_litter_during_verification_rejected(sqlite_tmp_pa
     lifecycle = cast(list[str], result["lifecycle"])
     assert "verification failed" in lifecycle
     assert not any(line.startswith("candidate accepted") for line in lifecycle)
-    evidence = export_dogfood(control)
+    evidence = export_task(control)
     assert "acceptance" not in evidence
     assert "pr" not in evidence
 
@@ -486,7 +495,7 @@ def test_ignored_cache_artifacts_do_not_reject_verification(sqlite_tmp_path: Pat
         "import pathlib; pathlib.Path('__pycache__').mkdir(exist_ok=True); "
         "pathlib.Path('__pycache__/m.cpython-312.pyc').write_text('cache')",
     )
-    task = DogfoodTaskSpec(
+    task = TaskSpec(
         task_id="fixture-caching",
         forge_repository=REPOSITORY.value,
         repository_url="https://forge.invalid/BioMedical-IT/scarcity-router",
@@ -521,9 +530,9 @@ def test_runtime_identity_mismatch_refuses_and_stays_uncertain(sqlite_tmp_path: 
     result = run(control, source, fixed, fault=None, task=fixture_task(repeats=1))
     assert result["condition"] == "unknown"
     assert fixed.starts == 0
-    assert "acceptance" not in export_dogfood(control)
+    assert "acceptance" not in export_task(control)
     with SQLiteProgramStore(control / "kernel.sqlite3") as store:
-        assert store.operation("runtime:dogfood:change").attempts == 1
+        assert store.operation("runtime:task_execution:change").attempts == 1
 
 
 def test_no_allocation_refuses_without_dispatch(sqlite_tmp_path: Path) -> None:
@@ -558,7 +567,7 @@ def test_crash_recovery_completes_without_duplicate_work(sqlite_tmp_path: Path, 
     source = make_source(sqlite_tmp_path)
     control = sqlite_tmp_path / "control"
     connection = FixtureConnection(deflake_edit)
-    with pytest.raises(DogfoodInterrupted):
+    with pytest.raises(TaskInterrupted):
         run(control, source, connection, fault=fault, task=fixture_task(repeats=1))
     result = run(control, source, connection, fault=None, task=fixture_task(repeats=1))
     assert result["condition"] == "accepted"
@@ -576,7 +585,7 @@ def test_crash_recovery_completes_without_duplicate_work(sqlite_tmp_path: Path, 
         assert any(line.startswith("exact base established: ") for line in lifecycle)
     else:
         assert any(line.startswith("exact base recovered: ") for line in lifecycle)
-    evidence = export_dogfood(control)
+    evidence = export_task(control)
     assert len(cast(list[dict[str, object]], evidence["attempts"])) == 1
 
 
@@ -584,7 +593,7 @@ def test_uncertain_dispatch_is_not_duplicated_after_lost_context(sqlite_tmp_path
     source = make_source(sqlite_tmp_path)
     control = sqlite_tmp_path / "control"
     first = FixtureConnection(deflake_edit)
-    with pytest.raises(DogfoodInterrupted):
+    with pytest.raises(TaskInterrupted):
         run(control, source, first, fault="send", task=fixture_task(repeats=1))
     assert first.starts == 1
     time.sleep(1.1)  # the durable claim lease must expire before reconciliation
@@ -598,21 +607,21 @@ def test_uncertain_dispatch_is_not_duplicated_after_lost_context(sqlite_tmp_path
     assert result["condition"] == "unknown"
     assert first.starts == 1
     with SQLiteProgramStore(control / "kernel.sqlite3") as store:
-        assert store.operation("runtime:dogfood:change").attempts == 1
+        assert store.operation("runtime:task_execution:change").attempts == 1
 
 
 def test_verification_crash_reruns_deterministic_local_checks(sqlite_tmp_path: Path) -> None:
     source = make_source(sqlite_tmp_path)
     control = sqlite_tmp_path / "control"
     connection = FixtureConnection(deflake_edit)
-    with pytest.raises(DogfoodInterrupted):
+    with pytest.raises(TaskInterrupted):
         run(control, source, connection, fault="verification", task=fixture_task(repeats=1))
     result = run(control, source, connection, fault=None, task=fixture_task(repeats=1))
     assert result["condition"] == "accepted"
     assert connection.starts == 1
     head = str(result["head"])
     # Re-executed verification binds to the identical candidate Git subject.
-    assert dogfood_git(control / "workspace", "rev-parse", "HEAD") == head
+    assert task_git(control / "workspace", "rev-parse", "HEAD") == head
     commands = cast("dict[str, dict[str, object]]", result["verification"])
     runs = cast("list[dict[str, object]]", commands["verification-commands"]["runs"])
     assert all(run["exit_code"] == 0 for run in runs)
@@ -625,7 +634,7 @@ def test_pr_delivery_recovery_never_creates_a_second_pr(sqlite_tmp_path: Path, f
     control = sqlite_tmp_path / "control"
     forge, transport = make_forge(base)
     connection = FixtureConnection(deflake_edit)
-    with pytest.raises((DogfoodInterrupted, RuntimeError)):
+    with pytest.raises((TaskInterrupted, RuntimeError)):
         run(control, source, connection, forge=forge, base=base, fault=fault, task=fixture_task(repeats=1))
     assert connection.starts == 1
     result = run(control, source, connection, forge=forge, base=base, fault=None, task=fixture_task(repeats=1))
@@ -638,7 +647,7 @@ def test_pr_delivery_recovery_never_creates_a_second_pr(sqlite_tmp_path: Path, f
         # No durable reference was retained: delivery stays unknown and is never re-pushed.
         assert pr["status"] == "unknown"
         assert transport.pushes == 1
-    evidence = export_dogfood(control)
+    evidence = export_task(control)
     assert evidence["candidate"] is not None
 
 
@@ -647,7 +656,7 @@ def test_base_frozen_when_source_develop_moves(sqlite_tmp_path: Path) -> None:
     base = reference_git(source, "rev-parse", "refs/heads/develop")
     control = sqlite_tmp_path / "control"
     connection = FixtureConnection(deflake_edit)
-    with pytest.raises(DogfoodInterrupted):
+    with pytest.raises(TaskInterrupted):
         run(control, source, connection, fault="workspace-prepared", task=fixture_task(repeats=1))
     (source / "README.md").write_text("moved on\n")
     reference_git(source, "add", "-A")
@@ -655,7 +664,7 @@ def test_base_frozen_when_source_develop_moves(sqlite_tmp_path: Path) -> None:
     assert reference_git(source, "rev-parse", "refs/heads/develop") != base
     result = run(control, source, connection, fault=None, task=fixture_task(repeats=1))
     assert result["condition"] == "accepted"
-    assert cast(dict[str, object], export_dogfood(control)["candidate"])["base"] == base
+    assert cast(dict[str, object], export_task(control)["candidate"])["base"] == base
 
 
 def test_pinned_expected_base_enforced(sqlite_tmp_path: Path) -> None:
@@ -664,7 +673,7 @@ def test_pinned_expected_base_enforced(sqlite_tmp_path: Path) -> None:
     control = sqlite_tmp_path / "control"
     result = run(control, source, FixtureConnection(deflake_edit), task=fixture_task(repeats=1, expected_base_sha=base))
     assert result["condition"] == "accepted"
-    assert cast(dict[str, object], export_dogfood(control)["candidate"])["base"] == base
+    assert cast(dict[str, object], export_task(control)["candidate"])["base"] == base
     with pytest.raises(ValueError, match="failed"):
         run(
             sqlite_tmp_path / "other",
@@ -675,7 +684,7 @@ def test_pinned_expected_base_enforced(sqlite_tmp_path: Path) -> None:
 
 
 def test_frozen_task_registry_and_validation() -> None:
-    task = DOGFOOD_TASKS["143"]()
+    task = TASKS["143"]()
     assert task.allowed_paths == frozenset({"tests/test_e2e_execution.py"})
     assert task.verification[1].repeats == 8
     assert task.verification[2].argv == ("make", "check")
@@ -691,7 +700,7 @@ def test_frozen_task_registry_and_validation() -> None:
     with pytest.raises(ValueError):
         VerificationCommand(("make", "check"), 0)
     with pytest.raises(ValueError):
-        DogfoodTaskSpec(
+        TaskSpec(
             task_id="bad",
             forge_repository="not-forgejo",
             repository_url="x",
@@ -709,38 +718,38 @@ def test_durable_state_survives_controller_disposal(sqlite_tmp_path: Path) -> No
     control = sqlite_tmp_path / "control"
     base = reference_git(source, "rev-parse", "refs/heads/develop")
     forge, transport = make_forge(base)
-    with pytest.raises(DogfoodInterrupted):
+    with pytest.raises(TaskInterrupted):
         run(control, source, FixtureConnection(deflake_edit), forge=forge, base=base, fault="verification")
     # A completely fresh controller process re-derives everything from durable state.
     result = run(control, source, FixtureConnection(deflake_edit), forge=forge, base=base, fault=None)
     assert result["condition"] == "accepted"
     assert len(transport.pulls) == 1
     with SQLiteProgramStore(control / "kernel.sqlite3") as store:
-        assert store.operation("dogfood:base").status == "intent"
-        assert store.operation("candidate:dogfood:change").attempts == 0
+        assert store.operation("task_execution:base").status == "intent"
+        assert store.operation("candidate:task_execution:change").attempts == 0
 
 
 def test_live_composition_requires_complete_environment() -> None:
-    task = DOGFOOD_TASKS["143"]()
+    task = fixture_task()
     with pytest.raises(ValueError, match="missing"):
-        compose_dogfood_live({}, task)
-    components = compose_dogfood_live(live_environment("zai/glm-5.3"), task)
+        compose_task_live({}, task)
+    components = compose_task_live(live_environment("zai/glm-5.3"), task)
     assert isinstance(components.allocator, ScarcityRouterAllocator)
 
 
 LIVE_ENVIRONMENT = {
-    "CREATIDY_DOGFOOD_ROUTER_URL": "https://router.invalid",
-    "CREATIDY_DOGFOOD_CODEX_BIN": "/usr/local/bin/codex",
-    "CREATIDY_DOGFOOD_CODEX_VERSION": "0.45.0",
-    "CREATIDY_DOGFOOD_FORGE_API": "https://forge.invalid/api/v1",
-    "CREATIDY_DOGFOOD_FORGE_REMOTE": "https://forge.invalid/BioMedical-IT/scarcity-router.git",
-    "CREATIDY_DOGFOOD_FORGE_TOKEN": "synthetic-token",
+    "CREATIDY_KERNEL_ROUTER_URL": "https://router.invalid",
+    "CREATIDY_KERNEL_CODEX_BIN": "/usr/local/bin/codex",
+    "CREATIDY_KERNEL_CODEX_VERSION": "0.45.0",
+    "CREATIDY_KERNEL_FORGE_API": "https://forge.invalid/api/v1",
+    "CREATIDY_KERNEL_FORGE_REMOTE": "https://forge.invalid/BioMedical-IT/scarcity-router.git",
+    "CREATIDY_KERNEL_FORGE_TOKEN": "synthetic-token",
 }
 
 
 def live_environment(binding: str) -> dict[str, str]:
     environment = dict(LIVE_ENVIRONMENT)
-    environment["CREATIDY_DOGFOOD_RUNTIME_BINDING"] = binding
+    environment["CREATIDY_KERNEL_RUNTIME_BINDING"] = binding
     return environment
 
 
@@ -748,10 +757,16 @@ def live_environment(binding: str) -> dict[str, str]:
 # It never serves thread/start or turn/start, so no test can perform inference.
 FAKE_CODEX = f"""#!{sys.executable}
 import json
+import pathlib
 import sys
 
 if sys.argv[1:] == ['--version']:
     print('codex-cli __CODEX_VERSION__')
+    sys.exit(0)
+if sys.argv[1:4] == ['app-server', 'generate-json-schema', '--out']:
+    pathlib.Path(sys.argv[4], 'client_request.json').write_text(json.dumps({{
+        'properties': {{'method': {{'enum': ['thread/start', 'turn/start', 'thread/read', 'turn/interrupt']}}}}
+    }}))
     sys.exit(0)
 assert sys.argv[1:] == ['app-server']
 first = json.loads(sys.stdin.readline())
@@ -761,7 +776,7 @@ assert json.loads(sys.stdin.readline()) == {{'method': 'initialized', 'params': 
 """
 
 
-def _write_fake_codex(directory: Path, version: str) -> Path:
+def write_fake_codex(directory: Path, version: str) -> Path:
     binary = directory / "fake-codex"
     binary.write_text(FAKE_CODEX.replace("__CODEX_VERSION__", version))
     binary.chmod(0o700)
@@ -771,9 +786,9 @@ def _write_fake_codex(directory: Path, version: str) -> Path:
 def test_live_connection_factory_pins_schema_version_to_codex_version(sqlite_tmp_path: Path) -> None:
     version = "0.155.0-alpha.16.3"
     environment = live_environment("zai/glm-5.3/low")
-    environment["CREATIDY_DOGFOOD_CODEX_BIN"] = str(_write_fake_codex(sqlite_tmp_path, version))
-    environment["CREATIDY_DOGFOOD_CODEX_VERSION"] = version
-    components = compose_dogfood_live(environment, fixture_task())
+    environment["CREATIDY_KERNEL_CODEX_BIN"] = str(write_fake_codex(sqlite_tmp_path, version))
+    environment["CREATIDY_KERNEL_CODEX_VERSION"] = version
+    components = compose_task_live(environment, fixture_task())
     connection = components.connection_factory()
     assert isinstance(connection, CodexStdio)
     try:
@@ -787,9 +802,9 @@ def test_live_connection_factory_pins_schema_version_to_codex_version(sqlite_tmp
 
 def test_live_connection_factory_fails_closed_on_version_disagreement(sqlite_tmp_path: Path) -> None:
     environment = live_environment("zai/glm-5.3/low")
-    environment["CREATIDY_DOGFOOD_CODEX_BIN"] = str(_write_fake_codex(sqlite_tmp_path, "0.155.0-alpha.16.3"))
-    environment["CREATIDY_DOGFOOD_CODEX_VERSION"] = "0.155.0-alpha.16.4"
-    components = compose_dogfood_live(environment, fixture_task())
+    environment["CREATIDY_KERNEL_CODEX_BIN"] = str(write_fake_codex(sqlite_tmp_path, "0.155.0-alpha.16.3"))
+    environment["CREATIDY_KERNEL_CODEX_VERSION"] = "0.155.0-alpha.16.4"
+    components = compose_task_live(environment, fixture_task())
     with pytest.raises(ValueError, match="version"):
         components.connection_factory()
 
@@ -805,13 +820,13 @@ EFFORT_BINDING_CASES: list[tuple[str, frozenset[tuple[str, str, str]]]] = [
 def test_supported_efforts_come_only_from_the_controller_runtime_binding(
     binding: str, expected: frozenset[tuple[str, str, str]]
 ) -> None:
-    components = compose_dogfood_live(live_environment(binding), DOGFOOD_TASKS["143"]())
+    components = compose_task_live(live_environment(binding), fixture_task())
     # "none" is a literal effort string; only an absent third component is null and
     # manufactures no evidence.
     assert components.supported_efforts == expected
 
 
-def _selection_document(provider: str, model: str, effort: str | None) -> bytes:
+def selection_document(provider: str, model: str, effort: str | None) -> bytes:
     document = {
         "schema_version": 1,
         "decision": {
@@ -852,7 +867,7 @@ def _selection_document(provider: str, model: str, effort: str | None) -> bytes:
 
 
 def _stub_router_selection(monkeypatch: pytest.MonkeyPatch, provider: str, model: str, effort: str | None) -> None:
-    raw = _selection_document(provider, model, effort)
+    raw = selection_document(provider, model, effort)
 
     def exchange(_self: ScarcityRouterAllocator, _requirement: dict[str, object]) -> bytes:
         return raw
@@ -860,16 +875,16 @@ def _stub_router_selection(monkeypatch: pytest.MonkeyPatch, provider: str, model
     monkeypatch.setattr(ScarcityRouterAllocator, "_exchange", exchange)
 
 
-DOGFOOD_RESOURCE_REQUEST = ResourceRequest("change", frozenset({"reference"}), 128)
+TASK_RESOURCE_REQUEST = ResourceRequest("change", frozenset({"reference"}), 128)
 
 
 def test_matching_router_selection_becomes_executable_with_controller_evidence(
     sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = make_source(sqlite_tmp_path)
-    components = compose_dogfood_live(live_environment("zai/glm-5.3/low"), fixture_task())
+    components = compose_task_live(live_environment("zai/glm-5.3/low"), fixture_task())
     _stub_router_selection(monkeypatch, "zai", "glm-5.3", "low")
-    allocation = components.allocator.select(DOGFOOD_RESOURCE_REQUEST)
+    allocation = components.allocator.select(TASK_RESOURCE_REQUEST)
     assert (allocation.provider_id, allocation.model_id, allocation.reasoning_effort) == ("zai", "glm-5.3", "low")
     assert ("zai", "glm-5.3", "low") in components.supported_efforts
     connection = FixtureConnection(deflake_edit, effort="low")
@@ -886,19 +901,19 @@ def test_matching_router_selection_becomes_executable_with_controller_evidence(
 
 
 def test_router_selection_outside_the_controller_binding_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    components = compose_dogfood_live(live_environment("zai/glm-5.3/low"), fixture_task())
+    components = compose_task_live(live_environment("zai/glm-5.3/low"), fixture_task())
     _stub_router_selection(monkeypatch, "zai", "glm-5.3", "high")
     with pytest.raises(AllocationUnavailable, match="incompatible"):
-        components.allocator.select(DOGFOOD_RESOURCE_REQUEST)
+        components.allocator.select(TASK_RESOURCE_REQUEST)
 
 
 def test_router_selection_cannot_manufacture_effort_support(monkeypatch: pytest.MonkeyPatch) -> None:
     # The controller binding carries no explicit effort; the Router returns one.
-    components = compose_dogfood_live(live_environment("zai/glm-5.3"), fixture_task())
+    components = compose_task_live(live_environment("zai/glm-5.3"), fixture_task())
     assert components.supported_efforts == frozenset()
     _stub_router_selection(monkeypatch, "zai", "glm-5.3", "low")
     with pytest.raises(AllocationUnavailable, match="incompatible"):
-        components.allocator.select(DOGFOOD_RESOURCE_REQUEST)
+        components.allocator.select(TASK_RESOURCE_REQUEST)
 
 
 def test_explicit_effort_without_trusted_support_fails_closed_before_dispatch(sqlite_tmp_path: Path) -> None:
@@ -920,11 +935,11 @@ def test_recovery_and_router_provenance_do_not_expand_effort_trust(
 ) -> None:
     source = make_source(sqlite_tmp_path)
     control = sqlite_tmp_path / "control"
-    components = compose_dogfood_live(live_environment("zai/glm-5.3/low"), fixture_task())
+    components = compose_task_live(live_environment("zai/glm-5.3/low"), fixture_task())
     _stub_router_selection(monkeypatch, "zai", "glm-5.3", "low")
-    allocation = components.allocator.select(DOGFOOD_RESOURCE_REQUEST)
+    allocation = components.allocator.select(TASK_RESOURCE_REQUEST)
     assert allocation.decision_provenance is not None  # Router output alone is never evidence.
-    with pytest.raises(DogfoodInterrupted):
+    with pytest.raises(TaskInterrupted):
         run(
             control,
             source,
@@ -943,11 +958,11 @@ def test_recovery_and_router_provenance_do_not_expand_effort_trust(
 
 
 def test_codex_environment_is_closed_and_secret_free(monkeypatch: pytest.MonkeyPatch) -> None:
-    from creatidy_kernel.adapters.dogfood import codex_environment
+    from creatidy_kernel.adapters.task_execution import codex_environment
 
     sentinels = {
         name: "synthetic-" + name.lower().replace("_", "-")
-        for name in ("CREATIDY_DOGFOOD_ROUTER_KEY", "CREATIDY_DOGFOOD_FORGE_TOKEN", "UNRELATED_OWNER_API_KEY")
+        for name in ("CREATIDY_KERNEL_ROUTER_KEY", "CREATIDY_KERNEL_FORGE_TOKEN", "UNRELATED_OWNER_API_KEY")
     }
     for name, value in sentinels.items():
         monkeypatch.setenv(name, value)
@@ -956,8 +971,8 @@ def test_codex_environment_is_closed_and_secret_free(monkeypatch: pytest.MonkeyP
     assert not any(
         name in closed
         for name in (
-            "CREATIDY_DOGFOOD_ROUTER_KEY",
-            "CREATIDY_DOGFOOD_FORGE_TOKEN",
+            "CREATIDY_KERNEL_ROUTER_KEY",
+            "CREATIDY_KERNEL_FORGE_TOKEN",
             "UNRELATED_OWNER_API_KEY",
         )
     )

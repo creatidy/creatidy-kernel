@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import ast
 import re
 import tomllib
 from pathlib import Path
@@ -56,3 +57,35 @@ def test_ci_is_canonical_with_pinned_actions_and_no_configured_secrets() -> None
     assert not re.search(r"\bsecrets\s*[.\[]", yaml.safe_dump(workflow))
     assert "make check" in workflow_text and "make package-check" in workflow_text
     assert not list((ROOT / ".github" / "workflows").glob("*"))
+
+
+def test_public_runtime_uses_neutral_task_names() -> None:
+    # Historical docs may retain old names. Only the two explicit negative
+    # regression tests and the rejecting parser may mention them in live source.
+    pattern = re.compile("dogfood", re.IGNORECASE)
+    for path in (ROOT / "src").rglob("*"):
+        if not path.is_file() or path.suffix != ".py":
+            continue
+        assert not pattern.search(path.name), path
+        for line in path.read_text().splitlines():
+            if pattern.search(line):
+                assert path.name == "task_execution.py" and 'name.startswith("CREATIDY_" + "DOGFOOD_")' in line
+    for path in (ROOT / "tests").glob("*.py"):
+        assert not pattern.search(path.name), path
+        text = path.read_text()
+        negative_tests = {
+            "test_legacy_environment_is_rejected_without_fallback",
+            "test_legacy_command_is_not_a_compatibility_alias",
+            "test_public_runtime_uses_neutral_task_names",
+        }
+        allowed_lines = {
+            line
+            for node in ast.walk(ast.parse(text))
+            if isinstance(node, ast.FunctionDef) and node.name in negative_tests
+            for line in range(node.lineno, (node.end_lineno or node.lineno) + 1)
+        }
+        for number, line in enumerate(text.splitlines(), 1):
+            if pattern.search(line):
+                assert number in allowed_lines, f"{path}:{number}"
+    for path in (ROOT / "README.md", ROOT / "Makefile", ROOT / "pyproject.toml"):
+        assert not pattern.search(path.read_text()), path

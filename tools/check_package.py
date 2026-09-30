@@ -68,6 +68,8 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
     subprocess.run([str(python), "-I", "-m", "creatidy_kernel.adapters.cli", "--help"], cwd=work, check=True)
     cli = environment / ("Scripts/creatidy-kernel.exe" if os.name == "nt" else "bin/creatidy-kernel")
     subprocess.run([str(cli), "reference", "--help"], cwd=work, check=True)
+    for command in ("preflight", "run", "status", "export"):
+        subprocess.run([str(cli), "task", command, "--help"], cwd=work, check=True)
     storage_root = Path(os.environ.get("CREATIDY_TEST_STORAGE_DIR", str(work))).expanduser()
     storage_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="reference-", dir=storage_root) as state_directory:
