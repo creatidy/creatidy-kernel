@@ -34,7 +34,10 @@ through a reviewed PR handoff.
 7. Run focused checks, then `make check` and `make package-check`. Run `make audit` when relevant.
    Diagnose failures before any retry and report environmental blockers truthfully.
 8. Inspect `git status` and `git diff`; confirm only intended files are changed and scratch state is
-   not staged. Commit the smallest coherent change, then push the feature branch with normal Git.
+   not staged. Commit count is not an acceptance criterion. Use as many small, coherent, reviewable
+   commits as needed. Remediation commits are normal. Do not squash, amend, force-push, or rewrite
+   published history merely to reduce commit count. Keep the overall change focused and coherent
+   within the selected issue, then push the feature branch with normal Git.
 9. Create one Forgejo PR targeting `develop` through MCP. Link the selected issue in the PR body or
    metadata, include concise acceptance evidence, and do not merge or close the issue.
 10. Post one concise issue update with the changed files, exact checks and results, acceptance

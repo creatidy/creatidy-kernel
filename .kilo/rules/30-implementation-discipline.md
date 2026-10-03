@@ -35,6 +35,10 @@ Before a commit, inspect `git status` and `git diff`, confirm only intended file
 that scratch state and secrets are not staged. Record material skipped checks or blockers on the issue
 when issue tracking applies.
 
+Commit count is not an acceptance criterion. Use as many small, coherent, reviewable commits as
+needed. Remediation commits are normal. Do not squash, amend, force-push, or rewrite published history
+merely to reduce commit count. Keep the overall change focused and coherent within the selected issue.
+
 ## Independent Review
 
 The implementation session is not an independent reviewer. Review uses a fresh context, the frozen
