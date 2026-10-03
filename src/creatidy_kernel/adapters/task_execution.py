@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded task execution: one frozen owner-approved real task, end to end.
+"""Bounded task execution for frozen owner-approved real tasks.
 
 This module composes already-proved K1-K8 mechanisms into a single supported path:
 Program/Attempt durability, ResourceAllocator, CodexRuntime, controller-owned Git
@@ -131,6 +131,13 @@ class VerificationCommand:
             raise ValueError("verification repeats must be bounded")
 
 
+class TaskStructure(StrEnum):
+    """Closed controller-owned task validators, not programmable expressions."""
+
+    CANCELLATION_143 = "scarcity-router-143"
+    FEEDER_166 = "scarcity-router-166"
+
+
 @dataclass(frozen=True, slots=True)
 class StructuralPolicy:
     """Deterministic anti-weakening constraints for one frozen task; not a DSL."""
@@ -139,8 +146,11 @@ class StructuralPolicy:
     required_tokens: tuple[str, ...]
     forbidden_added_patterns: tuple[str, ...]
     forbidden_sleep_seconds: float
+    task_structure: TaskStructure = TaskStructure.CANCELLATION_143
 
     def __post_init__(self) -> None:
+        if type(self.task_structure) is not TaskStructure:
+            raise ValueError("structural validator must be a supported typed task structure")
         for name, values in (("required_names", self.required_names), ("required_tokens", self.required_tokens)):
             if (
                 type(values) is not tuple
@@ -163,6 +173,167 @@ class StructuralPolicy:
             or self.forbidden_sleep_seconds <= 0
         ):
             raise ValueError("structural sleep threshold must be positive")
+
+    def validate_baseline(self, content: str) -> None:
+        tree = ast.parse(content)
+        if self.task_structure is TaskStructure.CANCELLATION_143:
+            for name in self.required_names:
+                scenarios = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == name]
+                if len(scenarios) != 1:
+                    raise ValueError("frozen scenario is absent or ambiguous")
+                scenario = ast.get_source_segment(content, scenarios[0]) or ""
+                if ".recv(" not in scenario or re.search(r"\bif\s+not\s+\w+\s*:\s*break\b", scenario) is None:
+                    raise ValueError("frozen cancellation race baseline is absent or already changed")
+        else:
+            _feeder_structure(tree, baseline=True)
+            classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SafeTermination"]
+            if len(classes) != 1:
+                raise ValueError("frozen SafeTermination class is absent or ambiguous")
+            for name in self.required_names:
+                if sum(isinstance(node, ast.FunctionDef) and node.name == name for node in classes[0].body) != 1:
+                    raise ValueError("frozen SafeTermination scenario is absent or ambiguous")
+
+    @property
+    def deferred_to_review(self) -> tuple[str, ...]:
+        if self.task_structure is TaskStructure.FEEDER_166:
+            return (
+                *DEFERRED_TO_REVIEW,
+                "forced interleaving proves unsafe baseline and corrected descriptor ownership",
+            )
+        return DEFERRED_TO_REVIEW
+
+
+def _feeder_structure(tree: ast.Module, *, baseline: bool) -> None:
+    """Fixed #166 fixture shape; never execute or interpret repository code."""
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "_FakeAppServer"]
+    if len(classes) != 1:
+        raise ValueError("real feeder fixture is absent or ambiguous")
+    methods = {node.name: node for node in classes[0].body if isinstance(node, ast.FunctionDef)}
+    if len(methods) != sum(isinstance(node, ast.FunctionDef) for node in classes[0].body):
+        raise ValueError("feeder fixture methods are ambiguous")
+    for name, required in (
+        ("__init__", {"os.pipe", "threading.Thread", "self._feeder.start"}),
+        ("_feed", {"os.set_blocking", "os.write"}),
+    ):
+        method = methods.get(name)
+        method_calls: set[str] = (
+            {ast.unparse(node.func) for node in ast.walk(method) if isinstance(node, ast.Call)} if method else set()
+        )
+        if not required <= method_calls:
+            raise ValueError("real pipe/non-blocking feeder structure is missing")
+    if not any(
+        isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "threading.Thread"
+        and any(keyword.arg == "target" and ast.unparse(keyword.value) == "self._feed" for keyword in node.keywords)
+        for node in ast.walk(methods["__init__"])
+    ):
+        raise ValueError("real feeder thread target must be preserved")
+    feed_calls = [node for node in ast.walk(methods["_feed"]) if isinstance(node, ast.Call)]
+    if not any(
+        ast.unparse(node.func) == "os.set_blocking"
+        and len(node.args) == 2
+        and ast.unparse(node.args[0]) == "self._write_fd"
+        and isinstance(node.args[1], ast.Constant)
+        and node.args[1].value is False
+        for node in feed_calls
+    ):
+        raise ValueError("feeder write descriptor must remain non-blocking")
+    if baseline:
+        closer = methods.get("_close_write")
+        calls = [node for node in ast.walk(closer) if isinstance(node, ast.Call)] if closer else []
+        names = {ast.unparse(node.func) for node in calls}
+        timed_join = any(
+            ast.unparse(node.func) == "self._feeder.join"
+            and any(keyword.arg == "timeout" and ast.unparse(keyword.value) == "5.0" for keyword in node.keywords)
+            for node in calls
+        )
+        if (
+            not timed_join
+            or not {"self._stop.set", "os.close"} <= names
+            or "self._feeder.is_alive" in names
+            or not any(ast.unparse(node.func) == "self._stop.is_set" for node in feed_calls)
+        ):
+            raise ValueError("frozen timed-join feeder race baseline is absent or already changed")
+
+
+def _feeder_candidate_findings(base: str, content: str) -> list[str]:
+    try:
+        original, candidate = ast.parse(base), ast.parse(content)
+        _feeder_structure(candidate, baseline=False)
+    except (SyntaxError, ValueError) as error:
+        return [str(error)]
+    # Preserve existing test identities and assertion expressions, including the
+    # shared stderr assertion. New regressions remain subject to semantic review.
+    findings: list[str] = []
+    original_tests: set[tuple[str, str]] = set()
+    candidate_tests: set[tuple[str, str]] = set()
+    candidate_methods = {
+        (cls.name, method.name): method
+        for cls in candidate.body
+        if isinstance(cls, ast.ClassDef)
+        for method in cls.body
+        if isinstance(method, ast.FunctionDef)
+    }
+    for cls in original.body:
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        for method in cls.body:
+            if not isinstance(method, ast.FunctionDef) or not (
+                method.name.startswith("test_") or method.name == "_assert_no_output"
+            ):
+                continue
+            key = (cls.name, method.name)
+            if method.name.startswith("test_"):
+                original_tests.add(key)
+            replacement = candidate_methods.get(key)
+            assertions = [
+                ast.dump(node)
+                for node in ast.walk(method)
+                if isinstance(node, ast.Assert)
+                or (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and (node.func.attr.startswith("assert") or node.func.attr == "_assert_no_output")
+                )
+            ]
+            remaining = [ast.dump(node) for node in ast.walk(replacement)] if replacement else []
+            for assertion in assertions:
+                if assertion in remaining:
+                    remaining.remove(assertion)
+                else:
+                    findings.append(f"existing assertion removed or changed: {cls.name}.{method.name}")
+            if replacement is None:
+                findings.append(f"existing scenario removed: {cls.name}.{method.name}")
+    candidate_tests.update(key for key in candidate_methods if key[1].startswith("test_"))
+    regressions = candidate_tests - original_tests
+    if not regressions or not any(
+        isinstance(node, ast.Assert)
+        or (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr.startswith("assert"))
+        for key in regressions
+        for node in ast.walk(candidate_methods[key])
+    ):
+        findings.append("forced-interleaving regression coverage must be added")
+    sleeps = [
+        ast.dump(node)
+        for node in ast.walk(original)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) in {"time.sleep", "sleep"}
+    ]
+    for node in ast.walk(candidate):
+        if isinstance(node, ast.Call) and ast.unparse(node.func) in {"time.sleep", "sleep"}:
+            if ast.dump(node) in sleeps:
+                sleeps.remove(ast.dump(node))
+            else:
+                findings.append("new or changed sleep cannot establish feeder correctness")
+        if not isinstance(node, ast.Call) or ast.unparse(node.func) != "self._feeder.join":
+            continue
+        timeouts = [keyword.value for keyword in node.keywords if keyword.arg == "timeout"]
+        timeouts.extend(node.args[:1])
+        if any(
+            isinstance(value, ast.Constant) and isinstance(value.value, (int, float)) and value.value > 5
+            for value in timeouts
+        ):
+            findings.append("feeder join timeout increase is not an ownership fix")
+    return findings
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +421,12 @@ class TaskSpec:
                 "required_tokens": list(self.structural.required_tokens),
                 "forbidden_added_patterns": list(self.structural.forbidden_added_patterns),
                 "forbidden_sleep_seconds": self.structural.forbidden_sleep_seconds,
+                # Preserve the shipped #143 payload/digest for durable recovery.
+                **(
+                    {"task_structure": self.structural.task_structure.value}
+                    if self.structural.task_structure is not TaskStructure.CANCELLATION_143
+                    else {}
+                ),
             },
             "max_attempts": self.max_attempts,
             "pr_title": self.pr_title,
@@ -338,7 +515,83 @@ def scarcity_router_143_task(expected_base_sha: str | None = None) -> TaskSpec:
     )
 
 
-TASKS = {"143": scarcity_router_143_task}
+def scarcity_router_166_task(expected_base_sha: str | None = None) -> TaskSpec:
+    """Bounded support only; registration does not authorize #166 execution.
+
+    Selection observed 5792d2dfa1d76fbd973baf2ef82b5fcf236342e9. Like #143,
+    admission freezes current develop unless the owner supplies an explicit pin.
+    """
+    module = ("uv", "run", "python", "-m", "unittest", "tests.test_openai_codex_acquisition", "-v")
+    return TaskSpec(
+        task_id="scarcity-router-166",
+        forge_repository="forgejo:BioMedical-IT/scarcity-router",
+        forge_issue=166,
+        repository_url="https://forgejo.creatidy.com/BioMedical-IT/scarcity-router",
+        base_branch="develop",
+        instruction=(
+            "Fix #166 only in tests/test_openai_codex_acquisition.py. _FakeAppServer._close_write() "
+            "currently joins _feed with timeout=5.0 then closes the real pipe write descriptor even "
+            "if the feeder is still alive. A feeder paused after its stop check can resume os.write "
+            "after close (including descriptor reuse). Establish safe feeder/write-descriptor "
+            "ownership or shutdown ordering without leaked thread tracebacks. Preserve the real "
+            "pipe, non-blocking writer, concurrency, all existing tests and assertion strength. "
+            "Add deterministic forced-interleaving regression coverage that proves the unsafe "
+            "baseline and the corrected ownership invariant, not merely module-isolated loops. "
+            "Do not increase timeouts arbitrarily, use sleep-based correctness, skip/xfail, swallow "
+            "assertions/exceptions, reduce coverage or the eight-repeat contract, or replace real "
+            "concurrency with an inert mock. Do not change production code."
+        ),
+        repository_instructions=(
+            "The repository uses uv and unittest. The targeted class is "
+            "tests.test_openai_codex_acquisition.SafeTermination. Fixtures are synthetic and "
+            "offline with real local pipes and threads; no network or credentials are permitted."
+        ),
+        allowed_paths=frozenset({"tests/test_openai_codex_acquisition.py"}),
+        verification=(
+            VerificationCommand((*module[:-2], "tests.test_openai_codex_acquisition.SafeTermination", "-v"), 900),
+            VerificationCommand(module, 900),
+            VerificationCommand(module, 900, repeats=8),
+            VerificationCommand(("make", "check"), 3600),
+        ),
+        structural=StructuralPolicy(
+            required_names=(
+                "test_success_path_terminates_without_kill",
+                "test_failure_paths_terminate_without_kill",
+                "test_timeout_path_terminates_and_never_leaks",
+                "test_stubborn_child_is_killed_after_bounded_wait",
+                "test_reader_startup_failure_terminates_child",
+                "test_reader_startup_failure_kills_stubborn_child",
+                "test_shutdown_never_raises_through_collect",
+            ),
+            required_tokens=(
+                "os.pipe()",
+                "os.set_blocking(self._write_fd, False)",
+                "os.write(",
+                "threading.Thread(",
+                "self._feeder.start()",
+                'self.assertEqual(fake.events, ["terminate"])',
+                'self.assertEqual(fake.events, ["terminate", "kill"])',
+                "self.assertTrue(fake.stdin.closed)",
+                'self.assertEqual(self.stderr.getvalue(), "")',
+            ),
+            forbidden_added_patterns=(
+                r"@\s*(?:unittest\.)?skip(?:If|Unless)?\b",
+                r"@pytest\.mark\.(?:skip|xfail)",
+                r"\bxfail\b",
+                r"except\s+.*\b(?:AssertionError|Exception|BaseException|OSError)\b",
+                r"except\s*:",
+                r"\b(?:skipTest|expectedFailure)\b",
+            ),
+            forbidden_sleep_seconds=5.0,
+            task_structure=TaskStructure.FEEDER_166,
+        ),
+        expected_base_sha=expected_base_sha,
+        max_attempts=1,
+        pr_title="Fix fake-process feeder descriptor ownership (#166)",
+    )
+
+
+TASKS = {"143": scarcity_router_143_task, "166": scarcity_router_166_task}
 
 
 def task_program_spec(task: TaskSpec) -> ProgramSpec:
@@ -743,9 +996,15 @@ class TaskChecks:
             if match and float(match.group(1)) >= self.task.structural.forbidden_sleep_seconds:
                 findings.append("arbitrary large sleep substitution added")
                 break
+        if self.task.structural.task_structure is TaskStructure.FEEDER_166:
+            base_content = "\n".join(
+                git_bytes(self.workspace, "cat-file", "blob", f"{self.base}:{path}").decode("utf-8")
+                for path in sorted(self.task.allowed_paths)
+            )
+            findings.extend(_feeder_candidate_findings(base_content, content))
         payload: dict[str, object] = {
             "deterministic_findings": findings,
-            "deferred_to_independent_review": list(DEFERRED_TO_REVIEW),
+            "deferred_to_independent_review": list(self.task.structural.deferred_to_review),
             "scope_note": "deterministic structural subset only; semantic properties require independent review",
         }
         return payload, not findings
@@ -1596,14 +1855,7 @@ def _baseline(source: Path, base: str, task: TaskSpec, environment: Mapping[str,
     for required in (*task.structural.required_names, *task.structural.required_tokens):
         if required not in content:
             raise ValueError("frozen structural baseline is missing required scenario or assertion")
-    tree = ast.parse(content)
-    for name in task.structural.required_names:
-        scenarios = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == name]
-        if len(scenarios) != 1:
-            raise ValueError("frozen scenario is absent or ambiguous")
-        scenario = ast.get_source_segment(content, scenarios[0]) or ""
-        if ".recv(" not in scenario or re.search(r"\bif\s+not\s+\w+\s*:\s*break\b", scenario) is None:
-            raise ValueError("frozen cancellation race baseline is absent or already changed")
+    task.structural.validate_baseline(content)
     for command in task.verification:
         argv = command.argv
         executable = shutil.which(argv[0], path=environment.get("PATH", os.defpath))
@@ -1624,7 +1876,7 @@ def _baseline(source: Path, base: str, task: TaskSpec, environment: Mapping[str,
             for c in task.verification
         ],
         "verification_executed": False,
-        "deferred_to_independent_review": list(DEFERRED_TO_REVIEW),
+        "deferred_to_independent_review": list(task.structural.deferred_to_review),
     }
 
 
