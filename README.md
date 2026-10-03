@@ -7,8 +7,8 @@ software engineering. It is for individual developers and small teams with limit
 premium-model quota and human attention.
 
 **Status: deterministic domain, durable persistence, bounded Forge and Codex Runtime adapters,
-an offline two-node CLI reference flow, and owner-approved bounded task execution for one
-frozen real task, not a general autonomous Program engine.**
+an offline two-node CLI reference flow, and bounded TaskSpec support for two frozen real
+tasks, not a general autonomous Program engine.**
 The code includes immutable Program intent, legal domain commands, single-controller SQLite history
 and rebuildable projections, an external-operation journal/outbox with a synthetic effect seam and
 content-addressed artifacts, plus a replaceable resource allocator. Synthetic Runtime, Workspace and
@@ -139,8 +139,12 @@ This setup is deliberately specific to the reference scenario, not a general rep
 
 `creatidy-kernel task` composes the existing allocator, Codex runtime, controller-owned Git
 candidate, bounded verification and AGit delivery for a frozen, controller-owned task registry.
-The only current real task is `143`, representing `BioMedical-IT/scarcity-router#143`: a test-only
-cancellation-race repair with one allowed changed path, `tests/test_e2e_execution.py`. This is
+Task `143` represents `BioMedical-IT/scarcity-router#143`: a test-only cancellation-race repair
+with one allowed changed path, `tests/test_e2e_execution.py`. Task `166` represents
+`BioMedical-IT/scarcity-router#166`: real-pipe fake-process feeder shutdown/descriptor ownership
+with one allowed changed path, `tests/test_openai_codex_acquisition.py`. Its registration is
+support only, not execution authorization. After the support change is owner-merged, #166 requires
+a fresh zero-inference preflight before any separately owner-authorized live execution. This is
 **not arbitrary autonomous issue execution**. Issue prose cannot create a task or alter its
 authority. There is no workflow DSL, scheduler or general agent framework, and no automatic merge
 or deployment.
@@ -194,9 +198,13 @@ The source checkout is read-only to Kernel. Work happens in a disposable control
 the controller itself creates the candidate commit from the workspace tree. The base is durably
 frozen, and recovery uses that exact base even if a source branch moves. Changed paths must remain
 inside the task's frozen allowed set. Task-owned argv-only verification runs in the candidate
-workspace with bounded capture/timeouts: the current task has targeted cancellation checks, exactly
-eight repeated targeted runs, and one `make check`. Structural checks reject obvious test weakening;
-semantic residue remains subject to independent review. After verification the workspace must be
+workspace with bounded capture/timeouts. Task `143` retains targeted cancellation checks, exactly
+eight repeated targeted runs, and one `make check`. Task `166` checks `SafeTermination`, the acquisition
+module, exactly eight repeated module runs, and `make check`. A closed typed structural seam selects
+the task-specific baseline; #166 also preserves real pipe/non-blocking feeder structure and existing
+test assertions. Structural checks reject obvious test weakening; semantic correctness, including
+the forced-interleaving proof of unsafe baseline and corrected ownership, remains subject to
+independent review. After verification the workspace must be
 Git-clean for tracked and non-ignored untracked state; ignored cache artifacts remain ignored.
 
 ### Runtime Configuration
