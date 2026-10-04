@@ -51,8 +51,10 @@ Kernel / Router / MI -> owner-served state/events -> Console and CLI
 
 Public Kernel must not require private `creatidy-onprem`. Public module dependencies are allowed
 when they avoid duplication; offline core/tests remain self-contained. Separate ownership does not
-require four permanent services, a shared database, broker or Kubernetes. Names and public
-repository identifiers are unchanged: `creatidy-router` was a typo for `scarcity-router`, not Kernel.
+require four permanent services, a shared database, broker or Kubernetes. Public repository identifiers
+are unchanged: Creatidy Kernel remains the orchestration/control-plane product, and Scarcity Router
+remains the resource-routing product. No additional router product or repository is introduced, and
+no rename of Creatidy Kernel is implied.
 
 ## Contract Consequences
 
