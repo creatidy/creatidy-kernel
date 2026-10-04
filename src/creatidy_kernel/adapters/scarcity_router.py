@@ -21,6 +21,7 @@ import socket
 import ssl
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
+from enum import StrEnum
 from threading import Timer
 from time import monotonic
 from typing import cast
@@ -34,12 +35,37 @@ MAX_JSON_DEPTH = 32
 _IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._:-]{0,63}\Z")
 
 
+class RouterFailureCategory(StrEnum):
+    """Closed safe failure vocabulary; never response bodies, credentials or free text."""
+
+    REQUEST_UNSUPPORTED = "request_unsupported"
+    ENDPOINT_UNREACHABLE = "endpoint_unreachable"
+    HTTP_REJECTED = "http_rejected"
+    INVALID_RESPONSE = "invalid_response"
+    NO_ELIGIBLE_SELECTION = "no_eligible_selection"
+    SELECTION_INCOMPATIBLE = "selection_incompatible"
+
+
 class ScarcityRouterUnavailable(AllocationUnavailable):
     """Safe refusal, optionally retaining a validated public no-selection decision."""
 
-    def __init__(self, message: str, decision_provenance: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        decision_provenance: str | None = None,
+        category: RouterFailureCategory | None = None,
+    ) -> None:
         super().__init__(message)
         self.decision_provenance = decision_provenance
+        self.category = category
+
+
+class _ExchangeFailure(ValueError):
+    """Transport-phase refusal carrying its safe closed category."""
+
+    def __init__(self, category: RouterFailureCategory, message: str) -> None:
+        super().__init__(message)
+        self.category = category
 
 
 def _object(value: object) -> dict[str, object]:
@@ -359,13 +385,13 @@ class ScarcityRouterAllocator(ResourceAllocator):
             response = connection.getresponse()
             if response.status != 200:
                 # http.client does not follow redirects. Never inspect or echo error bodies.
-                raise ValueError("Router HTTP refusal")
+                raise _ExchangeFailure(RouterFailureCategory.HTTP_REJECTED, "Router HTTP refusal")
             if response.getheader("Content-Encoding", "identity") != "identity":
-                raise ValueError("unsupported encoding")
+                raise _ExchangeFailure(RouterFailureCategory.INVALID_RESPONSE, "unsupported encoding")
             body = bytearray()
             while len(body) <= MAX_RESPONSE_BYTES:
                 if monotonic() >= deadline:
-                    raise TimeoutError("response deadline")
+                    raise _ExchangeFailure(RouterFailureCategory.INVALID_RESPONSE, "response deadline")
                 chunk = response.read1(min(8192, MAX_RESPONSE_BYTES + 1 - len(body)))
                 if not chunk:
                     break
@@ -385,12 +411,16 @@ class ScarcityRouterAllocator(ResourceAllocator):
 
     def select(self, request: ResourceRequest) -> Allocation:
         if request.required_capabilities != frozenset({"reference"}):
-            raise ScarcityRouterUnavailable("unsupported Scarcity Router request capabilities")
+            raise ScarcityRouterUnavailable(
+                "unsupported Scarcity Router request capabilities",
+                category=RouterFailureCategory.REQUEST_UNSUPPORTED,
+            )
         hard: dict[str, object] = {"requires_tool_use": True}
         if request.context_tokens:
             hard["minimum_input_context_tokens"] = request.context_tokens
         requirement: dict[str, object] = {"task_level": "L0", "capability_minima": {}, "hard_constraints": hard}
         failure = "Scarcity Router unavailable or invalid public response"
+        category = RouterFailureCategory.INVALID_RESPONSE
         evidence: str | None = None
         try:
             document = _parse(self._exchange(requirement))
@@ -399,6 +429,7 @@ class ScarcityRouterAllocator(ResourceAllocator):
             decision, provenance = _decision(document, requirement)
             if decision["selected"] is None:
                 failure = "Scarcity Router returned no eligible allocation"
+                category = RouterFailureCategory.NO_ELIGIBLE_SELECTION
                 evidence = provenance
             else:
                 selected = _object(decision["selected"])
@@ -427,8 +458,15 @@ class ScarcityRouterAllocator(ResourceAllocator):
                             rationale="Scarcity Router: " + ", ".join(_strings(decision["reason_codes"])),
                         )
                 failure = "Scarcity Router selection is incompatible with configured runtime bindings"
+                category = RouterFailureCategory.SELECTION_INCOMPATIBLE
                 evidence = provenance
-        except (OSError, http.client.HTTPException, ValueError, TypeError, KeyError, RecursionError, OverflowError):
+        except _ExchangeFailure as error:
+            failure, category = str(error), error.category
+        except OSError:
+            # Socket-level failures (including connect timeouts) mean the endpoint
+            # itself could not be reached; protocol and schema failures stay below.
+            failure, category = "Scarcity Router endpoint unreachable", RouterFailureCategory.ENDPOINT_UNREACHABLE
+        except (http.client.HTTPException, ValueError, TypeError, KeyError, RecursionError, OverflowError):
             pass
         # Raise outside the handler: no raw response/credential exception in even __context__.
-        raise ScarcityRouterUnavailable(failure, evidence)
+        raise ScarcityRouterUnavailable(failure, evidence, category)
