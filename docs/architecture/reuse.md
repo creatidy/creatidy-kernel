@@ -6,6 +6,37 @@ A0 copied no upstream product source. K8's bounded transport adaptation is recor
 Default-branch snapshots below are inspection evidence, not production-tested dependency pins.
 Licensing was read for repository scope; copying requires checking the particular file and its notices.
 
+## Shared-Architecture Reuse Gate
+
+[ADR 0007](../adr/0007-shared-harness-routing-observability.md) and
+[#47](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/47) require a new version-evidenced
+control/backend assessment. The dated tables below preserve original design choices; `ADAPT BEHIND
+PORT` there is not proof that a dependency or complete adapter was installed. Only explicitly
+described built mechanisms (such as K8 transport and native Codex) are implemented here.
+
+Start with current local Runtime/Workspace, immutable allocation/identity, effects, verification,
+outcome correction/deduplication and SQLite/backup mechanisms. Retain them unless an alternative
+preserves guarantees with a demonstrated advantage; similar upstream names are not replacement proof.
+Use `ADOPT -> VENDOR/COPY -> PORT -> ADAPT -> BUILD`, justifying retained local code as well as reuse.
+
+| Candidate / problem | Evidence required before a concrete adoption recommendation | Registered owner |
+| --- | --- | --- |
+| ACP and existing client/agent implementations | Exact protocol/implementation versions; start/events/load/resume/cancel/permissions; actual client file/terminal executor and enforcement; lost response and native resume distinctions | #47 control proof, #53 adapter, #50 isolation |
+| Kilo CLI/ACP/serve/attach/SDK, Codex App Server, Claude Agent SDK, ZCode | Current installed generation/API; native delegation/cold review; explicit session/process ownership, descendant settlement and UI-close/attach; separately prove gateway backend/tool/stream/pin/retry compatibility | #47/#48/#53 and #52 consumer; no forced selection |
+| Symphony SPEC tracker/workspace/runner/status patterns | Exact revision/licence; loss of response, persistence/authority and restart semantics, not just presence of start | #47/#49; preserve Kernel reception authority, no imported scheduler |
+| Existing sandboxes, HAR/OpenHands workspace mechanisms | Real worker/test/reviewer host/DB/credential/network/terminal denials, cleanup/process ownership and platform limitations | #50/#59/#61; no own sandbox/framework |
+| Rich and OpenTelemetry | Human/JSON/pipe compatibility, safe bounded presentation/correlation and opt-in exporter; diagnostic loss must not lose durable state | #57; no new collector required |
+| Native bounded process and migration tools, SOPS | Streaming byte/time/process bounds; real synthetic ciphertext and interrupted atomic upgrade/rollback, not field-name compatibility | #56/#62; no secrets manager |
+
+For any actual recommendation record source and exact revision/files, file-specific licence and
+attribution, semantics and negative tests, security/trust boundary, dependencies and maintenance.
+Code licensing is distinct from subscription/service access and data redistribution rights. Missing
+evidence leaves a **candidate**, not an approved library, command, protocol or public contract.
+Permission, inference and live service evidence are separately scoped; this documentation task grants
+no product call. ACP's candidacy does not authorize a custom harness, protocol or VS Code plugin.
+
+## Historical Audit Catalogue
+
 ## Agent And Workspace References
 
 | Problem / reference | Primary implementation evidence | Chosen approach | Reason / limit |
@@ -67,7 +98,7 @@ In the following table, linked files are pinned to that revision.
 | Runtime/forge coupling | [runtime adapters](https://github.com/watt-mind/factory/blob/d57be4bfbfc4931f6948da969dd9ac541ba63b66/event-runtime/lib/adapters/index.mjs), [forge contract tests](https://github.com/watt-mind/factory/blob/d57be4bfbfc4931f6948da969dd9ac541ba63b66/lib/forge/contract.test.mjs) | BORROW DESIGN | Reuse port/conformance-test approach. Only memory/GitHub forge implementations ship, with direct `gh` calls still in merge paths. Do not assume demonstrated Forgejo portability. |
 | Attempt cost attribution | [database and usage](https://github.com/watt-mind/factory/blob/d57be4bfbfc4931f6948da969dd9ac541ba63b66/event-runtime/lib/db.mjs) | BORROW DESIGN | Keep attempt-level provider/model/usage provenance. Unknown usage must remain unknown rather than upstream's zero normalization; distinguish accounting observations from reservation authority. |
 
-## What We Own Or Defer
+## Historical Ownership And Deferral
 
 | Subsystem | Chosen approach | Reason |
 | --- | --- | --- |
@@ -76,6 +107,11 @@ In the following table, linked files are pinned to that revision.
 | Capability checks and verification policy | BORROW DESIGN; BUILD OUR OWN narrow domain checks later | Required digest-bound consumption and acceptance semantics exceed the audited references. Credential storage, isolation and check tools remain existing components. |
 | Context compilation and local outcomes | BORROW DESIGN; DEFER implementation | Pin sources, separate evidence/verdict, retain unitful observations; no vector platform, evaluation service or analytics engine yet. |
 | Adaptive allocation, distributed controller, UI, release signing | DEFER | Need real usage and the first durable slice before their integration/maintenance cost is justified. |
+
+These are A0-era timing statements. Bounded domain/verification/context/outcome code now exists;
+full product integration is still incomplete. Known shared requirements have actual issues in
+[the coverage roadmap](successor.md), not an unregistered DEFER queue. Kernel does not adopt
+adaptive model ranking, a distributed controller or release signing merely to look complete.
 
 ## Reuse Discipline
 

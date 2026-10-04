@@ -27,8 +27,9 @@ through a reviewed PR handoff.
    `.git/info/exclude`, and record the acceptance criteria and current decisions. Never commit it.
 4. Fetch `origin/develop` and create a feature branch from it. Preserve unrelated work.
 5. Implement the smallest coherent change in the issue scope. Keep `adapters -> ports -> core`, do
-   not invent hidden contracts, and do not add private runtime, Program, M5-B, or model-routing
-   behavior.
+   not invent hidden contracts or private runtime/M5-B dependencies. Do not infer Program execution
+   authority or duplicate Router policy. Explicitly selected product work must follow the owning
+   architecture/ADRs, not be encoded as a development Markdown executor.
 6. Add or update focused tests where the issue changes behavior. Use deterministic synthetic fixtures
    and test negative paths when relevant.
 7. Run focused checks, then `make check` and `make package-check`. Run `make audit` when relevant.

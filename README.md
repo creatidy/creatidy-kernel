@@ -2,9 +2,9 @@
 
 **Democratize software development with AI.**
 
-Creatidy Kernel is the foundation of a local-first, provider-neutral control plane for autonomous
-software engineering. It is for individual developers and small teams with limited AI budgets,
-premium-model quota and human attention.
+Creatidy Kernel is a local-first work controller for engineering with existing AI harnesses. It is
+for individual creators and small teams with limited money, subscription quota, time and attention.
+The objective is an accepted result including verification, review and fixes, not the cheapest token.
 
 **Status: deterministic domain, durable persistence, bounded Forge and Codex Runtime adapters,
 an offline two-node CLI reference flow, and bounded TaskSpec support for two frozen real
@@ -51,16 +51,31 @@ state and evidence that make a sequence of engineering work reliable, even when 
 or a model is replaced. The goal is fewer wasted attempts and owner interruptions, not just cheaper
 tokens. It is not a new coding agent, IDE or general multi-agent framework.
 
-The target supports existing harnesses and providers, including US and Chinese providers and local
-models. No Creatidy cloud account is required. Source, control-plane state, policies and outcome
-history can stay self-hosted; only explicitly chosen cloud intelligence/integrations require egress.
+The target controls existing harnesses through documented, version-evidenced adapters; it does not
+rebuild their model-tool-result loop or operate by clicking an IDE. Source, control-plane state,
+policies and outcome history can stay self-hosted; only explicitly chosen cloud integrations require egress.
 There is no mandatory telemetry. These are architecture commitments, not a claim that all adapters
 already exist.
 
-[Scarcity Router](https://github.com/creatidy/scarcity-router) independently allocates scarce machine
-intelligence. The optional `ScarcityRouterAllocator` consumes its public recommendation interface
-through the ResourceAllocator port, without embedding its policy or using its execution gateway.
-Either product remains useful without the other; the example below uses a FixedAllocator.
+[Scarcity Router](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router) owns execution sources,
+private quota/telemetry, selection/admission policy and the provider gateway. Today the optional
+`ScarcityRouterAllocator` consumes its model recommendation interface, **not the execution gateway**;
+the bounded live composition then uses native Codex and one configured binding. The agreed target is
+dynamic Router-backed harness inference, with an explicit user pin as an exception, not a permanent
+hand-maintained model table. The offline example remains a FixedAllocator proof.
+
+[Model Intelligence](https://forgejo.creatidy.com/Creatidy/model-intelligence) owns versioned external
+model/interface/benchmark/public-offer evidence, not private balances or routing. Router normally
+consumes it; Kernel will retain the utilized knowledge reference. Console will consume state served
+by each product owner and forward authorized commands, not query Kernel SQLite or own scheduling,
+ranking or permissions. Separate products do not imply four services, a broker or shared database.
+Public dependencies may be reused; no private `creatidy-onprem` is required for the public operator.
+
+[ADR 0007](docs/adr/0007-shared-harness-routing-observability.md) records the owner's 2026-10-04
+shared-architecture direction and source availability. [The coverage roadmap](docs/architecture/successor.md)
+distinguishes **Agreed**, revision-**Verified**, **Proposed clarification** and **To prove**. The current
+foundations are not evidence that ordinary intake, gateway, product review, isolation, full costs or
+Console integration are complete. No Creatidy cloud account is required by the target architecture.
 
 ## Development Authority
 
@@ -143,8 +158,8 @@ Task `143` represents `BioMedical-IT/scarcity-router#143`: a test-only cancellat
 with one allowed changed path, `tests/test_e2e_execution.py`. Task `166` represents
 `BioMedical-IT/scarcity-router#166`: real-pipe fake-process feeder shutdown/descriptor ownership
 with one allowed changed path, `tests/test_openai_codex_acquisition.py`. Its registration is
-support only, not execution authorization. After the support change is owner-merged, #166 requires
-a fresh zero-inference preflight before any separately owner-authorized live execution. This is
+support only, not execution authorization; that support is integrated through PR #43. Any live task
+still needs fresh zero-inference readiness and separate owner authorization. This is
 **not arbitrary autonomous issue execution**. Issue prose cannot create a task or alter its
 authority. There is no workflow DSL, scheduler or general agent framework, and no automatic merge
 or deployment.
@@ -152,13 +167,12 @@ or deployment.
 Infrastructure configuration must be provisioned before these commands. The following illustrates
 the public CLI contract, not authorization to perform the first live execution:
 
-**First-live rollout gate:** no real model task is authorized during the coordinated
-[Kernel #37](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/37) and
-[operator #43](https://forgejo.creatidy.com/Infrastructure/creatidy-onprem/issues/43) change.
-Both separate PRs must be owner-merged, then
-[preflight #34](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/34) must produce a fresh
-`READY_FOR_LIVE_TASK` through the new operator surfaces. The first live run remains a separate
-owner-approved step. No agent merge or live rollout is implied by this documentation.
+**Execution boundary:** public operator support is integrated through PR #45. Historical coordinated
+private-operator rollout and preflight #34 are no longer current prerequisites. #34 closed as
+`INFRASTRUCTURE_BLOCKED`; #39 closed as `TASK_STALE`, not successful live acceptance. Readiness is
+neither owner approval nor proof of the full shared architecture. Current lifetime, verification,
+source and budget deviations are [registered blockers](docs/architecture/successor.md#first-priority-deviations),
+not hidden by documentation acceptance. These examples grant no model/task, merge or deployment authority.
 
 ```sh
 uv run --locked creatidy-kernel doctor --task 143
@@ -174,8 +188,9 @@ uv run --locked creatidy-kernel task export
 The normal path needs no local Scarcity Router checkout and no `creatidy-onprem` access:
 the controller acquires its own read-only source cache from the TaskSpec canonical
 repository, discovers Codex on `PATH`, and selects user-local state defaults. An explicit
-`--repo` remains an advanced override for an existing checkout and is verified against the
-exact canonical remote like any other source.
+`--repo` remains an advanced override. Preflight checks its exact canonical origin and clean source;
+the current run path does not share all those checks. [#61](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/61)
+tracks enforcement before dispatch, cache ownership and host-qualified identity.
 
 Preflight is quota-free: it validates runtime configuration, source/state suitability, exact base,
 frozen structural assumptions, allowed paths and verification command shapes; probes the pinned
@@ -199,13 +214,17 @@ or unreconciled WAL/SHM/journal sidecars. Such state returns `state_not_ready`; 
 to force readiness. Offline status/export use the normal store opening/closing path without
 dispatching work. Runtime-effect reconciliation remains owned by the bounded run/recovery path.
 
-The source is read-only to Kernel: normal operation reads the controller's own cache acquired
-from the TaskSpec canonical repository (an explicit `--repo` checkout is verified against that
-exact identity). Work happens in a disposable controller-owned clone;
+Task work treats the source as read-only: normal operation uses the controller cache acquired
+from the TaskSpec canonical repository. Cache acquisition/refresh does write local files; preflight
+checks explicit `--repo` identity, while shared dispatch enforcement remains #61. Work happens in a disposable clone;
 the controller itself creates the candidate commit from the workspace tree. The base is durably
 frozen, and recovery uses that exact base even if a source branch moves. Changed paths must remain
-inside the task's frozen allowed set. Task-owned argv-only verification runs in the candidate
-workspace with bounded capture/timeouts. Task `143` retains targeted cancellation checks, exactly
+inside the task's frozen allowed set for acceptance. That is a post-hoc gate, not a sandbox:
+verification currently runs all checks even after a scope failure, and capture is truncated only
+after buffering command output. [#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50) and
+[#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56) cover safe preconditions,
+isolation and full execution bounds. Task-owned argv-only commands have per-command timeouts.
+Task `143` retains targeted cancellation checks, exactly
 eight repeated targeted runs, and one `make check`. Task `166` checks `SafeTermination`, the acquisition
 module, exactly eight repeated module runs, and `make check`. A closed typed structural seam selects
 the task-specific baseline; #166 also preserves real pipe/non-blocking feeder structure and existing
@@ -261,22 +280,38 @@ or the controller's standard `os.defpath`, not an ambient factory lookup. Option
 directory. Only supplied `HOME`, `LANG`, `LC_ALL` and `TMPDIR` are copied. The factory never merges
 an unrelated ambient environment; controller-owned verification also uses closed operational values.
 
-`task run --deadline UNIX_SECONDS` pins an absolute deadline no more than one hour ahead; when
-omitted on a fresh run it defaults to 55 minutes ahead. Recovery retains the original deadline,
-within the frozen task's Attempt limit and with zero automatic remediation budget. Application callers retain
-the bounded observation budget of 1-100; the CLI advances the task once per invocation rather than
-running an unbounded polling loop. Bounded exit requests cancellation but does not assert the remote
-worker has stopped. These limits are not provider-side monetary/token quotas. Native-shaped offline
-fixtures cover composition and recovery; the test suite claims no live model or remote-Forge execution.
+`task run --deadline UNIX_SECONDS` validates an incoming absolute dispatch deadline no more than
+one hour ahead; the CLI defaults to 55 minutes ahead on each invocation. The task mode records the
+original deadline but **does not enforce its recovery**. It advances once and closes the owned Codex
+transport even if the returned state is running; it has no durable task cancellation loop. Verification
+and delivery are not bounded by a whole-task monetary/quota/time envelope. These current deviations
+are [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48) and
+[#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56), not promised recovery features.
+Native-shaped offline fixtures are not live model or remote-Forge acceptance.
+
+The separate `run_live_reference` Python composition has a 1-100 observation budget, original
+deadline recovery and a cancellation Operation. Its bounded exit does not prove remote descendants
+have stopped. Those reference guarantees do not apply automatically to `task run`.
 
 Runtime requests carry requested identity only. Acceptance requires matching runtime-resolved
 identity evidence, retained durably for the exact operation/accepted handle. A receipt-only Codex
 restart cannot reconstruct that resolution from a native thread read: without previously stored
 resolution evidence it reports `identity_unavailable` and cannot accept a candidate. Unknown
-generated-turn attestation remains distinct from verified configuration resolution. Cancellation has
-its own durable operation; once delivery is claimed, restarts observe the target without blindly
-reissuing the interrupt. Exports distinguish uncertain cancellation delivery from an observed terminal
-target, neither of which grants engineering acceptance.
+generated-turn attestation remains distinct from verified configuration resolution. The live reference's
+cancellation journal separates uncertain interrupt delivery from terminal observation; the task
+composition does not yet supply that loop or its export. Task acceptance currently satisfies a frozen
+deterministic policy (`reviewer_required=False`), **not independent product review**. The durable
+product review/remediation loop is [#54](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/54);
+repository `/deliver-issue` is development workflow, not its implementation or budget.
+
+`task export` is a thin persisted task/Allocation/candidate/acceptance/PR summary, not the richer
+reference export or a task-integrated `core.outcomes` pipeline. It lacks full requested/resolved/observed
+identity, provenance, usage, review/remediation and cancellation history. A stored PR receipt is
+historical evidence, not current remote state. [#58](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/58)
+covers versioned private full-path outcome/cost export, preserving unknowns and causal limits.
+Current status/export open SQLite themselves and are not concurrent views of an active exclusive
+controller. [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) owns the served
+snapshot/events/command/notification contract; no future API/flag is asserted here.
 
 ## Public Operator Surface
 
@@ -303,8 +338,9 @@ Normal operation requires no checkout-path, Codex, or state configuration:
 - **Source.** Kernel acquires its own read-only controller cache from the TaskSpec canonical
   repository under `${XDG_CACHE_HOME:-~/.cache}/creatidy-kernel/source`, verifies the exact
   canonical origin before every use, refreshes it with a bounded fetch, and fails closed if the
-  refresh fails. There is no sibling-directory or workspace-layout search anywhere; a stale,
-  dirty, or foreign cache entry is replaced (or refused, when locally modified), never adopted.
+  refresh fails. There is no sibling-directory or workspace-layout search; a dirty cache is refused.
+  Current foreign-entry replacement, hostless keys and lack of acquisition
+  locking are limitations under #61, not proved cleanup ownership or multi-task safety.
 - **Codex.** `CREATIDY_KERNEL_CODEX_BIN`/`VERSION` are optional: Kernel deterministically resolves
   the explicit override or the first `codex` on `PATH`, probes `codex --version` in the closed
   operational environment, and validates the version shape and native schema with the existing
@@ -373,7 +409,7 @@ Forge effect are unchanged, and neither path can merge or deploy.
 | Adapter conformance, effect recovery and merge races | [Port contracts](docs/architecture/contracts.md) |
 | Trust boundaries and malicious-worker assumptions | [Threat model](docs/architecture/threat-model.md) |
 | Existing Creatidy mapping, without wholesale migration | [Migration analysis](docs/architecture/migration.md) |
-| Bounded next program and failure regressions A-F | [Successor plan](docs/architecture/successor.md) |
+| Current G01-G13 coverage, registered work and historical A-F corpus | [Coverage roadmap](docs/architecture/successor.md) |
 | Independent challenge and remaining risks | [A0 review](docs/architecture/a0-review.md) |
 | Canonical CI, mirror and deferred release activation | [Delivery contract](docs/architecture/delivery.md) |
 
@@ -385,6 +421,7 @@ Forge effect are unchanged, and neither path can merge or deploy.
 | [0004](docs/adr/0004-ports-and-resources.md) | Runtime, resource, workspace and forge boundaries |
 | [0005](docs/adr/0005-authority-and-acceptance.md) | Capabilities, independent verification and genuine Human Gates |
 | [0006](docs/adr/0006-context-and-outcomes.md) | Bounded context and user-owned outcome history |
+| [0007](docs/adr/0007-shared-harness-routing-observability.md) | Shared product/harness/routing/state ownership and explicit proof gaps |
 
 Contributions: [CONTRIBUTING.md](CONTRIBUTING.md). Security: [SECURITY.md](SECURITY.md).
 Licensed under [Apache-2.0](LICENSE). Adapted-source attribution is distributed in [NOTICE](NOTICE).

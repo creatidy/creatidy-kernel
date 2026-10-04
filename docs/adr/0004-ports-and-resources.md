@@ -2,6 +2,11 @@
 
 Status: accepted, 2026-09-21; target fixed before the Creatidy implementation audit.
 
+Historical decision retained. [ADR 0007](0007-shared-harness-routing-observability.md) makes existing
+harness control and Router-backed inference the agreed target, without discarding the delivered
+FixedAllocator/recommendation proof. Dynamic executable selection/admission/pin, distinct identity
+and actual gateway compatibility need producer-consumer evidence; they are not provided by A0/K8.
+
 ## Decision
 
 An agent runtime is a replaceable worker, never the owner of Program truth. Define internal Runtime,

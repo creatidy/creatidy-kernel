@@ -5,6 +5,28 @@ A compromised host administrator can read/change the database and credentials; A
 protection from that administrator. K3 synthetic fakes exercise worker and authority behavior but
 provide no OS isolation, real credential broker or live worker execution.
 
+Current bounded native Codex and verification commands run in trusted-development mode. They do not
+prove same-user filesystem/network/control-state isolation. At inspected Kernel
+`eb4f4a2956712bfaf39a3271e1523e7f77a91e26`, all verification checks execute before final scope
+rejection; candidate-modified tooling can therefore run. [#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50)
+requires no-execution precondition evidence and existing-sandbox denial tests for worker, tests and
+reviewer. Full output capture/process/whole-task bounds are [#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56).
+These are source findings, not executed exploit or live isolation proof.
+
+[ADR 0007](../adr/0007-shared-harness-routing-observability.md) fixes shared ownership. ACP/native
+file/terminal operations need an actual identified executor; permission text is not enforcement.
+Cancel is not rollback, interrupt is not descendant settlement, UI closure is not process ownership.
+Router's existing native workspace-editing lane requires its own authority decision before Kernel
+integration. Do not remove a working producer lane or take over an owner's active IDE session here.
+
+Cache host collisions, unchecked cleanup ownership and concurrent source operations are
+[#61](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/61); one mutating controller per
+Attempt/manual-edit reconciliation is [#59](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/59).
+Console state/commands are served by Kernel with current revision/grant checks, never direct SQL or
+client-owned permissions. Progress/notifications/lossy telemetry cannot replace durable authority.
+Migration/export must protect actual ciphertext and user data, including uncommitted profiles;
+synthetic fixtures and local/private-by-default evidence are required, not secret inspection.
+
 ## Boundaries
 
 Owner UI/CLI uses an authenticated control channel. The control process, selected policy and trusted

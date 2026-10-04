@@ -1,8 +1,40 @@
 # Current Creatidy Mapping
 
-Second pass: the [target](target.md) and accepted ADRs were fixed before inspecting existing
-Creatidy implementation. This is a mapping, not authorization to move code. No private source,
+Current direction: [ADR 0007](../adr/0007-shared-harness-routing-observability.md) and
+[registered coverage](successor.md). The dated second-pass mappings below are history, not current
+rollout instructions or authorization to move code. No private source,
 secrets, operational payloads or customer data are incorporated in this public foundation.
+
+## Current Public Transition
+
+Kernel `eb4f4a2956712bfaf39a3271e1523e7f77a91e26` integrates public source acquisition, generic
+profiles/optional SOPS, Codex discovery, user-local defaults and doctor/preflight/status/export
+(#44/PR #45). Private onprem is optional machine deployment, not the normal product operator owner.
+The old coordinated private rollout/#34 gate is superseded; original history remains in Forgejo.
+
+| Existing mechanism | Preserve | Required transition / registered receipt |
+| --- | --- | --- |
+| Immutable domain/Attempt/Operation/artifact/Allocation state | IDs, original byte/digest provenance, unknowns, journal/receipt/reconciliation and no recovery reselection | Each changed codec must retain old records; [#62](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/62) compatibility/backup/interrupted migration proof |
+| Router recommendation then direct Codex/one configured binding | Strict parsing, explicit effort separate from variant, durable-before-dispatch compatibility and missing-resolution refusal | [#51](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/51) approved requirements; [#52](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/52) dynamic executable-route consumer, no false gateway relabelling |
+| Frozen #143/#166 TaskSpec examples | Existing immutable task identities and controller-owned authority | [#49](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/49) ordinary intake; no issue/AGENTS/model authorization or automatic adoption of issue edits |
+| Canonical cache/preflight and advanced checkout override | No sibling guessing, read-only remote, exact origin/base, source/candidate separation | [#61](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/61) host-qualified keys, owned locking/cleanup, shared dispatch validation and non-destructive old-cache migration |
+| Generic dotenv/SOPS profile outside source | Actual ciphertext, ownership/metadata and recovery access, never plaintext logs/files | #62 producer-shaped encrypted fixtures, failed/atomic migration/rollback. Git history cannot restore an uncommitted user profile. Do not read real owner profiles for public proof. |
+| Dedicated EXCLUSIVE SQLite | Current topology, synchronization, owner process/thread and immutable facts | [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) owner-served projection; no Console SQL or durability downgrade |
+
+Router observed `8d9d4b04bcb23fe19ff702b6209fbcb1537cdf1b` has distinct recommendation,
+Python route/admission and Chat Completions gateway contracts; Responses is deferred and generic
+effort-from-variant behavior needs producer correction. Its D-063 backend-native ZCode workspace
+editing conflicts with shared task ownership: [Router #180](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/issues/180)
+owns explicit authority/migration disposition. Do not silently delete or reinterpret that behavior.
+MI `fb7299810fdc4612d4e0559465faef571662c6ef` integrates a synthetic temporal evidence proof,
+not publication; MI #13 -> Router #176 -> Kernel #55 is the publication/consumer order. Producer
+revisions were corroborated by merge metadata; live deployment and sibling file equality were not proved.
+
+No product migration or cutover is performed by this documentation change. Concrete schemas,
+lifetimes, thresholds and platform support await their selected issue/owner decision; Linux-only
+native storage enforcement is not an exercised WSL/Windows/macOS installation matrix.
+
+## Historical Second-Pass Mapping
 
 ## Scarcity Router
 

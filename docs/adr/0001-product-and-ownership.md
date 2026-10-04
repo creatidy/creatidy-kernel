@@ -2,6 +2,10 @@
 
 Status: accepted from the A0 owner constraints, 2026-09-21.
 
+Historical decision retained. [ADR 0007](0007-shared-harness-routing-observability.md) extends the
+public ownership map with MI/Console and supersedes interpreting optional recommendation-only
+allocation or private composition as the complete shared product architecture. No namespace changes.
+
 ## Decision
 
 Creatidy Kernel's mission is **Democratize software development with AI**. Its reference user is

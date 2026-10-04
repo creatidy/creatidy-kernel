@@ -29,22 +29,25 @@ advisory/package-index access. The ordinary tests/example do not contact models 
 Format intentional edits with `uv run --locked ruff format .`; do not weaken checks to make them pass.
 
 Use core-owned immutable values and protocols. Adapters depend inward; core must not depend on
-private systems, vendor SDKs, a forge or a coding harness. The first real application layer will be
-shared by CLI/REST/MCP, not copied into each entrance. The prototype allocator API is not yet stable;
+private systems, vendor SDKs, a forge or a coding harness. The existing application layer is shared by
+the CLI compositions; future entrances must consume it rather than duplicate semantics. The allocator
+API is not yet stable;
 new hard constraints must be explicitly supported or rejected rather than silently dropped.
 
 ## Scope And Evidence
 
-A0 deliberately does not implement a Program engine. Follow the bounded successor plan rather than
-the historical private Engine v1 brief. Add behavior/negative tests for each implemented invariant;
+A0's resource proof and K1-K8 bounded foundations are historical deliveries, not the complete shared
+architecture. Follow one explicitly selected issue and the [coverage roadmap](docs/architecture/successor.md),
+not the historical private Engine v1 brief or an inferred execution queue. Add behavior/negative tests
+for each implemented invariant;
 do not claim that an architecture document is an implemented control. Tests use synthetic evidence,
 not credentials or private workload data. Runtime state/artifacts belong outside this source checkout.
 
 Use existing dependencies/designs before inventing mechanisms. For substantial source reuse, verify
 the exact upstream revision/file license, preserve required copyright/license/NOTICE, mark modifications
-and record upstream origin. Add `NOTICE`/third-party notices when an actual obligation arises. A0 has
-no copied upstream product source and therefore no third-party source NOTICE requirement. Dependency
-licenses remain with their packages. Never copy proprietary Factory.ai source or confuse that company
+and record upstream origin. Add `NOTICE`/third-party notices when an actual obligation arises. A0 copied
+no product source; the later K8 transport adaptation has attribution in `NOTICE` and must preserve it.
+Dependency licenses remain with their packages. Never copy proprietary Factory.ai source or confuse that company
 with the independent Apache-2.0 `watt-mind/factory` project.
 
 Contributions are under Apache-2.0. Describe what changed, why, validation performed and limits.

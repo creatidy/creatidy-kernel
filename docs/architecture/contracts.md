@@ -1,8 +1,57 @@
 # Port And Recovery Contracts
 
-These are post-A0 implementation requirements, not claims about existing adapters. The only coded
-port in A0 is the deliberately narrower ResourceAllocator proof. Ports use core-owned values and
-advertise supported operations; unsupported requirements fail closed, not through weaker fallbacks.
+The table records post-A0 requirements, not a claim that every adapter passes every case. A0 coded
+only the narrower ResourceAllocator; subsequent bounded ports/adapters exist. Current verification
+and missing receipts are in the [coverage roadmap](successor.md), governed by
+[ADR 0007](../adr/0007-shared-harness-routing-observability.md). Ports use core-owned values;
+unsupported requirements must fail closed, not through weaker fallbacks.
+
+## Current Boundary Evidence
+
+Inspected Kernel revision: `eb4f4a2956712bfaf39a3271e1523e7f77a91e26`. Source/test definitions prove
+bounded mechanisms, not deployment or live reception.
+
+| Boundary | Built subset / evidence | Missing receipt and owner |
+| --- | --- | --- |
+| Runtime control | `ports/execution.py` five methods; `codex_runtime.py` native start/read/interrupt/known-handle restore; `codex_stdio.py` owned process/RPC bounds | [#47](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/47) control/backend proof, [#53](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53) adapter, [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48) lifetime/cancel/deadline repair. No generic events/permissions/resume/IDE guarantee. |
+| Allocation and inference | `scarcity_router.py` machine v1/D-057 recommendation and configured binding; `ports/allocation.py` durable no-reselection recovery | [#51](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/51) approved requirements and [#52](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/52) executable route consumer. Router owns producer selection/admission/pin; recommendation is not gateway execution. |
+| Task intake | Frozen `TaskSpec` registry, core immutable ProgramSpec | [#49](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/49) ordinary approved/versioned spec, fresh relevance/PR/source/test baseline. No prose authority. |
+| Acceptance/review | `core/verification.py` exact subject/freshness/independent-evidence seam; current task policy does not require reviewer | [#54](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/54) durable product loop; repository development review is not implementation. Actual decision-time freshness repair also #48. |
+| Workspace/source | Disposable candidate, canonical cache/preflight checks, same-user trusted-development | [#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50) safe verifier/isolation, [#61](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/61) source identity/locking/dispatch checks, [#59](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/59) concurrency/manual edits. Diff allowlist is not sandbox. |
+| State/observation | Dedicated EXCLUSIVE SQLite and offline CLI export/status | [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) owner-served snapshot/events/commands/notifications. Console cannot open active SQLite or weaken durability. |
+| Knowledge/outcomes | Durable context/allocation artifacts, pure unitful `core.outcomes`, richer reference and thin task export | [#55](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/55) utilized MI references, [#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56) full budgets/costs, [#58](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/58) versioned private export. Unknown is not zero or model quality. |
+
+## Cross-Product Contract Obligations
+
+These are **agreed semantic requirements and to-prove contracts**, not approved new wire shapes,
+endpoints, flags or versions. Each producer owns its schema and executable producer-consumer tests.
+
+- Separate harness control from model-backend ingress; validate exact harness/adapter/protocol/source
+  versions and tool/stream/retry semantics. ACP client file/terminal execution needs its own proved
+  permission boundary. Unsupported resume/recovery stays unknown or refused.
+- Persist Router's executable route before Attempt dispatch; keep main calls sticky, explicit user
+  pin and separately authorized helper/review route evidence. Preserve provider/model/resource/access
+  mode/explicit effort/opaque variant/harness versions and requested/resolved/observed gaps. No
+  physical identity inference for plan-managed execution or effort inferred from variant.
+- MI produces complete versioned knowledge with provenance/time/conflict/withdrawal semantics;
+  Router admits/consumes it. Kernel retains actual utilized references, frozen evidence cut and
+  evaluation semantics without ranking or granting authority. Missing publication cannot be invented
+  from a Python object/package version; unknown freshness is not a renewed guarantee on retrieval.
+- Kernel produces its own snapshot and progress/event view or controlled projection: reconnect,
+  position, deduplication, gap/resync, bounded retention and correlations are required. Commands are
+  checked against current owner authority/revision. Console, notifications and lossy telemetry are
+  never the only durable truth. PWA/IDE/web do not guarantee process or alert lifetime.
+- Full task budgets cover implementation/review/remediation/tools/tests/retries/auxiliary work and
+  separate money/quota/tokens/time/attention with sourced unknowns. Router's call admission/rate cap
+  is not that whole-task authorization. No reset/credit/overflow or hidden retry authority.
+- Preserve immutable IDs and actual state/profile ciphertext in migrations; backward compatibility
+  follows persisted data/contract evidence, not speculative aliases. Installation/Linux/WSL and
+  future-platform compatibility need documented reception under [#62](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/62).
+
+Producer-owned counterparts and exact current limitations are in the roadmap. Router's native
+workspace-editing lane conflicts with the agreed single workspace-controller boundary; its
+[authority decision #180](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/issues/180) must be
+received before enabling that affected path, not silently removed or relabelled.
 
 | Boundary | Minimum obligations | Required conformance cases |
 | --- | --- | --- |
@@ -45,6 +94,9 @@ consistent. A bounded page of search results is not absence proof. Delayed obser
 evidence but cannot silently regress terminal state or resurrect consumed authority.
 
 ## Acceptance And Merge Race
+
+This is historical design for a separately authorized future merge capability, not a current
+product command or permission. Current deliveries create PRs only; no auto-merge/deploy is granted.
 
 Acceptance binds `ProgramSpec + WorkUnitSpec + AttemptSpec + candidate artifact subjects + policy +
 evidence`. A merge operation is separate. If policy requires tests against the current base, merely
