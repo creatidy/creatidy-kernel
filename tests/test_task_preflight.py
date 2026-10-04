@@ -126,8 +126,12 @@ def test_ready_is_inference_free_read_only_and_runs_no_verification(
 def test_config_missing_fields_are_safe_names_and_blocker_is_machine_readable() -> None:
     result = preflight_task({}, task=fixture_task())
     assert not result.ready and result.exact_base_sha is None
-    assert result.blockers[0].reason is PreflightReason.CONFIGURATION
-    assert "CREATIDY_KERNEL_CODEX_BIN" in result.blockers[0].fields
+    reasons = {blocker.reason for blocker in result.blockers}
+    assert {PreflightReason.CONFIGURATION, PreflightReason.CODEX} <= reasons
+    configuration = next(blocker for blocker in result.blockers if blocker.reason is PreflightReason.CONFIGURATION)
+    assert "CREATIDY_KERNEL_FORGE_TOKEN" in configuration.fields
+    codex = next(blocker for blocker in result.blockers if blocker.reason is PreflightReason.CODEX)
+    assert "CREATIDY_KERNEL_CODEX_BIN" in codex.fields and codex.category == "not_found"
     assert result.payload()["status"] == "BLOCKED"
 
 

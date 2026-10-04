@@ -161,18 +161,21 @@ Both separate PRs must be owner-merged, then
 owner-approved step. No agent merge or live rollout is implied by this documentation.
 
 ```sh
-uv run --locked creatidy-kernel task preflight \
-  --data-dir /path/on/native-disk/task-state \
-  --repo /path/to/scarcity-router-checkout --task 143 --json
+uv run --locked creatidy-kernel doctor --task 143
+uv run --locked creatidy-kernel task preflight --task 143 --json
 # Only after separate owner authorization, pin the exact base reported by preflight:
 uv run --locked creatidy-kernel task run \
-  --data-dir /path/on/native-disk/task-state \
-  --repo /path/to/scarcity-router-checkout --task 143 \
-  --expected-base <exact-preflight-sha> --approve --trusted-development
+  --task 143 --expected-base <exact-preflight-sha> --approve --trusted-development
 # Optional: add --deadline UNIX_SECONDS to pin an explicit finite run deadline.
-uv run --locked creatidy-kernel task status --data-dir /path/on/native-disk/task-state
-uv run --locked creatidy-kernel task export --data-dir /path/on/native-disk/task-state
+uv run --locked creatidy-kernel task status
+uv run --locked creatidy-kernel task export
 ```
+
+The normal path needs no local Scarcity Router checkout and no `creatidy-onprem` access:
+the controller acquires its own read-only source cache from the TaskSpec canonical
+repository, discovers Codex on `PATH`, and selects user-local state defaults. An explicit
+`--repo` remains an advanced override for an existing checkout and is verified against the
+exact canonical remote like any other source.
 
 Preflight is quota-free: it validates runtime configuration, source/state suitability, exact base,
 frozen structural assumptions, allowed paths and verification command shapes; probes the pinned
@@ -183,7 +186,9 @@ preflight exits nonzero. Readiness is `READY_FOR_LIVE_TASK`, not owner execution
 reservation or a guarantee that external infrastructure cannot change before dispatch. Human output
 and `--json` are supported. The schema-1 JSON contains `status` (`READY_FOR_LIVE_TASK` or `BLOCKED`),
 `ready`, `task_id`, `task_digest`, `repository`, `exact_base_sha`, `base_ref`, `blockers` and `evidence`.
-Blockers contain a typed `reason` and safe `fields` (key names only). Reasons classify configuration,
+Blockers contain a typed `reason`, safe `fields` (key names only), and an optional safe closed
+`category` (for example Router and source diagnostic sub-classifications). Reasons classify
+configuration,
 source, state, task baseline, Codex, Router and Forge readiness failures. `inference_performed`,
 `forge_writes_performed` and `execution_authorized` are false. Operators must require both a zero
 exit status and readiness before using `exact_base_sha` for a separately authorized run.
@@ -194,7 +199,9 @@ or unreconciled WAL/SHM/journal sidecars. Such state returns `state_not_ready`; 
 to force readiness. Offline status/export use the normal store opening/closing path without
 dispatching work. Runtime-effect reconciliation remains owned by the bounded run/recovery path.
 
-The source checkout is read-only to Kernel. Work happens in a disposable controller-owned clone;
+The source is read-only to Kernel: normal operation reads the controller's own cache acquired
+from the TaskSpec canonical repository (an explicit `--repo` checkout is verified against that
+exact identity). Work happens in a disposable controller-owned clone;
 the controller itself creates the candidate commit from the workspace tree. The base is durably
 frozen, and recovery uses that exact base even if a source branch moves. Changed paths must remain
 inside the task's frozen allowed set. Task-owned argv-only verification runs in the candidate
@@ -216,23 +223,23 @@ Kernel owns one typed, immutable parser for the following neutral infrastructure
 | `CREATIDY_KERNEL_ROUTER_URL` | Router origin; verified HTTPS, or HTTP on a literal loopback address only |
 | `CREATIDY_KERNEL_ROUTER_KEY` | Optional Router bearer credential |
 | `CREATIDY_KERNEL_RUNTIME_BINDING` | Exact controller assertion `provider/model[/effort]` |
-| `CREATIDY_KERNEL_CODEX_BIN` | Absolute Codex executable path |
-| `CREATIDY_KERNEL_CODEX_VERSION` | Exact pinned Codex version |
+| `CREATIDY_KERNEL_CODEX_BIN` | Optional absolute Codex executable; discovered from `PATH` when unset |
+| `CREATIDY_KERNEL_CODEX_VERSION` | Optional exact Codex version; probed from the resolved binary when unset |
 | `CREATIDY_KERNEL_FORGE_API` | HTTPS Forge API URL ending in `/api/v1` |
 | `CREATIDY_KERNEL_FORGE_REMOTE` | HTTPS Git remote on the same origin, matching the exact task repository with `.git` |
 | `CREATIDY_KERNEL_FORGE_TOKEN` | Required scoped Forge credential |
 | `CREATIDY_KERNEL_FORGE_ASKPASS` | Optional absolute Git askpass executable |
-| `CREATIDY_KERNEL_SOURCE_REPOSITORY` | Optional absolute source checkout default for preflight/run |
-| `CREATIDY_KERNEL_STATE_DIRECTORY` | Optional absolute control-state directory default for preflight/run |
+| `CREATIDY_KERNEL_SOURCE_REPOSITORY` | Optional advanced source override; default is the controller-owned canonical cache |
+| `CREATIDY_KERNEL_STATE_DIRECTORY` | Optional absolute control-state directory; default is user-local XDG state |
 
 The process environment or an explicitly provided mapping feeds the parser, then typed configuration
 feeds live components. Missing/invalid configuration is reported by key name, not value. Credentials
 are excluded from configuration repr, logs and evidence, and are never task data or CLI arguments.
 Explicit `--repo` and `--data-dir` override the optional profile path defaults. Status/export are
-offline state operations: they require `--data-dir` but no runtime credentials or Router access.
-Secret management and deployment are **operator-owned**: public Kernel neither decrypts SOPS nor
-stores owner-specific credentials, paths or deployment details. The concrete onprem operator wrapper
-is planned in a separate repository, consuming this contract rather than duplicating product logic.
+offline state operations: they require a state directory but no runtime credentials or Router access.
+Secret management and deployment remain **operator-owned**: public Kernel neither decrypts owner
+infrastructure nor stores deployment details; the optional generic SOPS profile adapter below covers
+only a user-supplied profile and the user's own SOPS key environment.
 
 Runtime configuration describes executable infrastructure. `TaskSpec` separately owns repository,
 base branch, allowed paths, instructions and acceptance/verification authority. The parsed runtime
@@ -270,6 +277,50 @@ generated-turn attestation remains distinct from verified configuration resoluti
 its own durable operation; once delivery is claimed, restarts observe the target without blindly
 reissuing the interrupt. Exports distinguish uncertain cancellation delivery from an observed terminal
 target, neither of which grants engineering acceptance.
+
+## Public Operator Surface
+
+The installed `creatidy-kernel` command is self-contained for the bounded-task operator path;
+the former private operator wrapper is no longer required.
+
+```sh
+uv run --locked creatidy-kernel config template            # generic profile template with placeholders
+uv run --locked creatidy-kernel config validate --profile ~/.config/creatidy-kernel/kernel.env
+uv run --locked creatidy-kernel --profile ~/.config/creatidy-kernel/kernel.env doctor --task 166
+uv run --locked creatidy-kernel --profile ~/.config/creatidy-kernel/kernel.env task preflight --task 166
+```
+
+`doctor` runs the same quota-free readiness composition as `task preflight` and renders safe,
+closed-vocabulary diagnostics with fixed remediation hints. It never starts a native thread or
+turn, never writes Forge state, and readiness is still not run approval. Blocked results carry a
+typed `reason` plus an optional safe `category`: Router failures distinguish endpoint unreachable,
+HTTP rejection, invalid response/schema, no eligible selection, and selection incompatible with the
+controller runtime binding; source failures distinguish acquisition, fetch, remote-mismatch,
+checkout, and exact-base problems. Response bodies and credentials are never echoed.
+
+Normal operation requires no checkout-path, Codex, or state configuration:
+
+- **Source.** Kernel acquires its own read-only controller cache from the TaskSpec canonical
+  repository under `${XDG_CACHE_HOME:-~/.cache}/creatidy-kernel/source`, verifies the exact
+  canonical origin before every use, refreshes it with a bounded fetch, and fails closed if the
+  refresh fails. There is no sibling-directory or workspace-layout search anywhere; a stale,
+  dirty, or foreign cache entry is replaced (or refused, when locally modified), never adopted.
+- **Codex.** `CREATIDY_KERNEL_CODEX_BIN`/`VERSION` are optional: Kernel deterministically resolves
+  the explicit override or the first `codex` on `PATH`, probes `codex --version` in the closed
+  operational environment, and validates the version shape and native schema with the existing
+  inference-free mechanisms. A unusable resolved installation is reported by safe category and is
+  never silently substituted with another installation.
+- **State.** Task state defaults to `${XDG_STATE_HOME:-~/.local/state}/creatidy-kernel/task`;
+  the SQLite storage-safety requirements are unchanged, and `--data-dir` remains the explicit
+  override.
+
+Profiles are generic dotenv files of the same neutral runtime contract (literal `KEY=VALUE`
+values, never shell input). `--profile` values override the process environment for that
+invocation; `--sops` additionally decrypts a user-supplied SOPS-encrypted profile with the
+user's own SOPS key environment through the `sops` executable. This is not a secrets manager:
+there is no key generation, storage, or recipient configuration, no committed secrets, and no
+deployment-specific constants in the public product. Profile values are never printed, logged,
+or serialized into evidence; diagnostics report key names only.
 
 ## Optional Recommendations
 

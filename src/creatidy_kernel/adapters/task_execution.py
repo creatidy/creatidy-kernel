@@ -31,6 +31,11 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
 
+from creatidy_kernel.adapters.codex_discovery import (
+    CODEX_VERSION_PATTERN,
+    CodexDiscoveryFailure,
+    resolve_codex,
+)
 from creatidy_kernel.adapters.codex_runtime import CodexConnection, CodexInputs, CodexRuntime
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
 from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
@@ -39,7 +44,8 @@ from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.forgejo_transport import ConditionalGitTransport, HTTPSForgejoTransport
 from creatidy_kernel.adapters.reference import reference_git, reference_git_bytes
 from creatidy_kernel.adapters.reference_forge import deliver_reference_pr
-from creatidy_kernel.adapters.scarcity_router import ScarcityRouterAllocator
+from creatidy_kernel.adapters.scarcity_router import ScarcityRouterAllocator, ScarcityRouterUnavailable
+from creatidy_kernel.adapters.source_cache import SourceAcquisitionError, acquire_source, default_cache_root
 from creatidy_kernel.adapters.sqlite_store import (
     OperationConflict,
     ProgramNotFound,
@@ -1554,7 +1560,7 @@ class TaskRuntimeConfig:
             value = values[key]
             if value and (not Path(value).is_absolute() or any(ord(c) < 32 for c in value)):
                 raise invalid(key)
-        if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.+-]+)?", values["codex_version"]) is None:
+        if re.fullmatch(CODEX_VERSION_PATTERN, values["codex_version"]) is None:
             raise invalid("codex_version")
         for key in ("forge_api", "forge_remote"):
             try:
@@ -1742,9 +1748,17 @@ class PreflightReason(StrEnum):
 class PreflightBlocker:
     reason: PreflightReason
     fields: tuple[str, ...] = ()
+    category: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.category is not None and re.fullmatch(r"[a-z][a-z_]{0,63}", self.category) is None:
+            raise ValueError("blocker category must be a safe closed-vocabulary identifier")
 
     def payload(self) -> dict[str, object]:
-        return {"reason": self.reason.value, "fields": list(self.fields)}
+        payload: dict[str, object] = {"reason": self.reason.value, "fields": list(self.fields)}
+        if self.category is not None:
+            payload["category"] = self.category
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -1789,18 +1803,54 @@ def _executable(path: Path) -> None:
         raise ValueError("absolute executable file required")
 
 
+def default_state_directory(environ: Mapping[str, str] | None = None) -> Path:
+    """Platform-appropriate user-local task state root; XDG-compatible on Linux."""
+    values = os.environ if environ is None else environ
+    override = values.get("XDG_STATE_HOME", "")
+    base = Path(override) if override and Path(override).is_absolute() else Path.home() / ".local" / "state"
+    return base / "creatidy-kernel" / "task"
+
+
 def task_paths(
     config: TaskRuntimeConfig,
     directory: Path | None,
     source_repository: Path | None,
-) -> tuple[Path, Path]:
-    """CLI paths take precedence; infrastructure defaults never alter TaskSpec."""
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[Path, Path | None]:
+    """CLI paths first, then configured fields, then user-local state defaults.
+
+    Infrastructure defaults never alter TaskSpec. The returned source is ``None``
+    when normal operation must acquire the controller-owned cache from the
+    TaskSpec canonical repository; an explicit source remains the advanced
+    override and is verified exactly as before.
+    """
     state = directory if directory is not None else config.state_directory
+    if state is None and environ is not None:
+        state = default_state_directory(environ)
     source = source_repository if source_repository is not None else config.source_repository
-    missing = tuple(name for value, name in ((state, LIVE_ENV["state"]), (source, LIVE_ENV["source"])) if value is None)
-    if state is None or source is None:
-        raise ConfigurationError("missing path arguments or fields", missing)
+    if state is None:
+        raise ConfigurationError("missing path arguments or fields", (LIVE_ENV["state"],))
     return state, source
+
+
+def resolve_source(
+    config: TaskRuntimeConfig,
+    task: TaskSpec,
+    source_repository: Path | None,
+    *,
+    environment: Mapping[str, str],
+) -> Path:
+    """CLI override, then configured field, then the controller-owned canonical cache.
+
+    Normal operation therefore needs no ``CREATIDY_KERNEL_SOURCE_REPOSITORY`` and no
+    local checkout: the cache is acquired from the TaskSpec canonical repository and
+    verified against that exact identity.
+    """
+    source = source_repository if source_repository is not None else config.source_repository
+    if source is not None:
+        return source
+    return acquire_source(task.repository_url, askpass=config.forge_askpass, environment=environment)
 
 
 def _preflight_base(source: Path, directory: Path, task: TaskSpec) -> tuple[str, str]:
@@ -1880,6 +1930,31 @@ def _baseline(source: Path, base: str, task: TaskSpec, environment: Mapping[str,
     }
 
 
+CODEX_ENV_FIELDS = (LIVE_ENV["codex_bin"], LIVE_ENV["codex_version"])
+
+
+def environment_with_discovered_codex(
+    environ: Mapping[str, str],
+) -> tuple[dict[str, str], CodexDiscoveryFailure | None]:
+    """Fill missing Codex fields from deterministic local discovery; explicit overrides win.
+
+    Discovery resolves exactly one candidate (the override binary or the first
+    ``codex`` on the supplied ``PATH``) and only probes ``--version``: no
+    app-server thread or turn is ever started here.
+    """
+    enriched = dict(environ)
+    if all(enriched.get(name) for name in CODEX_ENV_FIELDS):
+        return enriched, None
+    resolution = resolve_codex(enriched)
+    if isinstance(resolution, CodexDiscoveryFailure):
+        return enriched, resolution
+    if not enriched.get(LIVE_ENV["codex_bin"]):
+        enriched[LIVE_ENV["codex_bin"]] = str(resolution.binary)
+    if not enriched.get(LIVE_ENV["codex_version"]):
+        enriched[LIVE_ENV["codex_version"]] = resolution.version
+    return enriched, None
+
+
 def preflight_task(
     environ: Mapping[str, str],
     *,
@@ -1896,12 +1971,26 @@ def preflight_task(
     def result() -> PreflightResult:
         return PreflightResult(task.task_id, task.digest, task.forge_repository, base, ref, tuple(blockers), evidence)
 
+    enriched, discovery_failure = environment_with_discovered_codex(environ)
     try:
-        config = TaskRuntimeConfig.parse(environ)
+        config = TaskRuntimeConfig.parse(enriched)
         components = compose_task_live(config, task)
-        directory, source = task_paths(config, directory, source_repository)
+        directory, source = task_paths(config, directory, source_repository, environ=enriched)
     except ConfigurationError as error:
-        blockers.append(PreflightBlocker(PreflightReason.CONFIGURATION, error.fields))
+        others = tuple(name for name in error.fields if name not in CODEX_ENV_FIELDS)
+        if others:
+            blockers.append(PreflightBlocker(PreflightReason.CONFIGURATION, others))
+        missing_codex = tuple(name for name in error.fields if name in CODEX_ENV_FIELDS)
+        if discovery_failure is not None and missing_codex:
+            blockers.append(
+                PreflightBlocker(
+                    PreflightReason.CODEX,
+                    missing_codex,
+                    category=discovery_failure.category.value,
+                )
+            )
+        if not blockers:
+            blockers.append(PreflightBlocker(PreflightReason.CONFIGURATION, error.fields))
         return result()
     evidence["configuration"] = {
         "runtime_id": config.binding.runtime_id,
@@ -1911,10 +2000,26 @@ def preflight_task(
         "supported_efforts": sorted(config.supported_efforts),
         "child_environment_keys": sorted(name for name, _ in config.child_environment),
     }
+    # Normal operation acquires the controller-owned read-only cache from the
+    # TaskSpec canonical repository before any path-suitability check, so state
+    # and source overlap rules apply to the cache as well. Acquisition is a
+    # remote read; it never writes to the remote.
+    acquired_cache: Path | None = None
+    if source is None:
+        try:
+            source = acquire_source(
+                task.repository_url,
+                askpass=config.forge_askpass,
+                environment=enriched,
+            )
+            acquired_cache = source
+        except SourceAcquisitionError as error:
+            blockers.append(PreflightBlocker(PreflightReason.SOURCE, category=error.category.value))
     try:
         _suitable_path(directory)
-        _suitable_path(source)
-        if directory == source or directory.is_relative_to(source) or source.is_relative_to(directory):
+        if source is not None and (
+            directory == source or directory.is_relative_to(source) or source.is_relative_to(directory)
+        ):
             raise ValueError("source and state must be separate trees")
         parent = directory
         while not parent.exists():
@@ -1938,37 +2043,59 @@ def preflight_task(
         if config.forge_askpass is not None:
             _suitable_path(config.forge_askpass)
             _executable(config.forge_askpass)
-            if config.forge_askpass.is_relative_to(source) or config.forge_askpass.is_relative_to(directory):
+            if source is not None and (
+                config.forge_askpass.is_relative_to(source) or config.forge_askpass.is_relative_to(directory)
+            ):
                 raise ValueError("askpass must be outside source/state trees")
         evidence["state"] = {"directory": str(directory), "filesystem": filesystem, "created": False}
     except (OSError, ValueError, RuntimeError):
         blockers.append(PreflightBlocker(PreflightReason.STATE))
-    try:
-        _suitable_path(source)
-        if not source.is_dir() or not (source / ".git").is_dir() or (source / ".git").is_symlink():
-            raise ValueError("source must be an ordinary Git checkout")
-        origin = git_text(source, "config", "--get", "remote.origin.url")
-        if origin not in {task.repository_url, task.repository_url + ".git"}:
-            raise ValueError("source origin differs from the exact task repository")
-        if git_text(source, "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"):
-            raise ValueError("source checkout is not clean")
-        base, ref = (
-            _resolve_base(source, task)
-            if any(blocker.reason is PreflightReason.STATE for blocker in blockers)
-            else _preflight_base(source, directory, task)
-        )
-        evidence["source"] = {"directory": str(source), "clean": True, "read_only": True}
-    except (OSError, ValueError, RuntimeError, sqlite3.Error, KeyError, TypeError):
-        blockers.append(PreflightBlocker(PreflightReason.SOURCE))
-    if base is not None:
+    source_category: str | None = None
+    checked_source: Path | None = None
+    if source is not None:
         try:
-            evidence["task"] = _baseline(source, base, task, dict(config.child_environment))
+            _suitable_path(source)
+            if not source.is_dir() or not (source / ".git").is_dir() or (source / ".git").is_symlink():
+                source_category = "checkout_unsuitable"
+                raise ValueError("source must be an ordinary Git checkout")
+            origin = git_text(source, "config", "--get", "remote.origin.url")
+            if origin not in {task.repository_url, task.repository_url + ".git"}:
+                source_category = "remote_mismatch"
+                raise ValueError("source origin differs from the exact task repository")
+            if git_text(source, "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"):
+                source_category = "checkout_dirty"
+                raise ValueError("source checkout is not clean")
+            try:
+                base, ref = (
+                    _resolve_base(source, task)
+                    if any(blocker.reason is PreflightReason.STATE for blocker in blockers)
+                    else _preflight_base(source, directory, task)
+                )
+            except (OSError, ValueError, RuntimeError, sqlite3.Error, KeyError, TypeError):
+                source_category = "base_unavailable"
+                raise
+            evidence["source"] = {
+                "directory": str(source),
+                "clean": True,
+                "read_only": True,
+                **(
+                    {"acquired": True, "cache_root": str(default_cache_root(enriched))}
+                    if acquired_cache is not None
+                    else {}
+                ),
+            }
+            checked_source = source
+        except (OSError, ValueError, RuntimeError, sqlite3.Error, KeyError, TypeError):
+            blockers.append(PreflightBlocker(PreflightReason.SOURCE, category=source_category))
+    if base is not None and checked_source is not None:
+        try:
+            evidence["task"] = _baseline(checked_source, base, task, dict(config.child_environment))
         except (OSError, ValueError, RuntimeError, SyntaxError):
             blockers.append(PreflightBlocker(PreflightReason.TASK))
     try:
         child = dict(config.child_environment)
         binary = config.codex_binary.resolve()
-        if binary.is_relative_to(source) or binary.is_relative_to(directory):
+        if source is not None and (binary.is_relative_to(source) or binary.is_relative_to(directory)):
             raise ValueError("Codex executable must be outside source and state")
         home = Path(child.get("HOME", ""))
         if not home.is_absolute() or not home.is_dir() or not os.access(home, os.R_OK | os.X_OK):
@@ -2003,8 +2130,13 @@ def preflight_task(
         ) != (binding.runtime_id, binding.provider_id, binding.model_id, binding.reasoning_effort):
             raise AllocationUnavailable("selection outside controller runtime binding")
         evidence["router"] = {"compatible": True, "reservation_acquired": False}
-    except (AllocationUnavailable, OSError, ValueError, RuntimeError):
-        blockers.append(PreflightBlocker(PreflightReason.ROUTER))
+    except (AllocationUnavailable, OSError, ValueError, RuntimeError) as error:
+        category = (
+            error.category.value
+            if isinstance(error, ScarcityRouterUnavailable) and error.category is not None
+            else None
+        )
+        blockers.append(PreflightBlocker(PreflightReason.ROUTER, category=category))
     try:
         if components.forge_read_factory is None:
             raise UnsupportedForge("read-only Forge composition unavailable")
