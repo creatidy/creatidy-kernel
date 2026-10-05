@@ -136,7 +136,9 @@ def test_cli_task_status_reports_missing_database(tmp_path: Path, capsys: pytest
     assert "task database does not exist" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(("initial_reads", "interrupt"), [(0, False), (5, False), (5, True), (5, "rpc")])
+@pytest.mark.parametrize(
+    ("initial_reads", "interrupt"), [(0, False), (5, False), (5, True), (5, "rpc"), (0, "startup")]
+)
 def test_cli_task_run_prints_lifecycle(
     sqlite_tmp_path: Path, capsys: pytest.CaptureFixture[str], initial_reads: int, interrupt: bool | str
 ) -> None:
@@ -168,12 +170,12 @@ def test_cli_task_run_prints_lifecycle(
         def __init__(self) -> None:
             FixtureConnection.__init__(self, deflake_edit, effort="low")
             self.events = []
-            if interrupt == "rpc":
+            if interrupt in {"rpc", "startup"}:
                 self._lock = threading.Lock()
                 self._process = cast("subprocess.Popen[bytes]", object())
 
         def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
-            if interrupt == "rpc":
+            if interrupt in {"rpc", "startup"}:
                 return CodexStdio.request(self, method, params)
             return self._exchange(method, params)
 
@@ -189,7 +191,10 @@ def test_cli_task_run_prints_lifecycle(
                     signal.raise_signal(signal.SIGINT)
                 if self.status != "interrupted":
                     self.status = "inProgress" if self.reads <= initial_reads else "completed"
-            return FixtureConnection.request(self, method, params)
+            result = FixtureConnection.request(self, method, params)
+            if interrupt == "startup" and method == "thread/start":
+                signal.raise_signal(signal.SIGINT)
+            return result
 
         def _close_unlocked(self) -> None:
             assert "cancellation" in export_task(control)
@@ -199,7 +204,7 @@ def test_cli_task_run_prints_lifecycle(
 
         def close(self) -> None:
             assert self.status in {"completed", "interrupted"}
-            if interrupt == "rpc":
+            if interrupt in {"rpc", "startup"}:
                 CodexStdio.close(self)
             else:
                 self.closed = True
@@ -246,7 +251,7 @@ def test_cli_task_run_prints_lifecycle(
     output = capsys.readouterr().out
     assert "task admitted: owner-approved frozen task" in output
     if interrupt:
-        assert "condition=cancelled" in output
+        assert ("condition=cancel_uncertain" if interrupt == "startup" else "condition=cancelled") in output
         assert "acceptance" not in export_task(control)
         assert "pr" not in export_task(control)
     else:
@@ -257,3 +262,7 @@ def test_cli_task_run_prints_lifecycle(
     assert signal.getsignal(signal.SIGINT) == original_sigint
     if interrupt == "rpc":
         assert connection.events.index("turn/interrupt") < connection.events.index("owned-teardown")
+    if interrupt == "startup":
+        assert "turn/start" not in connection.events
+        assert "turn/interrupt" not in connection.events
+        assert "cancellation" in export_task(control)

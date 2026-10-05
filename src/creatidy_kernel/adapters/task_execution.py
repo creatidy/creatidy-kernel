@@ -70,6 +70,7 @@ from creatidy_kernel.core.execution import (
     Artifact,
     ArtifactManifest,
     Candidate,
+    ExecutionConflict,
     ExecutionRequest,
     OperationKey,
     RuntimeIdentity,
@@ -1503,8 +1504,8 @@ def run_task(
                         cancel_requested=cancellation_requested_now,
                     )
                 )
-            except (OSError, RuntimeError, ValueError):
-                if not cancellation_requested_now():
+            except (ExecutionConflict, OSError, RuntimeError, ValueError):
+                if not cancellation_requested_now() and int(time.time()) < deadline:
                     raise
                 status = "cancel_uncertain"
             cancellation_pending = cancellation_pending or cancellation_requested_now()

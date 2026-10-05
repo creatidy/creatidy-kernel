@@ -37,7 +37,7 @@ from creatidy_kernel.adapters.task_execution import (
     compose_task_live as _compose_task_live,
 )
 from creatidy_kernel.adapters.task_execution import git_text as task_git
-from creatidy_kernel.core.execution import ExecutionConflict, UnsupportedExecution
+from creatidy_kernel.core.execution import UnsupportedExecution
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject
@@ -467,13 +467,12 @@ def test_deadline_expiring_during_thread_start_never_dispatches_turn(
 
     connection = SlowThread(edits.append)
     control = sqlite_tmp_path / "control"
-    with pytest.raises(ExecutionConflict, match="expired"):
-        run(control, source, connection)
     result = run(control, source, connection)
     assert result["condition"] == "expired"
     assert edits == []
     assert connection.starts == 1
     assert "acceptance" not in result
+    assert "cancellation" in result
 
 
 def test_end_to_end_accepted_with_synthetic_forge(sqlite_tmp_path: Path) -> None:
