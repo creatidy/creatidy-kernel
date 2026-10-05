@@ -14,6 +14,11 @@ control/backend assessment. The dated tables below preserve original design choi
 PORT` there is not proof that a dependency or complete adapter was installed. Only explicitly
 described built mechanisms (such as K8 transport and native Codex) are implemented here.
 
+The [bounded #47 feasibility result](harness-feasibility.md) records the 2026-10-05 source matrix,
+installed inference-free probes, distinct control/backend gaps and separately authorized proof plan.
+The owner selected dedicated Owned Sessions for the first bounded proof, not a harness dependency;
+controller-exit survival, independent supervision and existing IDE handoff remain unproved.
+
 Start with current local Runtime/Workspace, immutable allocation/identity, effects, verification,
 outcome correction/deduplication and SQLite/backup mechanisms. Retain them unless an alternative
 preserves guarantees with a demonstrated advantage; similar upstream names are not replacement proof.

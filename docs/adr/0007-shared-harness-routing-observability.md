@@ -70,6 +70,13 @@ Neither a PID nor an accepted request proves execution. Done text is not accepta
 not descendant settlement; repeated prompt is not resume. Session/process/supervisor handoff and IDE/UI-close
 guarantees remain open evidence/owner decisions under [#47](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/47).
 
+On 2026-10-05 the owner selected **Owned Sessions** for the first bounded proof: dedicated
+Kernel-owned sessions/processes, read-only UI observation and explicit controller-exit limitations.
+This narrows the proof direction, not the full target. Independent supervision and existing
+IDE-session handoff remain deferred and unproved; no harness, trust upgrade or live execution is
+approved by this choice. [The bounded feasibility result](../architecture/harness-feasibility.md)
+records distinct control/backend gaps and the remaining reception plan.
+
 Router owns the executable decision/admission/pin contract; Kernel consumes it and persists the
 main route before dispatch, bound to Attempt. Dynamic Router choice is the target default; a user
 pin is an explicit exception. Main calls do not silently switch resources, and helper/review routes
