@@ -3,7 +3,6 @@
 Adapted from Model Intelligence for Kernel identity, gates and lint; see NOTICE.
 """
 
-import hashlib
 import re
 import unittest
 from pathlib import Path
@@ -74,21 +73,29 @@ class WorkflowContractTests(unittest.TestCase):
         ):
             self.assertIn(requirement, loop)
 
-    def test_independent_review_is_reused_and_unchanged(self) -> None:
-        # Frozen Git blobs preserve the minimally identity/gate-adapted source contracts.
-        for path, expected in (
-            (
-                ".kilo/agents/pr-reviewer.md",
-                "330887933e34c425e8f27c6673022241b9233522",  # pragma: allowlist secret
-            ),
-            (
-                ".kilo/command/review-pr.md",
-                "a9d9f76da10f5482acdb32c55fe01ec5d488bf34",  # pragma: allowlist secret
-            ),
+    def test_independent_review_contract_and_failover(self) -> None:
+        reviewer = text(".kilo/agents/pr-reviewer.md").lower()
+        review_command = text(".kilo/command/review-pr.md")
+        for requirement in (
+            "independent reviewer, never the implementation agent",
+            "exact expected HEAD/base",
+            "independently",
+            "synthetic fixture values",
+            "never read the contents of `.env*` files or mount",
+            "SSH/cloud/provider/model/Forge/browser credential directories",
+            "exact cited pinned revision independently",
+            "Infrastructure failure consumes the reserved review ordinal",
+            "Distinguish it from actionable implementation findings",
         ):
-            data = (ROOT / path).read_bytes()
-            blob = b"blob " + str(len(data)).encode() + b"\0" + data
-            self.assertEqual(hashlib.sha1(blob, usedforsecurity=False).hexdigest(), expected, path)
+            self.assertIn(requirement.lower(), reviewer)
+        for requirement in (
+            "Classify missing task/agent/tool/runtime",
+            "change the execution condition before a new attempt",
+            "exact pinned public source checkout",
+            "never self-review",
+            "after no authorized alternative remains",
+        ):
+            self.assertIn(requirement, review_command)
         loop = text(".kilo/command/loop.md")
         self.assertIn("Use `.kilo/command/finish-pr.md` in this SAME primary context", loop)
         for path in (".kilo/command/loop.md", ".kilo/command/finish-pr.md"):
@@ -121,6 +128,8 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("never reset a counter or erase earlier delivery history", progress)
         self.assertIn("Missing/ambiguous recovery is BLOCKED", progress)
         self.assertIn("canonical evidence, never from the ledger", progress)
+        self.assertIn("consumed review ordinal", progress)
+        self.assertIn("why it is not engineering", progress)
 
     def test_exact_approval_and_loop_only_pr_merge(self) -> None:
         finish = text(".kilo/command/finish-pr.md")
@@ -208,9 +217,10 @@ class WorkflowContractTests(unittest.TestCase):
         ):
             self.assertIn(boundary, loop)
         for requirement in (
-            "exactly one normal checkout",
-            "Only one context may mutate it at a time",
-            "No git worktree, alternate checkouts, stash/reset of unrelated owner work",
+            "Use one normal checkout and ordinary issue branches by default",
+            "Only one context may mutate each checkout",
+            "one isolated temporary worktree when necessary",
+            "Never stash/reset unrelated owner work",
             "second controller",
             "Do not use Scarcity Router for model selection, execution, orchestration, telemetry or operation",
             "No mutation outside Creatidy/creatidy-kernel",
@@ -220,6 +230,38 @@ class WorkflowContractTests(unittest.TestCase):
             "Do not create speculative issues",
         ):
             self.assertIn(requirement, loop)
+
+    def test_technical_blockers_are_remediated_before_escalation(self) -> None:
+        loop = text(".kilo/command/loop.md")
+        discipline = text(".kilo/rules/30-implementation-discipline.md")
+        finish = text(".kilo/command/finish-pr.md")
+        for requirement in (
+            "A blocker is not automatically an owner decision",
+            "smallest suitable authorized alternative",
+            "synthetic HOME/cache/temp",
+            "Do not inherit ambient secrets",
+            "exact pinned public source fetch",
+            "infrastructure failure",
+            "judgment uncertainty",
+            "smallest materially distinct choices",
+            "no authorized technical path remaining",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement.lower(), loop.lower())
+        for requirement in (
+            "classify the obstacle as engineering/execution",
+            "same failed operation with the same relevant conditions",
+            "synthetic fixture values",
+            "cited exact pin",
+            "evidence-backed reviewer uncertainty",
+            "smallest materially distinct choices",
+            "exhausted authorized remediation paths",
+        ):
+            with self.subTest(discipline=requirement):
+                self.assertIn(requirement.lower(), discipline.lower())
+        self.assertIn("change a relevant condition", finish)
+        self.assertIn("infrastructure failure consumes its ordinal", finish.lower())
+        self.assertIn("Do not repeat the same failed inputs/environment", finish)
 
     def test_command_inventory_gates_and_reviewer_permissions(self) -> None:
         commands = {path.name for path in (ROOT / ".kilo/command").iterdir()}
@@ -233,10 +275,17 @@ class WorkflowContractTests(unittest.TestCase):
             "mode: subagent\nmodel: openai/gpt-6.1-sol\nvariant: high\n",
             'permission:\n  "*": deny\n',
             '  read:\n    "*": allow\n    "*.env*": deny\n    "*.task_progress.md": deny\n',
-            "  external_directory: deny\n  edit: deny\n  write: deny\n  apply_patch: deny\n  task: deny\n",
+            '  external_directory:\n    "/home/adrian/workspace/creatidy/creatidy-kernel-*/**": allow\n    "*": deny\n',
+            "  edit: deny\n  write: deny\n  apply_patch: deny\n  task: deny\n",
             '  bash:\n    "*": deny\n',
-            '    "uv run --no-sync pytest": allow\n',
-            '    "uv run --no-sync lint-imports": allow\n',
-            '    "UV_OFFLINE=1 make check": allow\n    "UV_OFFLINE=1 make package-check": allow\n',
         ):
             self.assertIn(requirement, reviewer)
+        self.assertIn('    "env -i HOME=/tmp PATH=', reviewer)
+        self.assertIn('"git -C /home/adrian/workspace/creatidy/creatidy-kernel-* status --short": allow', reviewer)
+        self.assertIn("Never read the contents of `.env*` files", text(".kilo/agents/pr-reviewer.md"))
+        prefix = "UV_OFFLINE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1"
+        for check in ("make check", "make package-check"):
+            with self.subTest(sanitized_check=check):
+                command = check.removeprefix("make ")
+                permission = f'{prefix} make -C /home/adrian/workspace/creatidy/creatidy-kernel-* {command}": allow'
+                self.assertIn(permission, reviewer)

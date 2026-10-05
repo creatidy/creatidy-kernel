@@ -60,15 +60,17 @@ owner-selected and unmerged; standalone review remains read-only.
   documentation approval is not live readiness, product GO or closure of functional requirements.
 - Do not read or copy secrets, runtime state, local Agent Manager state, or private audit payloads.
 
-Use one normal checkout and ordinary issue branches. Do not use `git worktree`
-or alternate checkout management. Only one context may mutate the checkout. Review
-the exact frozen Git objects/current clean PR branch read-only in this checkout;
-the parent must not edit or switch branches while the reviewer task is running.
-Never stash/reset unrelated changes to make branch switching possible.
+Use one normal checkout and ordinary issue branches by default. A specific owner-
+authorized task may use one isolated temporary worktree when necessary to preserve
+an active checkout; record that exception in its issue/ledger. Only one context may
+mutate a given checkout. Review exact frozen Git objects/current clean PR branch
+read-only; the parent must not edit it while the reviewer task runs. Never stash/reset
+unrelated changes to make branch switching possible.
 
 `.kilo/command/*` and `.kilo/agents/*` are loaded by the Kilo workspace runtime;
 availability is not dynamically guaranteed when files appear. After adding
 or changing commands, a VS Code/Kilo workspace reload may be required. The current
 repository checkout supplies its local commands/agents/rules. A missing native
-agent/task is a finite tool blocker, not permission to substitute parent self-review
-or external orchestration.
+agent/task is a review-infrastructure blocker to diagnose and remediate through an
+available equivalent independent, read-only review path before declaring BLOCKED;
+it is never permission to substitute parent self-review or external orchestration.

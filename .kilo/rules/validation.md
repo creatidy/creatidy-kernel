@@ -23,13 +23,20 @@
   executed validation/results and genuine unresolved decisions/blockers. Distinguish
   change-caused failures from unrelated/environmental blockers; no claim
   of passing checks, push or PR creation without successful evidence.
-- Parent uses the current normal checkout on the exact clean PR HEAD and prepares
-  its offline locked development environment before invoking a reviewer. No
-  additional checkout or branch switching during review. Reviewer verifies HEAD
-  and clean status before/after checks and inspects frozen Git objects/full base
-  delta. Ignored validation artifacts are allowed; tracked-file edits and
-  Git/Forgejo mutations are not. Read checks before running them; permission
-  allowlists do not make arbitrary repository code safe. Preserve unrelated work.
+- Parent prepares a clean exact PR HEAD and existing offline locked development
+  environment before invoking a reviewer. Use a normal checkout by default; a
+  specific owner-authorized task may use one isolated temporary worktree to preserve
+  concurrent work. No switching/editing of the reviewed checkout during review.
+  Reviewer verifies HEAD/clean status before and after checks and inspects frozen
+  Git objects/full base delta. Ignored validation artifacts are allowed; tracked
+  edits and Git/Forgejo mutations are not. Read checks before execution; permissions
+  do not make arbitrary code safe. Run environment-observing tests with synthetic
+  values in a sanitized closed environment, not ambient secrets. Preserve unrelated work.
 - `/finish-pr` records each reviewed HEAD/base/verdict, normal remediation commits,
   regression/check results and final currentness. Only an exact matching native
   reviewer result plus a final MCP currentness check can yield READY_TO_MERGE.
+- Reviewer tool/runtime/environment/dependency/public-source problems are not
+  automatic owner decisions or implementation findings. Diagnose and try a bounded
+  materially different authorized method while preserving exact HEAD, full independent
+  review, security, validation and ordinal limits. Only report BLOCKED when no
+  authorized alternative remains; report the exact missing capability and attempts.
