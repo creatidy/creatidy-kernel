@@ -21,7 +21,7 @@ additional checkout or alternate checkout management. Prepare the offline locked
 environment for required `make check` and `make package-check` here; review frozen
 Git objects/current clean branch read-only. The
 parent must not edit/switch while the reviewer is active. Locate `pr-reviewer`.
-If native task/agent or required access is unavailable, report a finite blocker as BLOCKED;
+If native task/agent or required access is unavailable, report a finite blocker;
 never self-review instead.
 
 Invoke `task` with `subagent_type: pr-reviewer`, `background: false`, no `task_id`.

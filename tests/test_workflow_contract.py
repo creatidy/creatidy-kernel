@@ -83,7 +83,7 @@ class WorkflowContractTests(unittest.TestCase):
             ),
             (
                 ".kilo/command/review-pr.md",
-                "4ccbef628bc964ef27a9215321b3140e000fedf9",  # pragma: allowlist secret
+                "a9d9f76da10f5482acdb32c55fe01ec5d488bf34",  # pragma: allowlist secret
             ),
         ):
             data = (ROOT / path).read_bytes()

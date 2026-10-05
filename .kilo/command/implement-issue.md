@@ -1,5 +1,5 @@
 ---
-description: Implement one owner-selected Forgejo issue through an unmerged develop PR
+description: Implement one Adrian-selected Forgejo issue through an unmerged develop PR
 ---
 
 <!-- Adapted from Model Intelligence for Kernel identity and validation; see NOTICE. -->
