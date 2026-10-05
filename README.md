@@ -302,6 +302,8 @@ terminality is not interrupt-delivery or descendant-settlement proof, and cancel
 Ctrl-C is deferred across finite framed RPCs so the original receipt can be cancelled before owned
 teardown; framing/transport failures still leave delivery uncertain. A durable receipt published
 before a crash can bind the cancellation target without rewriting its intent or resubmitting work.
+Cancellation before Attempt preparation remains a stable no-dispatch result; recovery never
+reactivates allocation or execution and does not delete the original envelope or stop intent.
 Expired work remains observable but cannot be newly dispatched or accepted; checks and admission
 use actual decision times. This is a synthetic-proved owned-session repair, not detached supervision
 or a live conformance receipt. Verification commands retain finite timeouts; full monetary/quota,

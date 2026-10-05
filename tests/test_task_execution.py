@@ -268,6 +268,42 @@ def test_recovery_refuses_changed_runtime_version(sqlite_tmp_path: Path) -> None
     assert connection.starts == 1
 
 
+@pytest.mark.parametrize("before_allocation", [False, True])
+def test_cancel_before_attempt_is_stable_without_dispatch(sqlite_tmp_path: Path, before_allocation: bool) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    requested = [before_allocation]
+
+    class StopAllocation(ResourceAllocator):
+        calls = 0
+
+        def select(self, request: ResourceRequest) -> Allocation:
+            self.calls += 1
+            requested[0] = True
+            return ALLOCATION
+
+    allocator = StopAllocation()
+    connection = FixtureConnection(deflake_edit)
+    first = run(
+        control, source, connection, allocation=None, allocator=allocator, cancellation_requested=lambda: requested[0]
+    )
+    assert first["condition"] == "cancelled_no_dispatch"
+    assert first["runtime_operation_absent"] is True
+    assert first["attempts"] == []
+    assert "cancellation" in first
+    requested[0] = False
+    for _ in range(2):
+        restored = run(control, source, connection, allocation=None, allocator=allocator)
+        assert restored["condition"] == "cancelled_no_dispatch"
+        assert restored["deadline"] == first["deadline"]
+        assert restored["cancellation"] == first["cancellation"]
+        assert restored["attempts"] == []
+        assert "acceptance" not in restored
+    assert task_status(control)["condition"] == "cancelled_no_dispatch"
+    assert allocator.calls == (0 if before_allocation else 1)
+    assert connection.starts == 0
+
+
 def test_cancellation_after_terminal_verification_is_durable(sqlite_tmp_path: Path) -> None:
     source = make_source(sqlite_tmp_path)
     control = sqlite_tmp_path / "control"

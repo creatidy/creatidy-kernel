@@ -1133,6 +1133,12 @@ class TaskCollector:
 def export_task_store(store: SQLiteProgramStore) -> dict[str, object]:
     program = store.load(PROGRAM_ID)
     mode = _request(store, "task_execution:mode")
+    try:
+        base = _request(store, "task_execution:base").get("base")
+    except OperationConflict as error:
+        if str(error) != "unknown operation":
+            raise
+        base = None
     attempts: list[dict[str, object]] = []
     for attempt in program.attempts:
         operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
@@ -1156,13 +1162,21 @@ def export_task_store(store: SQLiteProgramStore) -> dict[str, object]:
         "mode": mode.get("mode"),
         "task": mode.get("task"),
         "deadline": mode.get("deadline"),
-        "base": _request(store, "task_execution:base").get("base"),
+        "base": base,
         "attempts": attempts,
         "trust_mode": "trusted_development",
         "isolation": "not attested",
         "automatic_merge": False,
         "automatic_deploy": False,
     }
+    try:
+        store.operation(OPERATION_ID)
+    except OperationConflict as error:
+        if str(error) != "unknown operation":
+            raise
+        result["runtime_operation_absent"] = True
+    else:
+        result["runtime_operation_absent"] = False
     for key, operation in (
         ("candidate", CANDIDATE_OPERATION),
         ("acceptance", f"acceptance:{ATTEMPT_ID}"),
@@ -1199,6 +1213,8 @@ def task_status(directory: Path) -> dict[str, object]:
     condition = (
         "accepted"
         if acceptance is not None
+        else "cancelled_no_dispatch"
+        if result.get("cancellation") is not None and not operations and result["runtime_operation_absent"] is True
         else "cancelled"
         if result.get("cancellation") is not None and terminal
         else "cancel_uncertain"
@@ -1224,7 +1240,9 @@ def task_status(directory: Path) -> dict[str, object]:
         "expired": expired,
         "condition": condition,
         "next_action": (
-            "Inspect cancellation evidence; retain workspace until owned descendants are proved settled."
+            "Cancelled before dispatch; new execution requires separate approval."
+            if condition == "cancelled_no_dispatch"
+            else "Inspect cancellation evidence; retain workspace until owned descendants are proved settled."
             if result.get("cancellation") is not None
             else "Inspect terminal evidence; new execution requires separate approval."
             if terminal or expired
@@ -1325,6 +1343,13 @@ def run_task(
             if current.attempt(attempt_id).status is AttemptStatus.EXECUTING:
                 store.admit(PROGRAM_ID, f"finish:{attempt_id}", FinishAttempt(current.revision, "worker", attempt_id))
 
+        def cancelled_without_attempt() -> dict[str, object]:
+            result = export_task_store(store)
+            if result["runtime_operation_absent"] is not True:
+                raise ValueError("orphaned runtime Operation requires explicit reconciliation")
+            result.update(condition="cancelled_no_dispatch", lifecycle=lifecycle)
+            return result
+
         try:
             mode_recorded = _request(store, "task_execution:mode")
         except OperationConflict as error:
@@ -1416,7 +1441,7 @@ def run_task(
             crash("task-admitted")
         attempt_exists = any(item.spec.attempt_id == ATTEMPT_ID for item in program.attempts)
         if cancellation_pending and not attempt_exists:
-            raise ValueError("cancellation requires an existing durable Attempt")
+            return cancelled_without_attempt()
         base, objects, workspace = prepare_workspace(
             store, directory, source_repository, task, lifecycle, attempt_exists=attempt_exists
         )
@@ -1622,6 +1647,8 @@ def run_task(
             elif status in {"unknown", "waiting", "running"}:
                 lifecycle.append("runtime active or reconciling; preserve owned connection and original envelope")
             program = store.load(PROGRAM_ID)
+            if cancellation_pending and not program.attempts:
+                return cancelled_without_attempt()
         if cancellation_requested_now() and not cancellation_pending:
             cancellation_pending = True
             for attempt in program.attempts:
