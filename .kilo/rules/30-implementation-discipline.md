@@ -38,10 +38,37 @@
   asking for routine permission. Ask only for genuine authority, security/privacy,
   architecture, material scope, incompatible acceptance, irreversible/destructive
   action, meaningful cost or external credential/access decisions.
-- Every retry needs a diagnosis and changed hypothesis, input, state or strategy.
-  Normally make one corrected retry. A new session, timeout or model alone is not
-  diagnosis. If attempts add no durable state, stop that operation and report a
-  finite blocker. Never weaken requirements or claim unobserved success.
+- Before returning control, classify the obstacle as engineering/execution or a
+  genuine owner decision. Ordinary tool/runtime, environment, dependency, temp
+  filesystem, public-source access and diagnosable command failures are not owner
+  decisions. Diagnose and try the smallest sufficient existing authorized path first.
+- Every retry needs a diagnosis and a changed relevant hypothesis, input, state,
+  environment or strategy. `No blind retries` means never repeat the same failed
+  operation with the same relevant conditions; it does not mean stop after the first
+  approach fails. A new session/model or elapsed time alone is not a changed condition.
+  Record diagnosis, change, result and remaining alternatives. If no authorized path
+  remains, report a precise external blocker. Never weaken requirements or claim
+  unobserved success.
+- Tests/tools that observe environment state use a deliberate closed environment with
+  synthetic fixture values and minimum operational variables, not ambient owner
+  credentials. Do not mount credential directories or print/copy secrets unless the
+  exact selected operation explicitly requires authorized access. Use synthetic
+  HOME/cache/temp as appropriate; install through the existing locked mechanism.
+- Independent public-source verification follows the cited exact pin. If the first
+  reader/connector fails, switch to another authorized reader or isolated exact
+  revision fetch and retain provenance; implementation research is not independent
+  review. Split inspection from execution if their safe environment requirements differ.
+- Preserve distinctions between review findings, infrastructure failures and
+  evidence-backed reviewer uncertainty. Failed/COMMENT review dispatches consume the
+  durable ordinal; change the relevant execution condition before another attempt.
+  Use an alternative only if it satisfies the same independent, read-only, full-PR,
+  exact-HEAD contract. Never self-review or lower gates to avoid a tool blocker.
+- `STOP_AND_ASK` is for owner-controlled authority, architecture, security/privacy,
+  scope/acceptance, cost, external access/effects or irreversible decisions, not safe
+  reversible in-scope engineering. Record exact decision, why owner-controlled,
+  autonomous alternatives considered, why they cannot settle it, and the smallest
+  materially distinct choices before asking. `BLOCKED` requires an external condition
+  or exhausted authorized remediation paths and names the precise missing capability.
 - Report material new problems rather than expanding scope. Follow-ups must be
   durable, distinct, actionable and verifiable; do not create them automatically.
 - STOP_REVISE preserves an experiment as evidence, not authorization for more
@@ -56,5 +83,5 @@ state or secrets. Record material skipped checks/blockers in the delivery report
 
 The implementation session is not an independent reviewer. Every whole-PR review uses a fresh
 isolated foreground read-only `pr-reviewer` task on the frozen exact HEAD/base and complete PR.
-The parent must not edit/switch while it runs. Never resume a reviewer or substitute parent self-review.
+The parent must not edit the reviewed checkout while review runs. Never resume a reviewer or substitute parent self-review. Reviewer infrastructure inconvenience is not a finding; remediate by a changed authorized path within the preserved ordinal budget.
 Inspect checks before execution; permissions do not make untrusted PR code safe.

@@ -21,6 +21,13 @@
   ID where applicable, issue/PR/branch, frozen base/HEAD, ordinal reserved BEFORE
   dispatch, result, commits/checks and terminal state. Recover it across reentry or
   model/session changes; never reset a counter or erase earlier delivery history.
-  Missing/ambiguous recovery is BLOCKED. This bounds operation, not issue authority:
+  Missing/ambiguous recovery is BLOCKED after checking available recovery evidence;
+  do not reset or fabricate a counter. This bounds operation, not issue authority:
   eligibility/priority/dependencies/acceptance/current state come from refreshed
   canonical evidence, never from the ledger. Do not introduce a controller database.
+- Record material class-A blocker diagnosis/remediation: exact failure, changed
+  execution condition/hypothesis, result, consumed review ordinal, public source pin
+  and provenance when applicable, and the precise remaining external capability.
+  For `STOP_AND_ASK`, also record the exact owner decision, why it is not engineering,
+  autonomous paths considered and ruled out, and smallest distinct choices. Keep
+  diagnostics secret-safe: variable names/categories only, never values.
