@@ -121,6 +121,7 @@ class CodexRuntime(Runtime):
         collect: Callable[[ExecutionRequest], Candidate | None],
         freshness: int = 30,
         supported_efforts: frozenset[tuple[str, str, str]] = frozenset(),
+        clock: Callable[[], int] | None = None,
     ) -> None:
         if not version or connection.version != version or freshness <= 0:
             raise UnsupportedExecution("Codex version mismatch or invalid freshness contract")
@@ -139,6 +140,7 @@ class CodexRuntime(Runtime):
         self.authorize = authorize
         self.collect = collect
         self.freshness = freshness
+        self.clock = clock
         # Trusted support evidence for this pinned connection version, never a
         # vocabulary inferred from an allocator's requested configuration.
         self.supported_efforts = supported_efforts
@@ -234,6 +236,8 @@ class CodexRuntime(Runtime):
             }
             if inputs.reasoning_effort is not None:
                 turn_params["effort"] = inputs.reasoning_effort
+            if not self.authorize(request):
+                raise ExecutionConflict("operation authority expired before turn dispatch")
             turn = self.connection.request("turn/start", turn_params)
             run.turn = _field(_object(turn.get("turn")), "id")
         except (OSError, TimeoutError, CodexRejected):
@@ -287,6 +291,7 @@ class CodexRuntime(Runtime):
         if run is None:
             raise ExecutionConflict("unknown Codex receipt handle")
         state = self._read(run)
+        observed_at = self.clock() if self.clock is not None else now
         activity = Activity.UNKNOWN
         if state is not None:
             status, _ = state
@@ -299,7 +304,12 @@ class CodexRuntime(Runtime):
             elif status == "inProgress":
                 activity = Activity.TERMINAL if run.terminal else Activity.RUNNING
         return RuntimeObservation(
-            handle, activity, now, now + self.freshness if state else now, run.identity, run.cancelled
+            handle,
+            activity,
+            observed_at,
+            observed_at + self.freshness if state else observed_at,
+            run.identity,
+            run.cancelled,
         )
 
     def candidate(self, handle: str) -> Candidate | None:

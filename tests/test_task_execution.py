@@ -22,6 +22,7 @@ from creatidy_kernel.adapters.task_execution import (
     CODEX_METHODS,
     TASKS,
     LiveTaskComponents,
+    TaskChecks,
     TaskInterrupted,
     TaskRuntimeConfig,
     TaskSpec,
@@ -35,9 +36,10 @@ from creatidy_kernel.adapters.task_execution import (
     compose_task_live as _compose_task_live,
 )
 from creatidy_kernel.adapters.task_execution import git_text as task_git
-from creatidy_kernel.core.execution import UnsupportedExecution
+from creatidy_kernel.core.execution import ExecutionConflict, UnsupportedExecution
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
+from creatidy_kernel.core.verification import Evidence, EvidenceSubject
 from creatidy_kernel.ports.forge import Forge
 from creatidy_kernel.ports.resources import ResourceAllocator
 
@@ -239,13 +241,154 @@ def run(
         trusted_development_acknowledged=True,
         connection=connection,
         version=connection.version,
-        deadline=int(time.time()) + 1200,
+        deadline=None,
         allocation=allocation,
         allocator=allocator,
         forge_factory=lambda _directory: forge,
         supported_efforts=supported_efforts,
         fault=fault,
     )
+
+
+def test_recovery_refuses_changed_runtime_version(sqlite_tmp_path: Path) -> None:
+    source = make_source(sqlite_tmp_path)
+    connection = FixtureConnection(deflake_edit)
+    connection.status = "inProgress"
+    control = sqlite_tmp_path / "control"
+    assert run(control, source, connection)["condition"] == "running"
+    connection.version = "2.0.0"
+    with pytest.raises(ValueError, match="envelope"):
+        run(control, source, connection)
+    assert connection.starts == 1
+
+
+def test_failed_terminal_without_candidate_finishes_attempt(sqlite_tmp_path: Path) -> None:
+    source = make_source(sqlite_tmp_path)
+    connection = FixtureConnection(lambda _path: None)
+    connection.status = "failed"
+    result = run(sqlite_tmp_path / "control", source, connection)
+    assert result["condition"] == "terminal_no_candidate"
+    attempt = cast("list[dict[str, object]]", result["attempts"])[0]
+    assert cast("dict[str, object]", attempt["attempt"])["status"] == "finished"
+    assert cast("dict[str, object]", attempt["operation"])["status"] == "terminal"
+
+
+def test_restart_default_keeps_deadline_and_same_running_turn(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    connection = FixtureConnection(deflake_edit)
+    connection.status = "inProgress"
+    control = sqlite_tmp_path / "control"
+    monkeypatch.setattr(time, "time", lambda: 1000)
+    first = run(control, source, connection)
+    assert first["condition"] == "running"
+    monkeypatch.setattr(time, "time", lambda: 2000)
+    second = run(control, source, connection)
+    assert second["condition"] == "running"
+    assert first["deadline"] == second["deadline"] == 4300
+    assert first["attempts"] == second["attempts"]
+    assert connection.starts == 1
+    with pytest.raises(ValueError, match="envelope"):
+        run_task(
+            control,
+            task=fixture_task(),
+            source_repository=source,
+            owner_approved=True,
+            trusted_development_acknowledged=True,
+            connection=connection,
+            version=connection.version,
+            deadline=4301,
+            allocation=ALLOCATION,
+            forge_factory=lambda _directory: make_forge("0" * 40)[0],
+        )
+
+
+@pytest.mark.parametrize("fault", [None, "cancel-claim", "cancel-send", "cancel-observation"])
+def test_expiry_journals_interrupt_once_even_after_lost_reply(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str | None
+) -> None:
+    source = make_source(sqlite_tmp_path)
+
+    class LostInterrupt(FixtureConnection):
+        interrupts = 0
+
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            if method == "turn/interrupt":
+                self.interrupts += 1
+                raise TimeoutError("synthetic lost interrupt reply")
+            return super().request(method, params)
+
+    connection = LostInterrupt(deflake_edit)
+    connection.status = "inProgress"
+    control = sqlite_tmp_path / "control"
+    monkeypatch.setattr(time, "time", lambda: 1000)
+    assert run(control, source, connection)["condition"] == "running"
+    monkeypatch.setattr(time, "time", lambda: 4301)
+    if fault:
+        with pytest.raises(TaskInterrupted):
+            run(control, source, connection, fault=fault)
+    else:
+        assert run(control, source, connection)["condition"] == "expired"
+    before = connection.interrupts
+    result = run(control, source, connection)
+    assert result["condition"] == "expired"
+    assert connection.interrupts == before == (0 if fault == "cancel-claim" else 1)
+    assert connection.starts == 1
+    assert "acceptance" not in result
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        cancellation = store.operation("cancel:task_execution:change")
+        assert cancellation.attempts == 1
+        assert cancellation.status in {"dispatched", "unknown"}
+        if fault not in {"cancel-claim", "cancel-send"}:
+            assert store.find_artifact(cancellation.operation_id, "receipt") is not None
+
+
+def test_long_verification_cannot_extend_original_deadline(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    clock = [1000]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    original_check = TaskChecks.check
+
+    def delayed(checks: TaskChecks, name: str, subject: EvidenceSubject) -> Evidence | None:
+        result = original_check(checks, name, subject)
+        if name == "verification-commands":
+            clock[0] = 5000
+        return result
+
+    monkeypatch.setattr(TaskChecks, "check", delayed)
+    result = run(sqlite_tmp_path / "control", source, FixtureConnection(deflake_edit))
+    assert result["condition"] == "expired"
+    assert "acceptance" not in result
+    assert "pr" not in result
+
+
+def test_deadline_expiring_during_thread_start_never_dispatches_turn(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    clock = [1000]
+    edits: list[Path] = []
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    class SlowThread(FixtureConnection):
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            result = super().request(method, params)
+            if method == "thread/start":
+                clock[0] = 4301
+            return result
+
+    connection = SlowThread(edits.append)
+    control = sqlite_tmp_path / "control"
+    with pytest.raises(ExecutionConflict, match="expired"):
+        run(control, source, connection)
+    result = run(control, source, connection)
+    assert result["condition"] == "expired"
+    assert edits == []
+    assert connection.starts == 1
+    assert "acceptance" not in result
 
 
 def test_end_to_end_accepted_with_synthetic_forge(sqlite_tmp_path: Path) -> None:

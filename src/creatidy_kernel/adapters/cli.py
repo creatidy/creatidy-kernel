@@ -276,7 +276,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--deadline",
         type=int,
         default=None,
-        help="Owner deadline as a UNIX epoch second; default is 55 minutes ahead",
+        help="Owner deadline as a UNIX epoch second; recover original deadline or default to 55 minutes ahead",
     )
     status = task_commands.add_parser("status", help="Show concise durable task status")
     status.add_argument("--data-dir", type=Path, default=None, help="Control directory; default is user-local state")
@@ -333,13 +333,15 @@ def _task(args: argparse.Namespace, environment: dict[str, str]) -> int:
         return 0 if readiness.ready else 1
     if not args.approve or not args.trusted_development:
         raise ValueError("task run requires explicit --approve and --trusted-development acknowledgment")
-    deadline = args.deadline if args.deadline is not None else int(time.time()) + 3300
+    deadline = args.deadline
     config = TaskRuntimeConfig.parse(environment_with_discovered_codex(environment)[0])
     directory, _source = task_paths(config, args.data_dir, args.repo, environ=environment)
     source = resolve_source(config, task, args.repo, environment=environment)
     components = compose_task_live(config, task)
     connection = components.connection_factory()
-    try:
+    lifecycle: list[str] = []
+
+    def advance(*, cancel_requested: bool = False) -> dict[str, object]:
         result = run_task(
             directory,
             task=task,
@@ -353,7 +355,21 @@ def _task(args: argparse.Namespace, environment: dict[str, str]) -> int:
             forge_factory=components.forge_factory,
             supported_efforts=components.supported_efforts,
             command_environment=dict(config.child_environment),
+            cancel_requested=cancel_requested,
         )
+        lifecycle.extend(line for line in cast("list[str]", result.get("lifecycle", [])) if line not in lifecycle)
+        result["lifecycle"] = list(lifecycle)
+        return result
+
+    try:
+        while True:
+            result = advance()
+            if result.get("condition") not in {"running", "waiting"}:
+                break
+            deadline = cast(int, result["deadline"])
+            time.sleep(min(1, max(0, deadline - time.time())))
+    except KeyboardInterrupt:
+        result = advance(cancel_requested=True)
     finally:
         if isinstance(connection, CodexStdio):
             connection.close()

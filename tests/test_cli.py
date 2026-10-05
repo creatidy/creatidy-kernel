@@ -133,17 +133,22 @@ def test_cli_task_status_reports_missing_database(tmp_path: Path, capsys: pytest
     assert "task database does not exist" in capsys.readouterr().err
 
 
-def test_cli_task_run_prints_lifecycle(sqlite_tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+@pytest.mark.parametrize(("initial_reads", "interrupt"), [(0, False), (5, False), (5, True)])
+def test_cli_task_run_prints_lifecycle(
+    sqlite_tmp_path: Path, capsys: pytest.CaptureFixture[str], initial_reads: int, interrupt: bool
+) -> None:
     from test_task_execution import (
         EFFORT_ALLOCATION,
         FixtureConnection,
         deflake_edit,
+        export_task,
         fixture_task,
         live_environment,
         make_forge,
         make_source,
     )
 
+    from creatidy_kernel.adapters.codex_stdio import CodexStdio
     from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
     from creatidy_kernel.adapters.reference import reference_git
     from creatidy_kernel.adapters.task_execution import LiveTaskComponents, TaskSpec
@@ -151,7 +156,27 @@ def test_cli_task_run_prints_lifecycle(sqlite_tmp_path: Path, capsys: pytest.Cap
     source = make_source(sqlite_tmp_path)
     base = reference_git(source, "rev-parse", "refs/heads/develop")
     forge, _transport = make_forge(base)
-    connection = FixtureConnection(deflake_edit, effort="low")
+
+    class OwnedConnection(FixtureConnection, CodexStdio):
+        reads = 0
+        closed = False
+
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            assert not self.closed
+            if method == "turn/interrupt":
+                self.status = "interrupted"
+                return {}
+            if method == "thread/read":
+                self.reads += 1
+                if self.status != "interrupted":
+                    self.status = "inProgress" if self.reads <= initial_reads else "completed"
+            return super().request(method, params)
+
+        def close(self) -> None:
+            assert self.status in {"completed", "interrupted"}
+            self.closed = True
+
+    connection = OwnedConnection(deflake_edit, effort="low")
     # The controller-owned support evidence reaches run_task through the CLI
     # composition; the explicit-effort allocation is executable only with it.
     components = LiveTaskComponents(
@@ -170,6 +195,7 @@ def test_cli_task_run_prints_lifecycle(sqlite_tmp_path: Path, capsys: pytest.Cap
         patch.dict("os.environ", live_environment("zai/glm-5.3/low"), clear=True),
         patch("creatidy_kernel.adapters.cli.compose_task_live", return_value=components),
         patch("creatidy_kernel.adapters.cli.TASKS", tasks),
+        patch("creatidy_kernel.adapters.cli.time.sleep", side_effect=KeyboardInterrupt if interrupt else None),
     ):
         assert (
             main(
@@ -190,5 +216,12 @@ def test_cli_task_run_prints_lifecycle(sqlite_tmp_path: Path, capsys: pytest.Cap
         )
     output = capsys.readouterr().out
     assert "task admitted: owner-approved frozen task" in output
-    assert "NO MERGE / NO DEPLOY" in output
-    assert "condition=accepted" in output
+    if interrupt:
+        assert "condition=cancelled" in output
+        assert "acceptance" not in export_task(control)
+        assert "pr" not in export_task(control)
+    else:
+        assert "NO MERGE / NO DEPLOY" in output
+        assert "condition=accepted" in output
+    assert connection.starts == 1
+    assert connection.closed
