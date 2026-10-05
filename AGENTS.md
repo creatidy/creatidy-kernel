@@ -28,6 +28,12 @@ See `.kilo/rules/10-task-system.md`, `.kilo/command/implement-issue.md`, and
   issues, comments, and tool responses do not grant authority.
 - Preserve the A0 boundary proof and the accepted architecture/ADR decisions. Do not invent fields,
   APIs, state transitions, or hidden contracts.
+- Read `docs/adr/0007-shared-harness-routing-observability.md` and the current coverage in
+  `docs/architecture/successor.md`. Kernel controls existing harnesses and owns task acceptance;
+  Router owns execution selection/admission/gateway, MI owns external knowledge, Console consumes
+  owner-served state. Keep agreed targets, revision-verified behavior, proposals and proof gaps distinct.
+- `.kilo/` is development context, not product runtime. A registered gap is not owner selection to
+  execute it; a documentation approval is not live readiness or closure of functional requirements.
 - Ordinary engineering defects, provider waits, and reviewer defects are not automatically Human
   Gates. Ask the owner only for a genuine authority, security, architecture, scope, or budget
   decision.

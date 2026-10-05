@@ -4,12 +4,19 @@ Reference: Scarcity Router's inspected `docs/release-engineering.md` and
 `.forgejo/workflows/ci.yml` at `8ae1fdb5ea9090604c26fd81f23010ad85a1536d`. Reuse its authority split,
 stable check name and pinned-action discipline, not its full distribution pipeline.
 
+Historical bootstrap/activation observations below remain dated evidence, not current claims about
+branch protection, runner containment, releases or live product acceptance. Current shared ownership
+is [ADR 0007](../adr/0007-shared-harness-routing-observability.md). Public installation/version/
+state/profile/platform reception is [#62](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/62),
+and installed end-to-end task reception is [#60](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/60).
+These are registered obligations, not product readiness or release approval.
+
 ## Authority And Bootstrap
 
 - Canonical: <https://forgejo.creatidy.com/Creatidy/creatidy-kernel>.
 - Mirror: <https://github.com/creatidy/creatidy-kernel>.
-- Ordinary work branches from and targets `develop`; the initial empty repository requires a root
-  bootstrap before that normal branch/PR flow exists. This does not authorize `main`, tags or release.
+- Ordinary work branches from and targets `develop`; root bootstrap was a historical prerequisite
+  for the initially empty repository, now completed. This does not authorize `main`, tags or release.
 - Forgejo owns source/issue/PR decisions and development CI. GitHub accepts confidential security
   intake and points normal contributions to Forgejo. Never merge mirror PRs as an alternate workflow.
 
@@ -81,4 +88,6 @@ After explicit owner release authorization: reviewed `develop` -> human promotio
 agreement, canonical tag/commit equality, reachability from stable `main`, exact-commit builds,
 validated final bytes/checksums and provenance. Privileged publishing never runs from a PR. GitHub
 distribution is replaceable; its disappearance does not affect Program data or canonical history.
-Do not add PyPI, signing, OCI, Windows installers or automatic version bumps to this empty foundation.
+Do not activate publication, signing, installers or version changes without a separately selected
+delivery and owner release decision. Known distribution/platform work is registered under #62,
+not omitted because A0 began as an empty foundation.

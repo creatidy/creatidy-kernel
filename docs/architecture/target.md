@@ -1,7 +1,86 @@
 # Greenfield Target
 
-This target was drafted before the current Creatidy implementation audit. ADRs distinguish accepted
-architecture from the small A0 code proof. Nothing here claims an operational Program engine exists.
+The original target below predates the implementation audit. The current ownership direction is
+[ADR 0007](../adr/0007-shared-harness-routing-observability.md); the
+[coverage roadmap](successor.md) records revision-verified subsets and registered missing work.
+Historical A0 exclusions are not descriptions of the entire current checkout. Nothing here claims
+a complete operational Program engine or live shared integration.
+
+## Shared System Target
+
+**Agreed:** Kernel owns approved task intent/requirements/scope/authority, WorkUnit/Attempt inputs,
+workspace/context, harness lifecycle, durable state, candidate verification/review/remediation,
+external-effect reconciliation and outcome evidence. Existing harnesses own model-tool-result loops.
+Router owns execution sources/accounts/pools, private telemetry, channel compatibility, cost and
+selection/admission policy, gateway and provider execution. MI owns external evidence and versioned
+knowledge publication; Console owns views and command forwarding, not scheduling/ranking/permissions
+or direct producer-database access. See ADR 0007 for the source/status vocabulary and decision history.
+
+```mermaid
+flowchart LR
+    Owner[Owner / CLI] --> Kernel[Kernel work controller]
+    Kernel --> Adapter[Version-evidenced harness adapter]
+    Adapter --> Harness[Existing harness]
+    Harness --> Workspace[Task workspace]
+    Harness --> Gateway[Scarcity Router gateway]
+    Gateway --> Source[Permitted execution source]
+    MI[Model Intelligence] --> Router[Router admitted knowledge]
+    Router --> Gateway
+    Kernel --> View[Owner-served state / events]
+    Gateway --> View
+    MI --> View
+    View --> Console[Console / CLI clients]
+```
+
+This is a target responsibility diagram, not implemented API/dataflow or a service deployment. No
+private onprem runtime is required; public modules may be dependencies when useful. The design does
+not mandate four processes, a common package/ontology/database, broker or Kubernetes.
+
+**Verified at Kernel `eb4f4a2956712bfaf39a3271e1523e7f77a91e26`:** immutable domain, dedicated-writer
+SQLite, effects/artifacts, exact-subject verification, native Codex and Forgejo adapters, offline
+reference and two frozen TaskSpecs/public operator exist. Router use is recommendation-only followed
+by native Codex with one configured binding. General intake, gateway, product reviewer/remediation,
+full-cost collection, owner-served events and hostile-code isolation are not delivered by those seams.
+
+**To prove:** meaningful approved requirements precede admission, with fresh issue/source/PR/baseline
+evidence. Issue/AGENTS/model prose cannot approve or widen a spec. Kernel controls an explicitly owned
+harness session; real progress/permissions/cancel/resume/recovery/IDE attachment capabilities are
+version-specific. ACP is a candidate, and its file/terminal executor must be identified. Opening a
+workspace in an editor shows that workspace, not automatically the original checkout; neither UI
+closure nor a native interrupt proves process or descendant lifetime.
+
+**Agreed route semantics:** Router's dynamic executable decision is persisted before main dispatch
+and bound to Attempt; explicit owner pin is an exception. Main calls do not silently reroute. Review
+or helper roles can have separately authorized routes. Harness control and model-backend API
+compatibility are different proofs. Provider/model/resource/access mode/explicit effort/opaque variant/
+harness and versions remain separate with requested/resolved/observed/unknown evidence. Plan-managed
+identity is weaker, not a physical-model inference. No pin is permission, reservation or response replay.
+
+**Agreed acceptance/effect semantics:** every changed candidate gets fresh exact-SHA checks and
+independent review; platform review and substantive verdict differ. Product review/remediation is
+durable and budgeted, not repository `/deliver-issue`. Intent/claim/dispatch/receipt/reconciliation
+remain distinct; incomplete not-found or unknown outcome cannot justify retry or route change. SDK,
+harness and gateway retries/auxiliary calls need correlation, accounting and uncertainty evidence.
+
+**Agreed state/knowledge/cost semantics:** Kernel retains necessary durable facts; progress and
+telemetry can be lossy without losing authority. CLI/Console get owner-served snapshots and bounded
+reconnectable events, with cursor/dedup/gap/resync and task/Attempt/session/route/call/candidate
+correlation. UI commands recheck current revision/grant in Kernel. Useful notifications concern real
+states/decisions, not mandatory dashboard vigilance. MI normally feeds Router; utilized publication
+references are retained, while direct harness evidence creates no ranking. Costs include all Attempts,
+review/fixes/tests/tools/retries/helpers and distinguish money/quota/tokens/time/attention, estimates,
+reports, measurements and unknowns. Local/private export is the default; PASS/APPROVE is conditional
+evidence, not causal model quality.
+
+**Proposed clarification:** a minimal owner-served view or controlled projection can preserve current
+SQLite exclusivity without a new platform. Exact transport/auth/retention semantics and process handoff
+require their owning issue and any necessary ADR/owner approval, not specification by diagram.
+
+**To prove:** use maintained sandbox mechanisms for untrusted workers/tests/review, one mutating
+controller per Attempt, manual-edit detection/journaling, host-qualified source ownership/locking and
+safe cleanup. Migrations preserve actual ciphertext/state and immutable identities. Platform and
+installed acceptance are evidence work, not XDG-default or package-build assumptions. All these known
+requirements are registered in the roadmap; a vertical example does not replace them.
 
 ## Smallest Kernel
 
@@ -30,8 +109,9 @@ flowchart TD
     D --> H[Local outcome/context projections]
 ```
 
-These are responsibilities and call boundaries, not services. Initially there is one controller
-process, a local SQLite database and local artifact storage. Workers are isolated external processes.
+These are responsibilities and call boundaries, not services. The bounded current topology has one
+controller per store, a local SQLite database and local artifact storage. Target workers need proved
+isolation; current trusted-development external processes do not provide it.
 Context compilation, authority checking, verification orchestration and outcome projection belong
 inside this package, not four new products.
 
@@ -79,9 +159,10 @@ opaque within an installation; external identities are qualified by adapter/endp
 | ContextPackage | Bounded, source-pinned compiled input | Manifest digest and compiler/policy version; generated then retained or reproducible | Conversation history as project memory |
 | Event / Decision | Durable fact / legal choice with reason | Journal ID, aggregate sequence, schema, actor, correlation and causation | Arbitrary row mutation or log parsing |
 
-`Node` is not a second entity: the WorkUnit is the graph node. Do not add `task`, `job`, `child`, or
-`run` as competing core synonyms. Runtime-specific vocabulary stays in adapters. The state labels
-above express the target lifecycle; exact serialized enums/schema are deferred to the successor.
+`Node` is not a second entity: the WorkUnit is the graph node. The public bounded `TaskSpec` is an
+input contract, not a competing core WorkUnit/Attempt lifecycle. Do not add `job`, `child` or `run`
+as competing core synonyms. Runtime vocabulary stays in adapters. The labels above are historical
+target vocabulary; actual implemented enums/codecs determine serialized state, not this table.
 
 ## Critical Invariants
 
@@ -103,7 +184,7 @@ accepted predecessor outputs still applicable to the pinned spec. Planning can b
 but code checks cycles, references, scope, budgets and authority before activation. An amendment gets
 a new spec revision and re-evaluates affected readiness/acceptance without deleting old decisions.
 
-Examples of shared application operations: `start_program`, `next_action`, `report_candidate_result`,
+Conceptual operation names, not working API/CLI instructions: `start_program`, `next_action`, `report_candidate_result`,
 `record_evidence`, `accept_result`, `request_external_operation`, `reconcile_operation`,
 `grant_authority`, `record_owner_decision`. CLI, REST and MCP must not each implement those semantics.
 Public transport routes and exact method signatures are deferred.
@@ -120,9 +201,10 @@ truth includes Program/spec graph, command dedupe, operation identities/receipts
 Attempt inputs, candidate/evidence/artifact bindings, findings and consumption. A runtime transcript
 may help continuity but losing it must not lose this truth.
 
-## Explicit Limits
+## Historical A0 Limits
 
-A0 implements only a resource-boundary proof. It does not implement the lifecycles above, SQLite
+A0 implemented only a resource-boundary proof. It did not implement the lifecycles above, SQLite
 persistence, runtime/forge/sandbox adapters, context compilation or verification. There is no coding
 agent, UI, deployment, adaptive router, general scheduler, new protocol or Program engine. The
-[successor plan](successor.md) supplies the bounded implementation order and regression gates.
+[coverage roadmap](successor.md) separates subsequent built subsets from remaining acceptance and
+registered work. Do not use this historical exclusion to erase code already delivered or known goals.

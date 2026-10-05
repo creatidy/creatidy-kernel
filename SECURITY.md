@@ -1,7 +1,10 @@
 # Security
 
-This is a pre-alpha architecture/boundary foundation. It does not yet execute untrusted agents or
-enforce the future capability/sandbox design. Do not interpret it as a production security product.
+This is a pre-alpha controller with bounded trusted-development Codex execution, not a proved
+hostile-worker/test/reviewer sandbox or production security product. A closed child environment and
+post-hoc diff allowlist do not isolate same-user host access. Current verification can execute candidate
+tooling despite a scope failure; [#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50)
+tracks trusted preconditions and actual denial evidence. No live execution is authorized by these docs.
 The [threat model](docs/architecture/threat-model.md) separates target controls from implemented code.
 
 Report vulnerabilities through the mirror's
@@ -19,3 +22,11 @@ is not token containment. Runner/token settings require administrative verificat
 contributions; A0's local tests do not certify that infrastructure boundary.
 A Git worktree, path instruction, or MCP root is not a hostile-code sandbox. Never give a worker
 control-plane storage, owner API authority or a container daemon socket.
+
+Console must use a Kernel-owned state/command view or controlled projection, never SQL against the
+active exclusive SQLite store. UI commands require current revision/authority checks by Kernel;
+progress, alerts and telemetry do not grant authority or replace durable evidence. Profile/state
+migrations must preserve actual user ciphertext and immutable history with no plaintext leakage;
+synthetic fixtures, not owner secrets, are the public test evidence. See
+[ADR 0007](docs/adr/0007-shared-harness-routing-observability.md) and the
+[registered security/lifecycle/migration work](docs/architecture/successor.md).

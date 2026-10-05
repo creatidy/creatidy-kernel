@@ -2,6 +2,11 @@
 
 Status: accepted, 2026-09-21; target fixed before the Creatidy implementation audit.
 
+Historical decision retained. [ADR 0007](0007-shared-harness-routing-observability.md) clarifies MI
+publication/Router consumption/Kernel reference retention, owner-served Console state and complete
+accepted-result costs. Local outcomes are Kernel evidence, not MI public knowledge or routing policy;
+the pure outcomes contract is not a live collection/export pipeline.
+
 ## Decision
 
 Context compilation is a bounded function over explicit sources, not an LLM memory service.
