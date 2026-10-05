@@ -116,4 +116,6 @@ owner-served view and reuse choices are recommendations until proved and approve
 
 The complete known work is registered, including migration, UX, security, distribution and installed
 acceptance dependencies. Documentation approval does not close G01-G13, authorize inference or
-mean `READY_FOR_LIVE_TASK`. Each functional issue requires separate owner selection and reception.
+mean `READY_FOR_LIVE_TASK`. Each functional issue requires authorized selection and reception:
+explicit owner selection or selection under an explicit owner-invoked repository `/loop`.
+That development delegation does not change product routing or live execution authority.

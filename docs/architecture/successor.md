@@ -3,8 +3,9 @@
 Current alignment: [Kernel #46](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/46),
 [ADR 0007](../adr/0007-shared-harness-routing-observability.md). This is a requirement/evidence/issue
 map, **not an execution queue or Program authorization**. Functional work is selected one issue at
-a time. The known full product scope is retained; a vertical proof or documentation approval does
-not close missing requirements, authorize inference or mean `READY_FOR_LIVE_TASK`.
+a time, explicitly by the owner or under an explicit owner-invoked repository `/loop`. This map is
+not invocation authority. The known full product scope is retained; a vertical proof or documentation
+approval does not close missing requirements, authorize inference or mean `READY_FOR_LIVE_TASK`.
 
 ## Observation Basis
 

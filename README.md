@@ -86,6 +86,18 @@ neutral Forge port; autonomous runtime integration remains planned. GitHub is th
 of the project. Integration targets `develop`; `main` promotion and release tags remain human-owned.
 No package or release is published by A0.
 
+Repository commands are `/implement-issue`, `/review-pr`, `/finish-pr` and `/loop`;
+see [AGENTS.md](AGENTS.md) and the repository-local `.kilo/command/` files. Standalone
+implementation requires one owner-selected issue; review is read-only and finish performs
+bounded remediation without merging. Only an explicit owner `/loop` invocation delegates
+fresh canonical issue selection, independent review, approved Forgejo PR merge into `develop`,
+verified acceptance/issue closure and continuation. The primary context is the sole orchestrator
+in one normal checkout, with a locally excluded delivery ledger and at most ten whole-PR reviews
+per issue delivery. No worktrees, external controller, cross-repository mutation or Scarcity Router
+operation is used for this development workflow. It does not implement the product runtime,
+authorize product GO, touch `main`, release or deploy. A workspace reload may be needed to load
+changed commands or the read-only `pr-reviewer` agent.
+
 ## Run The Foundation
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). From a checkout:
@@ -302,7 +314,7 @@ cancellation journal separates uncertain interrupt delivery from terminal observ
 composition does not yet supply that loop or its export. Task acceptance currently satisfies a frozen
 deterministic policy (`reviewer_required=False`), **not independent product review**. The durable
 product review/remediation loop is [#54](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/54);
-repository `/deliver-issue` is development workflow, not its implementation or budget.
+repository `/finish-pr` and `/loop` are development workflow, not its implementation or budget.
 
 `task export` is a thin persisted task/Allocation/candidate/acceptance/PR summary, not the richer
 reference export or a task-integrated `core.outcomes` pipeline. It lacks full requested/resolved/observed
