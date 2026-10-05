@@ -37,6 +37,7 @@ from creatidy_kernel.adapters.task_execution import (
     compose_task_live as _compose_task_live,
 )
 from creatidy_kernel.adapters.task_execution import git_text as task_git
+from creatidy_kernel.core.domain import DomainCommandType, FinishAttempt, Program
 from creatidy_kernel.core.execution import UnsupportedExecution
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
@@ -314,7 +315,7 @@ def test_cancellation_during_verification_stops_further_commands(
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("fault", ["receipt-evidence", "receipt"])
+@pytest.mark.parametrize("fault", ["receipt-evidence", "receipt", "cancel-terminal"])
 def test_cancel_recovers_original_durable_receipt(sqlite_tmp_path: Path, fault: str) -> None:
     source = make_source(sqlite_tmp_path)
     control = sqlite_tmp_path / "control"
@@ -332,8 +333,13 @@ def test_cancel_recovers_original_durable_receipt(sqlite_tmp_path: Path, fault: 
 
     connection = Interrupted(deflake_edit)
     connection.status = "inProgress"
-    with pytest.raises(TaskInterrupted):
-        run(control, source, connection, fault=fault)
+    if fault == "cancel-terminal":
+        assert run(control, source, connection)["condition"] == "running"
+        with pytest.raises(TaskInterrupted):
+            run(control, source, connection, fault=fault, cancel_requested=True)
+    else:
+        with pytest.raises(TaskInterrupted):
+            run(control, source, connection, fault=fault)
     cancelled = run(control, source, connection, cancel_requested=True)
     assert cancelled["condition"] == "cancelled"
     assert run(control, source, connection)["condition"] == "cancelled"
@@ -345,6 +351,52 @@ def test_cancel_recovers_original_durable_receipt(sqlite_tmp_path: Path, fault: 
         assert store.artifact("cancel:task_execution:change", "target") == store.artifact(
             operation.operation_id, "runtime-receipt"
         )
+        assert store.load("task_execution").attempt("task_execution:change").status.value == "finished"
+
+
+def test_observed_cancellation_survives_crash_before_advance_returns(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    requested = [False]
+
+    class ProcessLoss(BaseException):
+        pass
+
+    class Signals(FixtureConnection):
+        inject = False
+
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            result = super().request(method, params)
+            if method == "thread/read" and self.inject:
+                requested[0] = True
+            return result
+
+    connection = Signals(deflake_edit)
+    connection.status = "inProgress"
+    assert run(control, source, connection)["condition"] == "running"
+    connection.status = "completed"
+    connection.inject = True
+    original_admit = SQLiteProgramStore.admit
+
+    def crash_finish(store: SQLiteProgramStore, program_id: str, key: str, command: DomainCommandType) -> Program:
+        if isinstance(command, FinishAttempt):
+            raise ProcessLoss()
+        return original_admit(store, program_id, key, command)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SQLiteProgramStore, "admit", crash_finish)
+        with pytest.raises(ProcessLoss):
+            run(control, source, connection, cancellation_requested=lambda: requested[0])
+    requested[0] = False
+    connection.inject = False
+    recovered = run(control, source, connection)
+    assert recovered["condition"] == "cancelled"
+    assert "cancellation" in recovered
+    assert "acceptance" not in recovered
+    assert "pr" not in recovered
+    assert connection.starts == 1
 
 
 def test_failed_terminal_without_candidate_finishes_attempt(sqlite_tmp_path: Path) -> None:

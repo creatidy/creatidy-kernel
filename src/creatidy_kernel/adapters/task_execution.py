@@ -1295,9 +1295,6 @@ def run_task(
     lifecycle: list[str] = []
     captured: dict[str, dict[str, object]] = {}
 
-    def cancellation_requested_now() -> bool:
-        return cancel_requested or (cancellation_requested is not None and cancellation_requested())
-
     def crash(boundary: str) -> None:
         if fault == boundary:
             lifecycle.append(f"interrupted after {boundary}; rerun to reconcile")
@@ -1316,6 +1313,17 @@ def run_task(
             if _request(store, key).get("operation") != operation_id:
                 raise ValueError("cancellation intent differs from original execution")
             return recorded
+
+        def cancellation_requested_now() -> bool:
+            requested = cancel_requested or (cancellation_requested is not None and cancellation_requested())
+            if requested:
+                record_cancellation(ATTEMPT_ID, OPERATION_ID)
+            return requested
+
+        def finish_cancelled_attempt(attempt_id: str) -> None:
+            current = store.load(PROGRAM_ID)
+            if current.attempt(attempt_id).status is AttemptStatus.EXECUTING:
+                store.admit(PROGRAM_ID, f"finish:{attempt_id}", FinishAttempt(current.revision, "worker", attempt_id))
 
         try:
             mode_recorded = _request(store, "task_execution:mode")
@@ -1517,6 +1525,7 @@ def run_task(
                     cancellation_id = f"cancel:{attempt.spec.attempt_id}"
                     cancellation = record_cancellation(attempt.spec.attempt_id, operation.operation_id)
                     if operation.status == "terminal":
+                        finish_cancelled_attempt(attempt.spec.attempt_id)
                         if int(time.time()) < deadline:
                             status = "cancelled"
                         continue
@@ -1590,13 +1599,8 @@ def run_task(
                             "terminal",
                             reference=handle,
                         )
-                        current = store.load(PROGRAM_ID)
-                        if current.attempt(attempt.spec.attempt_id).status is AttemptStatus.EXECUTING:
-                            store.admit(
-                                PROGRAM_ID,
-                                f"finish:{attempt.spec.attempt_id}",
-                                FinishAttempt(current.revision, "worker", attempt.spec.attempt_id),
-                            )
+                        crash("cancel-terminal")
+                        finish_cancelled_attempt(attempt.spec.attempt_id)
                         if int(time.time()) < deadline:
                             status = "cancelled"
                     lifecycle.append(

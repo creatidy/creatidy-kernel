@@ -90,6 +90,8 @@ def advance_work_unit(
 
     The caller operates in trusted-development mode and supplies pinned workspace,
     verifier and runtime bindings. No worker-provided checks execute here.
+    A supplied cancellation predicate journals the request before returning true;
+    it is consumed at external-return boundaries before subsequent durable writes.
     """
     program = store.load(program.program_id)
     decision_clock = clock if clock is not None else lambda: now
@@ -103,6 +105,8 @@ def advance_work_unit(
         if deadline is not None and decision_clock() >= deadline:
             return "expired"
         allocation = allocator.select(ResourceRequest(unit_id, frozenset({"reference"}), 128))
+        if cancel_requested is not None and cancel_requested():
+            return "cancel_requested"
         allocation_bytes = encode_allocation(allocation)
         allocation_ref = "sha256:" + hashlib.sha256(allocation_bytes).hexdigest()
         context = manifest_bytes([asdict(item) for item in program.resolved_inputs(unit_id)])
@@ -181,6 +185,8 @@ def advance_work_unit(
         if operation.lease_until is not None and now < operation.lease_until:
             return "waiting"
         lookup = runtime.reconcile(key, operation.accepted_reference)
+        if cancel_requested is not None:
+            cancel_requested()
         reconciled_at = decision_clock()
         operation = store.reconcile(
             operation_id,
@@ -197,6 +203,8 @@ def advance_work_unit(
     if operation.status == "intent" or operation.retry_proof is not None:
         if deadline is not None and decision_clock() >= deadline:
             return "expired"
+        if cancel_requested is not None and cancel_requested():
+            return "cancel_requested"
         fence = store.claim(operation_id, now=decision_clock(), lease_seconds=1)
         operation = store.operation(operation_id)
         request = ExecutionRequest(
@@ -218,10 +226,14 @@ def advance_work_unit(
             allocation,
         )
         handle = runtime.start(request)
+        if cancel_requested is not None:
+            cancel_requested()
         fault("send")
         # Publish the native handle and configuration together before accepting
         # the receipt. A process crash cannot retain one while losing the other.
         started = runtime.observe(handle, now=decision_clock())
+        if cancel_requested is not None:
+            cancel_requested()
         if started.handle != handle or not identity_matches(
             started.identity, allocation, attempt.agent_definition_reference, require_resolved=False, legacy=legacy
         ):
@@ -259,7 +271,11 @@ def advance_work_unit(
     )
     if restore is not None:
         restore(request, handle)
+        if cancel_requested is not None:
+            cancel_requested()
     observation = runtime.observe(handle, now=decision_clock())
+    if cancel_requested is not None:
+        cancel_requested()
     observation_data = manifest_bytes(asdict(observation))
     store.finalize_artifact(
         operation_id, f"observation:{hashlib.sha256(observation_data).hexdigest()}", observation_data
@@ -314,6 +330,8 @@ def advance_work_unit(
     if observation.activity is not Activity.TERMINAL:
         return observation.activity.value
     candidate = None if cancel_requested is not None and cancel_requested() else runtime.candidate(handle)
+    if cancel_requested is not None:
+        cancel_requested()
     if program.attempt(attempt_id).status is AttemptStatus.EXECUTING:
         store.observe(operation_id, operation.fence, f"terminal:{operation_id}", "terminal", reference=handle)
         program = store.admit(
