@@ -5,7 +5,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 from creatidy_kernel.core.domain import (
     AttemptSpec,
@@ -46,13 +46,38 @@ from creatidy_kernel.ports.allocation import (
     load_attempt_inputs,
 )
 from creatidy_kernel.ports.execution import Runtime
-from creatidy_kernel.ports.program_store import ApplicationStore
+from creatidy_kernel.ports.program_store import ApplicationStore, OperationRecord
 from creatidy_kernel.ports.resources import ResourceAllocator
 
 
 def manifest_bytes(value: object) -> bytes:
     """Canonical JSON for public, non-secret application evidence."""
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def terminal_outcome(store: ApplicationStore, attempt: AttemptSpec, operation: OperationRecord) -> str | None:
+    data = store.find_artifact(operation.operation_id, "terminal-outcome")
+    if data is None:
+        return None
+    raw: object = json.loads(data)
+    if not isinstance(raw, dict):
+        raise ValueError("invalid terminal outcome")
+    value = cast("dict[str, object]", raw)
+    disposition = value.get("candidate")
+    if (
+        type(disposition) is not str
+        or disposition not in {"absent", "present", "not_requested"}
+        or value
+        != {
+            "version": 1,
+            "attempt": attempt.digest,
+            "handle": operation.accepted_reference,
+            "fence": operation.fence,
+            "candidate": disposition,
+        }
+    ):
+        raise ValueError("terminal outcome differs from original Attempt")
+    return disposition
 
 
 @dataclass(frozen=True)
@@ -181,6 +206,16 @@ def advance_work_unit(
             operation = store.observe(
                 operation_id, receipt_fence, f"accepted:{receipt_handle}", "accepted", reference=receipt_handle
             )
+    if operation.status == "terminal":
+        candidate_status = terminal_outcome(store, attempt, operation)
+        if program.attempt(attempt_id).status is AttemptStatus.EXECUTING:
+            program = store.admit(
+                program.program_id, f"finish:{attempt_id}", FinishAttempt(program.revision, "worker", attempt_id)
+            )
+        if candidate_status == "absent":
+            return "terminal_no_candidate"
+        if candidate_status is None or candidate_status == "not_requested":
+            return "terminal_candidate_unknown"
     if operation.status in {"dispatched", "unknown"}:
         if operation.lease_until is not None and now < operation.lease_until:
             return "waiting"
@@ -328,11 +363,28 @@ def advance_work_unit(
             manifest_bytes({"version": 1, "handle": handle, "fence": operation.fence, "identity": asdict(recorded)}),
         )
     if observation.activity is not Activity.TERMINAL:
-        return observation.activity.value
+        return "terminal_candidate_unknown" if operation.status == "terminal" else observation.activity.value
     candidate = None if cancel_requested is not None and cancel_requested() else runtime.candidate(handle)
     if cancel_requested is not None:
         cancel_requested()
     if program.attempt(attempt_id).status is AttemptStatus.EXECUTING:
+        store.finalize_artifact(
+            operation_id,
+            "terminal-outcome",
+            manifest_bytes(
+                {
+                    "version": 1,
+                    "attempt": attempt.digest,
+                    "handle": handle,
+                    "fence": operation.fence,
+                    "candidate": "not_requested"
+                    if cancel_requested is not None and cancel_requested()
+                    else "present"
+                    if candidate is not None
+                    else "absent",
+                }
+            ),
+        )
         store.observe(operation_id, operation.fence, f"terminal:{operation_id}", "terminal", reference=handle)
         program = store.admit(
             program.program_id, f"finish:{attempt_id}", FinishAttempt(program.revision, "worker", attempt_id)

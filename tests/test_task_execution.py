@@ -301,6 +301,63 @@ def test_fixed_effort_cannot_change_before_attempt_preparation(sqlite_tmp_path: 
     assert connection.starts == 1
 
 
+@pytest.mark.parametrize("fault", ["prepared", "artifacts", "started", "commit"])
+def test_cancel_unclaimed_attempt_never_dispatches(sqlite_tmp_path: Path, fault: str) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    connection = FixtureConnection(deflake_edit)
+    with pytest.raises(TaskInterrupted):
+        run(control, source, connection, fault=fault)
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        original = store.operation("runtime:task_execution:change").request_json
+    for _ in range(2):
+        stopped = run(control, source, connection, cancel_requested=True)
+        assert stopped["condition"] == "cancelled_no_dispatch"
+        with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+            operation = store.operation("runtime:task_execution:change")
+            assert operation.request_json == original
+            assert operation.status == "intent" and operation.attempts == 0
+            assert store.load("task_execution").attempt("task_execution:change").status.value == "cancelled"
+    assert task_status(control)["condition"] == "cancelled_no_dispatch"
+    assert connection.starts == 0
+
+
+def test_failed_terminal_recovers_finish_without_native_context(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    connection = FixtureConnection(lambda _path: None)
+    connection.status = "failed"
+    original = SQLiteProgramStore.admit
+
+    class ProcessLoss(BaseException):
+        pass
+
+    def crash_finish(store: SQLiteProgramStore, program_id: str, key: str, command: DomainCommandType) -> Program:
+        if isinstance(command, FinishAttempt):
+            raise ProcessLoss()
+        return original(store, program_id, key, command)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SQLiteProgramStore, "admit", crash_finish)
+        with pytest.raises(ProcessLoss):
+            run(control, source, connection)
+
+    class Missing(FixtureConnection):
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            raise AssertionError("terminal proof must not require another native read")
+
+    for _ in range(2):
+        restored = run(control, source, Missing(lambda _path: None))
+        assert restored["condition"] == "terminal_no_candidate"
+        assert cast("list[dict[str, object]]", restored["attempts"])[0]["attempt"] == {
+            "attempt_id": "task_execution:change",
+            "status": "finished",
+        }
+        assert "acceptance" not in restored
+
+
 @pytest.mark.parametrize("before_allocation", [False, True])
 def test_cancel_before_attempt_is_stable_without_dispatch(sqlite_tmp_path: Path, before_allocation: bool) -> None:
     source = make_source(sqlite_tmp_path)

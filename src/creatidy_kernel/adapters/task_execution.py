@@ -57,6 +57,7 @@ from creatidy_kernel.core.domain import (
     AttemptStatus,
     AuthorityEnvelope,
     BudgetPolicy,
+    CancelAttempt,
     FinishAttempt,
     InputBinding,
     PolicyReference,
@@ -88,7 +89,7 @@ from creatidy_kernel.ports.allocation import (
     identity_matches,
     load_allocation,
 )
-from creatidy_kernel.ports.application import Collection, advance_work_unit, manifest_bytes
+from creatidy_kernel.ports.application import Collection, advance_work_unit, manifest_bytes, terminal_outcome
 from creatidy_kernel.ports.forge import Forge
 from creatidy_kernel.ports.program_store import OperationRecord
 from creatidy_kernel.ports.resources import ResourceAllocator
@@ -1151,7 +1152,14 @@ def export_task_store(store: SQLiteProgramStore) -> dict[str, object]:
         attempts.append(
             {
                 "attempt": {"attempt_id": attempt.spec.attempt_id, "status": attempt.status.value},
-                "operation": {"status": operation.status, "reference": operation.accepted_reference},
+                "terminal_candidate": terminal_outcome(store, attempt.spec, operation)
+                if operation.status == "terminal"
+                else None,
+                "operation": {
+                    "status": operation.status,
+                    "reference": operation.accepted_reference,
+                    "dispatch_claims": operation.attempts,
+                },
                 "allocation": {
                     "runtime_id": allocation.runtime_id,
                     "provider_id": allocation.provider_id,
@@ -1219,7 +1227,11 @@ def task_status(directory: Path) -> dict[str, object]:
         "accepted"
         if acceptance is not None
         else "cancelled_no_dispatch"
-        if result.get("cancellation") is not None and not operations and result["runtime_operation_absent"] is True
+        if result.get("cancellation") is not None
+        and (
+            (not operations and result["runtime_operation_absent"] is True)
+            or all(item["status"] == "intent" and item["dispatch_claims"] == 0 for item in operations)
+        )
         else "cancelled"
         if result.get("cancellation") is not None and terminal
         else "cancel_uncertain"
@@ -1227,6 +1239,8 @@ def task_status(directory: Path) -> dict[str, object]:
         else "expired"
         if expired
         else "terminal_no_candidate"
+        if terminal and all(item["terminal_candidate"] == "absent" for item in attempts)
+        else "terminal_candidate_unknown"
         if terminal and candidate is None
         else "terminal"
         if terminal
@@ -1580,6 +1594,19 @@ def run_task(
                     operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
                     cancellation_id = f"cancel:{attempt.spec.attempt_id}"
                     cancellation = record_cancellation(attempt.spec.attempt_id, operation.operation_id)
+                    if operation.status == "intent" and operation.attempts == 0:
+                        current = store.load(PROGRAM_ID)
+                        if current.attempt(attempt.spec.attempt_id).status in {
+                            AttemptStatus.PREPARED,
+                            AttemptStatus.EXECUTING,
+                        }:
+                            store.admit(
+                                PROGRAM_ID,
+                                f"cancel-before-dispatch:{attempt.spec.attempt_id}",
+                                CancelAttempt(current.revision, "owner", attempt.spec.attempt_id),
+                            )
+                        status = "cancelled_no_dispatch"
+                        continue
                     if operation.status == "terminal":
                         finish_cancelled_attempt(attempt.spec.attempt_id)
                         if int(time.time()) < deadline:
