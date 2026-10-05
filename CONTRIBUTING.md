@@ -2,8 +2,10 @@
 
 Development is canonical on [Forgejo](https://forgejo.creatidy.com/Creatidy/creatidy-kernel).
 Open issues and pull requests there; GitHub is a mirror. Fork or branch from `develop`, keep changes
-bounded, and target `develop`. Human maintainers control integration, promotion to `main` and release
-tags. An ordinary contribution does not authorize paid model calls, production access or deployment.
+bounded, and target `develop`. Standalone commands do not merge. Only an explicit owner `/loop`
+delegates approved Forgejo PR integration into `develop` under [AGENTS.md](AGENTS.md); promotion to
+`main` and release tags remain human-controlled. An ordinary contribution does not authorize paid
+model calls, production access or deployment.
 
 ## Local Gate
 
@@ -37,7 +39,8 @@ new hard constraints must be explicitly supported or rejected rather than silent
 ## Scope And Evidence
 
 A0's resource proof and K1-K8 bounded foundations are historical deliveries, not the complete shared
-architecture. Follow one explicitly selected issue and the [coverage roadmap](docs/architecture/successor.md),
+architecture. Follow one issue selected explicitly by the owner or under owner-invoked `/loop`, and
+the [coverage roadmap](docs/architecture/successor.md),
 not the historical private Engine v1 brief or an inferred execution queue. Add behavior/negative tests
 for each implemented invariant;
 do not claim that an architecture document is an implemented control. Tests use synthetic evidence,

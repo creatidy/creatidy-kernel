@@ -11,6 +11,8 @@ dist/
 !.kilo/rules/*.md
 !.kilo/command/
 !.kilo/command/*.md
+!.kilo/agents/
+!.kilo/agents/*.md
 .env
 .env.*
 

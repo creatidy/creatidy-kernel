@@ -35,6 +35,21 @@ evidence leaves a **candidate**, not an approved library, command, protocol or p
 Permission, inference and live service evidence are separately scoped; this documentation task grants
 no product call. ACP's candidacy does not authorize a custom harness, protocol or VS Code plugin.
 
+## Development Workflow Adaptation
+
+Issue [#64](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/64) adapts the current local
+Model Intelligence development workflow inspected 2026-10-05, checkout HEAD
+`013cbb43e11d7f698d359db5a456d26d8075e34e`. The source was the actual local files, not remembered
+text or an older Git revision. Their paths and modifications are recorded in [NOTICE](../../NOTICE).
+The source LICENSE is Apache-2.0, Copyright 2026 Creatidy; there is no source NOTICE or additional
+file-level copyright notice in the adapted files. The complete license is distributed here.
+
+Changes are repository identity/paths, accepted Kernel product boundaries, existing final gates
+(`make check` and `make package-check`), pytest/import-linter permissions, compatible test hash
+constants/lint annotations and a four-command inventory guard. The same native reviewer permissions,
+isolation, exact-SHA contract and owner-invoked loop model are retained. This is development context,
+not a Kernel product dependency, Router call, new controller or live runtime acceptance.
+
 ## Historical Audit Catalogue
 
 ## Agent And Workspace References

@@ -58,7 +58,7 @@ identity is weaker, not a physical-model inference. No pin is permission, reserv
 
 **Agreed acceptance/effect semantics:** every changed candidate gets fresh exact-SHA checks and
 independent review; platform review and substantive verdict differ. Product review/remediation is
-durable and budgeted, not repository `/deliver-issue`. Intent/claim/dispatch/receipt/reconciliation
+durable and budgeted, not repository `/finish-pr` or `/loop`. Intent/claim/dispatch/receipt/reconciliation
 remain distinct; incomplete not-found or unknown outcome cannot justify retry or route change. SDK,
 harness and gateway retries/auxiliary calls need correlation, accounting and uncertainty evidence.
 

@@ -16,3 +16,23 @@ response bounds, schema validation and safe-error handling. Synthetic tests
 adapt the public wire-contract cases, not Router's implementation or policy.
 The upstream snapshot has no separate NOTICE file. The complete Apache-2.0
 license is distributed in LICENSE. No endorsement by upstream is implied.
+
+The repository development commands, supporting workflow guidance, read-only
+pr-reviewer definition and tests/test_workflow_contract.py are adapted from
+Model Intelligence, Copyright 2026 Creatidy, under the Apache License, Version 2.0.
+
+Source repository: https://forgejo.creatidy.com/Creatidy/model-intelligence
+Source: current local workflow files inspected 2026-10-05; checkout HEAD
+013cbb43e11d7f698d359db5a456d26d8075e34e (local contents, not an older revision).
+Source files: .kilo/command/{implement-issue,review-pr,finish-pr,loop}.md;
+.kilo/agents/pr-reviewer.md; .kilo/rules/{10-task-system,20-forgejo-mcp,
+30-implementation-discipline,40-local-search,validation}.md; AGENTS.md;
+tests/test_workflow_contract.py.
+
+Modified for Kernel repository identity, existing architecture boundaries and
+make check/make package-check gates, pytest/import-linter validation permissions,
+and lint/secret-scan-compatible hash assertions plus a command-inventory guard.
+The workflow model and reviewer isolation are preserved; this is not product
+runtime reuse or a Model Intelligence/Scarcity Router runtime dependency.
+The source has no separate NOTICE file. LICENSE contains the complete Apache-2.0
+license. No upstream endorsement is implied.

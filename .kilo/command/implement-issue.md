@@ -1,53 +1,42 @@
 ---
-description: Implement one explicitly selected Forgejo issue end to end
+description: Implement one Adrian-selected Forgejo issue through an unmerged develop PR
 ---
 
-# Implement From Issue
+<!-- Adapted from Model Intelligence for Kernel identity and validation; see NOTICE. -->
 
-Implement one explicitly selected issue in `Creatidy/creatidy-kernel` from scope confirmation
-through a reviewed PR handoff.
+Implement the single owner-selected issue: $ARGUMENTS
 
-## Preconditions
+Read AGENTS.md and its listed rules. Standalone invocation requires an explicit
+owner-selected number, URL or unambiguous title; do not choose another issue.
+Only an explicit owner `/loop` invocation may supply its canonically selected issue
+instead, under `.kilo/command/loop.md`; this command cannot initiate autonomous
+selection itself. Resolve/fetch the actual issue via
+Forgejo MCP before planning/editing. Confirm its goal, scope, acceptance and
+constraints; seek only genuine decisions, not routine reversible choices.
 
-- The owner selected exactly one issue by number, URL, or unambiguous title.
-- The actual issue body can be fetched through Forgejo MCP.
-- Normal Git transport is available for branch and push operations.
-- Forgejo MCP is available for issue/PR platform operations.
-- The target branch is `develop`; never use `main`.
-- This command runs in normal single-issue mode. It does not select successor issues or execute a
-  Program graph.
-
-## Procedure
-
-1. Fetch the selected issue before reading implementation code. Summarize its title, goal, scope,
-   acceptance criteria, constraints, links, non-goals, and any ambiguity.
-2. Confirm that `Creatidy/creatidy-kernel` owns the change. Read `AGENTS.md`, the relevant local
-   rules, README/Makefile sections, and authoritative architecture or ADR material.
-3. If the issue has several subtasks, create local `.task_progress.md`, add it to
-   `.git/info/exclude`, and record the acceptance criteria and current decisions. Never commit it.
-4. Fetch `origin/develop` and create a feature branch from it. Preserve unrelated work.
-5. Implement the smallest coherent change in the issue scope. Keep `adapters -> ports -> core`, do
-   not invent hidden contracts or private runtime/M5-B dependencies. Do not infer Program execution
-   authority or duplicate Router policy. Explicitly selected product work must follow the owning
-   architecture/ADRs, not be encoded as a development Markdown executor.
-6. Add or update focused tests where the issue changes behavior. Use deterministic synthetic fixtures
-   and test negative paths when relevant.
-7. Run focused checks, then `make check` and `make package-check`. Run `make audit` when relevant.
-   Diagnose failures before any retry and report environmental blockers truthfully.
-8. Inspect `git status` and `git diff`; confirm only intended files are changed and scratch state is
-   not staged. Commit count is not an acceptance criterion. Use as many small, coherent, reviewable
-   commits as needed. Remediation commits are normal. Do not squash, amend, force-push, or rewrite
-   published history merely to reduce commit count. Keep the overall change focused and coherent
-   within the selected issue, then push the feature branch with normal Git.
-9. Create one Forgejo PR targeting `develop` through MCP. Link the selected issue in the PR body or
-   metadata, include concise acceptance evidence, and do not merge or close the issue.
-10. Post one concise issue update with the changed files, exact checks and results, acceptance
-    evidence, PR URL, review status, and remaining risks. Keep the issue open until integration into
-    `develop`.
-
-## Guardrails
-
-- Do not infer another issue, create K-series work, add planning systems, or expand scope.
-- Do not target `main`, auto-merge, bypass review, or claim a Forgejo mutation that failed.
-- Do not read, copy, or commit secrets, runtime state, local Agent Manager state, or private audit
-  payloads.
+1. Verify canonical remote/access and inspect local status/files/branches. Require
+   a clean safe normal checkout. Never stash/reset unrelated changes; if they
+   prevent safe switching, stop with a precise blocker. Fetch current canonical
+   develop and record its exact SHA; switch/update local develop safely, with no
+   guessed reconciliation of divergence.
+2. Create an ordinary `issue-<number>-<short-topic>` branch from that exact SHA in
+   the SAME checkout. For an existing current authorized issue PR, continue its
+   fetched branch/HEAD under finish-pr's safe checkout rules rather than creating
+   a replacement. Do not use git worktree or alternate checkout management.
+3. Implement only accepted scope; use reuse-first and product-boundary rules.
+   Track short local progress when needed, excluded through .git/info/exclude.
+4. Run focused checks and final `make check` and `make package-check`. Run `make audit`
+   only when relevant dependency/tooling changes require it. Inspect intended diff/status/full
+   base delta for scope, secrets and local state. Diagnose failures before retry.
+5. Inspect recent commit style and stage explicit intended files. Make small,
+   coherent, reviewable commits as needed, including remediation commits; commit
+   count is not acceptance. Follow the history-safety rule in
+   `.kilo/rules/30-implementation-discipline.md`. Push via normal Git.
+6. Create/reuse one Forgejo MCP PR targeting develop with `Refs #N`, scope, acceptance
+   evidence, exact base/head SHAs, checks/results and limitations. Keep issue open.
+7. Post a concise issue update with PR and validation. Continue through the native
+   `/finish-pr` workflow on that PR until its bounded terminal outcome; consume
+   reviewer task results directly, with no owner relaying. The implementation
+   context is not an independent reviewer. Standalone implementation never merges;
+   only the explicit `/loop` orchestrator may proceed after exact approval through
+   loop.md's merge/completion gates. Never auto-merge, touch main, release or deploy.
