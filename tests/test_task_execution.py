@@ -424,6 +424,65 @@ def test_terminal_outcome_recovers_before_operation_publication(
     assert "acceptance" not in recovered
 
 
+def test_one_shot_cancellation_cannot_be_forgotten(sqlite_tmp_path: Path) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    pending = [False]
+
+    class Pulse(FixtureConnection):
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            result = super().request(method, params)
+            if method == "turn/start":
+                pending[0] = True
+            return result
+
+    def consume() -> bool:
+        value = pending[0]
+        pending[0] = False
+        return value
+
+    result = run(control, source, Pulse(deflake_edit), cancellation_requested=consume)
+    assert result["condition"] == "cancelled"
+    assert "cancellation" in result
+    assert "acceptance" not in result
+    assert "pr" not in result
+
+
+def test_terminal_cancel_observation_recovers_without_native_context(sqlite_tmp_path: Path) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+
+    class Interrupted(FixtureConnection):
+        interrupts = 0
+
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            if method == "turn/interrupt":
+                self.interrupts += 1
+                self.status = "interrupted"
+                return {}
+            return super().request(method, params)
+
+    connection = Interrupted(deflake_edit)
+    connection.status = "inProgress"
+    assert run(control, source, connection)["condition"] == "running"
+    with pytest.raises(TaskInterrupted):
+        run(control, source, connection, cancel_requested=True, fault="cancel-observation")
+
+    class Unavailable(FixtureConnection):
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            raise AssertionError("durable terminal cancellation must not issue another RPC")
+
+    for _ in range(2):
+        recovered = run(control, source, Unavailable(deflake_edit))
+        assert recovered["condition"] == "cancelled"
+        assert "acceptance" not in recovered
+        assert cast("list[dict[str, object]]", recovered["attempts"])[0]["attempt"] == {
+            "attempt_id": "task_execution:change",
+            "status": "finished",
+        }
+    assert connection.interrupts == 1
+
+
 @pytest.mark.parametrize("before_allocation", [False, True])
 def test_cancel_before_attempt_is_stable_without_dispatch(sqlite_tmp_path: Path, before_allocation: bool) -> None:
     source = make_source(sqlite_tmp_path)

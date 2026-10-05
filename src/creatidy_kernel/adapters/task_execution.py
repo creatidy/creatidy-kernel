@@ -1338,8 +1338,11 @@ def run_task(
             raise TaskInterrupted(f"interrupted after {boundary}; rerun to reconcile")
 
     with SQLiteProgramStore(directory / "kernel.sqlite3") as store, ExitStack() as cleanup:
+        cancellation_latched = False
 
         def record_cancellation(attempt_id: str, operation_id: str) -> OperationRecord:
+            nonlocal cancellation_latched
+            cancellation_latched = True
             key = f"cancel:{attempt_id}"
             try:
                 recorded = store.operation(key)
@@ -1352,10 +1355,15 @@ def run_task(
             return recorded
 
         def cancellation_requested_now() -> bool:
-            requested = cancel_requested or (cancellation_requested is not None and cancellation_requested())
-            if requested:
+            nonlocal cancellation_latched
+            cancellation_latched = (
+                cancellation_latched
+                or cancel_requested
+                or (cancellation_requested is not None and cancellation_requested())
+            )
+            if cancellation_latched:
                 record_cancellation(ATTEMPT_ID, OPERATION_ID)
-            return requested
+            return cancellation_latched
 
         def finish_cancelled_attempt(attempt_id: str) -> None:
             current = store.load(PROGRAM_ID)
@@ -1460,6 +1468,7 @@ def run_task(
         try:
             store.operation(cancellation_id)
             cancellation_pending = True
+            cancellation_latched = True
         except OperationConflict as error:
             if str(error) != "unknown operation":
                 raise
@@ -1644,6 +1653,30 @@ def run_task(
                     if handle is None:
                         lifecycle.append("cancellation target unknown; no interrupt issued")
                         continue
+                    terminal_cancel = store.find_artifact(cancellation_id, "terminal")
+                    terminal_fact = {
+                        "version": 1,
+                        "attempt": attempt.spec.digest,
+                        "operation": operation.operation_id,
+                        "request_digest": operation.request_digest,
+                        "handle": handle,
+                        "fence": operation.fence,
+                        "candidate": "not_requested",
+                        "descendants": "unproven",
+                    }
+                    if terminal_cancel is not None:
+                        if json.loads(terminal_cancel) != terminal_fact:
+                            raise ValueError("terminal cancellation differs from original execution")
+                        store.observe(
+                            operation.operation_id,
+                            operation.fence,
+                            f"terminal:{operation.operation_id}",
+                            "terminal",
+                            reference=handle,
+                        )
+                        finish_cancelled_attempt(attempt.spec.attempt_id)
+                        status = "expired" if int(time.time()) >= deadline else "cancelled"
+                        continue
                     request = ExecutionRequest(
                         OperationKey(operation.operation_id, operation.effect_key, operation.request_digest),
                         attempt.spec,
@@ -1672,6 +1705,8 @@ def run_task(
                         store.finalize_artifact(cancellation_id, "receipt", manifest_bytes(asdict(receipt)))
                     observation = runtime.observe(handle, now=int(time.time()))
                     data = manifest_bytes(asdict(observation))
+                    if observation.activity is Activity.TERMINAL:
+                        store.finalize_artifact(cancellation_id, "terminal", manifest_bytes(terminal_fact))
                     store.finalize_artifact(cancellation_id, f"observation:{hashlib.sha256(data).hexdigest()}", data)
                     crash("cancel-observation")
                     if observation.activity is Activity.TERMINAL:
