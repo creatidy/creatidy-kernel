@@ -2,8 +2,11 @@
 """The command interface delegates lifecycle decisions to the application."""
 
 import json
+import signal
+import subprocess
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -133,9 +136,9 @@ def test_cli_task_status_reports_missing_database(tmp_path: Path, capsys: pytest
     assert "task database does not exist" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(("initial_reads", "interrupt"), [(0, False), (5, False), (5, True)])
+@pytest.mark.parametrize(("initial_reads", "interrupt"), [(0, False), (5, False), (5, True), (5, "rpc")])
 def test_cli_task_run_prints_lifecycle(
-    sqlite_tmp_path: Path, capsys: pytest.CaptureFixture[str], initial_reads: int, interrupt: bool
+    sqlite_tmp_path: Path, capsys: pytest.CaptureFixture[str], initial_reads: int, interrupt: bool | str
 ) -> None:
     from test_task_execution import (
         EFFORT_ALLOCATION,
@@ -160,23 +163,49 @@ def test_cli_task_run_prints_lifecycle(
     class OwnedConnection(FixtureConnection, CodexStdio):
         reads = 0
         closed = False
+        events: list[str]
+
+        def __init__(self) -> None:
+            FixtureConnection.__init__(self, deflake_edit, effort="low")
+            self.events = []
+            if interrupt == "rpc":
+                self._lock = threading.Lock()
+                self._process = cast("subprocess.Popen[bytes]", object())
 
         def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            if interrupt == "rpc":
+                return CodexStdio.request(self, method, params)
+            return self._exchange(method, params)
+
+        def _exchange(self, method: str, params: dict[str, object]) -> dict[str, object]:
             assert not self.closed
+            self.events.append(method)
             if method == "turn/interrupt":
                 self.status = "interrupted"
                 return {}
             if method == "thread/read":
                 self.reads += 1
+                if interrupt == "rpc" and self.reads == 4:
+                    signal.raise_signal(signal.SIGINT)
                 if self.status != "interrupted":
                     self.status = "inProgress" if self.reads <= initial_reads else "completed"
-            return super().request(method, params)
+            return FixtureConnection.request(self, method, params)
+
+        def _close_unlocked(self) -> None:
+            assert "cancellation" in export_task(control)
+            self.events.append("owned-teardown")
+            self._process = None
+            self.closed = True
 
         def close(self) -> None:
             assert self.status in {"completed", "interrupted"}
-            self.closed = True
+            if interrupt == "rpc":
+                CodexStdio.close(self)
+            else:
+                self.closed = True
 
-    connection = OwnedConnection(deflake_edit, effort="low")
+    connection = OwnedConnection()
+    original_sigint = signal.getsignal(signal.SIGINT)
     # The controller-owned support evidence reaches run_task through the CLI
     # composition; the explicit-effort allocation is executable only with it.
     components = LiveTaskComponents(
@@ -195,7 +224,7 @@ def test_cli_task_run_prints_lifecycle(
         patch.dict("os.environ", live_environment("zai/glm-5.3/low"), clear=True),
         patch("creatidy_kernel.adapters.cli.compose_task_live", return_value=components),
         patch("creatidy_kernel.adapters.cli.TASKS", tasks),
-        patch("creatidy_kernel.adapters.cli.time.sleep", side_effect=KeyboardInterrupt if interrupt else None),
+        patch("creatidy_kernel.adapters.cli.time.sleep", side_effect=KeyboardInterrupt if interrupt is True else None),
     ):
         assert (
             main(
@@ -225,3 +254,6 @@ def test_cli_task_run_prints_lifecycle(
         assert "condition=accepted" in output
     assert connection.starts == 1
     assert connection.closed
+    assert signal.getsignal(signal.SIGINT) == original_sigint
+    if interrupt == "rpc":
+        assert connection.events.index("turn/interrupt") < connection.events.index("owned-teardown")

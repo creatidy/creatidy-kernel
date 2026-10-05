@@ -10,8 +10,10 @@ profile; they are never printed or serialized into evidence.
 import argparse
 import json
 import os
+import signal
 import sqlite3
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -340,6 +342,20 @@ def _task(args: argparse.Namespace, environment: dict[str, str]) -> int:
     components = compose_task_live(config, task)
     connection = components.connection_factory()
     lifecycle: list[str] = []
+    cancellation_signal = False
+
+    def request_cancellation(_signum: int, _frame: object) -> None:
+        nonlocal cancellation_signal
+        cancellation_signal = True
+
+    # Do not interrupt a framed RPC and destroy its transport before journaling.
+    # Requests already have finite timeouts; the controller checks this flag at
+    # dispatch and acceptance boundaries and then cancels the original receipt.
+    previous_sigint = (
+        signal.signal(signal.SIGINT, request_cancellation)
+        if threading.current_thread() is threading.main_thread()
+        else None
+    )
 
     def advance(*, cancel_requested: bool = False) -> dict[str, object]:
         result = run_task(
@@ -356,6 +372,7 @@ def _task(args: argparse.Namespace, environment: dict[str, str]) -> int:
             supported_efforts=components.supported_efforts,
             command_environment=dict(config.child_environment),
             cancel_requested=cancel_requested,
+            cancellation_requested=lambda: cancellation_signal,
         )
         lifecycle.extend(line for line in cast("list[str]", result.get("lifecycle", [])) if line not in lifecycle)
         result["lifecycle"] = list(lifecycle)
@@ -364,6 +381,8 @@ def _task(args: argparse.Namespace, environment: dict[str, str]) -> int:
     try:
         while True:
             result = advance()
+            if cancellation_signal and result.get("condition") not in {"cancelled", "cancel_uncertain"}:
+                result = advance(cancel_requested=True)
             if result.get("condition") not in {"running", "waiting"}:
                 break
             deadline = cast(int, result["deadline"])
@@ -371,8 +390,12 @@ def _task(args: argparse.Namespace, environment: dict[str, str]) -> int:
     except KeyboardInterrupt:
         result = advance(cancel_requested=True)
     finally:
-        if isinstance(connection, CodexStdio):
-            connection.close()
+        try:
+            if isinstance(connection, CodexStdio):
+                connection.close()
+        finally:
+            if previous_sigint is not None:
+                signal.signal(signal.SIGINT, previous_sigint)
     if args.json:
         print(json.dumps(result, sort_keys=True, indent=2, allow_nan=False))
         return 0

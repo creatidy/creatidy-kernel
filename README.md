@@ -299,6 +299,9 @@ rejects envelope/version/mode/source changes. The CLI keeps its dedicated owned 
 while running/waiting and advances the same recorded turn, rather than closing after one step.
 Expiry and Ctrl-C journal cancellation separately; lost replies are never blindly reissued. Target
 terminality is not interrupt-delivery or descendant-settlement proof, and cancellation is not rollback.
+Ctrl-C is deferred across finite framed RPCs so the original receipt can be cancelled before owned
+teardown; framing/transport failures still leave delivery uncertain. A durable receipt published
+before a crash can bind the cancellation target without rewriting its intent or resubmitting work.
 Expired work remains observable but cannot be newly dispatched or accepted; checks and admission
 use actual decision times. This is a synthetic-proved owned-session repair, not detached supervision
 or a live conformance receipt. Verification commands retain finite timeouts; full monetary/quota,

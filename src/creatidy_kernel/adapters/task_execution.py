@@ -81,9 +81,10 @@ from creatidy_kernel.core.execution import (
 from creatidy_kernel.core.forge import EffectStatus, Presence, Reference, UnsupportedForge
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
-from creatidy_kernel.ports.allocation import load_allocation
+from creatidy_kernel.ports.allocation import decode_runtime_receipt, identity_matches, load_allocation
 from creatidy_kernel.ports.application import Collection, advance_work_unit, manifest_bytes
 from creatidy_kernel.ports.forge import Forge
+from creatidy_kernel.ports.program_store import OperationRecord
 from creatidy_kernel.ports.resources import ResourceAllocator
 
 PROGRAM_ID = "task_execution"
@@ -874,6 +875,7 @@ class TaskChecks:
         fault: Callable[[str], None] | None = None,
         captured: dict[str, dict[str, object]] | None = None,
         command_environment: Mapping[str, str] | None = None,
+        authorized: Callable[[], bool] = lambda: True,
     ) -> None:
         self.store = store
         self.task = task
@@ -885,6 +887,7 @@ class TaskChecks:
         self.fault = fault
         self.captured = captured if captured is not None else {}
         self.command_environment = dict(command_environment or {})
+        self.authorized = authorized
         self._last_payload: dict[str, object] = {}
 
     def _evidence(self, name: str, subject: EvidenceSubject, passed: bool, payload: dict[str, object]) -> Evidence:
@@ -937,6 +940,8 @@ class TaskChecks:
             runs: list[dict[str, object]] = []
             for command in self.task.verification:
                 for repeat in range(1, command.repeats + 1):
+                    if not self.authorized():
+                        return self._evidence(name, subject, False, {"runs": runs, "reason": "authority unavailable"})
                     runs.append(_run_command(self.workspace, command, repeat, self.command_environment))
                     if self.fault is not None:
                         self.fault("verification")
@@ -1034,6 +1039,7 @@ class TaskCollector:
         fault: Callable[[str], None] | None = None,
         captured: dict[str, dict[str, object]] | None = None,
         command_environment: Mapping[str, str] | None = None,
+        authorized: Callable[[], bool] = lambda: True,
     ) -> None:
         self.store = store
         self.task = task
@@ -1044,6 +1050,7 @@ class TaskCollector:
         self.fault = fault
         self.captured = captured if captured is not None else {}
         self.command_environment = dict(command_environment or {})
+        self.authorized = authorized
 
     def runtime_candidate(self, request: ExecutionRequest) -> Candidate | None:
         try:
@@ -1117,6 +1124,7 @@ class TaskCollector:
                 fault=self.fault,
                 captured=self.captured,
                 command_environment=self.command_environment,
+                authorized=self.authorized,
             ),
         )
 
@@ -1251,6 +1259,7 @@ def run_task(
     command_environment: Mapping[str, str] | None = None,
     fault: str | None = None,
     cancel_requested: bool = False,
+    cancellation_requested: Callable[[], bool] | None = None,
 ) -> dict[str, object]:
     """Run or recover one frozen task through the bounded K1-K8 composition.
 
@@ -1285,12 +1294,28 @@ def run_task(
     lifecycle: list[str] = []
     captured: dict[str, dict[str, object]] = {}
 
+    def cancellation_requested_now() -> bool:
+        return cancel_requested or (cancellation_requested is not None and cancellation_requested())
+
     def crash(boundary: str) -> None:
         if fault == boundary:
             lifecycle.append(f"interrupted after {boundary}; rerun to reconcile")
             raise TaskInterrupted(f"interrupted after {boundary}; rerun to reconcile")
 
     with SQLiteProgramStore(directory / "kernel.sqlite3") as store:
+
+        def record_cancellation(attempt_id: str, operation_id: str) -> OperationRecord:
+            key = f"cancel:{attempt_id}"
+            try:
+                recorded = store.operation(key)
+            except OperationConflict as error:
+                if str(error) != "unknown operation":
+                    raise
+                return store.intent(key, key, {"operation": operation_id, "descendants": "unproven"})
+            if _request(store, key).get("operation") != operation_id:
+                raise ValueError("cancellation intent differs from original execution")
+            return recorded
+
         try:
             mode_recorded = _request(store, "task_execution:mode")
         except OperationConflict as error:
@@ -1352,7 +1377,7 @@ def run_task(
             deadline = recorded_deadline
         assert deadline is not None  # noqa: S101 - established by durable envelope validation.
         cancellation_id = f"cancel:{ATTEMPT_ID}"
-        cancellation_pending = cancel_requested
+        cancellation_pending = cancellation_requested_now()
         try:
             store.operation(cancellation_id)
             cancellation_pending = True
@@ -1376,6 +1401,14 @@ def run_task(
             store, directory, source_repository, task, lifecycle, attempt_exists=attempt_exists
         )
         crash("workspace-prepared")
+        if cancellation_requested_now():
+            cancellation_pending = True
+        if cancellation_pending:
+            # Runtime terminality is not task acceptance. Intent must survive even
+            # when no interrupt is needed, including cancellation during verification.
+            for attempt in program.attempts:
+                operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
+                record_cancellation(attempt.spec.attempt_id, operation.operation_id)
         status = "accepted"
         if program.state(UNIT_ID).status is not WorkUnitStatus.SATISFIED:
             lifecycle.append("allocation recovered from durable Attempt" if attempt_exists else "allocation selected")
@@ -1400,6 +1433,7 @@ def run_task(
                 fault=crash,
                 captured=captured,
                 command_environment=command_environment,
+                authorized=lambda: int(time.time()) < deadline and not cancellation_requested_now(),
             )
 
             def resolve(request: ExecutionRequest) -> CodexInputs:
@@ -1428,6 +1462,7 @@ def run_task(
                 operation = store.operation(request.operation.operation_id)
                 return (
                     int(time.time()) < deadline
+                    and not cancellation_requested_now()
                     and operation.status == "dispatched"
                     and operation.fence == request.fence
                     and operation.request_digest == request.operation.request_digest
@@ -1446,46 +1481,76 @@ def run_task(
             def restore(request: ExecutionRequest, handle: str) -> None:
                 runtime.restore(request, handle)
 
-            status = (
-                "cancel_uncertain"
-                if cancellation_pending
-                else advance_work_unit(
-                    store,
-                    program,
-                    UNIT_ID,
-                    allocator=resource_allocator,
-                    runtime=runtime,
-                    workspace=workspace_handle,
-                    collector=collector,
-                    policy=POLICY,
-                    now=int(time.time()),
-                    fault=crash,
-                    restore=restore,
-                    artifact_path=CANDIDATE_PATH,
-                    clock=lambda: int(time.time()),
-                    deadline=deadline,
+            try:
+                status = (
+                    "cancel_uncertain"
+                    if cancellation_pending
+                    else advance_work_unit(
+                        store,
+                        program,
+                        UNIT_ID,
+                        allocator=resource_allocator,
+                        runtime=runtime,
+                        workspace=workspace_handle,
+                        collector=collector,
+                        policy=POLICY,
+                        now=int(time.time()),
+                        fault=crash,
+                        restore=restore,
+                        artifact_path=CANDIDATE_PATH,
+                        clock=lambda: int(time.time()),
+                        deadline=deadline,
+                        cancel_requested=cancellation_requested_now,
+                    )
                 )
-            )
-            if (cancellation_pending or int(time.time()) >= deadline) and status != "accepted":
+            except (OSError, RuntimeError, ValueError):
+                if not cancellation_requested_now():
+                    raise
+                status = "cancel_uncertain"
+            cancellation_pending = cancellation_pending or cancellation_requested_now()
+            if cancellation_pending or (int(time.time()) >= deadline and status != "accepted"):
                 status = "expired" if int(time.time()) >= deadline else "cancel_uncertain"
                 program = store.load(PROGRAM_ID)
                 for attempt in program.attempts:
                     operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
+                    cancellation_id = f"cancel:{attempt.spec.attempt_id}"
+                    cancellation = record_cancellation(attempt.spec.attempt_id, operation.operation_id)
                     if operation.status == "terminal":
                         if int(time.time()) < deadline:
                             status = "cancelled"
                         continue
-                    handle = operation.accepted_reference
-                    cancellation_id = f"cancel:{attempt.spec.attempt_id}"
-                    cancellation = store.intent(
-                        cancellation_id,
-                        cancellation_id,
-                        {"operation": operation.operation_id, "handle": handle, "descendants": "unproven"},
-                    )
-                    if handle is None:
-                        lifecycle.append("expired; cancellation target unknown; no interrupt issued")
-                        continue
                     selected = load_allocation(store, attempt.spec)
+                    handle = operation.accepted_reference
+                    receipt_data = store.find_artifact(operation.operation_id, "runtime-receipt")
+                    if receipt_data is not None:
+                        receipt_handle, receipt_fence, receipt_identity = decode_runtime_receipt(receipt_data)
+                        if (
+                            receipt_fence != operation.fence
+                            or handle not in {None, receipt_handle}
+                            or not identity_matches(
+                                receipt_identity,
+                                selected,
+                                str(attempt.spec.agent_definition_reference),
+                                require_resolved=False,
+                            )
+                        ):
+                            raise ValueError("cancellation receipt differs from original execution")
+                        if handle is None:
+                            if operation.status not in {"dispatched", "unknown"} or operation.retry_proof is not None:
+                                raise ValueError("cancellation receipt has no original delivery")
+                            store.record_transport(operation.operation_id, receipt_fence, True)
+                            operation = store.observe(
+                                operation.operation_id,
+                                receipt_fence,
+                                f"accepted:{receipt_handle}",
+                                "accepted",
+                                reference=receipt_handle,
+                            )
+                        handle = receipt_handle
+                        store.finalize_artifact(cancellation_id, "target", receipt_data)
+                    if handle is None:
+                        lifecycle.append("cancellation target unknown; no interrupt issued")
+                        continue
                     request = ExecutionRequest(
                         OperationKey(operation.operation_id, operation.effect_key, operation.request_digest),
                         attempt.spec,
@@ -1541,6 +1606,11 @@ def run_task(
             elif status in {"unknown", "waiting", "running"}:
                 lifecycle.append("runtime active or reconciling; preserve owned connection and original envelope")
             program = store.load(PROGRAM_ID)
+        if cancellation_requested_now() and not cancellation_pending:
+            cancellation_pending = True
+            for attempt in program.attempts:
+                operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
+                record_cancellation(attempt.spec.attempt_id, operation.operation_id)
         if program.state(UNIT_ID).status is WorkUnitStatus.SATISFIED:
             if cancellation_pending or int(time.time()) >= deadline:
                 result = export_task_store(store)

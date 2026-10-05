@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bounded task composition proof: real Git fixtures, native-shaped fakes, no paid calls."""
 
+import inspect
 import json
 import os
 import sys
@@ -230,6 +231,8 @@ def run(
     allocator: ResourceAllocator | None = None,
     supported_efforts: frozenset[tuple[str, str, str]] = frozenset(),
     fault: str | None = None,
+    cancel_requested: bool = False,
+    cancellation_requested: Callable[[], bool] | None = None,
 ) -> dict[str, object]:
     if forge is None:
         forge, _transport = make_forge(base or "0" * 40)
@@ -247,6 +250,8 @@ def run(
         forge_factory=lambda _directory: forge,
         supported_efforts=supported_efforts,
         fault=fault,
+        cancel_requested=cancel_requested,
+        cancellation_requested=cancellation_requested,
     )
 
 
@@ -260,6 +265,86 @@ def test_recovery_refuses_changed_runtime_version(sqlite_tmp_path: Path) -> None
     with pytest.raises(ValueError, match="envelope"):
         run(control, source, connection)
     assert connection.starts == 1
+
+
+def test_cancellation_after_terminal_verification_is_durable(sqlite_tmp_path: Path) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    connection = FixtureConnection(deflake_edit)
+    with pytest.raises(TaskInterrupted):
+        run(control, source, connection, fault="verification")
+    cancelled = run(control, source, connection, cancel_requested=True)
+    assert cancelled["condition"] == "cancelled"
+    assert "cancellation" in cancelled
+    recovered = run(control, source, connection)
+    assert recovered["condition"] == "cancelled"
+    assert "acceptance" not in recovered
+    assert "pr" not in recovered
+    assert connection.starts == 1
+
+
+def test_cancellation_during_verification_stops_further_commands(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from creatidy_kernel.adapters import task_execution
+
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    requested = [False]
+    calls: list[tuple[str, ...]] = []
+    original = cast(
+        "Callable[[Path, VerificationCommand, int, Mapping[str, str]], dict[str, object]]",
+        inspect.getattr_static(task_execution, "_run_command"),
+    )
+
+    def interrupt_after_command(
+        workspace: Path, command: VerificationCommand, repeat: int, supplied: Mapping[str, str]
+    ) -> dict[str, object]:
+        result = original(workspace, command, repeat, supplied)
+        calls.append(command.argv)
+        requested[0] = True
+        return result
+
+    monkeypatch.setattr(task_execution, "_run_command", interrupt_after_command)
+    result = run(control, source, FixtureConnection(deflake_edit), cancellation_requested=lambda: requested[0])
+    assert result["condition"] == "cancelled"
+    assert "cancellation" in result
+    assert "acceptance" not in result
+    assert "pr" not in result
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("fault", ["receipt-evidence", "receipt"])
+def test_cancel_recovers_original_durable_receipt(sqlite_tmp_path: Path, fault: str) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+
+    class Interrupted(FixtureConnection):
+        interrupts = 0
+
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            if method == "turn/interrupt":
+                assert params == {"threadId": "thread-1", "turnId": "turn-1"}
+                self.interrupts += 1
+                self.status = "interrupted"
+                return {}
+            return super().request(method, params)
+
+    connection = Interrupted(deflake_edit)
+    connection.status = "inProgress"
+    with pytest.raises(TaskInterrupted):
+        run(control, source, connection, fault=fault)
+    cancelled = run(control, source, connection, cancel_requested=True)
+    assert cancelled["condition"] == "cancelled"
+    assert run(control, source, connection)["condition"] == "cancelled"
+    assert connection.interrupts == connection.starts == 1
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        operation = store.operation("runtime:task_execution:change")
+        assert operation.accepted_reference == "codex:thread-1:turn-1"
+        assert operation.status == "terminal"
+        assert store.artifact("cancel:task_execution:change", "target") == store.artifact(
+            operation.operation_id, "runtime-receipt"
+        )
 
 
 def test_failed_terminal_without_candidate_finishes_attempt(sqlite_tmp_path: Path) -> None:

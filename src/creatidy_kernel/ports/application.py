@@ -84,6 +84,7 @@ def advance_work_unit(
     artifact_path: str = "result.txt",
     clock: Callable[[], int] | None = None,
     deadline: int | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> str:
     """Perform at most one dispatch/observation, never retry an uncertain effect blindly.
 
@@ -97,6 +98,8 @@ def advance_work_unit(
     attempt_id = f"{program.program_id}:{unit_id}"
     operation_id = f"runtime:{attempt_id}"
     if not any(item.spec.attempt_id == attempt_id for item in program.attempts):
+        if cancel_requested is not None and cancel_requested():
+            return "cancel_requested"
         if deadline is not None and decision_clock() >= deadline:
             return "expired"
         allocation = allocator.select(ResourceRequest(unit_id, frozenset({"reference"}), 128))
@@ -310,12 +313,14 @@ def advance_work_unit(
         )
     if observation.activity is not Activity.TERMINAL:
         return observation.activity.value
-    candidate = runtime.candidate(handle)
+    candidate = None if cancel_requested is not None and cancel_requested() else runtime.candidate(handle)
     if program.attempt(attempt_id).status is AttemptStatus.EXECUTING:
         store.observe(operation_id, operation.fence, f"terminal:{operation_id}", "terminal", reference=handle)
         program = store.admit(
             program.program_id, f"finish:{attempt_id}", FinishAttempt(program.revision, "worker", attempt_id)
         )
+    if cancel_requested is not None and cancel_requested():
+        return "cancel_requested"
     if candidate is None:
         return "terminal_no_candidate"
     if deadline is not None and decision_clock() >= deadline:
@@ -350,6 +355,8 @@ def advance_work_unit(
         )
         return "rejected"
     accepted_at = decision_clock()
+    if cancel_requested is not None and cancel_requested():
+        return "cancel_requested"
     if deadline is not None and accepted_at >= deadline:
         return "expired"
     admit_accepted(
