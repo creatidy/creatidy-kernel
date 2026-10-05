@@ -22,6 +22,13 @@
   decision arises for selected work, STOP_AND_ASK terminates the entire loop.
   Preserve STOP_REVISE dispositions; an open PR cannot authorize restarting them.
   No issue registration is authorized merely to keep `/loop` running.
+- Before substantive delivery, apply loop.md's post-selection eligibility revalidation.
+  A freshly proven missing prerequisite/producer/contract makes an untouched issue
+  temporarily ineligible: retain history/counters, keep it open, safely return to
+  clean develop and rebuild the full canonical queue; continue SELECT nonterminally.
+  All-gated queues yield QUEUE_EMPTY. Existing implementation commits/current PRs/
+  substantive changes require preservation, not silent de-selection. Genuine new
+  owner decisions still stop; eligible-issue execution failures use bounded recovery.
 - Verify the canonical remote, fetch current `develop`, record its exact SHA and
   inspect files/status/branches. Demonstrate access by successful operations.
   Use one normal checkout by default and only one mutator per checkout. A specific
@@ -61,6 +68,11 @@
   In `/loop` map OWNER_DECISION_NEEDED to STOP_AND_ASK; stop, never skip selected work.
 
 ## Blocker Classification and Remediation
+
+For `/loop`, apply post-selection eligibility revalidation before escalation:
+confirmed pre-implementation issue gates return nonterminal SELECT, not BLOCKED.
+Unavailable inspection is not proof of a gate; recover the tool/access first.
+Existing delivery and genuine new owner decisions retain their normal protections.
 
 - A blocker is not automatically an owner decision. Class-A engineering/execution
   blockers include missing reviewer tools/runtime, secret-contaminated ambient
