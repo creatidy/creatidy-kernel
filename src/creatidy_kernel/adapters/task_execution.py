@@ -82,7 +82,12 @@ from creatidy_kernel.core.execution import (
 from creatidy_kernel.core.forge import EffectStatus, Presence, Reference, UnsupportedForge
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
-from creatidy_kernel.ports.allocation import decode_runtime_receipt, identity_matches, load_allocation
+from creatidy_kernel.ports.allocation import (
+    decode_runtime_receipt,
+    encode_allocation,
+    identity_matches,
+    load_allocation,
+)
 from creatidy_kernel.ports.application import Collection, advance_work_unit, manifest_bytes
 from creatidy_kernel.ports.forge import Forge
 from creatidy_kernel.ports.program_store import OperationRecord
@@ -1375,7 +1380,11 @@ def run_task(
                     "repository": task.forge_repository,
                     "source": str(source_repository),
                     **(
-                        {"model": allocation.model_id, "provider": allocation.provider_id}
+                        {
+                            "model": allocation.model_id,
+                            "provider": allocation.provider_id,
+                            "fixed_allocation": encode_allocation(allocation).decode(),
+                        }
                         if allocation is not None
                         else {"allocator": "external"}
                     ),
@@ -1386,6 +1395,17 @@ def run_task(
             raise ValueError("durable task mode belongs to a different frozen task")
         else:
             task = _recover_task_pin(task, mode_recorded)
+            if allocation is not None:
+                fixed_binding = mode_recorded.get("fixed_allocation")
+                if fixed_binding is None:
+                    historical = store.load(PROGRAM_ID)
+                    if not any(item.spec.attempt_id == ATTEMPT_ID for item in historical.attempts):
+                        raise ValueError("original fixed allocation unavailable in legacy envelope")
+                    fixed_binding = encode_allocation(
+                        load_allocation(store, historical.attempt(ATTEMPT_ID).spec)
+                    ).decode()
+                if fixed_binding != encode_allocation(allocation).decode():
+                    raise ValueError("recovery differs from original fixed allocation envelope")
             recorded_deadline = mode_recorded.get("deadline")
             if (
                 type(recorded_deadline) is not int

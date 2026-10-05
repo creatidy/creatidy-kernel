@@ -268,6 +268,39 @@ def test_recovery_refuses_changed_runtime_version(sqlite_tmp_path: Path) -> None
     assert connection.starts == 1
 
 
+def test_fixed_effort_cannot_change_before_attempt_preparation(sqlite_tmp_path: Path) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    connection = FixtureConnection(deflake_edit, effort="low")
+    supports = frozenset({("zai", "glm-5.3", "low"), ("zai", "glm-5.3", "high")})
+    with pytest.raises(TaskInterrupted):
+        run(
+            control,
+            source,
+            connection,
+            allocation=EFFORT_ALLOCATION,
+            supported_efforts=supports,
+            fault="workspace-prepared",
+        )
+    high = Allocation(
+        EFFORT_ALLOCATION.runtime_id,
+        EFFORT_ALLOCATION.provider_id,
+        EFFORT_ALLOCATION.model_id,
+        EFFORT_ALLOCATION.capabilities,
+        EFFORT_ALLOCATION.context_tokens,
+        EFFORT_ALLOCATION.rationale,
+        "high",
+    )
+    with pytest.raises(ValueError, match="fixed allocation envelope"):
+        run(control, source, connection, allocation=high, supported_efforts=supports)
+    assert connection.starts == 0
+    assert (
+        run(control, source, connection, allocation=EFFORT_ALLOCATION, supported_efforts=supports)["condition"]
+        == "accepted"
+    )
+    assert connection.starts == 1
+
+
 @pytest.mark.parametrize("before_allocation", [False, True])
 def test_cancel_before_attempt_is_stable_without_dispatch(sqlite_tmp_path: Path, before_allocation: bool) -> None:
     source = make_source(sqlite_tmp_path)
