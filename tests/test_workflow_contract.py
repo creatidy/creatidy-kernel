@@ -81,7 +81,8 @@ class WorkflowContractTests(unittest.TestCase):
             "exact expected HEAD/base",
             "independently",
             "synthetic fixture values",
-            "never mount SSH/cloud/provider/model/Forge/browser credential directories",
+            "never read the contents of `.env*` files or mount",
+            "SSH/cloud/provider/model/Forge/browser credential directories",
             "exact cited pinned revision independently",
             "Infrastructure failure consumes the reserved review ordinal",
             "Distinguish it from actionable implementation findings",
@@ -274,14 +275,17 @@ class WorkflowContractTests(unittest.TestCase):
             "mode: subagent\nmodel: openai/gpt-6.1-sol\nvariant: high\n",
             'permission:\n  "*": deny\n',
             '  read:\n    "*": allow\n    "*.env*": deny\n    "*.task_progress.md": deny\n',
-            "  external_directory: deny\n  edit: deny\n  write: deny\n  apply_patch: deny\n  task: deny\n",
+            '  external_directory:\n    "/home/adrian/workspace/creatidy/creatidy-kernel-*/**": allow\n    "*": deny\n',
+            "  edit: deny\n  write: deny\n  apply_patch: deny\n  task: deny\n",
             '  bash:\n    "*": deny\n',
         ):
             self.assertIn(requirement, reviewer)
         self.assertIn('    "env -i HOME=/tmp PATH=', reviewer)
+        self.assertIn('"git -C /home/adrian/workspace/creatidy/creatidy-kernel-* status --short": allow', reviewer)
+        self.assertIn("Never read the contents of `.env*` files", text(".kilo/agents/pr-reviewer.md"))
+        prefix = "UV_OFFLINE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1"
         for check in ("make check", "make package-check"):
             with self.subTest(sanitized_check=check):
-                self.assertRegex(
-                    reviewer,
-                    rf'UV_OFFLINE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 {re.escape(check)}": allow',
-                )
+                command = check.removeprefix("make ")
+                permission = f'{prefix} make -C /home/adrian/workspace/creatidy/creatidy-kernel-* {command}": allow'
+                self.assertIn(permission, reviewer)
