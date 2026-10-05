@@ -24,7 +24,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Mapping
-from contextlib import closing
+from contextlib import ExitStack, closing
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
@@ -1300,7 +1300,7 @@ def run_task(
             lifecycle.append(f"interrupted after {boundary}; rerun to reconcile")
             raise TaskInterrupted(f"interrupted after {boundary}; rerun to reconcile")
 
-    with SQLiteProgramStore(directory / "kernel.sqlite3") as store:
+    with SQLiteProgramStore(directory / "kernel.sqlite3") as store, ExitStack() as cleanup:
 
         def record_cancellation(attempt_id: str, operation_id: str) -> OperationRecord:
             key = f"cancel:{attempt_id}"
@@ -1385,6 +1385,17 @@ def run_task(
                 raise UnsupportedExecution("recovery requires original trusted support evidence")
             deadline = recorded_deadline
         assert deadline is not None  # noqa: S101 - established by durable envelope validation.
+        if isinstance(connection, CodexStdio):
+            previous_before_close = connection.before_close
+
+            def before_owned_close() -> None:
+                if cancellation_requested_now() or int(time.time()) >= deadline:
+                    record_cancellation(ATTEMPT_ID, OPERATION_ID)
+                if previous_before_close is not None:
+                    previous_before_close()
+
+            connection.before_close = before_owned_close
+            cleanup.callback(setattr, connection, "before_close", previous_before_close)
         cancellation_id = f"cancel:{ATTEMPT_ID}"
         cancellation_pending = cancellation_requested_now()
         try:

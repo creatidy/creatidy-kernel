@@ -13,7 +13,7 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
 
@@ -23,6 +23,10 @@ class CodexRPCError(RuntimeError):
 
 
 class CodexStdio:
+    # The active controller can journal pending cancellation before pipe failure
+    # causes owned process cleanup, without reopening its exclusively held store.
+    before_close: Callable[[], None] | None = None
+
     def __init__(
         self,
         command: tuple[str, ...],
@@ -301,9 +305,13 @@ class CodexStdio:
             return messages
 
     def _close_unlocked(self) -> None:
-        process, self._process = self._process, None
-        if process is not None:
-            self._stop(process)
+        try:
+            if self.before_close is not None:
+                self.before_close()
+        finally:
+            process, self._process = self._process, None
+            if process is not None:
+                self._stop(process)
 
     def close(self) -> None:
         with self._lock:
