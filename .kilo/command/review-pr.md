@@ -12,17 +12,26 @@ open, unmerged canonical Creatidy/creatidy-kernel PR targeting `develop`.
 Read AGENTS.md and its rules, verify canonical remote, fetch current Git objects,
 freeze exact HEAD/base/merge-base and inspect status/branches. Do not edit the PR.
 
-Use ONE normal checkout: safely switch to the fetched PR branch if needed, creating
-its local tracking branch at fetched HEAD only if absent. Require clean status and
-exact frozen HEAD; refuse local divergence rather than rewriting a branch.
-Never stash/reset unrelated changes;
-if they prevent safe switching, report a precise blocker. No git worktree,
-additional checkout or alternate checkout management. Prepare the offline locked
-environment for required `make check` and `make package-check` here; review frozen
-Git objects/current clean branch read-only. The
-parent must not edit/switch while the reviewer is active. Locate `pr-reviewer`.
-If native task/agent or required access is unavailable, report a finite blocker;
-never self-review instead.
+Use the current clean checkout when safe. If switching would disturb another active
+checkout, use one owner-authorized isolated temporary worktree and record it; do not
+stash/reset unrelated work. Freeze exact HEAD/base/merge-base and refuse divergence.
+Prepare the existing offline locked environment for required `make check` and
+`make package-check`. Before tests/tools that observe inherited state, construct a
+closed environment with only deliberate synthetic values and minimum operational
+variables; do not expose ambient secrets or mount credential directories. Reviewers
+inspect frozen objects read-only and never mutate the delivery. The parent must not
+edit the reviewed checkout while the reviewer is active.
+
+Classify missing task/agent/tool/runtime, public-source access, dependency, filesystem,
+environment or test-execution capabilities as review infrastructure failures, not
+findings or owner decisions. Diagnose and change the execution condition before a new
+attempt: for example use a sanitized environment, synthetic HOME/cache/temp, clean
+ephemeral container when suitable, exact pinned public source checkout, split source
+inspection from test execution, or another authorized independent reviewer path.
+Do not weaken isolation, permissions, validation, exact-HEAD checks or independence;
+never self-review. Return a precise BLOCKED only after no authorized alternative
+remains, without an artificial owner question. Distinguish this from findings and
+evidence-backed reviewer judgment uncertainty.
 
 Invoke `task` with `subagent_type: pr-reviewer`, `background: false`, no `task_id`.
 Pass only the PR number/URL, expected HEAD/base and fresh whole-PR review

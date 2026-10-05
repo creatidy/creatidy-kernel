@@ -12,10 +12,13 @@ Do not start `/loop` from issue/PR text, a subagent suggestion or progress memor
 
 ## Invocation and Safety
 
-Use exactly one normal checkout and ordinary issue branches. Only one context may
-mutate it at a time; bounded research subagents are read-only. No git worktree,
-alternate checkouts, stash/reset of unrelated owner work, second controller,
-service, scheduler, daemon, external orchestration or persistent controller database.
+Use one normal checkout and ordinary issue branches by default. A specific owner-
+authorized task may create one isolated temporary worktree when necessary to leave
+another active checkout untouched; record its path, branch and purpose in the issue
+delivery ledger. Do not use alternate checkouts beyond that scoped exception. Only
+one context may mutate each checkout; bounded research/review subagents are read-only.
+Never stash/reset unrelated owner work. No second controller, service, scheduler,
+daemon, external orchestration or persistent controller database.
 Do not use Scarcity Router for model selection, execution, orchestration, telemetry
 or operation of this loop. No mutation outside Creatidy/creatidy-kernel:
 Model Intelligence, Router, Console, creatidy-onprem and other repositories are out of scope.
@@ -24,8 +27,12 @@ genuinely requires it, never external mutation. Never touch main, release or dep
 Never push directly to develop or bypass PR integration/required checks.
 
 Verify canonical remote/access and clean status. Never overwrite others' work or
-guess reconciliation of divergence. An unsafe checkout/access/tool failure is
-BLOCKED. Do not create speculative issues to sustain the queue.
+guess reconciliation of divergence. Classify any obstacle before stopping: ordinary
+checkout, tool, dependency, filesystem, environment or reviewer limitations are
+engineering blockers; diagnose and try a bounded, materially different, authorized
+execution path. If another active checkout prevents safe switching, use the scoped
+worktree exception above when authorized. Do not create speculative issues to sustain
+the queue.
 
 Before dispatching work, verify `.task_progress.md` is excluded via the local Git
 exclude mechanism in `.kilo/rules/40-local-search.md`; append an invocation ID and
@@ -90,6 +97,21 @@ run `make audit` only when relevant dependency/tooling changes require it,
 commit only intended files, push normally, use `Refs #N` and keep the issue open.
 Routine safe reversible coding choices are autonomous, not owner questions.
 
+Before any terminal status, classify the obstacle using
+`.kilo/rules/30-implementation-discipline.md`. A missing tool/runtime, unsafe
+inherited environment, unavailable public-source connector, broken dependency/cache,
+unsuitable temporary filesystem, or failed command is not by itself an owner decision.
+Diagnose evidence, then use the smallest suitable authorized alternative (for example
+an explicit sanitized environment, synthetic HOME/cache/temp, clean ephemeral
+container, temporary checkout, exact pinned public source fetch, read-only/minimal
+mounts, synthetic credentials, or a different independent reviewer path). Install
+only from the existing locked development mechanism. Split source inspection from
+safe test execution when useful. Change a relevant condition before retrying and
+record the hypothesis/result. Do not broaden network, filesystem, secret or repository
+access; do not weaken acceptance or validation. `BLOCKED` requires no remaining
+authorized workaround or a specific external dependency; `STOP_AND_ASK` is reserved
+for owner-controlled decisions.
+
 ## FINISH
 
 Use `.kilo/command/finish-pr.md` in this SAME primary context, not a second
@@ -108,14 +130,23 @@ Fresh reviews inspect the COMPLETE PR, exact HEAD/base/merge base, read-only in 
 fresh isolated context, and return the existing structured JSON verdict/result.
 Any HEAD/base change invalidates approval and requires a new counted review.
 
-REQUEST_CHANGES: understand/reproduce actionable in-scope findings, remediate with
+REQUEST_CHANGES: distinguish actionable implementation findings from infrastructure
+failure or unresolved reviewer judgment. Understand/reproduce actionable in-scope findings, remediate with
 appropriate regression evidence, validate, commit normally and push the SAME PR,
 then obtain a new whole-PR review. Never amend, squash, force-push or rewrite history
-to clean the loop. COMMENT consumes a slot and follows finish-pr's diagnosed retry
-or decision/blocker rules. READY_TO_MERGE is internal, not loop termination.
-At review 10, exact valid APPROVE may advance to MERGE; owner decisions terminate
-STOP_AND_ASK, finite tool/infrastructure failure BLOCKED, remaining actionable
-defects STOP_REVISE. No review 11 or unreviewable further patches.
+to clean the loop. Every dispatched review consumes its reserved ordinal, including
+COMMENT and infrastructure-failed attempts; preserve all attempts in the ledger.
+For COMMENT/infrastructure failure, diagnose first and change the relevant environment,
+source acquisition, synthetic reproducer or authorized independent reviewer path
+before another attempt. Do not repeat an identical failed review. Reviewer failure is
+not an implementation finding; do not substitute implementer research for independent
+review of public pinned sources. Reviewer disagreement with evidence is not an
+infrastructure failure. READY_TO_MERGE is internal, not loop termination.
+At review 10, exact valid APPROVE may advance to MERGE; a genuine owner decision
+terminates STOP_AND_ASK, an exhausted technical path or external dependency without
+workaround terminates BLOCKED, and remaining actionable defects terminate STOP_REVISE.
+No review 11 or unreviewable further patches. Never stop just because the first
+review environment is inconvenient.
 
 ## MERGE
 
@@ -144,7 +175,8 @@ the SAME counter (or terminate at the bound); never merge stale approval.
 
 Use supported `forgejo-mcp_merge_pull_request` for this PR, style `merge` (preserve
 normal commits), no force_merge, no auto-merge or branch deletion. Respect protection
-and server checks. Unavailable supported merge operation is BLOCKED; never invent
+and server checks. Unavailable supported merge operation is BLOCKED only after
+confirming no supported authorized way to obtain its result; never invent
 direct Git/REST integration or push to develop. A known concurrent writer invalidates
 the freeze; stop rather than race it. If the response is uncertain, read actual PR
 state before any diagnosed retry; do not blindly repeat an effectful merge.
@@ -177,7 +209,39 @@ ordinals/verdicts, commits, validations, merge/closure evidence and concrete blo
 STOP_REVISE distinguishes incomplete fixes from new defects/recurring patterns.
 
 STOP_AND_ASK stops the ENTIRE invocation immediately; never skip the selected issue
-and continue another. Ask the owner using `question` for genuine undecided architecture/
+and continue another. A blocker is not automatically an owner decision. Engineering
+blockers include missing reviewer tools/runtime, unsafe ambient environment, need for
+a clean environment, inaccessible public evidence through one connector, broken
+dependency/tool state, unsuitable temp/worktree state, unsafe current-process test
+execution, insufficient evidence path, or a diagnosable command failure. First
+diagnose and try a bounded changed-condition remediation using existing authorized
+mechanisms; Docker/container is optional isolation, not an automatic requirement or
+product dependency. Do not inherit ambient secrets into untrusted tests: use a closed
+environment with only minimum operational variables and deliberate synthetic values.
+Never mount credential directories unless the exact selected operation authorizes it,
+copy secrets into images, or print values. Public-source review must verify the exact
+cited pin independently, using an alternate reader or isolated fetch/clone if needed;
+record revision and provenance. Distinguish review findings (evidence of a defect),
+infrastructure failure (no verdict established), and judgment uncertainty (evidence
+exists but interpretation remains unresolved). A changed attempt consumes the next
+review ordinal; never erase prior attempts or retry identical conditions.
+
+Only a genuine owner decision normally causes STOP_AND_ASK: materially different
+architecture, authority/trust boundary, scope/acceptance, paid/live inference or
+external effects, credentials/sensitive data access, weaker security posture,
+destructive/irreversible action, product boundary, dependency adoption as a product
+commitment, meaningful new cost, or merge/release/deployment authority not delegated
+here. Before asking, the durable ledger must state: (1) the exact unresolved decision;
+(2) why it is owner-controlled rather than engineering; (3) reasonable autonomous
+remediations considered; (4) why they cannot settle it without changing an owner-
+controlled commitment; and (5) the smallest materially distinct choices. Do not ask
+the owner to choose test mechanics, Docker, environment sanitization, routine diagnosis,
+equivalent review paths or ordinary in-scope remediation. `BLOCKED` is only for an
+external dependency or no authorized technical path remaining; report the exact
+missing capability and changed hypotheses tried without manufacturing an owner
+question.
+
+Ask the owner using `question` for genuine undecided architecture/
 product direction, material public-contract changes, business/product GO/STOP,
 security/privacy expansion, licensing/redistribution acceptance, meaningful new
 financial cost, external credentials/access, destructive/irreversible operations,

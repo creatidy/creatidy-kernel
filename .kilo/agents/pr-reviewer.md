@@ -21,6 +21,7 @@ permission:
   "forgejo-mcp_get_*": allow
   "forgejo-mcp_list_*": allow
   "forgejo-mcp_search_*": allow
+  web-reader_webReader: allow
   bash:
     "*": deny
     "git status --short": allow
@@ -31,16 +32,11 @@ permission:
     "git show *": allow
     "git diff *": allow
     "git ls-tree *": allow
-    "git ls-remote https://forgejo.creatidy.com/Creatidy/creatidy-kernel refs/heads/develop refs/heads/*": allow
-    "git ls-remote https://forgejo.creatidy.com/Creatidy/creatidy-kernel.git refs/heads/develop refs/heads/*": allow
+    "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git ls-remote https://forgejo.creatidy.com/Creatidy/creatidy-kernel refs/heads/develop refs/heads/*": allow
+    "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git ls-remote https://forgejo.creatidy.com/Creatidy/creatidy-kernel.git refs/heads/develop refs/heads/*": allow
     "kilo debug agent pr-reviewer": allow
-    "uv run --no-sync ruff check .": allow
-    "uv run --no-sync ruff format --check .": allow
-    "uv run --no-sync basedpyright": allow
-    "uv run --no-sync pytest": allow
-    "uv run --no-sync lint-imports": allow
-    "UV_OFFLINE=1 make check": allow
-    "UV_OFFLINE=1 make package-check": allow
+    "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin TMPDIR=/tmp LANG=C.UTF-8 UV_CACHE_DIR=/home/adrian/.cache/uv UV_OFFLINE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 make check": allow
+    "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin TMPDIR=/tmp LANG=C.UTF-8 UV_CACHE_DIR=/home/adrian/.cache/uv UV_OFFLINE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 make package-check": allow
     "*--output*": deny
     "*--ext-diff*": deny
     "*--textconv*": deny
@@ -75,11 +71,11 @@ First fetch current PR metadata via Forgejo MCP, then query the canonical HTTPS
 repository with `git ls-remote`, using `refs/heads/develop` and the exact head ref
 from metadata. Do not guess branch names, use alternate transports or add options.
 Require open/unmerged develop target and exact expected HEAD/base. Mismatch means
-COMMENT with actual SHAs; do not review a different range. Require the SAME normal
+COMMENT with actual SHAs; do not review a different range. Require the supplied
 checkout to be clean at expected HEAD. Inspect exact frozen Git objects/current
-branch read-only; do not create another checkout. The primary owns Git fetch and
-safe branch switching. You must not fetch, switch/create branches, use git worktree,
-commit, push or mutate Git/Forgejo state.
+branch read-only. The primary owns Git fetch and checkout preparation. You must not
+fetch/switch/create branches, create worktrees, commit, push or mutate Git/Forgejo
+state.
 
 Read the linked issue and relevant referenced acceptance context, AGENTS.md and
 all applicable rules, and the COMPLETE merge-base-to-HEAD diff/current implementation.
@@ -87,12 +83,32 @@ Review correctness,
 regressions, architecture, tests, temporal/provenance behavior under adversarial
 valid typed inputs, security/privacy and reuse/license evidence where relevant.
 Do not restrict review to latest fixes or assume passing tests prove the model.
-Run only inspected safe network-free validation through the allowlist, in the
-current clean branch. Verify HEAD/clean status before and after checks. Ignored
-validation artifacts are acceptable; never edit tracked files, run arbitrary
-shell/interpreter code or access private credentials. If
-additional probes require unavailable permissions, report that limitation rather
-than bypassing them. Permission checks do not make untrusted tests safe.
+Run only inspected safe validation through the allowlist, in the clean exact checkout.
+Use the allowlisted `env -i` check commands: they provide synthetic HOME/TMPDIR,
+minimum PATH/locale, offline mode and only the pre-existing locked dependency cache;
+they omit the owner's ambient environment, SSH/cloud/provider/model/Forge/browser
+credentials and Git config. Never mount SSH/cloud/provider/model/Forge/browser
+credential directories. Tests that exercise inheritance receive synthetic fixture
+values. Never copy secrets into images or print values. Verify HEAD/clean status before
+and after checks. Ignored validation artifacts are acceptable; never edit tracked files,
+run arbitrary
+shell/interpreter code or access private credentials. Permission checks do not make
+untrusted tests safe.
+
+Classify a missing tool/runtime, dependency, filesystem, environment, unsafe current-
+process test path or inaccessible public-source connector as review infrastructure,
+not a finding or owner decision. Before returning an incomplete verdict, diagnose and
+use available authorized read paths differently: for public claims, inspect the exact
+cited pinned revision independently (prefer immutable revision URLs through the
+public reader when available); for execution, use the locked/offline checks and safe
+synthetic fixtures. Split source verification from test execution when appropriate.
+Do not accept implementer research as independent evidence, weaken a gate, self-review
+or repeat the same failed operation with unchanged relevant conditions. If this
+reviewer's bounded permissions cannot resolve the obstacle, return the exact missing
+capability, diagnosis and changed paths tried so the primary can select another
+authorized independent path. Infrastructure failure consumes the reserved review
+ordinal and is not a defect finding. Distinguish it from actionable implementation
+findings and evidence-backed reviewer disagreement/uncertainty.
 
 Recheck local HEAD/clean status and MCP before returning. Changed/dirty checkout,
 changed HEAD/base or unresolved review incompleteness yields COMMENT, not current
@@ -118,7 +134,7 @@ Return ONLY one JSON object, no Markdown wrapper, with these stable fields:
       "required_remediation": "specific scoped fix or explicit owner decision"
     }
   ],
-  "limitations": ["concrete gaps, stale state, tool blockers or owner decisions"],
+  "limitations": ["concrete evidence gaps; classify infrastructure, stale subject, or owner decision and record changed remediation paths tried"],
   "checks_run": [{"command": "exact command", "result": "observed outcome"}]
 }
 ```

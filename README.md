@@ -92,9 +92,10 @@ implementation requires one owner-selected issue; review is read-only and finish
 bounded remediation without merging. Only an explicit owner `/loop` invocation delegates
 fresh canonical issue selection, independent review, approved Forgejo PR merge into `develop`,
 verified acceptance/issue closure and continuation. The primary context is the sole orchestrator
-in one normal checkout, with a locally excluded delivery ledger and at most ten whole-PR reviews
-per issue delivery. No worktrees, external controller, cross-repository mutation or Scarcity Router
-operation is used for this development workflow. It does not implement the product runtime,
+in one normal checkout by default, with a locally excluded delivery ledger and at most ten whole-PR
+reviews per issue delivery. A specific owner-authorized task may use an isolated temporary worktree
+to preserve another active checkout. No external controller, cross-repository mutation or Scarcity
+Router operation is used for this development workflow. It does not implement the product runtime,
 authorize product GO, touch `main`, release or deploy. A workspace reload may be needed to load
 changed commands or the read-only `pr-reviewer` agent.
 
