@@ -21,6 +21,7 @@ from creatidy_kernel.core.execution import (
     Activity,
     ArtifactManifest,
     Candidate,
+    ExecutionConflict,
     ExecutionRequest,
     OperationKey,
     Presence,
@@ -66,7 +67,7 @@ def terminal_outcome(store: ApplicationStore, attempt: AttemptSpec, operation: O
     disposition = value.get("candidate")
     if (
         type(disposition) is not str
-        or disposition not in {"absent", "present", "not_requested"}
+        or disposition not in {"absent", "present", "not_requested", "unknown"}
         or value
         != {
             "version": 1,
@@ -206,15 +207,25 @@ def advance_work_unit(
             operation = store.observe(
                 operation_id, receipt_fence, f"accepted:{receipt_handle}", "accepted", reference=receipt_handle
             )
+    candidate_status = terminal_outcome(store, attempt, operation)
+    if candidate_status is not None and operation.status != "terminal":
+        if operation.status != "accepted" or operation.accepted_reference is None:
+            raise ValueError("terminal outcome has no matching accepted runtime")
+        operation = store.observe(
+            operation_id,
+            operation.fence,
+            f"terminal:{operation_id}",
+            "terminal",
+            reference=operation.accepted_reference,
+        )
     if operation.status == "terminal":
-        candidate_status = terminal_outcome(store, attempt, operation)
         if program.attempt(attempt_id).status is AttemptStatus.EXECUTING:
             program = store.admit(
                 program.program_id, f"finish:{attempt_id}", FinishAttempt(program.revision, "worker", attempt_id)
             )
         if candidate_status == "absent":
             return "terminal_no_candidate"
-        if candidate_status is None or candidate_status == "not_requested":
+        if candidate_status == "not_requested":
             return "terminal_candidate_unknown"
     if operation.status in {"dispatched", "unknown"}:
         if operation.lease_until is not None and now < operation.lease_until:
@@ -364,7 +375,12 @@ def advance_work_unit(
         )
     if observation.activity is not Activity.TERMINAL:
         return "terminal_candidate_unknown" if operation.status == "terminal" else observation.activity.value
-    candidate = None if cancel_requested is not None and cancel_requested() else runtime.candidate(handle)
+    retrieval_unknown = False
+    try:
+        candidate = None if cancel_requested is not None and cancel_requested() else runtime.candidate(handle)
+    except ExecutionConflict:
+        candidate = None
+        retrieval_unknown = True
     if cancel_requested is not None:
         cancel_requested()
     if program.attempt(attempt_id).status is AttemptStatus.EXECUTING:
@@ -379,6 +395,8 @@ def advance_work_unit(
                     "fence": operation.fence,
                     "candidate": "not_requested"
                     if cancel_requested is not None and cancel_requested()
+                    else "unknown"
+                    if retrieval_unknown
                     else "present"
                     if candidate is not None
                     else "absent",
@@ -391,6 +409,8 @@ def advance_work_unit(
         )
     if cancel_requested is not None and cancel_requested():
         return "cancel_requested"
+    if retrieval_unknown:
+        return "terminal_candidate_unknown"
     if candidate is None:
         return "terminal_no_candidate"
     if deadline is not None and decision_clock() >= deadline:

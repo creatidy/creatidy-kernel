@@ -43,6 +43,7 @@ from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject
 from creatidy_kernel.ports.forge import Forge
+from creatidy_kernel.ports.program_store import OperationRecord
 from creatidy_kernel.ports.resources import ResourceAllocator
 
 pytest_plugins = ["test_sqlite_store"]
@@ -356,6 +357,71 @@ def test_failed_terminal_recovers_finish_without_native_context(
             "status": "finished",
         }
         assert "acceptance" not in restored
+
+
+def test_lost_terminal_candidate_read_remains_recoverable(sqlite_tmp_path: Path) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+
+    class FlakyCandidate(FixtureConnection):
+        reads = 0
+
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            if method == "thread/read":
+                self.reads += 1
+                if self.reads == 4:
+                    raise TimeoutError("synthetic lost candidate read")
+            return super().request(method, params)
+
+    connection = FlakyCandidate(deflake_edit)
+    assert run(control, source, connection)["condition"] == "terminal_candidate_unknown"
+    assert task_status(control)["condition"] == "terminal_candidate_unknown"
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        original = store.artifact("runtime:task_execution:change", "terminal-outcome")
+        assert json.loads(original)["candidate"] == "unknown"
+    assert run(control, source, connection)["condition"] == "accepted"
+    assert connection.starts == 1
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        assert store.artifact("runtime:task_execution:change", "terminal-outcome") == original
+
+
+def test_terminal_outcome_recovers_before_operation_publication(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    connection = FixtureConnection(lambda _path: None)
+    connection.status = "failed"
+    original = SQLiteProgramStore.observe
+
+    class ProcessLoss(BaseException):
+        pass
+
+    def crash_terminal(
+        store: SQLiteProgramStore,
+        operation_id: str,
+        fence: int,
+        observation_id: str,
+        kind: str,
+        *,
+        reference: str | None = None,
+    ) -> OperationRecord:
+        if kind == "terminal":
+            raise ProcessLoss()
+        return original(store, operation_id, fence, observation_id, kind, reference=reference)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SQLiteProgramStore, "observe", crash_terminal)
+        with pytest.raises(ProcessLoss):
+            run(control, source, connection)
+
+    class Unavailable(FixtureConnection):
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            raise AssertionError("durable outcome must recover without a native read")
+
+    recovered = run(control, source, Unavailable(lambda _path: None))
+    assert recovered["condition"] == "terminal_no_candidate"
+    assert "acceptance" not in recovered
 
 
 @pytest.mark.parametrize("before_allocation", [False, True])

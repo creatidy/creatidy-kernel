@@ -316,9 +316,15 @@ class CodexRuntime(Runtime):
         run = self._by_handle.get(handle)
         if run is None:
             raise ExecutionConflict("unknown Codex receipt handle")
-        state = self._read(run)
-        if state is None or state[0] != "completed" or run.terminal_status not in {None, "completed"}:
+        if run.terminal_status in {"failed", "interrupted"}:
             return None
+        state = self._read(run)
+        if state is not None and state[0] in {"failed", "interrupted"}:
+            return None
+        if state is None or state[0] != "completed":
+            if not run.terminal:
+                return None
+            raise ExecutionConflict("terminal candidate retrieval is uncertain")
         run.terminal = True
         run.terminal_status = "completed"
         candidate = self.collect(run.request)
