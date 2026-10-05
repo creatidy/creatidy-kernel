@@ -272,7 +272,7 @@ class WorkflowContractTests(unittest.TestCase):
                 self.assertIn("`make check` and `make package-check`", command)
         reviewer = (ROOT / ".kilo/agents/pr-reviewer.md").read_text().split("---", 2)[1]
         for requirement in (
-            "mode: subagent\nmodel: openai/gpt-6.1-sol\nvariant: high\n",
+            "mode: subagent\n",
             'permission:\n  "*": deny\n',
             '  read:\n    "*": allow\n    "*.env*": deny\n    "*.task_progress.md": deny\n',
             '  external_directory:\n    "/home/adrian/workspace/creatidy/creatidy-kernel-*/**": allow\n    "*": deny\n',
@@ -280,6 +280,20 @@ class WorkflowContractTests(unittest.TestCase):
             '  bash:\n    "*": deny\n',
         ):
             self.assertIn(requirement, reviewer)
+        # The reviewer binding is intentionally unpinned: enforce the durable
+        # inheritance/affinity policy instead of a specific model configuration.
+        self.assertNotRegex(reviewer, r"(?m)^model:|^variant:")
+        binding = text(".kilo/agents/pr-reviewer.md")
+        for requirement in (
+            "## Reviewer binding",
+            "intentionally does not pin a provider, model, model version or reasoning/thinking variant",
+            "inherits the implementation session's effective provider family,"
+            " model and reasoning/thinking configuration",
+            "an OpenAI implementation is reviewed by an OpenAI reviewer",
+            "a z.ai implementation is reviewed by a z.ai reviewer",
+            "Never silently substitute a provider, model, version or reasoning/thinking configuration",
+        ):
+            self.assertIn(requirement, binding)
         self.assertIn('    "env -i HOME=/tmp PATH=', reviewer)
         self.assertIn('"git -C /home/adrian/workspace/creatidy/creatidy-kernel-* status --short": allow', reviewer)
         self.assertIn("Never read the contents of `.env*` files", text(".kilo/agents/pr-reviewer.md"))
