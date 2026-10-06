@@ -49,10 +49,14 @@ def test_ci_is_canonical_with_pinned_actions_and_no_configured_secrets() -> None
     jobs = cast(dict[str, object], workflow["jobs"])
     assert set(jobs) == {"check"}
     job = cast(dict[str, object], jobs["check"])
-    steps = cast(list[dict[str, str]], job["steps"])
+    steps = cast(list[dict[str, object]], job["steps"])
     for step in steps:
-        if "uses" in step:
-            assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", step["uses"])
+        uses = step.get("uses")
+        if isinstance(uses, str):
+            assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", uses)
+            if uses.startswith("astral-sh/setup-uv@"):
+                options = cast(dict[str, object], step["with"])
+                assert options["github-token"] == ""
     assert "persist-credentials: false" in workflow_text
     assert not re.search(r"\bsecrets\s*[.\[]", yaml.safe_dump(workflow))
     assert "make check" in workflow_text and "make package-check" in workflow_text
