@@ -14,7 +14,82 @@ def text(path: str) -> str:
     return " ".join((ROOT / path).read_text().split())
 
 
+def eligibility_transitions() -> dict[str, tuple[str, str, str]]:
+    """Decode command classification, not a Kernel product/runtime controller."""
+    section = (
+        (ROOT / ".kilo/command/loop.md")
+        .read_text()
+        .split("## Post-Selection Eligibility Revalidation", 1)[1]
+        .split("## IMPLEMENT", 1)[0]
+    )
+    rows: dict[str, tuple[str, str, str]] = {}
+    for line in section.splitlines():
+        if not line.startswith("| "):
+            continue
+        cells = tuple(cell.strip() for cell in line.strip("|").split("|"))
+        if cells[0] in ("Evidence Class", "---"):
+            continue
+        if len(cells) != 4 or cells[0] in rows:
+            raise AssertionError("classification rows must be unique four-column rules")
+        rows[cells[0]] = (cells[1], cells[2], cells[3])
+    return rows
+
+
 class WorkflowContractTests(unittest.TestCase):
+    def test_pre_delivery_gates_refresh_queue_without_terminating_or_resetting_history(self) -> None:
+        transitions = eligibility_transitions()
+        gates = ("unmet_prerequisite", "missing_producer", "missing_contract_artifact", "known_dependency_gate")
+        for gate in gates:
+            with self.subTest(gate=gate):
+                before, after, action = transitions[gate]
+                self.assertEqual((before, after, action), ("SELECT", "PRESERVE_DELIVERY", "retain"))
+                fresh_queue = (49, 52)
+                gated_this_cycle = {49}
+                eligible = tuple(issue for issue in fresh_queue if issue not in gated_this_cycle)
+                self.assertEqual(eligible, (52,))
+                self.assertNotIn(before, ("BLOCKED", "STOP_REVISE", "STOP_AND_ASK"))
+                gated_this_cycle.add(52)
+                eligible = tuple(issue for issue in fresh_queue if issue not in gated_this_cycle)
+                outcome = eligible[0] if eligible else transitions["all_ineligible_queue"][0]
+                self.assertEqual(outcome, "QUEUE_EMPTY")
+        section = (
+            text(".kilo/command/loop.md")
+            .split("## Post-Selection Eligibility Revalidation", 1)[1]
+            .split("## IMPLEMENT", 1)[0]
+        )
+        for invariant in (
+            "BEFORE the first substantive implementation mutation",
+            "no implementation commit, no current authorized implementation PR",
+            "including documentation/contract work",
+            "Prior delivery in another checkout/session still counts",
+            "Make no speculative implementation, invented producer semantics or workaround",
+            "Keep the issue open and unchanged",
+            "clean current develop",
+            "rebuild the FULL canonical issue queue, paging to exhaustion",
+            "not a permanent exclusion or authority from progress memory",
+            "revalidate gates against current canonical/upstream evidence each cycle",
+            "If all remaining issues are ineligible, QUEUE_EMPTY",
+            "a gated candidate alone never emits BLOCKED",
+        ):
+            self.assertIn(invariant, section)
+
+    def test_started_delivery_and_real_stops_cannot_be_evaded_by_a_gate(self) -> None:
+        transitions = eligibility_transitions()
+        for has_commit, has_pr, has_changes in ((True, False, False), (False, True, False), (False, False, True)):
+            with self.subTest(commit=has_commit, pr=has_pr, changes=has_changes):
+                phase = 1 if has_commit or has_pr or has_changes else 0
+                self.assertEqual(transitions["missing_producer"][phase], "PRESERVE_DELIVERY")
+        for condition, expected in (
+            ("genuine_owner_decision", "STOP_AND_ASK"),
+            ("eligible_execution_problem", "RECOVER"),
+            ("exhausted_machinery_failure", "BLOCKED"),
+        ):
+            self.assertEqual(transitions[condition], (expected, expected, "retain"))
+        self.assertEqual(transitions["review_findings_at_bound"], ("NOT_APPLICABLE", "STOP_REVISE", "retain"))
+        self.assertTrue(all(rule[2] == "retain" for rule in transitions.values()))
+        for path in (".kilo/rules/10-task-system.md", ".kilo/rules/30-implementation-discipline.md"):
+            self.assertIn("post-selection eligibility revalidation", text(path))
+
     def test_discovery_and_primary_context_authority(self) -> None:
         loop = text(".kilo/command/loop.md")
         for path in ("AGENTS.md", "README.md", ".kilo/rules/10-task-system.md"):
