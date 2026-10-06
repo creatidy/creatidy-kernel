@@ -330,6 +330,13 @@ class SQLiteProgramStore:
                 raise CorruptHistory("Program projection does not match the authoritative history head")
             return program
 
+    def find_program(self, program_id: str) -> Program | None:
+        """Optional local aggregate lookup; corruption and access errors are not absence."""
+        try:
+            return self.load(program_id)
+        except ProgramNotFound:
+            return None
+
     def admit(self, program_id: str, command_key: str, command: DomainCommandType) -> Program:
         return self._admit(program_id, command_key, command, intent=None)
 
@@ -519,6 +526,8 @@ class SQLiteProgramStore:
             raise ValueError("now must be an integer and lease_seconds positive")
         with self._gate, self._transaction():
             op = self.operation(operation_id)
+            if json.loads(op.request_json)["request"].get("kind") == "ordinary-intake-record":
+                raise OperationConflict("inert intake metadata cannot be dispatched")
             if op.lease_until is not None and op.lease_until > now:
                 raise OperationConflict("delivery lease is held")
             if op.status in {"accepted", "running", "waiting", "terminal", "rejected"}:

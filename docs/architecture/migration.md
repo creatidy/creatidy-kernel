@@ -34,6 +34,32 @@ No product migration or cutover is performed by this documentation change. Concr
 lifetimes, thresholds and platform support await their selected issue/owner decision; Linux-only
 native storage enforcement is not an exercised WSL/Windows/macOS installation matrix.
 
+## Ordinary Record Compatibility
+
+The local ordinary preparation API in #49 does not migrate the frozen #143/#166 definitions,
+digest payloads, exact-base envelopes, allocation bytes or receipts. The frozen registry/CLI and
+legacy SQLite codec remain unchanged. An ordinary task is neither a third frozen task nor an
+alias for historical execution; preparing/approving meaning cannot enable `run_task`.
+
+New inert metadata is tagged `ordinary-intake-record` with local version 1 and inner
+`ordinary-draft`, `ordinary-owner-decision` or `ordinary-consumption` kind/version. It uses the
+existing journal/artifact tables, without a database schema migration or another state tracker.
+SQLite refuses to claim these metadata entries for delivery. Unsupported/malformed versions
+fail on ordinary recovery instead of reinterpreting old payloads. No legacy record is rewritten.
+
+Reopen through `OrdinaryIntake.history(task_id)` and `historical_decision(decision_id)` to inspect
+original records. Historical decision bytes retain their original expiry and do not approve
+current work. Repeating `approve` must supply the same original decision identity/expiry/policy
+and pass fresh owner/revision/source/issue/baseline checks; expired or superseded receipts remain
+historical. Interrupted artifact/create/amend recovery is tested with original command identities.
+A new current decision can supersede an interrupted expired decision without reviving it.
+
+Operators configure the trusted local reader, evidence producers and policy outside untrusted
+declaration JSON. No new profile, server/channel authentication or CLI approval flag is introduced.
+The installed smoke exercises actual preparation/approval/refusal/reopen with synthetic data;
+it is not live ordinary execution. See [README Ordinary Preparation](../../README.md#ordinary-preparation)
+and [Local Intake Reception](contracts.md#local-intake-reception) for the received path and limits.
+
 ## Historical Second-Pass Mapping
 
 ## Scarcity Router

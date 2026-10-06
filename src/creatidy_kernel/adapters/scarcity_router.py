@@ -27,6 +27,7 @@ from time import monotonic
 from typing import cast
 from urllib.parse import urlsplit
 
+from creatidy_kernel.core.intake import RequirementsHandoff, TranslationRefusal
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.ports.resources import ResourceAllocator
 
@@ -408,6 +409,16 @@ class ScarcityRouterAllocator(ResourceAllocator):
             if timer is not None:
                 timer.cancel()
             connection.close()
+
+    @staticmethod
+    def translate_ordinary(handoff: RequirementsHandoff) -> TranslationRefusal:
+        """Receive all approved meaning, then refuse before any Router transport.
+
+        Rich mapping is #51/Router #175, not the legacy L0/reference translator.
+        Keeping the original handoff in the result binds the diagnostic to every
+        requirement, evidence subject and owner decision without dropping fields.
+        """
+        return TranslationRefusal(handoff)
 
     def select(self, request: ResourceRequest) -> Allocation:
         if request.required_capabilities != frozenset({"reference"}):

@@ -107,10 +107,11 @@ disable automatic merge. Do not silently weaken the gate for a particular forge.
 
 ## Proposed Ordinary Intake Contract (#49)
 
-**Status: proposed for contract review, not implemented or an accepted wire format.** This section
+**Status: reviewed logical proposal, not an accepted cross-product wire format or execution authority.** This section
 describes the independent preparation slice of [#49](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/49).
 It does not add an endpoint, operator flag, worker protocol, or ordinary-task execution path.
-The final implementation must receive all six issue acceptance criteria; contract review alone is
+The bounded local implementation is described under [Local Intake Reception](#local-intake-reception).
+The issue still requires all six acceptance criteria and final independent review; contract review alone is
 not functional acceptance, an owner grant, or live readiness.
 
 ### Scope And Trust
@@ -138,7 +139,7 @@ isolation and execution receipts.
 ### Logical Records
 
 The following are logical contents to review, not prescribed new shared JSON keys or HTTP shapes.
-Concrete serialization and operator syntax follow contract review and must reject ambiguous,
+Concrete local serialization below follows the logical review and must reject ambiguous,
 malformed and unsupported input without echoing secret values in diagnostics.
 
 | Record | Logical contents and invariant |
@@ -242,3 +243,58 @@ and its Apache-2.0 licence. Borrow qualified tracker snapshots and reconciliatio
 patterns only. Symphony's tracker/workspace/in-memory retry state, prompt policy, hooks and
 implementation-defined approval posture do not replace Kernel's durable owner decision, grants
 or acceptance. No source is copied, library adopted, scheduler imported or runtime constructed.
+
+### Local Intake Reception
+
+The implemented local path is `ports/intake.OrdinaryIntake` with `core/intake` inert values and
+`adapters/intake.ForgeIntakeEvidence` / `GitContentSource`. It introduces no shared endpoint, CLI flag,
+Router payload, remote authentication or execution contract. The preceding section remains the logical
+proposal/history; these are the narrower actual local mechanisms, not new architectural authority.
+
+`Declaration.raw` retains the exact UTF-8 proposer bytes. Its strict local JSON version 1 requires
+exactly `version`, nonblank `outcome`, and string arrays `criteria`, `quality`, `interface`, `context`,
+`unknowns`, `paths`, `network`, `effects`, `recipes`, `provenance`. Criteria/recipes/provenance are
+nonempty; paths are relative without traversal, network requests name explicit HTTPS origins.
+Unknown fields, duplicate keys, unsupported versions and authority/principal/policy/budget claims
+are rejected. No integers for quality, prices, model-derived minima or Router vocabulary are inferred.
+Unknowns are reviewable but prevent approval/admission in this slice.
+
+Forgejo adds read-only `issue_snapshot`, `change_snapshot`, `intake_changes` normalization over
+existing issue/PR reads and `changes` pagination. State, merged status, number, `updated_at`, exact
+head/base and repository fields come from actual provider shapes; no API field is invented.
+Snapshots are re-read and scans compared before disposition. A page bound, failure, unsupported fork
+or observed movement refuses exhaustive absence. Repeated stable reads are qualified observations,
+not a claim of a globally serializable Forgejo snapshot. Merged PRs do not establish current source
+implementation. An active equivalent PR requires exact supported content proof at its observed head.
+
+The built-in relevance proof is deliberately **literal**, using controller-configured
+`ContentCriterion(path, expected_bytes)`: criteria identify exact file bytes, not arbitrary semantic
+claims decorated with a hash. `GitContentSource` reads bounded exact objects with closed operational
+environment and replacement/lazy-fetch disabled. It does not import repository code or execute recipes.
+General textual requirements are unresolved, not guessed from titles, links or claimed booleans.
+The draft retains complete normalized proof bytes and exact subject, not only a disposition/digest.
+The separate `BaselineReader` receives already-produced identified source/recipe-bound evidence;
+its original observation time is retained for freshness. No baseline runner is added. Unknown, future,
+stale or unrelated failing evidence cannot become a pass through approval.
+
+`OwnerPolicy` and current `Principal` are injected through trusted local controller composition, never
+decoded from declarations. A current owner decision freezes the exact draft/evidence/policy/expiry.
+Approval constructs an approved `ProgramSpec` only after validation; the domain Program remains
+DRAFT. Declaration, full relevance/baseline subject and recipe digests are **consumed** WorkUnit inputs;
+result-affecting changes invalidate applicability. Operational-only budget/authority changes retain
+the existing core applicability behavior. Scope requests are preserved in consumed declaration bytes.
+
+Drafts, decisions and consumption use versioned `ordinary-*` records in the existing SQLite journal
+and content-addressed artifacts. Reserved `ordinary-intake-record` requests cannot be claimed by
+SQLite delivery, even though existing outbox bookkeeping is retained. There is no synthetic Attempt,
+second lifecycle/table/database or metadata worker effect. Interrupted artifact publication is
+reconstructed from original journal bytes; interrupted create/amend resumes the original decision
+only after current owner/revision/evidence/expiry checks. Reads/callbacks finish before the authority
+clock is sampled. Historical decision recovery exposes immutable bytes, not renewed authority.
+
+The installed package smoke and `tests/test_intake.py` receive the complete ordinary declaration at
+`ScarcityRouterAllocator.translate_ordinary`. Its static local refusal seam needs no configured
+model/binding or Router operation. The returned diagnostic retains the full `RequirementsHandoff`:
+original declaration bytes/provenance, draft/evidence subjects, revision, exact decision bytes and
+Program digest. Rich translation, execution, calibration and privacy enforcement remain unimplemented
+under #51/Router #175. No reference/L0 request is built for ordinary intake.
