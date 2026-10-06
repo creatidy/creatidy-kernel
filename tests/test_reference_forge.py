@@ -62,6 +62,30 @@ def test_lost_pr_reply_never_repeats_creation(sqlite_tmp_path: Path) -> None:
         assert remote.artifact("synthetic:pr", "pull").count(b'"number": 1') == 1
 
 
+@pytest.mark.parametrize("allowed_checks", [0, 1])
+def test_pr_dispatch_authority_refusal_never_creates_effect(sqlite_tmp_path: Path, allowed_checks: int) -> None:
+    checks = [0]
+    transport = SyntheticForgeTransport(SYNTHETIC_REPOSITORY)
+    forge = ForgejoForge(transport, transport, lambda _effect: True)
+
+    def authorized() -> bool:
+        checks[0] += 1
+        return checks[0] <= allowed_checks
+
+    with SQLiteProgramStore(sqlite_tmp_path / "controller.sqlite3") as store:
+        result = deliver_reference_pr(
+            store,
+            repository_path=sqlite_tmp_path / "repository",
+            head=HEAD,
+            acceptance_reference="accepted:second",
+            forge=forge,
+            authorize_dispatch=authorized,
+        )
+        assert result["status"] == ("intent" if allowed_checks == 0 else "unknown")
+        assert store.operation(PR_OPERATION).attempts == allowed_checks
+    assert transport.pushes == transport.posts == 0
+
+
 def test_missing_acceptance_and_bad_head_fail_before_intent(sqlite_tmp_path: Path) -> None:
     with SQLiteProgramStore(sqlite_tmp_path / "controller.sqlite3") as store:
         for head, acceptance in ((HEAD, ""), ("not-a-full-sha", "accepted:second")):

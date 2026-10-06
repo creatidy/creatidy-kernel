@@ -1738,9 +1738,19 @@ def run_task(
                 record_cancellation(attempt.spec.attempt_id, operation.operation_id)
         if program.state(UNIT_ID).status is WorkUnitStatus.SATISFIED:
             if cancellation_pending or int(time.time()) >= deadline:
-                result = export_task_store(store)
-                result.update(condition="expired" if int(time.time()) >= deadline else "cancelled", lifecycle=lifecycle)
-                return result
+                try:
+                    delivery = store.operation(PR_OPERATION)
+                except OperationConflict as error:
+                    if str(error) != "unknown operation":
+                        raise
+                    delivery = None
+                # Stop new effects, not observation of an already-claimed effect.
+                if delivery is None or delivery.attempts == 0:
+                    result = export_task_store(store)
+                    result.update(
+                        condition="expired" if int(time.time()) >= deadline else "cancelled", lifecycle=lifecycle
+                    )
+                    return result
             accepted = _request(store, f"acceptance:{ATTEMPT_ID}")
             head = str(accepted["head"])
             lifecycle.append(f"candidate accepted: {head}")
@@ -1758,6 +1768,7 @@ def run_task(
                 schema="task-pr-v1",
                 title=task.pr_title,
                 body=f"{task.pr_body}\n\nTask: {task.task_id}. Accepted result: {accepted['manifest']}.",
+                authorize_dispatch=lambda: int(time.time()) < deadline and not cancellation_requested_now(),
             )
             if receipt.get("interrupted"):
                 raise TaskInterrupted(f"interrupted after {receipt['interrupted']}; rerun to reconcile")
@@ -1774,7 +1785,11 @@ def run_task(
             lifecycle.append("NO MERGE / NO DEPLOY")
             result = export_task_store(store)
             result.update(
-                condition="accepted",
+                condition="expired"
+                if int(time.time()) >= deadline
+                else "cancelled"
+                if cancellation_requested_now()
+                else "accepted",
                 head=head,
                 pr=receipt,
                 verification=captured,

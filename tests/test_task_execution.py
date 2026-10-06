@@ -1280,6 +1280,62 @@ def test_pr_delivery_recovery_never_creates_a_second_pr(sqlite_tmp_path: Path, f
     assert evidence["candidate"] is not None
 
 
+@pytest.mark.parametrize("stop", ["expired", "cancelled"])
+@pytest.mark.parametrize("claimed", [False, True])
+def test_stopped_task_reconciles_claimed_pr_without_new_dispatch(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: str, claimed: bool
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    base = reference_git(source, "rev-parse", "refs/heads/develop")
+    control = sqlite_tmp_path / "control"
+    forge, transport = make_forge(base)
+    connection = FixtureConnection(deflake_edit)
+    task = fixture_task(repeats=1)
+    clock = [1000]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    original = SQLiteProgramStore.finalize_artifact
+
+    class ProcessLoss(BaseException):
+        pass
+
+    def crash_reference(store: SQLiteProgramStore, operation_id: str, name: str, data: bytes) -> str:
+        reference = original(store, operation_id, name, data)
+        if name == "known-reference":
+            raise ProcessLoss()
+        return reference
+
+    if claimed:
+        with monkeypatch.context() as patch:
+            patch.setattr(SQLiteProgramStore, "finalize_artifact", crash_reference)
+            with pytest.raises(ProcessLoss):
+                run(control, source, connection, forge=forge, base=base, task=task)
+    else:
+        with pytest.raises(TaskInterrupted):
+            run(control, source, connection, forge=forge, base=base, task=task, fault="pr-commit")
+    previous = export_task(control)
+    clock[0] = 4301 if stop == "expired" else 1002
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        request = store.operation("task_execution:pr").request_json
+    for _ in range(2):
+        result = run(
+            control, source, connection, forge=forge, base=base, task=task, cancel_requested=stop == "cancelled"
+        )
+        assert result["condition"] == stop
+        assert result["deadline"] == previous["deadline"] == 4300
+        assert result["acceptance"] == previous["acceptance"]
+        if claimed:
+            assert cast("dict[str, object]", result["pr"])["status"] == "accepted"
+        else:
+            assert "pr" not in result
+        with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+            operation = store.operation("task_execution:pr")
+            assert operation.request_json == request
+            assert operation.attempts == (1 if claimed else 0)
+            assert operation.status == ("accepted" if claimed else "intent")
+    assert connection.starts == 1
+    assert transport.pushes == transport.posts == (1 if claimed else 0)
+
+
 def test_base_frozen_when_source_develop_moves(sqlite_tmp_path: Path) -> None:
     source = make_source(sqlite_tmp_path)
     base = reference_git(source, "rev-parse", "refs/heads/develop")
