@@ -305,6 +305,11 @@ second lifecycle/table/database or metadata worker effect. Interrupted artifact 
 reconstructed from original journal bytes; interrupted create/amend resumes the original decision
 only after current owner/revision/evidence/expiry checks. Reads/callbacks finish before the authority
 clock is sampled. Historical decision recovery exposes immutable bytes, not renewed authority.
+Current Core `CANCELLED` status (owner abandonment) blocks approval replay, new approvals/amendments
+and translator handoff even when the Spec digest is unchanged. Lifecycle is reloaded after current
+checks/callbacks at the final return/handoff boundary; stored historical decisions remain readable.
+Other Core states retain their existing amendment semantics, including explicit amendments from
+COMPLETED. This adds no activation, resume or other lifecycle transition to ordinary intake.
 Recovery validates the actual record kind, namespace and content subject, not a draft-looking ID
 alone. New consumption IDs include `:record:` to avoid draft-ID collisions; legacy consumption IDs
 remain readable as their actual kind. A legacy consumption occupying a new draft's normal ID uses

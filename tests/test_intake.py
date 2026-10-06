@@ -9,7 +9,7 @@ from typing import cast
 from unittest.mock import patch
 
 import pytest
-from test_domain import active, finished, satisfied
+from test_domain import active, finished, satisfaction, satisfied
 
 from creatidy_kernel.adapters.fake_forge import SyntheticForgeTransport
 from creatidy_kernel.adapters.forge_refs import ForgeBinding
@@ -21,12 +21,20 @@ from creatidy_kernel.adapters.sqlite_store import OperationConflict, SQLiteProgr
 from creatidy_kernel.adapters.task_execution import TASKS
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.domain import (
+    ActivateProgram,
     AmendProgramSpec,
     AuthorityEnvelope,
     BudgetPolicy,
+    CancelProgram,
+    FinishAttempt,
+    PauseProgram,
     PolicyReference,
+    PrepareAttempt,
+    ProgramSpec,
     ProgramStatus,
+    SatisfyWorkUnit,
     SpecAmendment,
+    StartAttempt,
     WorkUnitStatus,
 )
 from creatidy_kernel.core.forge import Reference
@@ -1372,3 +1380,219 @@ def test_malformed_age_and_consumption_bindings_refuse_recovery_without_rewrite(
                     intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
             translator.assert_not_called()
         assert store.artifact(key, "record") == raw
+
+
+@pytest.mark.parametrize("action", ["approve", "handoff", "new-decision", "amendment"])
+def test_owner_cancelled_program_refuses_replay_and_handoff_after_reopen(sqlite_tmp_path: Path, action: str) -> None:
+    scenario = Scenario()
+    path = sqlite_tmp_path / "intake.db"
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+        original = {
+            record.operation_id: store.artifact(record.operation_id, "record")
+            for record in store.operations("ordinary:")
+        }
+        cancelled = store.admit(
+            approved.program.program_id, "owner-cancel", CancelProgram(approved.program.revision, "owner")
+        )
+        assert cancelled.status is ProgramStatus.CANCELLED
+        assert cancelled.spec == approved.program.spec
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        assert intake.history("task") == (draft,)
+        assert intake.historical_decision("original") == approved.decision_bytes
+        with patch.object(
+            ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+        ) as translator:
+            with pytest.raises(IntakeRefused, match="cancelled"):
+                if action == "handoff":
+                    intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+                elif action == "amendment":
+                    changed = intake.prepare(
+                        "task", SUBJECT, declaration(context=["new inert proposal"]), expected_parent=draft.digest
+                    )
+                    intake.approve(OWNER, changed, policy(), decision_id="amended", expires_at=400)
+                else:
+                    intake.approve(
+                        OWNER,
+                        draft,
+                        policy(),
+                        decision_id="original" if action == "approve" else "new-decision",
+                        expires_at=400,
+                    )
+            translator.assert_not_called()
+        assert store.load(approved.program.program_id) == cancelled
+        assert all(store.artifact(key, "record") == raw for key, raw in original.items())
+        assert not store.operations("ordinary:decision:new-decision")
+        assert not store.operations("ordinary:decision:amended")
+
+
+@pytest.mark.parametrize("action", ["approve", "handoff"])
+@pytest.mark.parametrize("cut", ["closing-evidence", "history-read", "final-clock"])
+def test_cancellation_during_current_checks_refuses_stale_approved_copy(
+    sqlite_tmp_path: Path, action: str, cut: str
+) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+        decision = intake.historical_decision("original")
+        fired = False
+
+        def cancel() -> None:
+            nonlocal fired
+            if not fired:
+                program = store.load(approved.program.program_id)
+                store.admit(program.program_id, "owner-cancel", CancelProgram(program.revision, "owner"))
+                fired = True
+
+        if cut == "closing-evidence":
+            reads = 0
+
+            def closing_issue(path: str) -> None:
+                nonlocal reads
+                if "/issues/" in path:
+                    reads += 1
+                    if reads == 2:
+                        cancel()
+
+            scenario.transport.callback = closing_issue
+        elif cut == "history-read":
+            operations = store.operations
+
+            def history_read(prefix: str = ""):
+                result = operations(prefix)
+                if prefix == "ordinary:":
+                    cancel()
+                return result
+
+            store.operations = history_read
+        else:
+            clocks = 0
+
+            def final_clock() -> int:
+                nonlocal clocks
+                clocks += 1
+                if clocks == (3 if action == "approve" else 2):
+                    cancel()
+                return scenario.time
+
+            intake.clock = final_clock
+        with patch.object(
+            ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+        ) as translator:
+            with pytest.raises(IntakeRefused, match="cancelled"):
+                if action == "approve":
+                    intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+                else:
+                    intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            translator.assert_not_called()
+        assert fired
+        assert approved.program.status is ProgramStatus.DRAFT
+        assert store.load(approved.program.program_id).status is ProgramStatus.CANCELLED
+        assert intake.historical_decision("original") == decision
+        assert intake.history("task") == (draft,)
+
+
+@pytest.mark.parametrize("action", ["replay", "amendment"])
+def test_cancellation_during_decision_recording_prevents_return_or_amendment(
+    sqlite_tmp_path: Path, action: str
+) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+        decision_id = "original"
+        if action == "amendment":
+            draft = intake.prepare("task", SUBJECT, declaration(context=["amended"]), expected_parent=draft.digest)
+            decision_id = "amended"
+        intent = store.intent
+        fired = False
+
+        def cancel_after_record(operation_id: str, effect_key: str, request: dict[str, object]):
+            nonlocal fired
+            result = intent(operation_id, effect_key, request)
+            if operation_id == f"ordinary:decision:{decision_id}" and not fired:
+                program = store.load(approved.program.program_id)
+                store.admit(program.program_id, "owner-cancel", CancelProgram(program.revision, "owner"))
+                fired = True
+            return result
+
+        with patch.object(store, "intent", side_effect=cancel_after_record):
+            with pytest.raises(IntakeRefused, match="cancelled"):
+                intake.approve(OWNER, draft, policy(), decision_id=decision_id, expires_at=400)
+        assert fired
+        program = store.load(approved.program.program_id)
+        assert program.status is ProgramStatus.CANCELLED and program.spec == approved.program.spec
+        assert intake.historical_decision("original") == approved.decision_bytes
+
+
+@pytest.mark.parametrize(
+    "status", [ProgramStatus.DRAFT, ProgramStatus.ACTIVE, ProgramStatus.PAUSED, ProgramStatus.COMPLETED]
+)
+def test_nonabandoned_core_states_retain_replay_and_explicit_amendment_compatibility(
+    sqlite_tmp_path: Path, status: ProgramStatus
+) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+        program = approved.program
+        if status is not ProgramStatus.DRAFT:
+            program = store.admit(program.program_id, "owner-activate", ActivateProgram(program.revision, "owner"))
+        if status is ProgramStatus.PAUSED:
+            program = store.admit(program.program_id, "owner-pause", PauseProgram(program.revision, "owner"))
+        elif status is ProgramStatus.COMPLETED:
+            fixture = finished(program, "ordinary")
+            attempt = fixture.attempts[0]
+            program = store.admit(
+                program.program_id, "fixture-prepare", PrepareAttempt(program.revision, "owner", attempt.spec)
+            )
+            program = store.admit(
+                program.program_id, "fixture-start", StartAttempt(program.revision, "owner", attempt.attempt_id)
+            )
+            program = store.admit(
+                program.program_id, "fixture-finish", FinishAttempt(program.revision, "owner", attempt.attempt_id)
+            )
+            fact = satisfaction(program, "ordinary", "s1", attempt.attempt_id)
+            program = store.admit(
+                program.program_id, "fixture-satisfy", SatisfyWorkUnit(program.revision, fact.issuer_id, fact)
+            )
+        assert program.status is status
+        replay = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+        assert replay.program == program
+        assert intake.handoff(OWNER, replay, policy(), ScarcityRouterAllocator).handoff.draft == draft
+        amended = intake.prepare(
+            "task", SUBJECT, declaration(context=["explicit owner amendment"]), expected_parent=draft.digest
+        )
+        current = intake.approve(OWNER, amended, policy(), decision_id="amended", expires_at=400)
+        assert current.program.spec.revision == 2
+        assert current.program.status is (ProgramStatus.ACTIVE if status is ProgramStatus.COMPLETED else status)
+
+
+def test_cancellation_after_core_create_is_not_returned_as_new_approval(sqlite_tmp_path: Path) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        create = store.create
+
+        def cancel_after_create(spec: ProgramSpec, command_key: str):
+            program = create(spec, command_key)
+            store.admit(program.program_id, "owner-cancel", CancelProgram(program.revision, "owner"))
+            return program
+
+        with patch.object(store, "create", side_effect=cancel_after_create):
+            with pytest.raises(IntakeRefused, match="cancelled"):
+                intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+        program = store.load("ordinary:task")
+        assert program.status is ProgramStatus.CANCELLED
+        assert program.spec.revision == 1 and not program.attempts
+        assert intake.historical_decision("original")
+        with pytest.raises(IntakeRefused, match="cancelled"):
+            intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)

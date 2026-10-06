@@ -12,6 +12,7 @@ from creatidy_kernel.core.domain import (
     InputBinding,
     Program,
     ProgramSpec,
+    ProgramStatus,
     SpecAmendment,
     WorkUnit,
 )
@@ -458,6 +459,7 @@ class OrdinaryIntake:
     ) -> None:
         history = self.history(draft.task_id)
         baseline_age = self._baseline_age(current)
+        program = self.store.find_program(f"ordinary:{draft.task_id}")
         now = self.clock()
         if (
             type(principal) is not Principal
@@ -465,6 +467,8 @@ class OrdinaryIntake:
             or principal.actor_id != policy.authority.owner_id
         ):
             raise IntakeRefused("authenticated owner required")
+        if program is not None and program.status is ProgramStatus.CANCELLED:
+            raise IntakeRefused("Program is cancelled")
         if (
             type(now) is not int
             or type(expires_at) is not int
@@ -501,6 +505,15 @@ class OrdinaryIntake:
         ):
             if not frozenset(strings(data[name])) <= allowed:
                 raise IntakeRefused("proposal exceeds trusted owner policy")
+
+    def _current_program(self, program_id: str, spec_digest: str) -> Program:
+        """Recheck abandonment after callbacks; other states retain Core amendment semantics."""
+        program = self.store.load(program_id)
+        if program.status is ProgramStatus.CANCELLED:
+            raise IntakeRefused("Program is cancelled")
+        if program.spec.digest != spec_digest:
+            raise IntakeRefused("current Program binding changed")
+        return program
 
     def approve(
         self, principal: Principal, draft: Draft, policy: OwnerPolicy, *, decision_id: str, expires_at: int
@@ -551,6 +564,7 @@ class OrdinaryIntake:
                 self._validate(principal, draft, policy, current, expires_at)
                 self._record(key, decision)
                 self._validate(principal, draft, policy, current, expires_at)
+                current_program = self._current_program(program_id, current_program.spec.digest)
                 return ApprovedMeaning(draft, decision_id, decision, current_program)
             if consumed.get("expected_revision") != current_program.revision:
                 raise IntakeRefused("approval recovery no longer matches Program")
@@ -610,13 +624,13 @@ class OrdinaryIntake:
             self._record(key, decision)
             self._record(consumption_key, consumption)
             self._validate(principal, draft, policy, current, expires_at)
+            self._current_program(program_id, program.spec.digest)
             program = self.store.admit(
                 program_id,
                 f"ordinary:approve:{decision_id}",
                 AmendProgramSpec(program.revision, principal.actor_id, amendment),
             )
-        if self.store.load(program_id).spec.digest != program.spec.digest:
-            raise IntakeRefused("historical receipt is not current approval")
+        program = self._current_program(program_id, program.spec.digest)
         return ApprovedMeaning(draft, decision_id, decision, program)
 
     def handoff(
@@ -645,6 +659,7 @@ class OrdinaryIntake:
         ):
             raise IntakeRefused("decision has no matching durable consumption")
         self._validate(principal, approved.draft, policy, current, _integer(decision["expires_at"]))
+        program = self._current_program(program.program_id, approved.program.spec.digest)
         return translator.translate_ordinary(
             RequirementsHandoff(approved.draft, approved.decision_id, approved.decision_bytes, program.spec.digest)
         )
