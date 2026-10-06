@@ -31,6 +31,7 @@ from creatidy_kernel.core.forge import (
     Reference,
     UnsupportedForge,
 )
+from creatidy_kernel.core.intake import ChangeSnapshot, IssueSnapshot, digest, encode
 from creatidy_kernel.ports.forge import Forge
 
 
@@ -220,7 +221,15 @@ class ForgejoForge(Forge):
             head=Reference(f"forgejo:{oid(_field(head, 'sha'))}"),
         )
 
-    def _page(self, repository: Reference, path: str, cursor: str | None, *, subject: Reference | None = None) -> Page:
+    def _page(
+        self,
+        repository: Reference,
+        path: str,
+        cursor: str | None,
+        *,
+        subject: Reference | None = None,
+        retain_permission: bool = False,
+    ) -> Page:
         self._require_reads()
         if cursor is not None and not valid_number(cursor):
             return Page((), None, False)
@@ -232,6 +241,8 @@ class ForgejoForge(Forge):
         status, payload = self._read(
             f"/repos/{self._repo(repository)}/{path}{separator}page={page}&limit={self.page_size}"
         )
+        if retain_permission and status in {401, 403}:
+            return Page((Observation(Presence.INACCESSIBLE),), None, False)
         if status != 200:
             return Page((), None, False)
         if not isinstance(payload, list):
@@ -268,6 +279,71 @@ class ForgejoForge(Forge):
 
     def changes(self, repository: Reference, cursor: str | None = None) -> Page:
         return self._page(repository, "pulls?state=all", cursor)
+
+    def intake_changes(self, repository: Reference, cursor: str | None = None) -> Page:
+        return self._page(repository, "pulls?state=all", cursor, retain_permission=True)
+
+    def issue_snapshot(self, repository: Reference, number: int) -> IssueSnapshot:
+        """Normalize actual Forgejo issue fields without deriving authority from prose."""
+        self._require_reads()
+        if not positive_id(number):
+            raise ForgeConflict("invalid issue number")
+        status, payload = self._read(f"/repos/{self._repo(repository)}/issues/{number}")
+        if status in {401, 403}:
+            return IssueSnapshot(Presence.INACCESSIBLE)
+        if status != 200:
+            # A 404 here is never task absence or work-remaining evidence.
+            return IssueSnapshot(Presence.UNKNOWN)
+        try:
+            data = _object(payload)
+            if (
+                not positive_id(data.get("number"))
+                or data.get("number") != number
+                or "pull_request" in data
+                and data["pull_request"] is not None
+            ):
+                raise ValueError("issue identity differs")
+            state = _field(data, "state")
+            if state not in {"open", "closed"} or type(data.get("body")) is not str:
+                raise ValueError("invalid issue content")
+            return IssueSnapshot(
+                Presence.FOUND,
+                digest(encode({"title": _field(data, "title"), "body": data["body"]})),
+                _field(data, "updated_at"),
+                state,
+            )
+        except ValueError:
+            return IssueSnapshot(Presence.UNKNOWN)
+
+    def change_snapshot(self, repository: Reference, change: Reference) -> ChangeSnapshot:
+        self._require_reads()
+        prefix = f"{repository.value}#"
+        suffix = change.value.removeprefix(prefix)
+        if not change.value.startswith(prefix) or not valid_number(suffix):
+            raise ForgeConflict("change does not belong to repository")
+        status, payload = self._read(f"/repos/{self._repo(repository)}/pulls/{suffix}")
+        if status in {401, 403}:
+            return ChangeSnapshot(Observation(Presence.INACCESSIBLE))
+        if status != 200:
+            return ChangeSnapshot(Observation(Presence.UNKNOWN))
+        try:
+            data = _object(payload)
+            observation = self._change_observation(repository, data)
+            state = _field(data, "state")
+            target_branch = _field(_object(data.get("base")), "ref")
+            valid_branch(target_branch)
+            if (
+                observation.reference != change
+                or state not in {"open", "closed"}
+                or type(data.get("merged")) is not bool
+            ):
+                raise ValueError("invalid change snapshot")
+            return ChangeSnapshot(
+                observation, state, cast(bool, data["merged"]), _field(data, "updated_at"), target_branch
+            )
+        except ValueError:
+            # Unsupported fork repositories remain unknown, not irrelevant/absent.
+            return ChangeSnapshot(Observation(Presence.UNKNOWN))
 
     def checks(self, repository: Reference, revision: Reference, cursor: str | None = None) -> Page:
         return self._page(

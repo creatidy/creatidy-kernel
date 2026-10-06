@@ -90,4 +90,8 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
                 reference_attempts = exported["attempts"]
             elif reference_attempts != exported["attempts"]:
                 raise SystemExit("Installed CLI rerun/export changed the logical Attempts")
+    with tempfile.TemporaryDirectory(prefix="prepared-", dir=storage_root) as state_directory:
+        subprocess.run(
+            [str(python), "-I", str(ROOT / "tools/check_prepared.py"), state_directory], cwd=work, check=True
+        )
 print("Package check: wheel metadata/license, sdist rebuild, isolated install and CLI replay/export passed.")

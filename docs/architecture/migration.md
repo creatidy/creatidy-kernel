@@ -34,6 +34,44 @@ No product migration or cutover is performed by this documentation change. Concr
 lifetimes, thresholds and platform support await their selected issue/owner decision; Linux-only
 native storage enforcement is not an exercised WSL/Windows/macOS installation matrix.
 
+## Ordinary Record Compatibility
+
+The local ordinary preparation API in #49 does not migrate the frozen #143/#166 definitions,
+digest payloads, exact-base envelopes, allocation bytes or receipts. The frozen registry/CLI and
+legacy SQLite codec remain unchanged. An ordinary task is neither a third frozen task nor an
+alias for historical execution; preparing/approving meaning cannot enable `run_task`.
+
+New inert metadata is tagged `ordinary-intake-record` with local version 1 and inner
+`ordinary-draft`, `ordinary-owner-decision`, `ordinary-consumption` or `ordinary-baseline-age`
+kind/version. It uses the
+existing journal/artifact tables, without a database schema migration or another state tracker.
+SQLite refuses to claim these metadata entries for delivery. Unsupported/malformed versions
+fail on ordinary recovery instead of reinterpreting old payloads. No legacy record is rewritten.
+Kind-aware recovery validates namespace and subject bindings. New consumption IDs use
+`ordinary:consumed:<task>:record:<ordinal>` while existing four-part consumption IDs retain their
+original bytes and meaning. If a legacy consumption already occupies a draft ID, the new draft uses
+`ordinary:record:ordinary-draft:<task>:<revision>`; both draft namespaces are read with strict kind
+and lineage checks. No controller task ID is banned merely because it resembles a record kind.
+
+Learning a lower observation time for an otherwise unchanged baseline receipt writes an immutable
+`ordinary-baseline-age` fact through the same journal/artifact mechanism, not a new draft revision
+or renewed decision. These non-dispatchable facts participate in preparation, approval and handoff
+after reopen, including interrupted artifact-publication recovery. The original draft, decision
+and expiry stay byte-identical; a genuinely new identified receipt retains its own age.
+
+Reopen through `OrdinaryIntake.history(task_id)` and `historical_decision(decision_id)` to inspect
+original records. Historical decision bytes retain their original expiry and do not approve
+current work. Repeating `approve` must supply the same original decision identity/expiry/policy
+and pass fresh owner/revision/source/issue/baseline checks; expired or superseded receipts remain
+historical. Interrupted artifact/create/amend recovery is tested with original command identities.
+A new current decision can supersede an interrupted expired decision without reviving it.
+
+Operators configure the trusted local reader, evidence producers and policy outside untrusted
+declaration JSON. No new profile, server/channel authentication or CLI approval flag is introduced.
+The installed smoke exercises actual preparation/approval/refusal/reopen with synthetic data;
+it is not live ordinary execution. See [README Ordinary Preparation](../../README.md#ordinary-preparation)
+and [Local Intake Reception](contracts.md#local-intake-reception) for the received path and limits.
+
 ## Historical Second-Pass Mapping
 
 ## Scarcity Router

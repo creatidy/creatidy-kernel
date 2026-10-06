@@ -7,8 +7,9 @@ for individual creators and small teams with limited money, subscription quota, 
 The objective is an accepted result including verification, review and fixes, not the cheapest token.
 
 **Status: deterministic domain, durable persistence, bounded Forge and Codex Runtime adapters,
-an offline two-node CLI reference flow, and bounded TaskSpec support for two frozen real
-tasks, not a general autonomous Program engine.**
+an offline two-node CLI reference flow, bounded TaskSpec support for two frozen real
+tasks, and inert ordinary preparation/approval through a trusted local API, not a general
+autonomous Program engine.**
 The code includes immutable Program intent, legal domain commands, single-controller SQLite history
 and rebuildable projections, an external-operation journal/outbox with a synthetic effect seam and
 content-addressed artifacts, plus a replaceable resource allocator. Synthetic Runtime, Workspace and
@@ -74,7 +75,8 @@ Public dependencies may be reused; no private `creatidy-onprem` is required for 
 [ADR 0007](docs/adr/0007-shared-harness-routing-observability.md) records the owner's 2026-10-04
 shared-architecture direction and source availability. [The coverage roadmap](docs/architecture/successor.md)
 distinguishes **Agreed**, revision-**Verified**, **Proposed clarification** and **To prove**. The current
-foundations are not evidence that ordinary intake, gateway, product review, isolation, full costs or
+foundations and bounded intake are not evidence that ordinary execution, rich routing, gateway,
+product review, isolation, full costs or
 Console integration are complete. No Creatidy cloud account is required by the target architecture.
 
 ## Development Authority
@@ -337,6 +339,50 @@ covers versioned private full-path outcome/cost export, preserving unknowns and 
 Current status/export open SQLite themselves and are not concurrent views of an active exclusive
 controller. [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) owns the served
 snapshot/events/command/notification contract; no future API/flag is asserted here.
+
+## Ordinary Preparation
+
+Ordinary issues use the installed Python API `creatidy_kernel.ports.intake.OrdinaryIntake`,
+not `task run`, a new CLI approval flag, or a remote approval endpoint. Preparation takes one
+controller-selected `IssueSubject` (HTTPS origin, repository, issue number, branch and exact base)
+and untrusted `Declaration` bytes. It returns a versioned inert `Draft`, including evidence-backed
+relevance and explicit unknowns. An ordinary draft is not an approved `ProgramSpec`.
+
+The trusted local controller composes `ForgeIntakeEvidence` with a read-only `ForgejoForge`,
+its exact `ForgeBinding`, `GitContentSource` over vetted controller-owned Git objects, an identified
+`BaselineReader`, explicit `ContentCriterion` values, a clock, and a finite `max_pages` scan bound.
+No recipe, hook, test, inference, worker or Forge effect runs during preparation. Baseline evidence
+must already exist and bind the exact selected source and recipe. Empty checks and unknown baselines
+are not passes. The built-in positive relevance producer supports literal exact-file-content
+obligations only, not general semantic correctness. General criteria yield an unresolved-equivalence
+draft; missing objects, unsupported forks, partial/moving scans and permission failures remain distinct.
+
+`prepare(task_id, selected, declaration, expected_parent=...)` appends immutable amendments when
+meaning or evidence changes. Reobserving unchanged content returns the existing revision. `history`
+recovers those original bytes. `approve(principal, draft, policy, decision_id=..., expires_at=...)`
+requires a current owner `Principal` supplied **outside** proposer/Console data, an explicit trusted
+`OwnerPolicy` (including budget, authority, scopes, recipes, producer identities and freshness), and
+fresh current evidence. It persists the exact decision and consumption and creates/amends a domain
+Program that remains **DRAFT**, without an Attempt or worker grant. Unknown required meaning/evidence,
+expired decisions, stale revisions, issue edits, changed baseline and unapproved scope changes refuse.
+A failing baseline is admissible only for its exact explicitly approved repair reference.
+
+Host authentication is the existing trusted-caller assumption in `ports.authority`, not authentication
+by a label or JSON field. The controller must authenticate callers and protect policy, store and
+reader composition before supplying a `Principal`. Workers and Console must never be given this
+trusted controller access. No same-UID hostile isolation or new authenticated channel is claimed.
+
+`handoff(principal, approved, policy, ScarcityRouterAllocator)` revalidates current authority and
+delivers every original declaration field/byte, evidence subject, revision and decision to the real
+Router translator. Today it returns `ordinary_requirement_mapping_unavailable` with the full bound
+handoff before any transport. It never falls back to reference/L0. Rich mapping remains #51/Router #175;
+neither approval nor this refusal enables ordinary execution or changes frozen #143/#166.
+
+`make package-check` exercises preparation, approval, intact refusal and reopen in an isolated installed
+wheel with synthetic Forgejo-shaped reads and real local Git objects. The fixture is also runnable as
+`uv run --locked python tools/check_prepared.py <existing-empty-native-directory>`; it creates only
+synthetic local state, not a real task or live approval. See [contract reception](docs/architecture/contracts.md#local-intake-reception)
+for the strict local declaration format and [migration](docs/architecture/migration.md#ordinary-record-compatibility).
 
 ## Public Operator Surface
 

@@ -7,6 +7,10 @@ from typing import Protocol
 from creatidy_kernel.core.domain import DomainCommandType, Program, ProgramSpec
 
 
+class ProgramReadChanged(ValueError):
+    """A callback invalidated a bounded single-controller store read cut."""
+
+
 @dataclass(frozen=True, slots=True)
 class OperationRecord:
     operation_id: str
