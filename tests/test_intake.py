@@ -106,7 +106,9 @@ class Transport(SyntheticForgeTransport):
             "updated_at": "2026-10-06T00:00:00Z",
         }
         self.issue_status = 200
+        self.branch_status = 200
         self.scan_status = 200
+        self.pull_status: dict[str, int] = {}
         self.reads: list[str] = []
         self.callback: Callable[[str], None] | None = None
 
@@ -117,8 +119,14 @@ class Transport(SyntheticForgeTransport):
             self.callback(path)
         if "/issues/" in path:
             return self.issue_status, dict(self.issue)
+        if "/branches/" in path and self.branch_status != 200:
+            return self.branch_status, {}
         if "/pulls?" in path and self.scan_status != 200:
             return self.scan_status, {}
+        if "/pulls/" in path:
+            status = self.pull_status.get(path.rsplit("/", 1)[1], 200)
+            if status != 200:
+                return status, {}
         return super().request(method, path, body)
 
     def add_pr(self, *, head: str = "a" * 40, state: str = "open", merged: bool = False) -> None:
@@ -1596,3 +1604,157 @@ def test_cancellation_after_core_create_is_not_returned_as_new_approval(sqlite_t
         assert intake.historical_decision("original")
         with pytest.raises(IntakeRefused, match="cancelled"):
             intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("failed_read", ["closing-issue", "closing-branch", "second-scan"])
+def test_late_permission_loss_retains_failed_presence_and_refuses_actual_handoff(
+    sqlite_tmp_path: Path, status: int, failed_read: str
+) -> None:
+    scenario = Scenario()
+    scenario.transport.add_pr(head="c" * 40)
+    scenario.content.results["c" * 40] = False
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+
+        def install_loss() -> None:
+            scenario.transport.issue_status = scenario.transport.branch_status = scenario.transport.scan_status = 200
+            counts = {"issue": 0, "branch": 0, "scan": 0}
+
+            def lose_permission(path: str) -> None:
+                if "/issues/" in path:
+                    counts["issue"] += 1
+                    if failed_read == "closing-issue" and counts["issue"] == 2:
+                        scenario.transport.issue_status = status
+                elif "/branches/" in path:
+                    counts["branch"] += 1
+                    if failed_read == "closing-branch" and counts["branch"] == 2:
+                        scenario.transport.branch_status = status
+                elif "/pulls?" in path and "page=1" in path:
+                    counts["scan"] += 1
+                    if failed_read == "second-scan" and counts["scan"] == 2:
+                        scenario.transport.scan_status = status
+
+            scenario.transport.callback = lose_permission
+
+        install_loss()
+        observed = scenario.reader.read(SUBJECT, declaration())
+        assert observed.disposition is Disposition.PERMISSION
+        proof = json.loads(observed.relevance_proof)
+        if failed_read == "second-scan":
+            failed = next(item for item in proof if item.get("scan") == "closing")
+            assert failed["failure"] == Disposition.PERMISSION.value and failed["presence"] == "inaccessible"
+        else:
+            reads = next(item["reads"] for item in proof if "reads" in item)
+            assert reads["issue" if failed_read == "closing-issue" else "branch"]["closing"] == "inaccessible"
+        cut = next(item for item in proof if "reads" in item)
+        assert cut["issue_changed"] is False and cut["branch_changed"] is False
+        with patch.object(
+            ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+        ) as translator:
+            install_loss()
+            with pytest.raises(IntakeRefused):
+                intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+            install_loss()
+            with pytest.raises(IntakeRefused):
+                intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            translator.assert_not_called()
+        assert scenario.transport.pushes == scenario.transport.posts == 0
+
+
+@pytest.mark.parametrize("permission_read", ["issue", "scan"])
+def test_confirmed_branch_change_and_permission_loss_are_both_retained(permission_read: str) -> None:
+    scenario = Scenario()
+    scenario.transport.add_pr(head="c" * 40)
+    scenario.content.results["c" * 40] = False
+    counts = {"issue": 0, "branch": 0, "scan": 0}
+
+    def change_and_lose(path: str) -> None:
+        if "/issues/" in path:
+            counts["issue"] += 1
+            if permission_read == "issue" and counts["issue"] == 2:
+                scenario.transport.issue_status = 403
+        elif "/branches/" in path:
+            counts["branch"] += 1
+            if counts["branch"] == 2:
+                scenario.transport.branches["develop"] = "c" * 40
+        elif "/pulls?" in path and "page=1" in path:
+            counts["scan"] += 1
+            if permission_read == "scan" and counts["scan"] == 2:
+                scenario.transport.scan_status = 403
+
+    scenario.transport.callback = change_and_lose
+    observed = scenario.reader.read(SUBJECT, declaration())
+    assert observed.disposition is Disposition.PERMISSION
+    cut = next(item for item in json.loads(observed.relevance_proof) if "reads" in item)
+    assert cut["branch_changed"] is True and cut["issue_changed"] is False
+    assert cut["branch_initial_revision"] == f"forgejo:{SUBJECT.base}"
+    assert cut["branch_closing_revision"] == "forgejo:" + "c" * 40
+
+
+@pytest.mark.parametrize("phase", ["initial", "closing"])
+def test_pr_permission_failure_is_not_masked_by_another_unknown_read(phase: str) -> None:
+    scenario = Scenario()
+    scenario.transport.add_pr(head="c" * 40)
+    scenario.transport.add_pr(head="c" * 40)
+    scenario.content.results["c" * 40] = False
+    reads = 0
+
+    def fail_pr_reads(path: str) -> None:
+        nonlocal reads
+        if path.endswith("/pulls/1"):
+            reads += 1
+            if reads == (1 if phase == "initial" else 2):
+                scenario.transport.pull_status = {"1": 403, "2": 500}
+
+    scenario.transport.callback = fail_pr_reads
+    observed = scenario.reader.read(SUBJECT, declaration())
+    assert observed.disposition is Disposition.PERMISSION
+    proof = json.loads(observed.relevance_proof)
+    failed = next(
+        item
+        for item in proof
+        if item.get("change_read") == phase and item.get("requested_reference") == "forgejo:team/project#1"
+    )
+    unknown = next(
+        item
+        for item in proof
+        if item.get("change_read") == phase and item.get("requested_reference") == "forgejo:team/project#2"
+    )
+    assert failed["presence"] == "inaccessible" and unknown["presence"] == "unknown"
+
+
+@pytest.mark.parametrize("read", ["issue", "branch"])
+def test_unknown_closing_read_is_incomplete_not_a_claimed_source_change(read: str) -> None:
+    scenario = Scenario()
+    reads = 0
+
+    def fail_closing(path: str) -> None:
+        nonlocal reads
+        if (read == "issue" and "/issues/" in path) or (read == "branch" and "/branches/" in path):
+            reads += 1
+            if reads == 2:
+                if read == "issue":
+                    scenario.transport.issue_status = 500
+                else:
+                    scenario.transport.branch_status = 500
+
+    scenario.transport.callback = fail_closing
+    observed = scenario.reader.read(SUBJECT, declaration())
+    assert observed.disposition is Disposition.INCOMPLETE
+    cut = next(item for item in json.loads(observed.relevance_proof) if "reads" in item)
+    assert cut["reads"][read]["closing"] == "unknown"
+    assert cut["issue_changed"] is False and cut["branch_changed"] is False
+
+
+def test_permission_provenance_contains_no_provider_response_body() -> None:
+    scenario = Scenario()
+    scenario.transport.issue["body"] = "synthetic private response marker, not provenance"
+    scenario.transport.issue_status = 403
+    observed = scenario.reader.read(SUBJECT, declaration())
+    assert observed.disposition is Disposition.PERMISSION
+    assert b"synthetic private response marker" not in observed.relevance_proof
+    cut = next(item for item in json.loads(observed.relevance_proof) if "reads" in item)
+    assert cut["reads"]["issue"] == {"initial": "inaccessible", "closing": "inaccessible"}

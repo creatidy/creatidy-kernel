@@ -268,6 +268,13 @@ not a claim of a globally serializable Forgejo snapshot. Merged PRs do not estab
 implementation. An active equivalent PR requires the exact selected target branch and supported
 content proof at its observed head. Missing/malformed targets or target movement remain incomplete;
 a known different target branch does not suppress selected-branch work merely because its SHA matches.
+Permission-limited reads take explicit primary precedence over generic scan mismatch/incompleteness
+and observed source movement. Normalized proof retains initial/closing read presences, scan failures,
+qualified PR subjects and observed source revisions/digests without copying response bodies or
+credentials. A failed closing read is not called source movement; movement is recorded only when
+both compared reads succeeded. If permission loss and a confirmed change coexist, both facts remain
+in proof while the primary disposition is permission-limited. These finite reads do not establish a
+global atomic snapshot or exhaustive absence through an inaccessible/partial scan.
 
 The built-in relevance proof is deliberately **literal**, using controller-configured
 `ContentCriterion(path, expected_bytes)`: criteria identify exact file bytes, not arbitrary semantic

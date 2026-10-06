@@ -191,10 +191,11 @@ class ForgeIntakeEvidence:
                 }
             )
             refs, incomplete = self._scan(repository)
+            initial_scan_failure = incomplete
             states = tuple(self.forge.change_snapshot(repository, ref) for ref in refs)
             active = False
             unresolved = implemented is None
-            for state in states:
+            for ref, state in zip(refs, states, strict=True):
                 observation = state.observation
                 matched = None
                 if observation.presence is Presence.INACCESSIBLE:
@@ -212,6 +213,9 @@ class ForgeIntakeEvidence:
                         unresolved = unresolved or matched is None
                 proof.append(
                     {
+                        "change_read": "initial",
+                        "requested_reference": ref.value,
+                        "presence": observation.presence.value,
                         "reference": None if observation.reference is None else observation.reference.value,
                         "head": None if observation.head is None else observation.head.value,
                         "base": None if observation.base is None else observation.base.value,
@@ -223,9 +227,40 @@ class ForgeIntakeEvidence:
                     }
                 )
             again, changed = self._scan(repository)
-            if refs != again or states != tuple(self.forge.change_snapshot(repository, ref) for ref in again):
+            closing_states = tuple(self.forge.change_snapshot(repository, ref) for ref in again)
+            for ref, state in zip(again, closing_states, strict=True):
+                proof.append(
+                    {
+                        "change_read": "closing",
+                        "requested_reference": ref.value,
+                        "presence": state.observation.presence.value,
+                        "head": None if state.observation.head is None else state.observation.head.value,
+                        "base": None if state.observation.base is None else state.observation.base.value,
+                        "target_branch": state.target_branch,
+                        "state": state.state,
+                        "merged": state.merged,
+                        "updated_at": state.updated_at,
+                    }
+                )
+            for phase, failure in (("initial", initial_scan_failure), ("closing", changed)):
+                proof.append(
+                    {
+                        "scan": phase,
+                        "complete": failure is None,
+                        "failure": None if failure is None else failure.value,
+                        "presence": Presence.INACCESSIBLE.value if failure is Disposition.PERMISSION else None,
+                    }
+                )
+            if (
+                initial_scan_failure is Disposition.PERMISSION
+                or changed is Disposition.PERMISSION
+                or any(state.observation.presence is Presence.INACCESSIBLE for state in (*states, *closing_states))
+            ):
+                incomplete = Disposition.PERMISSION
+            elif refs != again or states != closing_states:
                 incomplete = Disposition.INCOMPLETE
-            incomplete = incomplete or changed
+            else:
+                incomplete = incomplete or changed
             if incomplete is not None:
                 disposition = incomplete
             elif implemented:
@@ -240,8 +275,41 @@ class ForgeIntakeEvidence:
                 disposition = Disposition.REMAINS
         closing_issue = self.forge.issue_snapshot(repository, subject.issue)
         closing_branch = self.forge.branch(repository, subject.branch)
-        if issue != closing_issue or branch != closing_branch:
+        issue_changed = (
+            issue.presence is Presence.FOUND and closing_issue.presence is Presence.FOUND and issue != closing_issue
+        )
+        branch_changed = (
+            branch.presence is Presence.FOUND and closing_branch.presence is Presence.FOUND and branch != closing_branch
+        )
+        proof.append(
+            {
+                "reads": {
+                    "issue": {"initial": issue.presence.value, "closing": closing_issue.presence.value},
+                    "branch": {"initial": branch.presence.value, "closing": closing_branch.presence.value},
+                },
+                "issue_changed": issue_changed,
+                "branch_changed": branch_changed,
+                "issue_initial_digest": issue.content_digest,
+                "issue_closing_digest": closing_issue.content_digest,
+                "branch_initial_revision": None if branch.revision is None else branch.revision.value,
+                "branch_closing_revision": None if closing_branch.revision is None else closing_branch.revision.value,
+                "base_mismatch": branch.presence is Presence.FOUND and source_revision != subject.base,
+            }
+        )
+        # Permission loss is explicit; failed reads are not evidence of source movement.
+        if disposition is Disposition.PERMISSION or Presence.INACCESSIBLE in (
+            issue.presence,
+            branch.presence,
+            closing_issue.presence,
+            closing_branch.presence,
+        ):
+            disposition = Disposition.PERMISSION
+        elif issue_changed or branch_changed:
             disposition = Disposition.STALE
+        elif disposition is not Disposition.STALE and (
+            closing_issue.presence is not Presence.FOUND or closing_branch.presence is not Presence.FOUND
+        ):
+            disposition = Disposition.INCOMPLETE
         closing_baseline = self.baseline.read_baseline(subject, recipe)
         now = self.clock()
         # Close the finite evidence cut after Forge reads. Timestamps validate age,
