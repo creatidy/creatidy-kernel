@@ -38,6 +38,11 @@
   asking for routine permission. Ask only for genuine authority, security/privacy,
   architecture, material scope, incompatible acceptance, irreversible/destructive
   action, meaningful cost or external credential/access decisions.
+- In `/loop`, first apply loop.md's post-selection eligibility revalidation:
+  confirmed pre-implementation prerequisites/producer/contract gates make the issue
+  temporarily ineligible; preserve history and return to fresh full SELECT. Failed
+  inspection is not proof; recover execution first. Substantive delivery is preserved,
+  genuine new owner decisions still stop, and no package/security/review gate is waived.
 - Before returning control, classify the obstacle as engineering/execution or a
   genuine owner decision. Ordinary tool/runtime, environment, dependency, temp
   filesystem, public-source access and diagnosable command failures are not owner
