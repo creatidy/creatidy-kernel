@@ -361,6 +361,77 @@ def test_failed_terminal_recovers_finish_without_native_context(
         assert "acceptance" not in restored
 
 
+@pytest.mark.parametrize("status", ["failed", "interrupted"])
+@pytest.mark.parametrize("crash", [False, True])
+def test_receipt_only_terminal_without_resolution_finishes_without_redispatch(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str, crash: bool
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    original = FixtureConnection(lambda _path: None)
+    original.status = "inProgress"
+    with pytest.raises(TaskInterrupted):
+        run(control, source, original, fault="receipt")
+    find = SQLiteProgramStore.find_artifact
+
+    def legacy_receipt(store: SQLiteProgramStore, operation: str, name: str) -> bytes | None:
+        return None if name == "runtime-receipt" else find(store, operation, name)
+
+    monkeypatch.setattr(SQLiteProgramStore, "find_artifact", legacy_receipt)
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        operation = store.operation("runtime:task_execution:change")
+        request = operation.request_json
+        receipt = find(store, operation.operation_id, "runtime-receipt")
+        assert receipt is not None
+        assert store.find_artifact(operation.operation_id, "identity") is None
+    recovered = FixtureConnection(lambda _path: None)
+    recovered.status = status
+    observe = SQLiteProgramStore.observe
+
+    class ProcessLoss(BaseException):
+        pass
+
+    def crash_terminal(
+        store: SQLiteProgramStore,
+        operation_id: str,
+        fence: int,
+        observation_id: str,
+        kind: str,
+        *,
+        reference: str | None = None,
+    ) -> OperationRecord:
+        if kind == "terminal":
+            raise ProcessLoss()
+        return observe(store, operation_id, fence, observation_id, kind, reference=reference)
+
+    if crash:
+        with monkeypatch.context() as patch:
+            patch.setattr(SQLiteProgramStore, "observe", crash_terminal)
+            with pytest.raises(ProcessLoss):
+                run(control, source, recovered)
+    else:
+        assert run(control, source, recovered)["condition"] == "terminal_no_candidate"
+
+    class Missing(FixtureConnection):
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            raise AssertionError("receipt-only terminal fact must recover without native context")
+
+    for _ in range(2):
+        result = run(control, source, Missing(lambda _path: None))
+        assert result["condition"] == "terminal_no_candidate"
+        assert "acceptance" not in result and "pr" not in result
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        operation = store.operation("runtime:task_execution:change")
+        assert operation.status == "terminal" and operation.attempts == 1
+        assert operation.request_json == request
+        assert operation.accepted_reference == "codex:thread-1:turn-1"
+        assert store.load("task_execution").attempt("task_execution:change").status.value == "finished"
+        assert store.find_artifact(operation.operation_id, "identity") is None
+        assert find(store, operation.operation_id, "runtime-receipt") == receipt
+        assert json.loads(store.artifact(operation.operation_id, "terminal-outcome"))["candidate"] == "absent"
+    assert original.starts == 1 and recovered.starts == 0
+
+
 def test_lost_terminal_candidate_read_remains_recoverable(sqlite_tmp_path: Path) -> None:
     source = make_source(sqlite_tmp_path)
     control = sqlite_tmp_path / "control"

@@ -337,6 +337,7 @@ def advance_work_unit(
     ):
         return "identity_unavailable"
     persisted_identity = store.find_artifact(operation_id, "identity")
+    recorded: RuntimeIdentity | None
     if persisted_identity is None:
         original = (
             receipt_identity if receipt_identity is not None and receipt_identity.resolved is not None else identity
@@ -344,9 +345,13 @@ def advance_work_unit(
         if not identity_matches(
             original, allocation, attempt.agent_definition_reference, require_resolved=True, legacy=legacy
         ):
-            return "identity_unavailable"
-        store.finalize_artifact(operation_id, "identity", manifest_bytes(asdict(original)))
-        recorded = original
+            if observation.activity is not Activity.TERMINAL:
+                return "identity_unavailable"
+            # Exact-handle terminality does not prove model resolution or acceptance.
+            recorded = None
+        else:
+            store.finalize_artifact(operation_id, "identity", manifest_bytes(asdict(original)))
+            recorded = original
     else:
         # The immutable Operation owns the accepted handle and its original runtime
         # resolution. A restored adapter's unknown identity cannot erase that fact.
@@ -365,7 +370,7 @@ def advance_work_unit(
             recorded=recorded,
         ):
             return "identity_unavailable"
-    if receipt is None and receipt_identity is None:
+    if receipt is None and receipt_identity is None and recorded is not None:
         # A proved exact-operation lookup can recover a lost reply. Publish only
         # independently validated original resolution, never requested identity.
         store.finalize_artifact(
@@ -413,6 +418,8 @@ def advance_work_unit(
         return "terminal_candidate_unknown"
     if candidate is None:
         return "terminal_no_candidate"
+    if recorded is None:
+        return "identity_unavailable"
     if deadline is not None and decision_clock() >= deadline:
         return "expired"
     collection = collector.collect(request, candidate, now=decision_clock())
