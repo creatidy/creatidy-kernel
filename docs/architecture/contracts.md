@@ -277,8 +277,12 @@ General textual requirements are unresolved, not guessed from titles, links or c
 The draft retains complete normalized proof bytes and exact subject, not only a disposition/digest.
 The separate `BaselineReader` receives already-produced identified source/recipe-bound evidence;
 it is reobserved after closing Forge reads with exact semantic receipt identity comparison. Both
-observation times must be valid; the earliest time, including the original draft's bound age, limits
-freshness without creating a revision or renewing expiry for an unchanged receipt. No baseline runner
+observation times must be valid. Freshness uses the earliest durably known age of the same qualified
+subject/source/recipe/producer/reference/result receipt across immutable draft histories in the
+controller store, including task-ID aliases. Declaration, issue-content and proposal-provenance edits
+do not renew that receipt; a genuinely new identified receipt has its own age. These checks also run
+on approval/handoff after reopen without rewriting historical records or adding a tracker.
+Unchanged rereads create no revision and do not renew expiry. No baseline runner
 is added. Unknown, future,
 stale or unrelated failing evidence cannot become a pass through approval.
 

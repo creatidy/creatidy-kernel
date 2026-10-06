@@ -35,6 +35,7 @@ from creatidy_kernel.core.intake import (
     ContentCriterion,
     Declaration,
     Disposition,
+    Draft,
     IntakeRefused,
     IssueSubject,
     OwnerPolicy,
@@ -886,3 +887,221 @@ def test_same_baseline_receipt_timestamp_refresh_cannot_revive_original_age(sqli
         with pytest.raises(IntakeRefused, match="expired"):
             intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
         assert intake.historical_decision("original") == decision
+
+
+@pytest.mark.parametrize("amendment", ["context", "issue", "provenance"])
+def test_amended_draft_retains_same_baseline_receipt_durable_age(sqlite_tmp_path: Path, amendment: str) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        original = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400)
+        scenario.time = scenario.baseline.observed_at = 201
+        meaning = declaration()
+        if amendment == "context":
+            meaning = declaration(context=["new context does not create baseline evidence"])
+        elif amendment == "issue":
+            scenario.transport.issue["body"] = "Issue edit does not create baseline evidence"
+        else:
+            meaning = declaration(provenance=["different proposal provenance, unchanged evidence producer"])
+        changed = intake.prepare("task", SUBJECT, meaning, expected_parent=original.digest)
+        assert changed.revision == 2
+        assert changed.evidence.digest != original.evidence.digest or changed.declaration != original.declaration
+        assert changed.evidence.observed_at == 100
+
+
+@pytest.mark.parametrize("amendment", ["context", "issue", "alias"])
+def test_old_baseline_cannot_approve_amendment_after_reopen(sqlite_tmp_path: Path, amendment: str) -> None:
+    scenario = Scenario()
+    path = sqlite_tmp_path / "intake.db"
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        original = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400)
+        decision = intake.historical_decision("original")
+        scenario.time = scenario.baseline.observed_at = 201
+        if amendment == "issue":
+            scenario.transport.issue["body"] = "changed issue, same baseline receipt"
+        task_id = "alias" if amendment == "alias" else "task"
+        changed = intake.prepare(
+            task_id,
+            SUBJECT,
+            declaration(context=["amended context"]) if amendment == "context" else declaration(),
+            expected_parent=None if amendment == "alias" else original.digest,
+        )
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        recovered = intake.history(task_id)[-1]
+        assert recovered == changed
+        with patch.object(
+            ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+        ) as translator:
+            with pytest.raises(IntakeRefused, match="expired"):
+                intake.approve(OWNER, recovered, policy(), decision_id="stale-amendment", expires_at=400)
+            with pytest.raises(IntakeRefused):
+                intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            translator.assert_not_called()
+        assert store.find_program("ordinary:task") == approved.program
+        if amendment == "alias":
+            assert store.find_program("ordinary:alias") is None
+        assert intake.historical_decision("original") == decision
+
+
+@pytest.mark.parametrize("amendment", ["context", "issue", "alias"])
+def test_original_baseline_age_blocks_amended_approval_handoff_after_reopen(
+    sqlite_tmp_path: Path, amendment: str
+) -> None:
+    scenario = Scenario()
+    path = sqlite_tmp_path / "intake.db"
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        original = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400)
+        scenario.time = scenario.baseline.observed_at = 150
+        if amendment == "issue":
+            scenario.transport.issue["body"] = "changed issue, same baseline receipt"
+        task_id = "alias" if amendment == "alias" else "task"
+        changed = intake.prepare(
+            task_id,
+            SUBJECT,
+            declaration(context=["new meaning"]) if amendment == "context" else declaration(),
+            expected_parent=None if amendment == "alias" else original.digest,
+        )
+        approved = intake.approve(OWNER, changed, policy(), decision_id="amended", expires_at=400)
+        decision = intake.historical_decision("amended")
+    scenario.time = scenario.baseline.observed_at = 201
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        with patch.object(
+            ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+        ) as translator:
+            with pytest.raises(IntakeRefused, match="expired"):
+                intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            with pytest.raises(IntakeRefused, match="expired"):
+                intake.approve(OWNER, intake.history(task_id)[-1], policy(), decision_id="amended", expires_at=400)
+            translator.assert_not_called()
+        assert intake.historical_decision("amended") == decision
+
+
+def test_nonadjacent_old_receipt_cannot_borrow_new_receipt_age(sqlite_tmp_path: Path) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        original = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400)
+        scenario.time = scenario.baseline.observed_at = 150
+        scenario.baseline.reference = "fixture:baseline:new"
+        newer = intake.prepare("task", SUBJECT, declaration(), expected_parent=original.digest)
+        intake.approve(OWNER, newer, policy(), decision_id="newer", expires_at=400)
+        scenario.time = scenario.baseline.observed_at = 201
+        scenario.baseline.reference = "fixture:baseline:1"
+        restored = intake.prepare(
+            "task", SUBJECT, declaration(context=["restored old evidence"]), expected_parent=newer.digest
+        )
+        assert restored.evidence.observed_at == 100
+        with pytest.raises(IntakeRefused, match="expired"):
+            intake.approve(OWNER, restored, policy(), decision_id="restored", expires_at=400)
+
+
+@pytest.mark.parametrize("task_id", ["task", "alias"])
+def test_genuinely_new_identified_baseline_receipt_permits_fresh_age_after_reopen(
+    sqlite_tmp_path: Path, task_id: str
+) -> None:
+    scenario = Scenario()
+    path = sqlite_tmp_path / "intake.db"
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        original = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400)
+    scenario.time = scenario.baseline.observed_at = 201
+    scenario.baseline.reference = "fixture:baseline:genuinely-new"
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        fresh = intake.prepare(
+            task_id,
+            SUBJECT,
+            declaration(context=["explicit amendment with new evidence"]),
+            expected_parent=original.digest if task_id == "task" else None,
+        )
+        assert fresh.evidence.observed_at == 201
+        approved = intake.approve(OWNER, fresh, policy(), decision_id="fresh", expires_at=400)
+        with patch.object(
+            ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+        ) as translator:
+            refusal = intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            translator.assert_called_once()
+        assert refusal.handoff.draft.evidence.baseline_reference == "fixture:baseline:genuinely-new"
+        assert refusal.handoff.draft.evidence.observed_at == 201
+        assert refusal.reason == "ordinary_requirement_mapping_unavailable"
+        assert intake.history("task")[0] == original
+
+
+def test_existing_inflated_age_record_is_checked_against_older_history_on_reopen(sqlite_tmp_path: Path) -> None:
+    scenario = Scenario()
+    path = sqlite_tmp_path / "intake.db"
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        original = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400)
+        scenario.time = scenario.baseline.observed_at = 150
+        # Synthetic persisted shape from the former task-alias age-renewal bug.
+        legacy = Draft(
+            "legacy-alias",
+            1,
+            None,
+            declaration(context=["amended legacy context"]),
+            replace(original.evidence, observed_at=150),
+        )
+        raw = encode(legacy.payload())
+        key = "ordinary:legacy-alias:draft:1"
+        store.intent(key, key, {"kind": "ordinary-intake-record", "version": 1, "bytes": raw.decode()})
+        store.finalize_artifact(key, "record", raw)
+        approved = intake.approve(OWNER, legacy, policy(), decision_id="legacy", expires_at=400)
+    scenario.time = scenario.baseline.observed_at = 201
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        assert intake.history("legacy-alias") == (legacy,)
+        assert intake.history("task")[0] == original
+        with patch.object(
+            ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+        ) as translator:
+            with pytest.raises(IntakeRefused, match="expired"):
+                intake.approve(OWNER, legacy, policy(), decision_id="legacy", expires_at=400)
+            with pytest.raises(IntakeRefused, match="expired"):
+                intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            translator.assert_not_called()
+        assert store.artifact(key, "record") == raw
+
+
+@pytest.mark.parametrize("binding", ["source", "recipe"])
+def test_old_receipt_cannot_claim_a_new_unverified_source_or_recipe(sqlite_tmp_path: Path, binding: str) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        original = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400)
+        scenario.time = scenario.baseline.observed_at = 201
+        selected = SUBJECT
+        meaning = declaration(context=["proposal claims fresh evidence"])
+        current_policy = policy()
+        if binding == "source":
+            selected = replace(SUBJECT, base="c" * 40)
+            scenario.transport.branches["develop"] = selected.base
+            scenario.content.results[selected.base] = False
+            # The identified baseline producer still binds the original source.
+        else:
+            meaning = declaration(recipes=["controller:new-recipe:v2"])
+            current_policy = replace(policy(), recipes=frozenset({"controller:new-recipe:v2"}))
+            scenario.baseline.recipe_digest = original.evidence.recipe_digest
+        changed = intake.prepare("task", selected, meaning, expected_parent=original.digest)
+        assert changed.evidence.disposition is Disposition.BASELINE
+        assert changed.evidence.baseline_reference == "unknown"
+        with pytest.raises(IntakeRefused):
+            intake.approve(OWNER, changed, current_policy, decision_id="counterfeit", expires_at=400)
+        assert not store.operations("ordinary:decision:counterfeit")
+
+
+@pytest.mark.parametrize("field", ["baseline_reference", "baseline_producer", "baseline_result", "observed_at"])
+def test_proposal_cannot_mint_new_baseline_identity_or_age(field: str) -> None:
+    with pytest.raises(IntakeRefused):
+        declaration(**{field: "new-evidence-claim"})

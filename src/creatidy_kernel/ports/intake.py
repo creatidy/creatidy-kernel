@@ -3,7 +3,7 @@
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
 from creatidy_kernel.core.authority import Principal
@@ -222,6 +222,36 @@ class OrdinaryIntake:
                 raise IntakeRefused("broken immutable draft chain")
         return tuple(drafts)
 
+    def _baseline_age(self, evidence: IntakeEvidence) -> int:
+        """Earliest durable receipt age in this store, independent of task aliases/meaning."""
+        identity = (
+            evidence.subject,
+            evidence.source,
+            evidence.recipe_digest,
+            evidence.baseline_producer,
+            evidence.baseline_reference,
+            evidence.baseline_result,
+        )
+        task_ids = {
+            record.operation_id.split(":")[1]
+            for record in self.store.operations("ordinary:")
+            if re.fullmatch(r"ordinary:[A-Za-z0-9_-]+:draft:[1-9][0-9]*", record.operation_id)
+        }
+        observed_at = evidence.observed_at
+        for task_id in sorted(task_ids):
+            for draft in self.history(task_id):
+                old = draft.evidence
+                if identity == (
+                    old.subject,
+                    old.source,
+                    old.recipe_digest,
+                    old.baseline_producer,
+                    old.baseline_reference,
+                    old.baseline_result,
+                ):
+                    observed_at = min(observed_at, old.observed_at)
+        return observed_at
+
     def historical_decision(self, decision_id: str) -> bytes:
         """Recover immutable historical bytes only; no present authority or expiry renewal."""
         raw = self._recover(self.store.operation(f"ordinary:decision:{decision_id}"))
@@ -260,6 +290,7 @@ class OrdinaryIntake:
         evidence = self.reader.read(selected, declaration)
         if evidence.subject != selected:
             raise IntakeRefused("evidence subject differs")
+        evidence = replace(evidence, observed_at=self._baseline_age(evidence))
         if previous is not None and previous.evidence.subject != selected:
             old = previous.evidence.subject
             if (old.origin, old.repository, old.issue, old.branch) != (
@@ -285,6 +316,7 @@ class OrdinaryIntake:
         self, principal: Principal, draft: Draft, policy: OwnerPolicy, current: IntakeEvidence, expires_at: int
     ) -> None:
         history = self.history(draft.task_id)
+        baseline_age = self._baseline_age(current)
         now = self.clock()
         if (
             type(principal) is not Principal
@@ -298,7 +330,7 @@ class OrdinaryIntake:
             or now >= expires_at
             or current.observed_at > now
             or draft.evidence.observed_at > now
-            or now - min(draft.evidence.observed_at, current.observed_at) > policy.freshness_seconds
+            or now - min(draft.evidence.observed_at, baseline_age) > policy.freshness_seconds
         ):
             raise IntakeRefused("decision or evidence expired")
         if not history or history[-1].digest != draft.digest or current.digest != draft.evidence.digest:
