@@ -38,7 +38,7 @@ from creatidy_kernel.core.domain import (
     ProgramSpec,
     ProgramStatus,
 )
-from creatidy_kernel.ports.program_store import OperationRecord
+from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
 
 SCHEMA_VERSION = 2
 _APPLICATION_ID = 0x43544B31
@@ -336,6 +336,26 @@ class SQLiteProgramStore:
             return self.load(program_id)
         except ProgramNotFound:
             return None
+
+    def program_read_cut[T](
+        self, program_id: str, read: Callable[[Program], T], clock: Callable[[], int]
+    ) -> tuple[Program, T, int]:
+        """Finish local reads before time sampling; callbacks may not invalidate the cut.
+
+        Existing exclusive connection/writer-thread ownership rules out another
+        store writer. SQLite's cached total_changes detects reentrant callback
+        writes (including cancellation) without a database read after the clock.
+        This is not an atomic remote snapshot or a hostile same-UID boundary.
+        """
+        self._assert_writer_thread()
+        with self._gate:
+            changes = self._connection.total_changes
+            program = self.load(program_id)
+            value = read(program)
+            now = clock()
+            if self._closed or self._connection.total_changes != changes:
+                raise ProgramReadChanged("final store read cut changed during a callback")
+            return program, value, now
 
     def admit(self, program_id: str, command_key: str, command: DomainCommandType) -> Program:
         return self._admit(program_id, command_key, command, intent=None)

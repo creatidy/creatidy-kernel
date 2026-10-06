@@ -313,8 +313,16 @@ reconstructed from original journal bytes; interrupted create/amend resumes the 
 only after current owner/revision/evidence/expiry checks. Reads/callbacks finish before the authority
 clock is sampled. Historical decision recovery exposes immutable bytes, not renewed authority.
 Current Core `CANCELLED` status (owner abandonment) blocks approval replay, new approvals/amendments
-and translator handoff even when the Spec digest is unchanged. Lifecycle is reloaded after current
-checks/callbacks at the final return/handoff boundary; stored historical decisions remain readable.
+and translator handoff even when the Spec digest is unchanged. The final return/handoff guard uses
+`program_read_cut` on the existing single-writer SQLite store: it loads the authoritative Program,
+reads/revalidates the latest draft and durable receipt age, and finishes pure owner/evidence/scope
+checks before sampling the clock. SQLite's existing in-memory `total_changes` counter detects
+reentrant callback writes during the cut (including clock-time cancellation or amendment); an
+invalidated cut refuses rather than silently retrying. No database/artifact reads or writes remain
+after that final clock/expiry/freshness check. Stored historical decisions remain readable.
+This uses existing connection exclusivity, writer-thread ownership and gate, not a new lock,
+tracker/table or atomic remote/runtime-gateway promise. Journal-only callback writes conservatively
+invalidate the cut too; a read-only callback can advance time but cannot bypass expiry/freshness.
 Other Core states retain their existing amendment semantics, including explicit amendments from
 COMPLETED. This adds no activation, resume or other lifecycle transition to ordinary intake.
 Recovery validates the actual record kind, namespace and content subject, not a draft-looking ID

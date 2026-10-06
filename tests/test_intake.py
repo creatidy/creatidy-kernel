@@ -30,6 +30,7 @@ from creatidy_kernel.core.domain import (
     PauseProgram,
     PolicyReference,
     PrepareAttempt,
+    Program,
     ProgramSpec,
     ProgramStatus,
     SatisfyWorkUnit,
@@ -50,6 +51,7 @@ from creatidy_kernel.core.intake import (
     encode,
 )
 from creatidy_kernel.ports.intake import OrdinaryIntake, draft_from
+from creatidy_kernel.ports.program_store import ProgramReadChanged
 
 pytest_plugins = ["test_sqlite_store"]
 
@@ -1758,3 +1760,208 @@ def test_permission_provenance_contains_no_provider_response_body() -> None:
     assert b"synthetic private response marker" not in observed.relevance_proof
     cut = next(item for item in json.loads(observed.relevance_proof) if "reads" in item)
     assert cut["reads"]["issue"] == {"initial": "inaccessible", "closing": "inaccessible"}
+
+
+@pytest.mark.parametrize("action", ["approve", "handoff"])
+@pytest.mark.parametrize("limit", ["expiry", "freshness"])
+def test_final_program_load_crossing_temporal_limit_refuses_delivery(
+    sqlite_tmp_path: Path, action: str, limit: str
+) -> None:
+    scenario = Scenario()
+    current_policy = policy() if limit == "expiry" else replace(policy(), freshness_seconds=99)
+    expires_at = 200 if limit == "expiry" else 400
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, current_policy, decision_id="original", expires_at=expires_at)
+        decision = intake.historical_decision("original")
+        scenario.time = 199
+        load = store.load
+        loads = 0
+        crossed = False
+
+        def cross_at_final_load(program_id: str):
+            nonlocal loads, crossed
+            program = load(program_id)
+            loads += 1
+            if loads == (5 if action == "approve" else 4):
+                scenario.time = 200
+                crossed = True
+            return program
+
+        with (
+            patch.object(store, "load", side_effect=cross_at_final_load),
+            patch.object(
+                ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+            ) as translator,
+        ):
+            with pytest.raises(IntakeRefused, match="expired"):
+                if action == "approve":
+                    intake.approve(OWNER, draft, current_policy, decision_id="original", expires_at=expires_at)
+                else:
+                    intake.handoff(OWNER, approved, current_policy, ScarcityRouterAllocator)
+            translator.assert_not_called()
+        assert crossed
+        assert intake.history("task") == (draft,)
+        assert intake.historical_decision("original") == decision
+        assert store.load(approved.program.program_id) == approved.program
+
+
+@pytest.mark.parametrize("action", ["approve", "handoff"])
+@pytest.mark.parametrize("cut", ["last-load", "final-clock"])
+@pytest.mark.parametrize("change", ["cancel", "spec"])
+def test_mutation_during_final_load_or_clock_cannot_deliver_stale_program(
+    sqlite_tmp_path: Path, action: str, cut: str, change: str
+) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+        load = store.load
+        loads = 0
+        armed = False
+        fired = False
+
+        def mutate() -> None:
+            nonlocal fired
+            program = load(approved.program.program_id)
+            if change == "cancel":
+                command = CancelProgram(program.revision, "owner")
+            else:
+                command = AmendProgramSpec(
+                    program.revision,
+                    "owner",
+                    SpecAmendment(program.spec.revision, objective="changed in final callback"),
+                )
+            store.admit(program.program_id, "owner-final-change", command)
+            fired = True
+
+        def final_load(program_id: str):
+            nonlocal loads, armed
+            program = load(program_id)
+            loads += 1
+            if loads == (5 if action == "approve" else 4):
+                if cut == "last-load":
+                    mutate()
+                else:
+                    armed = True
+            return program
+
+        def final_clock() -> int:
+            if armed and not fired:
+                mutate()
+            return scenario.time
+
+        intake.clock = final_clock
+        with (
+            patch.object(store, "load", side_effect=final_load),
+            patch.object(
+                ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+            ) as translator,
+        ):
+            with pytest.raises(IntakeRefused):
+                if action == "approve":
+                    intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+                else:
+                    intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            translator.assert_not_called()
+        assert fired
+        current = store.load(approved.program.program_id)
+        assert current.revision > approved.program.revision
+        if change == "cancel":
+            assert current.status is ProgramStatus.CANCELLED and current.spec == approved.program.spec
+        else:
+            assert current.spec.digest != approved.program.spec.digest
+        assert intake.historical_decision("original") == approved.decision_bytes
+
+
+@pytest.mark.parametrize("action", ["approve", "handoff"])
+def test_final_temporal_check_has_no_following_privileged_reads(sqlite_tmp_path: Path, action: str) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+        trace: list[str] = []
+
+        def clock() -> int:
+            trace.append("clock")
+            return scenario.time
+
+        intake.clock = clock
+        store._connection.set_trace_callback(lambda _: trace.append("sql"))  # pyright: ignore[reportPrivateUsage]
+        with patch.object(
+            ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+        ) as translator:
+            if action == "approve":
+                assert intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400) == approved
+            else:
+                assert intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator).handoff.draft == draft
+                translator.assert_called_once()
+        last_clock = len(trace) - 1 - trace[::-1].index("clock")
+        assert "sql" in trace[:last_clock]
+        assert trace[last_clock:] == ["clock"]
+        store._connection.set_trace_callback(None)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("where", ["read", "clock"])
+def test_local_read_cut_detects_callback_writes_without_post_clock_queries(sqlite_tmp_path: Path, where: str) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+        trace: list[str] = []
+
+        def mutate() -> None:
+            # Even a journal-only write invalidates this cut; no new tracking table.
+            store.intent("synthetic:callback", "synthetic:callback", {"fixture": "write"})
+
+        def read(program: Program) -> str:
+            assert program == approved.program
+            if where == "read":
+                mutate()
+            return "received"
+
+        def clock() -> int:
+            if where == "clock":
+                mutate()
+            trace.append("clock-return")
+            return scenario.time
+
+        store._connection.set_trace_callback(lambda _: trace.append("sql"))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(ProgramReadChanged, match="changed"):
+            store.program_read_cut(approved.program.program_id, read, clock)
+        assert trace[-1] == "clock-return"
+        store._connection.set_trace_callback(None)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_final_cut_rechecks_latest_draft_after_earlier_clock_amendment(sqlite_tmp_path: Path) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+        clocks = 0
+        changed = False
+
+        def clock() -> int:
+            nonlocal clocks, changed
+            clocks += 1
+            if clocks == 2:
+                intake.prepare(
+                    "task", SUBJECT, declaration(context=["new proposal in callback"]), expected_parent=draft.digest
+                )
+                changed = True
+            return scenario.time
+
+        intake.clock = clock
+        with patch.object(
+            ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+        ) as translator:
+            with pytest.raises(IntakeRefused, match="revision"):
+                intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            translator.assert_not_called()
+        assert changed and len(intake.history("task")) == 2
+        assert store.load(approved.program.program_id) == approved.program

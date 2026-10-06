@@ -36,7 +36,7 @@ from creatidy_kernel.core.intake import (
     object_from,
     strings,
 )
-from creatidy_kernel.ports.program_store import ApplicationStore, OperationRecord
+from creatidy_kernel.ports.program_store import ApplicationStore, OperationRecord, ProgramReadChanged
 
 
 class EvidenceReader(Protocol):
@@ -67,6 +67,9 @@ class RequirementsTranslator(Protocol):
 class IntakeStore(ApplicationStore, Protocol):
     def operations(self, prefix: str = "") -> tuple[OperationRecord, ...]: ...
     def find_program(self, program_id: str) -> Program | None: ...
+    def program_read_cut[T](
+        self, program_id: str, read: Callable[[Program], T], clock: Callable[[], int]
+    ) -> tuple[Program, T, int]: ...
 
 
 def _text(value: object) -> str:
@@ -460,7 +463,19 @@ class OrdinaryIntake:
         history = self.history(draft.task_id)
         baseline_age = self._baseline_age(current)
         program = self.store.find_program(f"ordinary:{draft.task_id}")
-        now = self.clock()
+        self._check_authority(principal, draft, policy, current, history, program)
+        self._check_time(draft, policy, current, expires_at, baseline_age, self.clock())
+
+    @staticmethod
+    def _check_authority(
+        principal: Principal,
+        draft: Draft,
+        policy: OwnerPolicy,
+        current: IntakeEvidence,
+        history: tuple[Draft, ...],
+        program: Program | None,
+    ) -> None:
+        """Pure checks only: no privileged reads/callbacks after temporal validation."""
         if (
             type(principal) is not Principal
             or principal.role != "owner"
@@ -469,15 +484,6 @@ class OrdinaryIntake:
             raise IntakeRefused("authenticated owner required")
         if program is not None and program.status is ProgramStatus.CANCELLED:
             raise IntakeRefused("Program is cancelled")
-        if (
-            type(now) is not int
-            or type(expires_at) is not int
-            or now >= expires_at
-            or current.observed_at > now
-            or draft.evidence.observed_at > now
-            or now - min(draft.evidence.observed_at, baseline_age) > policy.freshness_seconds
-        ):
-            raise IntakeRefused("decision or evidence expired")
         if not history or history[-1].digest != draft.digest or current.digest != draft.evidence.digest:
             raise IntakeRefused("revision or evidence changed; explicit amendment required")
         if (
@@ -505,6 +511,50 @@ class OrdinaryIntake:
         ):
             if not frozenset(strings(data[name])) <= allowed:
                 raise IntakeRefused("proposal exceeds trusted owner policy")
+
+    @staticmethod
+    def _check_time(
+        draft: Draft,
+        policy: OwnerPolicy,
+        current: IntakeEvidence,
+        expires_at: int,
+        baseline_age: int,
+        now: int,
+    ) -> None:
+        if (
+            type(now) is not int
+            or type(expires_at) is not int
+            or now >= expires_at
+            or current.observed_at > now
+            or draft.evidence.observed_at > now
+            or now - min(draft.evidence.observed_at, baseline_age) > policy.freshness_seconds
+        ):
+            raise IntakeRefused("decision or evidence expired")
+
+    def _final_program(
+        self,
+        program_id: str,
+        spec_digest: str,
+        principal: Principal,
+        draft: Draft,
+        policy: OwnerPolicy,
+        current: IntakeEvidence,
+        expires_at: int,
+    ) -> Program:
+        def read(program: Program) -> int:
+            history = self.history(draft.task_id)
+            baseline_age = self._baseline_age(current)
+            if program.spec.digest != spec_digest:
+                raise IntakeRefused("current Program binding changed")
+            self._check_authority(principal, draft, policy, current, history, program)
+            return baseline_age
+
+        try:
+            program, baseline_age, now = self.store.program_read_cut(program_id, read, self.clock)
+        except ProgramReadChanged as error:
+            raise IntakeRefused(str(error)) from None
+        self._check_time(draft, policy, current, expires_at, baseline_age, now)
+        return program
 
     def _current_program(self, program_id: str, spec_digest: str) -> Program:
         """Recheck abandonment after callbacks; other states retain Core amendment semantics."""
@@ -564,7 +614,9 @@ class OrdinaryIntake:
                 self._validate(principal, draft, policy, current, expires_at)
                 self._record(key, decision)
                 self._validate(principal, draft, policy, current, expires_at)
-                current_program = self._current_program(program_id, current_program.spec.digest)
+                current_program = self._final_program(
+                    program_id, current_program.spec.digest, principal, draft, policy, current, expires_at
+                )
                 return ApprovedMeaning(draft, decision_id, decision, current_program)
             if consumed.get("expected_revision") != current_program.revision:
                 raise IntakeRefused("approval recovery no longer matches Program")
@@ -630,7 +682,7 @@ class OrdinaryIntake:
                 f"ordinary:approve:{decision_id}",
                 AmendProgramSpec(program.revision, principal.actor_id, amendment),
             )
-        program = self._current_program(program_id, program.spec.digest)
+        program = self._final_program(program_id, program.spec.digest, principal, draft, policy, current, expires_at)
         return ApprovedMeaning(draft, decision_id, decision, program)
 
     def handoff(
@@ -659,7 +711,15 @@ class OrdinaryIntake:
         ):
             raise IntakeRefused("decision has no matching durable consumption")
         self._validate(principal, approved.draft, policy, current, _integer(decision["expires_at"]))
-        program = self._current_program(program.program_id, approved.program.spec.digest)
+        program = self._final_program(
+            program.program_id,
+            approved.program.spec.digest,
+            principal,
+            approved.draft,
+            policy,
+            current,
+            _integer(decision["expires_at"]),
+        )
         return translator.translate_ordinary(
             RequirementsHandoff(approved.draft, approved.decision_id, approved.decision_bytes, program.spec.digest)
         )
