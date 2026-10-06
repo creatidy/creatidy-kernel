@@ -104,3 +104,141 @@ passing an expected head to the forge merge API is insufficient: the base may mo
 merge. Require a forge merge-queue/equivalent guarantee, or a precomputed tested merge commit applied
 with atomic expected-old target-ref comparison and branch-policy compliance. If neither is supported,
 disable automatic merge. Do not silently weaken the gate for a particular forge.
+
+## Proposed Ordinary Intake Contract (#49)
+
+**Status: proposed for contract review, not implemented or an accepted wire format.** This section
+describes the independent preparation slice of [#49](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/49).
+It does not add an endpoint, operator flag, worker protocol, or ordinary-task execution path.
+The final implementation must receive all six issue acceptance criteria; contract review alone is
+not functional acceptance, an owner grant, or live readiness.
+
+### Scope And Trust
+
+Preparation receives one explicitly identified ordinary issue and produces inert, reviewable task
+meaning. It neither discovers a queue nor creates a planner, scheduler, harness, or execution graph.
+Issue text, repository instructions and optional model suggestions are attributed proposal data.
+They cannot select the authenticated principal, approve themselves, choose a trusted policy, or
+create an Attempt, resource allocation, worker grant, baseline process, or Forge effect.
+
+The existing trusted-caller boundary in `ports/authority.py` supplies `Principal` separately from
+proposal data. Approval is owner-only. A principal label is not authentication: this slice retains
+the existing trusted local controller assumption and must not deserialize a principal from issue,
+model, Console, or declaration fields. Remote approval authentication, hostile same-UID protection,
+new credentials/signatures and a stronger sandbox are not implemented by this proposal. A Console
+may forward an owner-served request only after its actual authenticated channel is received; a
+Console claim cannot turn a worker/proposer into an owner.
+
+No preparation step runs repository hooks, repository-supplied verification commands, or inference.
+Known baseline evidence may be received from an identified, trusted evidence producer with an exact
+source/recipe subject. Unknown baseline remains unknown; it cannot be changed into a pass by owner
+approval of the task's meaning. Untrusted live execution still requires the separately accepted
+isolation and execution receipts.
+
+### Logical Records
+
+The following are logical contents to review, not prescribed new shared JSON keys or HTTP shapes.
+Concrete serialization and operator syntax follow contract review and must reject ambiguous,
+malformed and unsupported input without echoing secret values in diagnostics.
+
+| Record | Logical contents and invariant |
+| --- | --- |
+| Declaration | Kernel-owned task identity; host-qualified canonical repository and issue; proposed outcome and acceptance criteria; quality/interface/context needs with explicit unknowns; bounded path/network/effect requests; verification recipe and policy references; proposal provenance. No model inventory, new quality scale, inferred minimum, numeric budget, or authority-bearing approval field. |
+| Draft revision | Immutable declaration bytes and digest; positive revision and prior revision digest; references to its exact issue, source and baseline observations. A changed proposal creates another revision, never overwrites earlier bytes. A draft revision is not an approved `ProgramSpec`. |
+| Issue observation | Bound repository/issue identity, current issue state and provider-update evidence, content digest and observation time. Permission failures, incomplete pages or moving observations are retained as unknown/incomplete rather than negative existence evidence. |
+| Source and baseline observations | Exact source/base object IDs, relevant implementation evidence, baseline outcome and producer/recipe identity, subject references and observation time. Empty checks, structural presence, stale results and unsupported baseline collection are not passing tests. |
+| PR/equivalence observation | Exact PR identity, state, base/head/source binding, scan completeness and supported equivalence evidence. A link, matching title, open issue, or prose claiming equivalence is insufficient proof. Relevant fork PRs must be supported or make the assessment explicitly incomplete. |
+| Owner decision | Durable decision identity; separately authenticated owner; exact draft revision/digest, issue/source/baseline subjects, approved scope/recipes/policies and expiry. Its bytes and original expiry are immutable. It approves the bound meaning, not arbitrary future amendments or worker effects. |
+| Approved requirements handoff | Complete approved requirements and provenance, bound to the current approved revision/decision and exact evidence subjects. The actual translation/refusal seam must receive these contents intact; a recording fake or a blanket refusal before delivery is insufficient. |
+
+Issue/source observation times are freshness evidence, not semantic identity by themselves. Repeated
+observations of unchanged content must not manufacture declaration revisions or renew a decision.
+Changed issue content, source/base, baseline subject, requirement, scope or recipe must be detected
+and cannot silently reuse prior approval. Purely operational changes remain distinct from changes
+to intended results and their acceptance applicability.
+
+### Current-Relevance Dispositions
+
+The preparation result distinguishes positive current-source implementation evidence, a positively
+established active equivalent PR, known work remaining, incomplete search, permission-limited search,
+stale source, unresolved equivalence and unknown baseline. It includes the evidence and its limits,
+not only a status label.
+
+An already implemented issue is not redispatched because it remains open. A merged PR requires
+current-source evidence before it establishes implementation. An active equivalent PR requires
+exact state/head and supported equivalence evidence. Bounded or moving pagination, 404, missing
+checks, an unsupported fork, or inability to interpret equivalence cannot prove exhaustive absence
+or become `work remains`. Relevance may remain indeterminate while an inert draft is reviewable.
+
+A known failing baseline can be relevant to an approved repair. Its intended failure, unrelated
+failures, applicable recipe and exact subject must be explicit. Unknown baseline and unrelated
+failure are not interchangeable with that evidence. Unresolved required freshness/relevance/
+baseline evidence prevents admission; approving task meaning does not resolve those facts.
+
+### Approval, History And Applicability
+
+Reuse the immutable `ProgramSpec` revision/parent chain, existing domain owner checks, consumed
+inputs/pinned policies, `SQLiteProgramStore` command journal and content-addressed artifacts.
+Do not introduce another WorkUnit/Attempt lifecycle, controller database or synthetic approval
+signature service. Inert draft/decision records must not appear as executable worker outbox effects.
+
+Only a validated owner decision can produce an approved ordinary `ProgramSpec`. Any required
+budget/authority value must come from the trusted owner policy/decision, not a proposal, price,
+model name or a new fallback. Approval of incomplete meaning may be recorded, but missing required
+values or evidence cannot yield an admissible Program or executable grant. Preparing or approving
+meaning does not activate an ordinary task or enable the historical frozen execution entry point.
+
+Bind the declaration, relevant source/baseline/recipe evidence and result-affecting scope through
+inputs actually consumed by the WorkUnit or its pinned policy. Existing domain applicability
+deliberately excludes unused inputs and operational-only budget/authority changes. Therefore an
+unused metadata reference or changed ProgramSpec digest alone is not proof that stale acceptance
+was invalidated. Test amendments that change meaning/verification/scope and separately test
+unaffected history. A proposer amendment does not apply an owner amendment or widen a grant.
+
+Decision reuse first validates current principal, exact revision/digest, all required evidence,
+approved scope and expiry at decision time. Poll/read callbacks finish before the authority clock
+is sampled. Existing journal deduplication may recover a historical receipt, but cannot make an
+expired or superseded decision current, revive an earlier revision, renew expiry, or authorize
+another effect. Recovery distinguishes an immutable historical approval from present admission.
+
+### Requirements Delivery And Refusal
+
+Kernel owns approved task meaning; Router owns capability calibration, profiles, model catalogue,
+selection/admission and supported requirement interpretation. A full declaration is not just
+prompt text, `reference` plus a context count, or a task-level choice.
+
+Current public Router producer revision
+[`1dae1948f372e0f1739896655bb7db97d6b08460`](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/commit/1dae1948f372e0f1739896655bb7db97d6b08460)
+defines the existing three-part `TaskRequirement`, six capability dimensions with supplied minima
+and nine typed hard constraints. It does not establish every proposed task/harness/authority
+mapping; its privacy identifier does not prove privacy-policy enforcement. Router
+[#175](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/issues/175) receives actual Kernel
+declarations and agrees supported interpretation before richer execution reception.
+
+The #49 implementation must deliver the complete approved declaration and subject to a real,
+requirements-preserving translation/refusal boundary. Unsupported or unavailable mapping returns
+an explicit diagnostic tied to those original requirements, before any Router transport. It must
+not construct the historical L0/reference request, invent fields/minima or drop privacy, interface,
+context, verification or authority requirements. Successful rich mapping and execution preservation
+remain [#51](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/51) and its producer reception;
+this refusal boundary is not a claim those dependent requirements are complete.
+
+### Compatibility And Reception
+
+The frozen #143/#166 task definitions, logical digest encodings, exact-base rules, original
+allocation/envelope and receipt recovery are unchanged. Do not retrofit ordinary defaults or
+approval into them. Ordinary records must be explicitly distinguishable and versioned, survive
+reopen/recovery, and fail clearly on unsupported versions without modifying historical state.
+
+The issue's final proof includes immutable draft/approval round trips, owner/worker/Console and
+prose injection negatives, edits/replay/expiry/scope/recipe/baseline changes, current-source and
+equivalent-PR cases, partial/permission-limited scans, amendment applicability, actual intact
+translation/refusal delivery, historical #143/#166 regression and installed operator migration
+documentation. No new syntax is advertised as supported before this contract is reviewed.
+
+The reuse comparison uses the independently inspected
+[Symphony SPEC at `be10a1b79df723d6d7612b5651c8522704dafb2e`](https://github.com/openai/symphony/blob/be10a1b79df723d6d7612b5651c8522704dafb2e/SPEC.md)
+and its Apache-2.0 licence. Borrow qualified tracker snapshots and reconciliation-before-dispatch
+patterns only. Symphony's tracker/workspace/in-memory retry state, prompt policy, hooks and
+implementation-defined approval posture do not replace Kernel's durable owner decision, grants
+or acceptance. No source is copied, library adopted, scheduler imported or runtime constructed.
