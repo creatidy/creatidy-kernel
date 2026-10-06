@@ -80,6 +80,19 @@ def _integer(value: object) -> int:
     return value
 
 
+def _subject_from(value: object) -> IssueSubject:
+    subject = object_from(encode(value))
+    if set(subject) != {"origin", "repository", "issue", "branch", "base"}:
+        raise IntakeRefused("invalid issue subject fields")
+    return IssueSubject(
+        _text(subject["origin"]),
+        _text(subject["repository"]),
+        _integer(subject["issue"]),
+        _text(subject["branch"]),
+        _text(subject["base"]),
+    )
+
+
 def draft_from(raw: bytes) -> Draft:
     """Decode only inert records, never principals, policies, or approved Programs."""
     value = object_from(raw)
@@ -97,16 +110,7 @@ def draft_from(raw: bytes) -> Draft:
     if value["kind"] != "ordinary-draft" or type(value["version"]) is not int or value["version"] != 1:
         raise IntakeRefused("unsupported draft version")
     evidence = object_from(encode(value["evidence"]))
-    subject = object_from(encode(evidence.pop("subject", None)))
-    if set(subject) != {"origin", "repository", "issue", "branch", "base"}:
-        raise IntakeRefused("invalid issue subject fields")
-    selected = IssueSubject(
-        _text(subject["origin"]),
-        _text(subject["repository"]),
-        _integer(subject["issue"]),
-        _text(subject["branch"]),
-        _text(subject["base"]),
-    )
+    selected = _subject_from(evidence.pop("subject", None))
     fields = {
         "issue_digest",
         "issue_updated",
@@ -198,11 +202,86 @@ class OrdinaryIntake:
         if (
             type(inner.get("version")) is not int
             or inner["version"] != 1
-            or inner.get("kind") not in {"ordinary-draft", "ordinary-owner-decision", "ordinary-consumption"}
+            or inner.get("kind")
+            not in {"ordinary-draft", "ordinary-owner-decision", "ordinary-consumption", "ordinary-baseline-age"}
         ):
             raise IntakeRefused("unsupported ordinary record version or kind")
+        if operation.effect_key != operation.operation_id:
+            raise IntakeRefused("inert record effect identity differs")
         if inner["kind"] == "ordinary-draft":
-            draft_from(raw)
+            draft = draft_from(raw)
+            if operation.operation_id not in {
+                f"{self._prefix(draft.task_id)}{draft.revision}",
+                f"ordinary:record:ordinary-draft:{draft.task_id}:{draft.revision}",
+            }:
+                raise IntakeRefused("draft namespace differs from subject")
+        elif inner["kind"] == "ordinary-owner-decision":
+            if set(inner) != {
+                "kind",
+                "version",
+                "decision_id",
+                "issuer",
+                "draft_digest",
+                "revision",
+                "evidence_digest",
+                "policy_digest",
+                "policy",
+                "expires_at",
+            }:
+                raise IntakeRefused("invalid decision fields")
+            decision_id = _text(inner["decision_id"])
+            self._prefix(decision_id)
+            if operation.operation_id != f"ordinary:decision:{decision_id}":
+                raise IntakeRefused("decision namespace differs from subject")
+            _text(inner["issuer"])
+            _integer(inner["revision"])
+            _integer(inner["expires_at"])
+        elif inner["kind"] == "ordinary-consumption":
+            fields = set(inner)
+            if fields not in (
+                {"kind", "version", "decision", "draft", "program"},
+                {"kind", "version", "decision", "draft", "program", "expected_revision"},
+            ):
+                raise IntakeRefused("invalid consumption fields")
+            if "expected_revision" in inner and (
+                type(inner["expected_revision"]) is not int or inner["expected_revision"] < 0
+            ):
+                raise IntakeRefused("invalid consumption revision")
+            _text(inner["decision"])
+            _text(inner["draft"])
+            _text(inner["program"])
+            if (
+                re.fullmatch(r"ordinary:consumed:[A-Za-z0-9_-]+:(?:record:)?[1-9][0-9]*", operation.operation_id)
+                is None
+            ):
+                raise IntakeRefused("invalid consumption namespace")
+        else:
+            if set(inner) != {"kind", "version", "identity", "observed_at"}:
+                raise IntakeRefused("invalid baseline age fields")
+            identity = object_from(encode(inner["identity"]))
+            if set(identity) != {
+                "subject",
+                "source",
+                "recipe_digest",
+                "baseline_producer",
+                "baseline_reference",
+                "baseline_result",
+            }:
+                raise IntakeRefused("invalid baseline age identity")
+            subject = _subject_from(identity["subject"])
+            for name in set(identity) - {"subject"}:
+                _text(identity[name])
+            if (
+                identity["source"] != subject.base
+                or identity["baseline_result"] not in {"passed", "failed"}
+                or re.fullmatch(r"[0-9a-f]{64}", _text(identity["recipe_digest"])) is None
+                or identity["baseline_producer"] == "unknown"
+                or identity["baseline_reference"] == "unknown"
+            ):
+                raise IntakeRefused("unresolved baseline age subject")
+            observed_at = _integer(inner["observed_at"])
+            if operation.operation_id != f"ordinary:baseline-age:{digest(encode(identity))}:{observed_at}":
+                raise IntakeRefused("baseline age namespace differs from subject")
         artifact = self.store.find_artifact(operation.operation_id, "record")
         if artifact is None:
             self.store.finalize_artifact(operation.operation_id, "record", raw)
@@ -211,8 +290,16 @@ class OrdinaryIntake:
         return raw
 
     def history(self, task_id: str) -> tuple[Draft, ...]:
-        records = self.store.operations(self._prefix(task_id))
-        drafts = sorted((draft_from(self._recover(record)) for record in records), key=lambda item: item.revision)
+        records = (
+            *self.store.operations(self._prefix(task_id)),
+            *self.store.operations(f"ordinary:record:ordinary-draft:{task_id}:"),
+        )
+        drafts: list[Draft] = []
+        for record in records:
+            raw = self._recover(record)
+            if object_from(raw)["kind"] == "ordinary-draft":
+                drafts.append(draft_from(raw))
+        drafts.sort(key=lambda item: item.revision)
         for index, item in enumerate(drafts):
             if (
                 item.task_id != task_id
@@ -224,24 +311,34 @@ class OrdinaryIntake:
 
     def _baseline_age(self, evidence: IntakeEvidence) -> int:
         """Earliest durable receipt age in this store, independent of task aliases/meaning."""
-        identity = (
-            evidence.subject,
-            evidence.source,
-            evidence.recipe_digest,
-            evidence.baseline_producer,
-            evidence.baseline_reference,
-            evidence.baseline_result,
-        )
-        task_ids = {
-            record.operation_id.split(":")[1]
-            for record in self.store.operations("ordinary:")
-            if re.fullmatch(r"ordinary:[A-Za-z0-9_-]+:draft:[1-9][0-9]*", record.operation_id)
+        identity = {
+            "subject": evidence.subject.payload(),
+            "source": evidence.source,
+            "recipe_digest": evidence.recipe_digest,
+            "baseline_producer": evidence.baseline_producer,
+            "baseline_reference": evidence.baseline_reference,
+            "baseline_result": evidence.baseline_result,
         }
-        observed_at = evidence.observed_at
+        task_ids: set[str] = set()
+        known_age: int | None = None
+        for record in self.store.operations("ordinary:"):
+            inner = object_from(self._recover(record))
+            if inner["kind"] == "ordinary-draft":
+                task_ids.add(_text(inner["task_id"]))
+            elif inner["kind"] == "ordinary-baseline-age" and inner["identity"] == identity:
+                age = _integer(inner["observed_at"])
+                known_age = age if known_age is None else min(known_age, age)
         for task_id in sorted(task_ids):
             for draft in self.history(task_id):
                 old = draft.evidence
-                if identity == (
+                if (
+                    evidence.subject,
+                    evidence.source,
+                    evidence.recipe_digest,
+                    evidence.baseline_producer,
+                    evidence.baseline_reference,
+                    evidence.baseline_result,
+                ) == (
                     old.subject,
                     old.source,
                     old.recipe_digest,
@@ -249,8 +346,48 @@ class OrdinaryIntake:
                     old.baseline_reference,
                     old.baseline_result,
                 ):
-                    observed_at = min(observed_at, old.observed_at)
-        return observed_at
+                    known_age = old.observed_at if known_age is None else min(known_age, old.observed_at)
+        observed_at = _integer(evidence.observed_at)
+        if (
+            known_age is not None
+            and observed_at < known_age
+            and evidence.source == evidence.subject.base
+            and evidence.baseline_result in {"passed", "failed"}
+            and evidence.baseline_producer != "unknown"
+            and evidence.baseline_reference != "unknown"
+        ):
+            # Retain newly learned conservative age even when no semantic draft changes.
+            self._record(
+                f"ordinary:baseline-age:{digest(encode(identity))}:{observed_at}",
+                encode(
+                    {
+                        "kind": "ordinary-baseline-age",
+                        "version": 1,
+                        "identity": identity,
+                        "observed_at": observed_at,
+                    }
+                ),
+            )
+        return observed_at if known_age is None else min(observed_at, known_age)
+
+    def _consumptions(self, task_id: str) -> tuple[OperationRecord, ...]:
+        history = {draft.digest: draft for draft in self.history(task_id)}
+        records: list[OperationRecord] = []
+        for record in self.store.operations(f"ordinary:consumed:{task_id}:"):
+            inner = object_from(self._recover(record))
+            if inner["kind"] != "ordinary-consumption":
+                continue
+            draft = history.get(_text(inner["draft"]))
+            decision = object_from(self.historical_decision(_text(inner["decision"])))
+            if (
+                draft is None
+                or decision["draft_digest"] != draft.digest
+                or decision["revision"] != draft.revision
+                or decision["evidence_digest"] != draft.evidence.digest
+            ):
+                raise IntakeRefused("consumption differs from task subject")
+            records.append(record)
+        return tuple(records)
 
     def historical_decision(self, decision_id: str) -> bytes:
         """Recover immutable historical bytes only; no present authority or expiry renewal."""
@@ -309,7 +446,11 @@ class OrdinaryIntake:
             declaration,
             evidence,
         )
-        self._record(f"{self._prefix(task_id)}{draft.revision}", encode(draft.payload()))
+        key = f"{self._prefix(task_id)}{draft.revision}"
+        if any(record.operation_id == key for record in self.store.operations(key)):
+            # A legacy consumption for task 'draft' can occupy this exact draft key.
+            key = f"ordinary:record:ordinary-draft:{task_id}:{draft.revision}"
+        self._record(key, encode(draft.payload()))
         return draft
 
     def _validate(
@@ -397,7 +538,7 @@ class OrdinaryIntake:
             acceptance_policy_reference=policy.reference,
         )
         program_id = f"ordinary:{draft.task_id}"
-        prior_decisions = self.store.operations(f"ordinary:consumed:{draft.task_id}:")
+        prior_decisions = self._consumptions(draft.task_id)
         matching = [
             record for record in prior_decisions if object_from(self._recover(record)).get("decision") == decision_id
         ]
@@ -414,6 +555,9 @@ class OrdinaryIntake:
             if consumed.get("expected_revision") != current_program.revision:
                 raise IntakeRefused("approval recovery no longer matches Program")
         ordinal = len(prior_decisions) + 1 if not matching else int(matching[0].operation_id.rsplit(":", 1)[1])
+        consumption_key = (
+            matching[0].operation_id if matching else f"ordinary:consumed:{draft.task_id}:record:{ordinal}"
+        )
         if current_program is None:
             spec = ProgramSpec(
                 program_id,
@@ -436,7 +580,7 @@ class OrdinaryIntake:
             )
             self._validate(principal, draft, policy, current, expires_at)
             self._record(key, decision)
-            self._record(f"ordinary:consumed:{draft.task_id}:{ordinal}", consumption)
+            self._record(consumption_key, consumption)
             self._validate(principal, draft, policy, current, expires_at)
             program = self.store.create(spec, f"ordinary:approve:{decision_id}")
         else:
@@ -464,7 +608,7 @@ class OrdinaryIntake:
             )
             self._validate(principal, draft, policy, current, expires_at)
             self._record(key, decision)
-            self._record(f"ordinary:consumed:{draft.task_id}:{ordinal}", consumption)
+            self._record(consumption_key, consumption)
             self._validate(principal, draft, policy, current, expires_at)
             program = self.store.admit(
                 program_id,
@@ -493,7 +637,7 @@ class OrdinaryIntake:
             or program.spec.digest != approved.program.spec.digest
         ):
             raise IntakeRefused("decision or current Program binding changed")
-        consumed = self.store.operations(f"ordinary:consumed:{approved.draft.task_id}:")
+        consumed = self._consumptions(approved.draft.task_id)
         if not any(
             object_from(self._recover(record)).get("decision") == approved.decision_id
             and object_from(self._recover(record)).get("program") == program.spec.digest

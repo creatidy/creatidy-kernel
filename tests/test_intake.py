@@ -1105,3 +1105,270 @@ def test_old_receipt_cannot_claim_a_new_unverified_source_or_recipe(sqlite_tmp_p
 def test_proposal_cannot_mint_new_baseline_identity_or_age(field: str) -> None:
     with pytest.raises(IntakeRefused):
         declaration(**{field: "new-evidence-claim"})
+
+
+@pytest.mark.parametrize("observe_via", ["prepare", "approve", "handoff"])
+def test_unchanged_lower_age_observation_survives_reopen_without_rewriting_draft(
+    sqlite_tmp_path: Path, observe_via: str
+) -> None:
+    scenario = Scenario()
+    path = sqlite_tmp_path / "intake.db"
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        original = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400)
+        raw = store.artifact("ordinary:task:draft:1", "record")
+        decision = intake.historical_decision("original")
+        scenario.time = 150
+        scenario.baseline.observed_at = 50
+        if observe_via == "prepare":
+            assert intake.prepare("task", SUBJECT, declaration(), expected_parent=original.digest) == original
+        elif observe_via == "approve":
+            assert intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400) == approved
+        else:
+            refusal = intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            assert refusal.handoff.draft == original
+        assert intake.history("task") == (original,)
+        assert store.artifact("ordinary:task:draft:1", "record") == raw
+        assert intake.historical_decision("original") == decision
+    scenario.time = scenario.baseline.observed_at = 151
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        assert intake.history("task") == (original,)
+        with patch.object(
+            ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+        ) as translator:
+            with pytest.raises(IntakeRefused, match="expired"):
+                intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            with pytest.raises(IntakeRefused, match="expired"):
+                intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400)
+            translator.assert_not_called()
+        assert store.artifact("ordinary:task:draft:1", "record") == raw
+        assert intake.historical_decision("original") == decision
+
+
+@pytest.mark.parametrize("task_id", ["draft", "consumed", "decision", "baseline-age", "record"])
+def test_reserved_looking_task_ids_do_not_poison_other_history_or_reopen(sqlite_tmp_path: Path, task_id: str) -> None:
+    scenario = Scenario()
+    path = sqlite_tmp_path / "intake.db"
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare(task_id, SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="selected", expires_at=400)
+        other = intake.prepare("unrelated", SUBJECT, declaration(), expected_parent=None)
+        other_approved = intake.approve(OWNER, other, policy(), decision_id="unrelated", expires_at=400)
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        assert intake.history(task_id) == (draft,)
+        assert intake.history("unrelated") == (other,)
+        assert intake.approve(OWNER, draft, policy(), decision_id="selected", expires_at=400) == approved
+        assert intake.approve(OWNER, other, policy(), decision_id="unrelated", expires_at=400) == other_approved
+
+
+def test_draft_and_consumed_task_ids_coexist_with_further_amendments(sqlite_tmp_path: Path) -> None:
+    scenario = Scenario()
+    path = sqlite_tmp_path / "intake.db"
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        consumed = intake.prepare("consumed", SUBJECT, declaration(), expected_parent=None)
+        intake.approve(OWNER, consumed, policy(), decision_id="consumed", expires_at=400)
+        draft = intake.prepare("draft", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="draft", expires_at=400)
+        amendment = intake.prepare(
+            "consumed", SUBJECT, declaration(context=["amended"]), expected_parent=consumed.digest
+        )
+        changed = intake.approve(OWNER, amendment, policy(), decision_id="amendment", expires_at=400)
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        assert intake.history("consumed") == (consumed, amendment)
+        assert intake.history("draft") == (draft,)
+        assert intake.approve(OWNER, amendment, policy(), decision_id="amendment", expires_at=400) == changed
+        assert intake.approve(OWNER, draft, policy(), decision_id="draft", expires_at=400) == approved
+
+
+def test_lower_age_artifact_crash_recovers_from_nonexecutable_journal(sqlite_tmp_path: Path) -> None:
+    scenario = Scenario()
+    path = sqlite_tmp_path / "intake.db"
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        original = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400)
+        scenario.time = 150
+        scenario.baseline.observed_at = 50
+        publish = store.finalize_artifact
+
+        def crash_age(operation_id: str, name: str, data: bytes) -> str:
+            if operation_id.startswith("ordinary:baseline-age:"):
+                raise RuntimeError("age publication crash")
+            return publish(operation_id, name, data)
+
+        with patch.object(store, "finalize_artifact", side_effect=crash_age):
+            with pytest.raises(RuntimeError, match="age publication"):
+                intake.prepare("task", SUBJECT, declaration(), expected_parent=original.digest)
+        records = store.operations("ordinary:baseline-age:")
+        assert len(records) == 1 and records[0].attempts == 0
+        assert store.find_artifact(records[0].operation_id, "record") is None
+        with pytest.raises(OperationConflict, match="inert"):
+            store.claim(records[0].operation_id, now=150, lease_seconds=5)
+    scenario.time = scenario.baseline.observed_at = 151
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        with patch.object(
+            ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+        ) as translator:
+            with pytest.raises(IntakeRefused, match="expired"):
+                intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            translator.assert_not_called()
+        assert store.find_artifact(records[0].operation_id, "record") is not None
+        assert intake.history("task") == (original,)
+
+
+def test_retained_lower_age_is_idempotent_and_scoped_to_receipt_not_alias(sqlite_tmp_path: Path) -> None:
+    scenario = Scenario()
+    path = sqlite_tmp_path / "intake.db"
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        original = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400)
+        scenario.time = 150
+        scenario.baseline.observed_at = 50
+        for _ in range(2):
+            assert intake.prepare("task", SUBJECT, declaration(), expected_parent=original.digest) == original
+        assert len(store.operations("ordinary:baseline-age:")) == 1
+    scenario.time = scenario.baseline.observed_at = 151
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        alias = intake.prepare("draft", SUBJECT, declaration(context=["alias amendment"]), expected_parent=None)
+        assert alias.evidence.observed_at == 50
+        with pytest.raises(IntakeRefused, match="expired"):
+            intake.approve(OWNER, alias, policy(), decision_id="alias", expires_at=400)
+        scenario.baseline.reference = "fixture:genuinely-new-after-lower-age"
+        fresh = intake.prepare("task", SUBJECT, declaration(), expected_parent=original.digest)
+        assert fresh.evidence.observed_at == 151
+        approved = intake.approve(OWNER, fresh, policy(), decision_id="fresh", expires_at=400)
+        refusal = intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+        assert refusal.handoff.draft == fresh
+        assert len(store.operations("ordinary:baseline-age:")) == 1
+        assert intake.history("task")[0] == original
+
+
+def test_legacy_consumption_collision_is_readable_without_rewriting_history(sqlite_tmp_path: Path) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "producer.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("draft", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+        records = [
+            (record.operation_id, store.artifact(record.operation_id, "record"))
+            for record in store.operations("ordinary:")
+        ]
+    path = sqlite_tmp_path / "legacy.db"
+    legacy_key = "ordinary:consumed:draft:1"
+    legacy_raw = b""
+    with SQLiteProgramStore(path) as store:
+        for key, raw in records:
+            if json.loads(raw)["kind"] == "ordinary-consumption":
+                key = legacy_key
+                legacy_raw = raw
+            store.intent(key, key, {"kind": "ordinary-intake-record", "version": 1, "bytes": raw.decode()})
+            store.finalize_artifact(key, "record", raw)
+        store.create(approved.program.spec, "ordinary:approve:original")
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        assert intake.history("draft") == (draft,)
+        assert intake.history("consumed") == ()
+        assert intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400) == approved
+        consumed = intake.prepare("consumed", SUBJECT, declaration(), expected_parent=None)
+        changed = intake.approve(OWNER, consumed, policy(), decision_id="consumed", expires_at=400)
+        assert store.artifact(legacy_key, "record") == legacy_raw
+        assert intake.history("consumed") == (consumed,)
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        assert intake.approve(OWNER, consumed, policy(), decision_id="consumed", expires_at=400) == changed
+        assert intake.history("draft") == (draft,)
+        assert store.artifact(legacy_key, "record") == legacy_raw
+
+
+@pytest.mark.parametrize("corruption", ["kind", "namespace", "task-subject", "extra-field"])
+def test_malformed_draft_metadata_fails_without_rewriting(sqlite_tmp_path: Path, corruption: str) -> None:
+    scenario = Scenario()
+    path = sqlite_tmp_path / "malformed.db"
+    with SQLiteProgramStore(path) as store:
+        evidence = scenario.reader.read(SUBJECT, declaration())
+        value = Draft("task", 1, None, declaration(), evidence).payload()
+        key = "ordinary:task:draft:1"
+        if corruption == "kind":
+            value["kind"] = "ordinary-consumption"
+        elif corruption == "namespace":
+            key = "ordinary:task:draft:2"
+        elif corruption == "task-subject":
+            value["task_id"] = "other"
+        else:
+            value["approval"] = "untrusted extra field"
+        raw = encode(value)
+        store.intent(key, key, {"kind": "ordinary-intake-record", "version": 1, "bytes": raw.decode()})
+        store.finalize_artifact(key, "record", raw)
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        with pytest.raises(IntakeRefused):
+            intake.history("task")
+        assert store.artifact(key, "record") == raw
+
+
+@pytest.mark.parametrize("corruption", ["version", "kind", "subject", "timestamp", "extra-field", "wrong-task"])
+def test_malformed_age_and_consumption_bindings_refuse_recovery_without_rewrite(
+    sqlite_tmp_path: Path, corruption: str
+) -> None:
+    scenario = Scenario()
+    path = sqlite_tmp_path / "malformed.db"
+    with SQLiteProgramStore(path) as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        original = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400)
+        scenario.time = 150
+        scenario.baseline.observed_at = 50
+        intake.prepare("task", SUBJECT, declaration(), expected_parent=original.digest)
+        if corruption == "wrong-task":
+            record = store.operations("ordinary:consumed:task:")[0]
+            value = json.loads(store.artifact(record.operation_id, "record"))
+            key = "ordinary:consumed:other:record:1"
+        else:
+            record = store.operations("ordinary:baseline-age:")[0]
+            value = json.loads(store.artifact(record.operation_id, "record"))
+            key = record.operation_id
+            if corruption == "version":
+                value["version"] = 2
+            elif corruption == "kind":
+                value["kind"] = "ordinary-draft"
+            elif corruption == "subject":
+                value["identity"]["subject"]["issue"] = 50
+            elif corruption == "timestamp":
+                value["observed_at"] = 60
+            else:
+                value["principal"] = "owner"
+        raw = encode(value)
+        # Rebuild only the synthetic journal into a fresh store; immutable rows are not patched.
+        valid = [
+            (item.operation_id, store.artifact(item.operation_id, "record"))
+            for item in store.operations("ordinary:")
+            if item.operation_id != key
+        ]
+    with SQLiteProgramStore(sqlite_tmp_path / "recovered.db") as store:
+        for record_key, record_raw in [*valid, (key, raw)]:
+            store.intent(
+                record_key, record_key, {"kind": "ordinary-intake-record", "version": 1, "bytes": record_raw.decode()}
+            )
+            store.finalize_artifact(record_key, "record", record_raw)
+        store.create(approved.program.spec, "ordinary:approve:original")
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        with patch.object(
+            ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+        ) as translator:
+            with pytest.raises(IntakeRefused):
+                if corruption == "wrong-task":
+                    other = intake.prepare("other", SUBJECT, declaration(), expected_parent=None)
+                    intake.approve(OWNER, other, policy(), decision_id="other", expires_at=400)
+                else:
+                    intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            translator.assert_not_called()
+        assert store.artifact(key, "record") == raw

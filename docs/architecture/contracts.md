@@ -278,11 +278,16 @@ The draft retains complete normalized proof bytes and exact subject, not only a 
 The separate `BaselineReader` receives already-produced identified source/recipe-bound evidence;
 it is reobserved after closing Forge reads with exact semantic receipt identity comparison. Both
 observation times must be valid. Freshness uses the earliest durably known age of the same qualified
-subject/source/recipe/producer/reference/result receipt across immutable draft histories in the
+subject/source/recipe/producer/reference/result receipt across immutable draft histories and retained
+lower-age observations in the
 controller store, including task-ID aliases. Declaration, issue-content and proposal-provenance edits
 do not renew that receipt; a genuinely new identified receipt has its own age. These checks also run
 on approval/handoff after reopen without rewriting historical records or adding a tracker.
-Unchanged rereads create no revision and do not renew expiry. No baseline runner
+An unchanged reread learning an earlier age appends a versioned `ordinary-baseline-age` fact to the
+existing non-executable journal/artifacts, including through approval or handoff. It preserves the
+original draft/decision bytes, revision and expiry. Reopen reconstructs interrupted age publication
+from its original intent. Genuinely different receipts do not inherit another receipt's lower age.
+Unchanged rereads create no draft revision and do not renew expiry. No baseline runner
 is added. Unknown, future,
 stale or unrelated failing evidence cannot become a pass through approval.
 
@@ -293,13 +298,18 @@ DRAFT. Declaration, full relevance/baseline subject and recipe digests are **con
 result-affecting changes invalidate applicability. Operational-only budget/authority changes retain
 the existing core applicability behavior. Scope requests are preserved in consumed declaration bytes.
 
-Drafts, decisions and consumption use versioned `ordinary-*` records in the existing SQLite journal
+Drafts, decisions, consumption and lower-age facts use versioned `ordinary-*` records in the existing SQLite journal
 and content-addressed artifacts. Reserved `ordinary-intake-record` requests cannot be claimed by
 SQLite delivery, even though existing outbox bookkeeping is retained. There is no synthetic Attempt,
 second lifecycle/table/database or metadata worker effect. Interrupted artifact publication is
 reconstructed from original journal bytes; interrupted create/amend resumes the original decision
 only after current owner/revision/evidence/expiry checks. Reads/callbacks finish before the authority
 clock is sampled. Historical decision recovery exposes immutable bytes, not renewed authority.
+Recovery validates the actual record kind, namespace and content subject, not a draft-looking ID
+alone. New consumption IDs include `:record:` to avoid draft-ID collisions; legacy consumption IDs
+remain readable as their actual kind. A legacy consumption occupying a new draft's normal ID uses
+the disjoint `ordinary:record:ordinary-draft:<task>:<revision>` namespace without rewriting the
+legacy row. Accepted task IDs such as `draft`, `consumed`, `decision` and `baseline-age` remain usable.
 
 The installed package smoke and `tests/test_intake.py` receive the complete ordinary declaration at
 `ScarcityRouterAllocator.translate_ordinary`. Its static local refusal seam needs no configured
