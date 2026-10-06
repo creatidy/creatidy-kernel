@@ -36,6 +36,7 @@ class CodexStdio:
         schema_methods: frozenset[str] = frozenset(),
         schema_version: str | None = None,
         environment: Mapping[str, str] | None = None,
+        retain_notifications: bool = True,
     ) -> None:
         if (
             len(command) != 2
@@ -49,6 +50,7 @@ class CodexStdio:
             or type(schema_methods) is not frozenset
             or any(type(method) is not str or not method for method in schema_methods)
             or (schema_methods and schema_version != expected_version)
+            or type(retain_notifications) is not bool
         ):
             raise ValueError("absolute Codex app-server command, pinned version and finite limits required")
         if environment is not None:
@@ -66,12 +68,14 @@ class CodexStdio:
             self._environment = None
         self.timeout = timeout
         self.max_bytes = max_bytes
+        self._retain_notifications = retain_notifications
         self._lock = threading.Lock()
         self._pending = bytearray()
         self._notifications: list[dict[str, object]] = []
         self._notification_bytes = 0
         self._next_id = 1
         self._process: subprocess.Popen[bytes] | None = None
+        self.owned_group_settled: bool | None = None
         self._version = expected_version
         # initialize supplies no native method inventory. A trusted caller must
         # supply the method inventory from the schema generated for this binary.
@@ -117,8 +121,14 @@ class CodexStdio:
     def methods(self) -> frozenset[str]:
         return self._methods
 
-    def _stop(self, process: subprocess.Popen[bytes]) -> None:
+    def _stop(self, process: subprocess.Popen[bytes]) -> bool:
+        settled = False
         if process.poll() is None:
+            try:
+                if os.getpgid(process.pid) != process.pid:
+                    return False  # Never signal or adopt a shared/foreign process group.
+            except ProcessLookupError:
+                return False
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -126,17 +136,30 @@ class CodexStdio:
             try:
                 process.wait(timeout=self.timeout)
             except subprocess.TimeoutExpired:
+                pass
+            # A reaped leader does not establish descendant settlement. Its owned
+            # group may still contain children that ignored graceful termination.
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                settled = True
+            else:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
-                    pass
+                    settled = True
                 process.wait(timeout=self.timeout)
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    settled = True
         else:
             process.wait()
         if process.stdin is not None:
             process.stdin.close()
         if process.stdout is not None:
             process.stdout.close()
+        return settled
 
     def _version_output(self, process: subprocess.Popen[bytes]) -> str:
         if process.stdout is None:
@@ -215,8 +238,14 @@ class CodexStdio:
         return obj
 
     def _buffer_notification(self, obj: dict[str, object], size: int) -> None:
-        if not isinstance(obj.get("method"), str) or "id" in obj:
+        if not isinstance(obj.get("method"), str) or not obj["method"] or "id" in obj:
             raise OSError("unsupported Codex server request")
+        if "result" in obj or "error" in obj or ("params" in obj and not isinstance(obj["params"], dict)):
+            raise OSError("invalid Codex notification envelope")
+        # The task controller uses correlated receipts and thread/read as durable
+        # evidence, not progress events. Validation and exchange bounds still apply.
+        if not self._retain_notifications:
+            return
         self._notification_bytes += size
         if self._notification_bytes > self.max_bytes:
             raise OverflowError("Codex notification buffer exceeds limit")
@@ -311,7 +340,7 @@ class CodexStdio:
         finally:
             process, self._process = self._process, None
             if process is not None:
-                self._stop(process)
+                self.owned_group_settled = self._stop(process)
 
     def close(self) -> None:
         with self._lock:

@@ -2,7 +2,11 @@
 """Synthetic app-server fixtures; never starts the real Codex executable."""
 
 import json
+import os
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +15,8 @@ from creatidy_kernel.adapters.codex_stdio import CodexRPCError, CodexStdio
 
 FAKE = f"""#!{sys.executable}
 import json
+import os
+import signal
 import sys
 import time
 
@@ -23,6 +29,7 @@ assert first['method'] == 'initialize' and first['id'] == 1
 assert first['params']['clientInfo'] == {{'name': 'creatidy_kernel', 'title': 'Creatidy Kernel', 'version': '0.0.1'}}
 print(json.dumps({{'id': 1, 'result': {{'userAgent': 'fake'}}}}), flush=True)
 assert json.loads(sys.stdin.readline()) == {{'method': 'initialized', 'params': {{}}}}
+status = 'inProgress'
 for line in sys.stdin:
     message = json.loads(line)
     if message['method'] == 'timeout':
@@ -35,6 +42,46 @@ for line in sys.stdin:
         print(json.dumps({{'id': message['id'] + 1, 'result': {{}}}}), flush=True)
     elif message['method'] == 'server/request':
         print(json.dumps({{'id': 999, 'method': 'item/commandExecution/requestApproval', 'params': {{}}}}), flush=True)
+    elif message['method'] == 'malformed/notification':
+        print(json.dumps({{'method': 'item/agentMessage/delta', 'params': None}}), flush=True)
+    elif message['method'] in {{'progress', 'progress/flood'}}:
+        for _ in range(20 if message['method'] == 'progress/flood' else 2):
+            params = {{'threadId': 't', 'turnId': 'u', 'itemId': 'i', 'delta': 'x' * 64}}
+            print(json.dumps({{'method': 'item/agentMessage/delta', 'params': params}}))
+        result = {{'turn': {{'id': 'u', 'status': 'inProgress'}}}}
+        print(json.dumps({{'id': message['id'], 'result': result}}), flush=True)
+    elif message['method'] == 'spawn/stubborn' or (
+        os.environ.get('KERNEL_LIFECYCLE') == '1' and message['method'] == 'turn/start'
+    ):
+        read_fd, write_fd = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(read_fd)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            os.write(write_fd, b'ready')
+            os.close(write_fd)
+            while True:
+                signal.pause()
+        os.close(write_fd)
+        assert os.read(read_fd, 5) == b'ready'
+        os.close(read_fd)
+        result = {{'child': child, 'group': os.getpgrp(), 'turn': {{'id': 'turn-1'}}}}
+        print(json.dumps({{'id': message['id'], 'result': result}}), flush=True)
+    elif os.environ.get('KERNEL_LIFECYCLE') == '1':
+        method = message['method']
+        if method == 'thread/start':
+            result = {{'thread': {{'id': 'thread-1'}}, 'model': 'glm-5.3', 'modelProvider': 'zai'}}
+        elif method == 'turn/interrupt':
+            assert message['params'] == {{'threadId': 'thread-1', 'turnId': 'turn-1'}}
+            status = 'interrupted'
+            result = {{}}
+        else:
+            assert method == 'thread/read'
+            for _ in range(2):
+                params = {{'threadId': 'thread-1', 'turnId': 'turn-1', 'itemId': 'i', 'delta': 'x' * 64}}
+                print(json.dumps({{'method': 'item/agentMessage/delta', 'params': params}}))
+            result = {{'thread': {{'id': 'thread-1', 'turns': [{{'id': 'turn-1', 'status': status}}]}}}}
+        print(json.dumps({{'id': message['id'], 'result': result}}), flush=True)
     elif message['method'] == 'rpc/error':
         print(json.dumps({{'id': message['id'], 'error': {{'code': -32602, 'message': 'bad params'}}}}), flush=True)
     elif message['method'] == 'post/response':
@@ -101,6 +148,99 @@ def test_local_refusal_keeps_connection(command: tuple[str, ...]) -> None:
         with pytest.raises(ValueError, match="exceeds"):
             transport.request("thread/start", {"text": "x" * 512})
         assert transport.request("thread/start", {}) == {"ok": {}}
+    finally:
+        transport.close()
+
+
+def test_progress_discard_does_not_accumulate_across_healthy_exchanges(command: tuple[str, ...]) -> None:
+    transport = CodexStdio(command, "0.99.1", max_bytes=512, retain_notifications=False)
+    try:
+        for _ in range(30):
+            assert transport.request("progress", {}) == {"turn": {"id": "u", "status": "inProgress"}}
+        assert transport.notifications() == ()
+        assert transport.request("thread/read", {}) == {"ok": {}}
+    finally:
+        transport.close()
+
+
+def test_owned_cleanup_escalates_stubborn_child_without_signalling_bystander(
+    command: tuple[str, ...], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    transport = CodexStdio(command, "0.99.1", timeout=1, environment={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"})
+    spawned = transport.request("spawn/stubborn", {})
+    child = int(str(spawned["child"]))
+    owned_group = int(str(spawned["group"]))
+    original_killpg = os.killpg
+    signals: list[tuple[int, int]] = []
+
+    def capture(group: int, sig: int) -> None:
+        assert group == owned_group
+        signals.append((group, sig))
+        original_killpg(group, sig)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "killpg", capture)
+            transport.close()
+        assert (owned_group, signal.SIGTERM) in signals
+        assert (owned_group, signal.SIGKILL) in signals
+        assert bystander.poll() is None
+        # A residual group (including unreaped zombies) is not reported settled.
+        try:
+            original_killpg(owned_group, 0)
+        except ProcessLookupError:
+            assert transport.owned_group_settled is True
+        else:
+            assert transport.owned_group_settled is False
+        state = Path(f"/proc/{child}/stat")
+        deadline = time.monotonic() + 5
+        while state.exists() and state.read_text().split(")", 1)[1].split()[0] != "Z" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not state.exists() or state.read_text().split(")", 1)[1].split()[0] == "Z"
+    finally:
+        transport.close()
+        original_killpg(bystander.pid, signal.SIGKILL)
+        bystander.wait(timeout=5)
+        try:
+            original_killpg(owned_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_cleanup_refuses_shared_process_group(command: tuple[str, ...], monkeypatch: pytest.MonkeyPatch) -> None:
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+    class Inspected(CodexStdio):
+        def refuse_shared(self, process: subprocess.Popen[bytes]) -> bool:
+            return self._stop(process)
+
+    transport = Inspected(command, "0.99.1")
+    try:
+        with monkeypatch.context() as patch:
+
+            def forbidden(_group: int, _sig: int) -> None:
+                raise AssertionError("shared group must never be signalled")
+
+            patch.setattr(os, "killpg", forbidden)
+            assert transport.refuse_shared(bystander) is False
+        assert bystander.poll() is None
+    finally:
+        transport.close()
+        bystander.kill()
+        bystander.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "method", ["malformed/notification", "server/request", "too/large", "progress/flood", "malformed", "wrong/id"]
+)
+def test_progress_discard_still_refuses_invalid_individual_traffic(command: tuple[str, ...], method: str) -> None:
+    transport = CodexStdio(command, "0.99.1", max_bytes=512, retain_notifications=False)
+    try:
+        with pytest.raises((OSError, OverflowError, ValueError)):
+            transport.request(method, {})
+        with pytest.raises(OSError, match="closed"):
+            transport.request("thread/read", {})
     finally:
         transport.close()
 

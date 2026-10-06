@@ -2032,6 +2032,7 @@ def compose_task_live(config: TaskRuntimeConfig, task: TaskSpec) -> LiveTaskComp
             schema_methods=methods,
             schema_version=config.codex_version,
             environment=dict(config.child_environment),
+            retain_notifications=False,
         )
 
     def forge_factory(directory: Path) -> Forge:

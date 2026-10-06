@@ -4,6 +4,8 @@
 import inspect
 import json
 import os
+import signal
+import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -46,7 +48,7 @@ from creatidy_kernel.ports.forge import Forge
 from creatidy_kernel.ports.program_store import OperationRecord
 from creatidy_kernel.ports.resources import ResourceAllocator
 
-pytest_plugins = ["test_sqlite_store"]
+pytest_plugins = ["test_sqlite_store", "test_codex_stdio"]
 
 
 def compose_task_live(environ: Mapping[str, str], task: TaskSpec) -> LiveTaskComponents:
@@ -446,6 +448,103 @@ def test_one_shot_cancellation_cannot_be_forgotten(sqlite_tmp_path: Path) -> Non
     assert "cancellation" in result
     assert "acceptance" not in result
     assert "pr" not in result
+
+
+def test_partial_owned_cleanup_retains_workspace_and_unproven_stop(
+    sqlite_tmp_path: Path, command: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+
+    class Partial(CodexStdio):
+        interrupts = 0
+        starts = 0
+        child = 0
+        group = 0
+
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            result = super().request(method, params)
+            if method == "turn/start":
+                self.starts += 1
+                self.child = int(str(result["child"]))
+                self.group = int(str(result["group"]))
+            if method == "turn/interrupt":
+                assert params == {"threadId": "thread-1", "turnId": "turn-1"}
+                self.interrupts += 1
+            return result
+
+    connection = Partial(
+        command,
+        "0.99.1",
+        timeout=1,
+        max_bytes=8192,
+        schema_methods=CODEX_METHODS,
+        schema_version="0.99.1",
+        environment={"HOME": str(sqlite_tmp_path), "PATH": "/usr/bin:/bin", "KERNEL_LIFECYCLE": "1"},
+        retain_notifications=False,
+    )
+    bystander = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+        env={"HOME": str(sqlite_tmp_path), "PATH": "/usr/bin:/bin"},
+    )
+    original_killpg = os.killpg
+    signals: list[int] = []
+
+    def advance(*, cancel: bool = False) -> dict[str, object]:
+        return run_task(
+            control,
+            task=fixture_task(),
+            source_repository=source,
+            owner_approved=True,
+            trusted_development_acknowledged=True,
+            connection=connection,
+            version=connection.version,
+            deadline=None,
+            allocation=ALLOCATION,
+            forge_factory=lambda _path: make_forge("0" * 40)[0],
+            cancel_requested=cancel,
+        )
+
+    def owned_signal(group: int, sig: int) -> None:
+        assert group == connection.group != bystander.pid
+        signals.append(sig)
+        if sig == signal.SIGKILL:
+            # The leader has exited after TERM but its stubborn child remains live.
+            assert Path(f"/proc/{connection.child}/stat").read_text().split(")", 1)[1].split()[0] != "Z"
+            assert connection.owned_group_settled is not True
+        original_killpg(group, sig)
+
+    try:
+        for _ in range(30):
+            assert advance()["condition"] == "running"
+        assert connection.starts == 1
+        assert connection.notifications() == ()
+        stopped = advance(cancel=True)
+        assert stopped["condition"] == "cancelled"
+        assert cast("dict[str, object]", stopped["cancellation"])["descendants"] == "unproven"
+        assert "acceptance" not in stopped and "pr" not in stopped
+        workspace = control / "workspace"
+        assert workspace.exists()
+        assert Path(f"/proc/{connection.child}").exists()
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "killpg", owned_signal)
+            connection.close()
+        assert signal.SIGTERM in signals and signal.SIGKILL in signals
+        assert bystander.poll() is None
+        assert advance()["condition"] == "cancelled"
+        assert workspace.exists()
+        assert connection.interrupts == connection.starts == 1
+        assert cast("dict[str, object]", export_task(control)["cancellation"])["descendants"] == "unproven"
+    finally:
+        connection.close()
+        bystander.kill()
+        bystander.wait(timeout=5)
+        if connection.group:
+            try:
+                original_killpg(connection.group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_terminal_cancel_observation_recovers_without_native_context(sqlite_tmp_path: Path) -> None:
