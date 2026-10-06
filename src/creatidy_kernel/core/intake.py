@@ -317,6 +317,7 @@ class ChangeSnapshot:
     state: str = "unknown"
     merged: bool | None = None
     updated_at: str = "unknown"
+    target_branch: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

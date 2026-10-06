@@ -297,7 +297,8 @@ class OrdinaryIntake:
             or type(expires_at) is not int
             or now >= expires_at
             or current.observed_at > now
-            or now - current.observed_at > policy.freshness_seconds
+            or draft.evidence.observed_at > now
+            or now - min(draft.evidence.observed_at, current.observed_at) > policy.freshness_seconds
         ):
             raise IntakeRefused("decision or evidence expired")
         if not history or history[-1].digest != draft.digest or current.digest != draft.evidence.digest:

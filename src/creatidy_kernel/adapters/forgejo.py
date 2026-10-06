@@ -330,13 +330,17 @@ class ForgejoForge(Forge):
             data = _object(payload)
             observation = self._change_observation(repository, data)
             state = _field(data, "state")
+            target_branch = _field(_object(data.get("base")), "ref")
+            valid_branch(target_branch)
             if (
                 observation.reference != change
                 or state not in {"open", "closed"}
                 or type(data.get("merged")) is not bool
             ):
                 raise ValueError("invalid change snapshot")
-            return ChangeSnapshot(observation, state, cast(bool, data["merged"]), _field(data, "updated_at"))
+            return ChangeSnapshot(
+                observation, state, cast(bool, data["merged"]), _field(data, "updated_at"), target_branch
+            )
         except ValueError:
             # Unsupported fork repositories remain unknown, not irrelevant/absent.
             return ChangeSnapshot(Observation(Presence.UNKNOWN))

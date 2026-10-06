@@ -122,7 +122,7 @@ class Transport(SyntheticForgeTransport):
                 "title": "Exact file",
                 "body": "Refs #49",
                 "head": {"sha": head, "repo": {"full_name": "team/project"}},
-                "base": {"sha": SUBJECT.base, "repo": {"full_name": "team/project"}},
+                "base": {"sha": SUBJECT.base, "ref": SUBJECT.branch, "repo": {"full_name": "team/project"}},
             }
         )
 
@@ -143,13 +143,19 @@ class Baseline:
         self.observed_at = 100
         self.subject = SUBJECT
         self.producer = "fixture-baseline"
+        self.recipe_digest: str | None = None
         self.unknown = False
 
     def read_baseline(self, subject: IssueSubject, recipe_digest: str) -> BaselineSnapshot | None:
         if self.unknown:
             return None
         return BaselineSnapshot(
-            self.subject, recipe_digest, self.producer, self.reference, self.result, self.observed_at
+            self.subject,
+            recipe_digest if self.recipe_digest is None else self.recipe_digest,
+            self.producer,
+            self.reference,
+            self.result,
+            self.observed_at,
         )
 
 
@@ -714,3 +720,169 @@ def test_nonregular_blob_is_not_exact_file_implementation(tmp_path: Path) -> Non
     sha = reference_git(repository, "rev-parse", "HEAD")
     source = GitContentSource(repository, ForgeBinding(SUBJECT.origin, SUBJECT.repository))
     assert source.matches(replace(SUBJECT, base=sha), sha, (ContentCriterion("result.txt", b"missing-target"),)) is None
+
+
+@pytest.mark.parametrize("phase", ["approve", "handoff"])
+@pytest.mark.parametrize(
+    "movement",
+    [
+        "reference",
+        "subject",
+        "recipe",
+        "producer",
+        "result",
+        "disappeared",
+        "future-time",
+        "invalid-time",
+        "blank-reference",
+        "unknown-result",
+    ],
+)
+def test_closing_baseline_change_blocks_approval_and_real_translator(
+    sqlite_tmp_path: Path, phase: str, movement: str
+) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = None
+        if phase == "handoff":
+            approved = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=200)
+        reads = 0
+
+        def move_at_closing_issue(path: str) -> None:
+            nonlocal reads
+            if "/issues/" not in path:
+                return
+            reads += 1
+            if reads != 2:
+                return
+            if movement == "reference":
+                scenario.baseline.reference = "fixture:baseline:changed"
+            elif movement == "subject":
+                scenario.baseline.subject = replace(SUBJECT, base="c" * 40)
+            elif movement == "recipe":
+                scenario.baseline.recipe_digest = "changed-recipe"
+            elif movement == "producer":
+                scenario.baseline.producer = "changed-producer"
+            elif movement == "result":
+                scenario.baseline.result = "failed"
+            elif movement == "disappeared":
+                scenario.baseline.unknown = True
+            elif movement == "future-time":
+                scenario.baseline.observed_at = 300
+            elif movement == "invalid-time":
+                scenario.baseline.observed_at = 0
+            elif movement == "blank-reference":
+                scenario.baseline.reference = ""
+            else:
+                scenario.baseline.result = "unknown"
+
+        scenario.transport.callback = move_at_closing_issue
+        with patch.object(
+            ScarcityRouterAllocator, "translate_ordinary", wraps=ScarcityRouterAllocator.translate_ordinary
+        ) as translator:
+            with pytest.raises(IntakeRefused):
+                if phase == "approve":
+                    intake.approve(OWNER, draft, policy(), decision_id="changed", expires_at=200)
+                else:
+                    assert approved is not None
+                    intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            translator.assert_not_called()
+        if phase == "approve":
+            assert store.find_program("ordinary:task") is None
+        assert reads == 2
+
+
+@pytest.mark.parametrize(
+    "target,expected",
+    [
+        ("release", Disposition.REMAINS),
+        (None, Disposition.INCOMPLETE),
+        ("", Disposition.INCOMPLETE),
+        ("bad..branch", Disposition.INCOMPLETE),
+        (7, Disposition.INCOMPLETE),
+    ],
+)
+def test_same_sha_pr_requires_known_selected_target_branch(target: object, expected: Disposition) -> None:
+    scenario = Scenario()
+    scenario.transport.add_pr()
+    base = cast(dict[str, object], scenario.transport.pulls[0]["base"])
+    if target is None:
+        base.pop("ref")
+    else:
+        base["ref"] = target
+    observed = scenario.reader.read(SUBJECT, declaration())
+    assert observed.disposition is expected
+    if target == "release":
+        assert json.loads(observed.relevance_proof)[1]["target_branch"] == "release"
+
+
+def test_pr_target_movement_is_incomplete_with_same_sha_and_update_time() -> None:
+    scenario = Scenario()
+    scenario.transport.add_pr()
+    original = scenario.forge.change_snapshot(REPOSITORY, Reference("forgejo:team/project#1"))
+    reads = 0
+
+    def move_target(path: str) -> None:
+        nonlocal reads
+        if path.endswith("/pulls/1"):
+            reads += 1
+            if reads == 2:
+                cast(dict[str, object], scenario.transport.pulls[0]["base"])["ref"] = "release"
+
+    scenario.transport.callback = move_target
+    observed = scenario.reader.read(SUBJECT, declaration())
+    current = scenario.forge.change_snapshot(REPOSITORY, Reference("forgejo:team/project#1"))
+    assert current.observation == original.observation and current.updated_at == original.updated_at
+    assert observed.disposition is Disposition.INCOMPLETE
+
+
+@pytest.mark.parametrize("closing_time", [50, 150])
+def test_same_baseline_receipt_retains_earliest_age_without_revision_or_expiry_renewal(
+    sqlite_tmp_path: Path, closing_time: int
+) -> None:
+    scenario = Scenario()
+    scenario.time = 150
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=200)
+        original_decision = intake.historical_decision("original")
+        reads = 0
+
+        def update_timestamp(path: str) -> None:
+            nonlocal reads
+            if "/issues/" in path:
+                reads += 1
+                if reads == 2:
+                    scenario.baseline.observed_at = closing_time
+
+        scenario.transport.callback = update_timestamp
+        evidence = scenario.reader.read(SUBJECT, declaration())
+        assert evidence.observed_at == min(100, closing_time)
+        assert evidence.digest == draft.evidence.digest
+        scenario.transport.callback = None
+        assert intake.prepare("task", SUBJECT, declaration(), expected_parent=draft.digest) == draft
+        assert len(intake.history("task")) == 1
+        assert intake.historical_decision("original") == original_decision
+        scenario.baseline.observed_at = min(100, closing_time)
+        scenario.time = scenario.baseline.observed_at + policy().freshness_seconds + 1
+        with pytest.raises(IntakeRefused):
+            intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+
+
+def test_same_baseline_receipt_timestamp_refresh_cannot_revive_original_age(sqlite_tmp_path: Path) -> None:
+    scenario = Scenario()
+    with SQLiteProgramStore(sqlite_tmp_path / "intake.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
+        draft = intake.prepare("task", SUBJECT, declaration(), expected_parent=None)
+        approved = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+        decision = intake.historical_decision("original")
+        scenario.time = scenario.baseline.observed_at = 201
+        assert intake.prepare("task", SUBJECT, declaration(), expected_parent=draft.digest) == draft
+        with pytest.raises(IntakeRefused, match="expired"):
+            intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+        with pytest.raises(IntakeRefused, match="expired"):
+            intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
+        assert intake.historical_decision("original") == decision

@@ -261,11 +261,13 @@ Unknowns are reviewable but prevent approval/admission in this slice.
 
 Forgejo adds read-only `issue_snapshot`, `change_snapshot`, `intake_changes` normalization over
 existing issue/PR reads and `changes` pagination. State, merged status, number, `updated_at`, exact
-head/base and repository fields come from actual provider shapes; no API field is invented.
+head/base, target branch (`base.ref`) and repository fields come from actual provider shapes; no API field is invented.
 Snapshots are re-read and scans compared before disposition. A page bound, failure, unsupported fork
 or observed movement refuses exhaustive absence. Repeated stable reads are qualified observations,
 not a claim of a globally serializable Forgejo snapshot. Merged PRs do not establish current source
-implementation. An active equivalent PR requires exact supported content proof at its observed head.
+implementation. An active equivalent PR requires the exact selected target branch and supported
+content proof at its observed head. Missing/malformed targets or target movement remain incomplete;
+a known different target branch does not suppress selected-branch work merely because its SHA matches.
 
 The built-in relevance proof is deliberately **literal**, using controller-configured
 `ContentCriterion(path, expected_bytes)`: criteria identify exact file bytes, not arbitrary semantic
@@ -274,7 +276,10 @@ environment and replacement/lazy-fetch disabled. It does not import repository c
 General textual requirements are unresolved, not guessed from titles, links or claimed booleans.
 The draft retains complete normalized proof bytes and exact subject, not only a disposition/digest.
 The separate `BaselineReader` receives already-produced identified source/recipe-bound evidence;
-its original observation time is retained for freshness. No baseline runner is added. Unknown, future,
+it is reobserved after closing Forge reads with exact semantic receipt identity comparison. Both
+observation times must be valid; the earliest time, including the original draft's bound age, limits
+freshness without creating a revision or renewing expiry for an unchanged receipt. No baseline runner
+is added. Unknown, future,
 stale or unrelated failing evidence cannot become a pass through approval.
 
 `OwnerPolicy` and current `Principal` are injected through trusted local controller composition, never

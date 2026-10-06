@@ -162,7 +162,12 @@ class ForgeIntakeEvidence:
         branch = self.forge.branch(repository, subject.branch)
         recipe = digest(encode(declaration.value["recipes"]))
         baseline = self.baseline.read_baseline(subject, recipe)
-        baseline_valid = baseline is not None and baseline.subject == subject and baseline.recipe_digest == recipe
+        baseline_valid = (
+            baseline is not None
+            and baseline.subject == subject
+            and baseline.recipe_digest == recipe
+            and type(baseline.result) is str
+        )
         source_revision = "unknown" if branch.revision is None else branch.revision.value.removeprefix("forgejo:")
         disposition = Disposition.EQUIVALENCE
         proof: list[object] = []
@@ -194,9 +199,9 @@ class ForgeIntakeEvidence:
                 matched = None
                 if observation.presence is Presence.INACCESSIBLE:
                     incomplete = Disposition.PERMISSION
-                elif observation.presence is not Presence.FOUND:
+                elif observation.presence is not Presence.FOUND or state.target_branch is None:
                     incomplete = Disposition.INCOMPLETE
-                elif state.state == "open":
+                elif state.state == "open" and state.target_branch == subject.branch:
                     if observation.head is None or observation.base != Reference(f"forgejo:{subject.base}"):
                         unresolved = True
                     else:
@@ -210,6 +215,7 @@ class ForgeIntakeEvidence:
                         "reference": None if observation.reference is None else observation.reference.value,
                         "head": None if observation.head is None else observation.head.value,
                         "base": None if observation.base is None else observation.base.value,
+                        "target_branch": state.target_branch,
                         "state": state.state,
                         "merged": state.merged,
                         "updated_at": state.updated_at,
@@ -232,21 +238,43 @@ class ForgeIntakeEvidence:
                 disposition = Disposition.BASELINE
             else:
                 disposition = Disposition.REMAINS
-        if issue != self.forge.issue_snapshot(repository, subject.issue) or branch != self.forge.branch(
-            repository, subject.branch
-        ):
+        closing_issue = self.forge.issue_snapshot(repository, subject.issue)
+        closing_branch = self.forge.branch(repository, subject.branch)
+        if issue != closing_issue or branch != closing_branch:
             disposition = Disposition.STALE
+        closing_baseline = self.baseline.read_baseline(subject, recipe)
         now = self.clock()
-        if baseline is not None and (
-            type(baseline.observed_at) is not int
-            or baseline.observed_at > now
-            or baseline.observed_at <= 0
-            or not baseline.producer
-            or not baseline.reference
+        # Close the finite evidence cut after Forge reads. Timestamps validate age,
+        # not receipt identity: rereading the same receipt cannot renew its age.
+        if (
+            baseline is None
+            or closing_baseline is None
+            or (baseline.subject, baseline.recipe_digest, baseline.producer, baseline.reference, baseline.result)
+            != (
+                closing_baseline.subject,
+                closing_baseline.recipe_digest,
+                closing_baseline.producer,
+                closing_baseline.reference,
+                closing_baseline.result,
+            )
         ):
             baseline_valid = False
-            if disposition is Disposition.REMAINS:
-                disposition = Disposition.BASELINE
+        else:
+            baseline_valid = all(
+                snapshot.subject == subject
+                and snapshot.recipe_digest == recipe
+                and type(snapshot.observed_at) is int
+                and 0 < snapshot.observed_at <= now
+                and type(snapshot.producer) is str
+                and bool(snapshot.producer.strip())
+                and type(snapshot.reference) is str
+                and bool(snapshot.reference.strip())
+                and type(snapshot.result) is str
+                and snapshot.result in {"passed", "failed"}
+                for snapshot in (baseline, closing_baseline)
+            )
+        if not baseline_valid and disposition is Disposition.REMAINS:
+            disposition = Disposition.BASELINE
         return IntakeEvidence(
             subject,
             issue.content_digest,
@@ -261,5 +289,7 @@ class ForgeIntakeEvidence:
             f"sha256:{digest(encode(proof))}",
             encode(proof),
             disposition,
-            now if not baseline_valid or baseline is None else min(now, baseline.observed_at),
+            now
+            if not baseline_valid or baseline is None or closing_baseline is None
+            else min(baseline.observed_at, closing_baseline.observed_at),
         )
