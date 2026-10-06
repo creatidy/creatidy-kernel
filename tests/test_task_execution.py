@@ -957,6 +957,80 @@ def test_long_verification_cannot_extend_original_deadline(
     assert "pr" not in result
 
 
+@pytest.mark.parametrize("boundary", ["turn", "commands", "acceptance", "pr"])
+def test_false_cancellation_poll_crossing_deadline_cannot_authorize_late_effect(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    base = reference_git(source, "rev-parse", "refs/heads/develop")
+    forge, transport = make_forge(base)
+    control = sqlite_tmp_path / "control"
+    clock = [1000]
+    armed = [False]
+    crossed = [False]
+    methods: list[str] = []
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def cancellation_requested() -> bool:
+        if armed[0]:
+            clock[0] = 4301
+            crossed[0] = True
+        return False
+
+    class Connection(FixtureConnection):
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            methods.append(method)
+            result = super().request(method, params)
+            if boundary == "turn" and method == "thread/start":
+                armed[0] = True
+            return result
+
+    check = TaskChecks.check
+    finalize = SQLiteProgramStore.finalize_artifact
+    claim = SQLiteProgramStore.claim
+
+    def checked(checks: TaskChecks, name: str, subject: EvidenceSubject) -> Evidence | None:
+        if boundary == "commands" and name == "verification-commands":
+            armed[0] = True
+        return check(checks, name, subject)
+
+    def finalized(store: SQLiteProgramStore, operation_id: str, name: str, data: bytes) -> str:
+        result = finalize(store, operation_id, name, data)
+        if boundary == "acceptance" and name.startswith("verification:"):
+            armed[0] = True
+        return result
+
+    def claimed(store: SQLiteProgramStore, operation_id: str, *, now: int, lease_seconds: int) -> int:
+        result = claim(store, operation_id, now=now, lease_seconds=lease_seconds)
+        if boundary == "pr" and operation_id == "task_execution:pr":
+            armed[0] = True
+        return result
+
+    monkeypatch.setattr(TaskChecks, "check", checked)
+    monkeypatch.setattr(SQLiteProgramStore, "finalize_artifact", finalized)
+    monkeypatch.setattr(SQLiteProgramStore, "claim", claimed)
+    result = run(
+        control,
+        source,
+        Connection(deflake_edit),
+        forge=forge,
+        base=base,
+        task=fixture_task(repeats=1),
+        cancellation_requested=cancellation_requested,
+    )
+    assert crossed[0] and result["deadline"] == 4300
+    assert transport.pushes == transport.posts == 0
+    if boundary == "turn":
+        assert "turn/start" not in methods
+    if boundary == "commands":
+        checks = cast("dict[str, dict[str, object]]", result["verification"])
+        assert checks["verification-commands"]["runs"] == []
+    if boundary != "pr":
+        assert "acceptance" not in result and "pr" not in result
+        with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+            assert store.load("task_execution").state("change").status.value != "satisfied"
+
+
 def test_deadline_expiring_during_thread_start_never_dispatches_turn(
     sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

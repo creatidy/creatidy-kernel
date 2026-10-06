@@ -451,9 +451,9 @@ def advance_work_unit(
             {"manifest": reference, "reason": "verification failed; bounded run paused"},
         )
         return "rejected"
-    accepted_at = decision_clock()
     if cancel_requested is not None and cancel_requested():
         return "cancel_requested"
+    accepted_at = decision_clock()
     if deadline is not None and accepted_at >= deadline:
         return "expired"
     admit_accepted(

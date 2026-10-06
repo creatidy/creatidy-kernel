@@ -1521,7 +1521,7 @@ def run_task(
                 fault=crash,
                 captured=captured,
                 command_environment=command_environment,
-                authorized=lambda: int(time.time()) < deadline and not cancellation_requested_now(),
+                authorized=lambda: not cancellation_requested_now() and int(time.time()) < deadline,
             )
 
             def resolve(request: ExecutionRequest) -> CodexInputs:
@@ -1549,8 +1549,8 @@ def run_task(
             def authorize(request: ExecutionRequest) -> bool:
                 operation = store.operation(request.operation.operation_id)
                 return (
-                    int(time.time()) < deadline
-                    and not cancellation_requested_now()
+                    not cancellation_requested_now()
+                    and int(time.time()) < deadline
                     and operation.status == "dispatched"
                     and operation.fence == request.fence
                     and operation.request_digest == request.operation.request_digest
@@ -1768,7 +1768,7 @@ def run_task(
                 schema="task-pr-v1",
                 title=task.pr_title,
                 body=f"{task.pr_body}\n\nTask: {task.task_id}. Accepted result: {accepted['manifest']}.",
-                authorize_dispatch=lambda: int(time.time()) < deadline and not cancellation_requested_now(),
+                authorize_dispatch=lambda: not cancellation_requested_now() and int(time.time()) < deadline,
             )
             if receipt.get("interrupted"):
                 raise TaskInterrupted(f"interrupted after {receipt['interrupted']}; rerun to reconcile")
