@@ -1326,6 +1326,8 @@ def run_task(
     ):
         raise ValueError("control directory and source repository must be separate trees")
     existing_database = (directory / "kernel.sqlite3").exists()
+    if not existing_database and deadline is not None and deadline <= now:
+        raise ValueError("owner deadline must be within one hour ahead")
     if directory.exists() and not existing_database and any(directory.iterdir()):
         raise ValueError("unjournaled task control directory must be empty")
     directory.mkdir(parents=True, exist_ok=True)
@@ -1387,8 +1389,6 @@ def run_task(
             if existing_database:
                 raise ValueError("existing database is not this neutral task")
             deadline = deadline if deadline is not None else now + 3300
-            if deadline <= now:
-                raise ValueError("owner deadline must be within one hour ahead")
             store.intent(
                 "task_execution:mode",
                 "task_execution:mode",

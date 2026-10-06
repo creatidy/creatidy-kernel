@@ -325,6 +325,40 @@ def test_cancel_unclaimed_attempt_never_dispatches(sqlite_tmp_path: Path, fault:
     assert connection.starts == 0
 
 
+@pytest.mark.parametrize("invalid", [0, 1000])
+@pytest.mark.parametrize("corrected", [None, 1001])
+def test_invalid_fresh_deadline_does_not_poison_corrected_same_directory_run(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: int, corrected: int | None
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    connection = FixtureConnection(lambda _path: None)
+    connection.status = "inProgress"
+    monkeypatch.setattr(time, "time", lambda: 1000)
+
+    def advance(deadline: int | None) -> dict[str, object]:
+        return run_task(
+            control,
+            task=fixture_task(),
+            source_repository=source,
+            owner_approved=True,
+            trusted_development_acknowledged=True,
+            connection=connection,
+            version="1.2.3",
+            deadline=deadline,
+            allocation=ALLOCATION,
+        )
+
+    with pytest.raises(ValueError, match="owner deadline"):
+        advance(invalid)
+    assert connection.starts == 0
+    assert not (control / "kernel.sqlite3").exists()
+    result = advance(corrected)
+    assert result["condition"] == "running"
+    assert result["deadline"] == (4300 if corrected is None else corrected)
+    assert connection.starts == 1
+
+
 def test_failed_terminal_recovers_finish_without_native_context(
     sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
