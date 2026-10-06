@@ -293,13 +293,25 @@ or the controller's standard `os.defpath`, not an ambient factory lookup. Option
 directory. Only supplied `HOME`, `LANG`, `LC_ALL` and `TMPDIR` are copied. The factory never merges
 an unrelated ambient environment; controller-owned verification also uses closed operational values.
 
-`task run --deadline UNIX_SECONDS` validates an incoming absolute dispatch deadline no more than
-one hour ahead; the CLI defaults to 55 minutes ahead on each invocation. The task mode records the
-original deadline but **does not enforce its recovery**. It advances once and closes the owned Codex
-transport even if the returned state is running; it has no durable task cancellation loop. Verification
-and delivery are not bounded by a whole-task monetary/quota/time envelope. These current deviations
-are [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48) and
-[#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56), not promised recovery features.
+`task run --deadline UNIX_SECONDS` records an absolute deadline no more than one hour ahead. A new
+task defaults to 55 minutes ahead; recovery without `--deadline` retains the original deadline and
+rejects envelope/version/mode/source changes. The CLI keeps its dedicated owned connection open
+while running/waiting and advances the same recorded turn, rather than closing after one step.
+Expiry and Ctrl-C journal cancellation separately; lost replies are never blindly reissued. Target
+terminality is not interrupt-delivery or descendant-settlement proof, and cancellation is not rollback.
+Ctrl-C is deferred across finite framed RPCs so the original receipt can be cancelled before owned
+teardown; framing/transport failures still leave delivery uncertain. A durable receipt published
+before a crash can bind the cancellation target without rewriting its intent or resubmitting work.
+Cancellation before Attempt preparation remains a stable no-dispatch result; recovery never
+reactivates allocation or execution and does not delete the original envelope or stop intent.
+Expired work remains observable but cannot be newly dispatched or accepted; checks and admission
+use actual decision times. This is a synthetic-proved owned-session repair, not detached supervision
+or a live conformance receipt. Verification commands retain finite timeouts; full monetary/quota,
+hidden-call and auxiliary-effect accounting remains unimplemented. Remaining work belongs to
+[#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56) and the separately proved
+native integration under [#53](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53), not
+promised detached recovery features. [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48)
+supplies the bounded owned-session repair.
 Native-shaped offline fixtures are not live model or remote-Forge acceptance.
 
 The separate `run_live_reference` Python composition has a 1-100 observation budget, original

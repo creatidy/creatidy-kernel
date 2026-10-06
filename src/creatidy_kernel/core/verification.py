@@ -7,6 +7,7 @@ this module validates their subjects and makes the acceptance decision, not thei
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, cast
@@ -208,6 +209,7 @@ def verify_candidate(
     verifier_id: str,
     reference_id: str,
     now: int,
+    clock: Callable[[], int] | None = None,
 ) -> AcceptedResult | RejectedResult:
     """Run required trusted checks; only matching fresh evidence permits satisfaction."""
     if type(program) is not Program or type(candidate) is not CandidateResult or type(policy) is not VerificationPolicy:
@@ -258,6 +260,10 @@ def verify_candidate(
     if len(set(required)) != len(required):
         raise InvalidDomainValue("independent review check cannot duplicate deterministic checks")
     observations = tuple(producer.check(name, subject) for name in required)
+    if clock is not None:
+        now = clock()
+        if type(now) is not int:
+            raise InvalidDomainValue("trusted decision time required")
     evidence = tuple(item for item in observations if type(item) is Evidence)
     if len({item.evidence_id for item in evidence}) != len(evidence):
         raise InvalidDomainValue("duplicate evidence IDs")

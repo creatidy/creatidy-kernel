@@ -2,15 +2,21 @@
 """The command interface delegates lifecycle decisions to the application."""
 
 import json
+import os
+import signal
+import subprocess
+import threading
+import time
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
 
 from creatidy_kernel.adapters.cli import main
 
-pytest_plugins = ["test_sqlite_store"]
+pytest_plugins = ["test_sqlite_store", "test_codex_stdio"]
 
 
 def test_reference_delegates_explicit_approval_and_fault(capsys: pytest.CaptureFixture[str]) -> None:
@@ -133,17 +139,24 @@ def test_cli_task_status_reports_missing_database(tmp_path: Path, capsys: pytest
     assert "task database does not exist" in capsys.readouterr().err
 
 
-def test_cli_task_run_prints_lifecycle(sqlite_tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+@pytest.mark.parametrize(
+    ("initial_reads", "interrupt"), [(0, False), (5, False), (5, True), (5, "rpc"), (0, "startup")]
+)
+def test_cli_task_run_prints_lifecycle(
+    sqlite_tmp_path: Path, capsys: pytest.CaptureFixture[str], initial_reads: int, interrupt: bool | str
+) -> None:
     from test_task_execution import (
         EFFORT_ALLOCATION,
         FixtureConnection,
         deflake_edit,
+        export_task,
         fixture_task,
         live_environment,
         make_forge,
         make_source,
     )
 
+    from creatidy_kernel.adapters.codex_stdio import CodexStdio
     from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
     from creatidy_kernel.adapters.reference import reference_git
     from creatidy_kernel.adapters.task_execution import LiveTaskComponents, TaskSpec
@@ -151,7 +164,56 @@ def test_cli_task_run_prints_lifecycle(sqlite_tmp_path: Path, capsys: pytest.Cap
     source = make_source(sqlite_tmp_path)
     base = reference_git(source, "rev-parse", "refs/heads/develop")
     forge, _transport = make_forge(base)
-    connection = FixtureConnection(deflake_edit, effort="low")
+
+    class OwnedConnection(FixtureConnection, CodexStdio):
+        reads = 0
+        closed = False
+        events: list[str]
+
+        def __init__(self) -> None:
+            FixtureConnection.__init__(self, deflake_edit, effort="low")
+            self.events = []
+            if interrupt in {"rpc", "startup"}:
+                self._lock = threading.Lock()
+                self._process = cast("subprocess.Popen[bytes]", object())
+
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            if interrupt in {"rpc", "startup"}:
+                return CodexStdio.request(self, method, params)
+            return self._exchange(method, params)
+
+        def _exchange(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            assert not self.closed
+            self.events.append(method)
+            if method == "turn/interrupt":
+                self.status = "interrupted"
+                return {}
+            if method == "thread/read":
+                self.reads += 1
+                if interrupt == "rpc" and self.reads == 4:
+                    signal.raise_signal(signal.SIGINT)
+                if self.status != "interrupted":
+                    self.status = "inProgress" if self.reads <= initial_reads else "completed"
+            result = FixtureConnection.request(self, method, params)
+            if interrupt == "startup" and method == "thread/start":
+                signal.raise_signal(signal.SIGINT)
+            return result
+
+        def _close_unlocked(self) -> None:
+            assert "cancellation" in export_task(control)
+            self.events.append("owned-teardown")
+            self._process = None
+            self.closed = True
+
+        def close(self) -> None:
+            assert self.status in {"completed", "interrupted"}
+            if interrupt in {"rpc", "startup"}:
+                CodexStdio.close(self)
+            else:
+                self.closed = True
+
+    connection = OwnedConnection()
+    original_sigint = signal.getsignal(signal.SIGINT)
     # The controller-owned support evidence reaches run_task through the CLI
     # composition; the explicit-effort allocation is executable only with it.
     components = LiveTaskComponents(
@@ -166,10 +228,34 @@ def test_cli_task_run_prints_lifecycle(sqlite_tmp_path: Path, capsys: pytest.Cap
 
     tasks = {"143": task}
     control = sqlite_tmp_path / "control"
+    real_sleep = time.sleep
+    original_wait = subprocess.Popen[bytes].wait
+    waits = 0
+    polls = 0
+
+    def wait(process: subprocess.Popen[Any], timeout: float | None = None) -> int:
+        nonlocal waits
+        waits += 1
+        assert time.sleep is real_sleep
+        return original_wait(process, timeout=timeout)
+
+    def poll(_seconds: float) -> None:
+        nonlocal polls
+        polls += 1
+        assert connection.starts == 1 and connection.status == "inProgress"
+        attempt = cast("list[dict[str, object]]", export_task(control)["attempts"])[0]
+        assert cast("dict[str, object]", attempt["attempt"])["status"] == "executing"
+        if interrupt is True:
+            raise KeyboardInterrupt()
+
+    # Replace only the CLI binding, never the time module used by subprocess/Git.
+    clock = SimpleNamespace(time=time.time, sleep=poll)
     with (
         patch.dict("os.environ", live_environment("zai/glm-5.3/low"), clear=True),
         patch("creatidy_kernel.adapters.cli.compose_task_live", return_value=components),
         patch("creatidy_kernel.adapters.cli.TASKS", tasks),
+        patch("creatidy_kernel.adapters.cli.time", clock),
+        patch.object(subprocess.Popen, "wait", wait),
     ):
         assert (
             main(
@@ -189,6 +275,152 @@ def test_cli_task_run_prints_lifecycle(sqlite_tmp_path: Path, capsys: pytest.Cap
             == 0
         )
     output = capsys.readouterr().out
+    assert waits > 0 and time.sleep is real_sleep
+    if interrupt is True:
+        assert polls == 1
     assert "task admitted: owner-approved frozen task" in output
-    assert "NO MERGE / NO DEPLOY" in output
-    assert "condition=accepted" in output
+    if interrupt:
+        assert ("condition=cancel_uncertain" if interrupt == "startup" else "condition=cancelled") in output
+        assert "acceptance" not in export_task(control)
+        assert "pr" not in export_task(control)
+    else:
+        assert "NO MERGE / NO DEPLOY" in output
+        assert "condition=accepted" in output
+    assert connection.starts == 1
+    assert connection.closed
+    assert signal.getsignal(signal.SIGINT) == original_sigint
+    if interrupt == "rpc":
+        assert connection.events.index("turn/interrupt") < connection.events.index("owned-teardown")
+    if interrupt == "startup":
+        assert "turn/start" not in connection.events
+        assert "turn/interrupt" not in connection.events
+        assert "cancellation" in export_task(control)
+
+
+def test_real_pipe_timeout_persists_stop_before_owned_teardown(sqlite_tmp_path: Path, command: tuple[str, ...]) -> None:
+    from test_task_execution import (
+        ALLOCATION,
+        CODEX_METHODS,
+        FixtureConnection,
+        deflake_edit,
+        export_task,
+        fixture_task,
+        live_environment,
+        make_forge,
+        make_source,
+    )
+
+    from creatidy_kernel.adapters.codex_stdio import CodexStdio
+    from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
+    from creatidy_kernel.adapters.task_execution import LiveTaskComponents, TaskSpec, run_task
+
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    task = fixture_task(repeats=1)
+
+    class Recovered(FixtureConnection):
+        interrupts = 0
+
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            if method == "turn/interrupt":
+                assert params == {"threadId": "thread-1", "turnId": "turn-1"}
+                self.interrupts += 1
+                return {}
+            return super().request(method, params)
+
+    original = Recovered(deflake_edit)
+    original.version = "0.99.1"
+    original.status = "inProgress"
+
+    def advance_original() -> dict[str, object]:
+        return run_task(
+            control,
+            task=task,
+            source_repository=source,
+            owner_approved=True,
+            trusted_development_acknowledged=True,
+            connection=original,
+            version=original.version,
+            deadline=None,
+            allocator=FixedAllocator(ALLOCATION),
+            forge_factory=lambda _path: make_forge("0" * 40)[0],
+        )
+
+    assert advance_original()["condition"] == "running"
+    events: list[str] = []
+
+    class ProcessLoss(BaseException):
+        pass
+
+    class Pipe(CodexStdio):
+        armed = False
+
+        def _exchange(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            if method == "thread/read":
+                events.append("pipe-read")
+                timer = threading.Timer(0.1, lambda: os.kill(os.getpid(), signal.SIGINT))
+                timer.start()
+                try:
+                    return super()._exchange("timeout", {})
+                finally:
+                    timer.join()
+            return super()._exchange(method, params)
+
+        def _close_unlocked(self) -> None:
+            had_process = self._process is not None
+            super()._close_unlocked()
+            if self.armed and had_process:
+                self.armed = False
+                events.append("owned-teardown")
+                raise ProcessLoss()
+
+    pipe = Pipe(
+        command,
+        "0.99.1",
+        timeout=1,
+        schema_methods=CODEX_METHODS,
+        schema_version="0.99.1",
+        environment={"HOME": str(sqlite_tmp_path), "PATH": "/usr/bin:/bin"},
+    )
+    pipe.armed = True
+    components = LiveTaskComponents(
+        FixedAllocator(ALLOCATION), lambda: pipe, lambda _path: make_forge("0" * 40)[0], frozenset()
+    )
+    environment = live_environment("zai/glm-5.3")
+    environment["CREATIDY_KERNEL_CODEX_VERSION"] = "0.99.1"
+
+    def frozen_task(*, expected_base_sha: str | None = None) -> TaskSpec:
+        return task
+
+    with (
+        patch.dict("os.environ", environment, clear=True),
+        patch("creatidy_kernel.adapters.cli.compose_task_live", return_value=components),
+        patch("creatidy_kernel.adapters.cli.TASKS", {"143": frozen_task}),
+        pytest.raises(ProcessLoss),
+    ):
+        main(
+            [
+                "task",
+                "run",
+                "--task",
+                "143",
+                "--data-dir",
+                str(control),
+                "--repo",
+                str(source),
+                "--approve",
+                "--trusted-development",
+            ]
+        )
+    assert events == ["pipe-read", "owned-teardown"]
+    assert "cancellation" in export_task(control)
+    assert pipe.before_close is None
+    original.status = "completed"
+    recovered = advance_original()
+    assert recovered["condition"] == "cancelled"
+    assert "acceptance" not in recovered
+    assert "pr" not in recovered
+    assert original.starts == 1
+    assert original.interrupts == 1
+    assert advance_original()["condition"] == "cancelled"
+    assert original.interrupts == 1

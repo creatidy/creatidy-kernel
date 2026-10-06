@@ -5,7 +5,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 from creatidy_kernel.core.domain import (
     AttemptSpec,
@@ -21,6 +21,7 @@ from creatidy_kernel.core.execution import (
     Activity,
     ArtifactManifest,
     Candidate,
+    ExecutionConflict,
     ExecutionRequest,
     OperationKey,
     Presence,
@@ -46,13 +47,38 @@ from creatidy_kernel.ports.allocation import (
     load_attempt_inputs,
 )
 from creatidy_kernel.ports.execution import Runtime
-from creatidy_kernel.ports.program_store import ApplicationStore
+from creatidy_kernel.ports.program_store import ApplicationStore, OperationRecord
 from creatidy_kernel.ports.resources import ResourceAllocator
 
 
 def manifest_bytes(value: object) -> bytes:
     """Canonical JSON for public, non-secret application evidence."""
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def terminal_outcome(store: ApplicationStore, attempt: AttemptSpec, operation: OperationRecord) -> str | None:
+    data = store.find_artifact(operation.operation_id, "terminal-outcome")
+    if data is None:
+        return None
+    raw: object = json.loads(data)
+    if not isinstance(raw, dict):
+        raise ValueError("invalid terminal outcome")
+    value = cast("dict[str, object]", raw)
+    disposition = value.get("candidate")
+    if (
+        type(disposition) is not str
+        or disposition not in {"absent", "present", "not_requested", "unknown"}
+        or value
+        != {
+            "version": 1,
+            "attempt": attempt.digest,
+            "handle": operation.accepted_reference,
+            "fence": operation.fence,
+            "candidate": disposition,
+        }
+    ):
+        raise ValueError("terminal outcome differs from original Attempt")
+    return disposition
 
 
 @dataclass(frozen=True)
@@ -82,19 +108,31 @@ def advance_work_unit(
     fault: Callable[[str], None] = lambda _: None,
     restore: Callable[[ExecutionRequest, str], None] | None = None,
     artifact_path: str = "result.txt",
+    clock: Callable[[], int] | None = None,
+    deadline: int | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> str:
     """Perform at most one dispatch/observation, never retry an uncertain effect blindly.
 
     The caller operates in trusted-development mode and supplies pinned workspace,
     verifier and runtime bindings. No worker-provided checks execute here.
+    A supplied cancellation predicate journals the request before returning true;
+    it is consumed at external-return boundaries before subsequent durable writes.
     """
     program = store.load(program.program_id)
+    decision_clock = clock if clock is not None else lambda: now
     if program.state(unit_id).status is WorkUnitStatus.SATISFIED:
         return "accepted"
     attempt_id = f"{program.program_id}:{unit_id}"
     operation_id = f"runtime:{attempt_id}"
     if not any(item.spec.attempt_id == attempt_id for item in program.attempts):
+        if cancel_requested is not None and cancel_requested():
+            return "cancel_requested"
+        if deadline is not None and decision_clock() >= deadline:
+            return "expired"
         allocation = allocator.select(ResourceRequest(unit_id, frozenset({"reference"}), 128))
+        if cancel_requested is not None and cancel_requested():
+            return "cancel_requested"
         allocation_bytes = encode_allocation(allocation)
         allocation_ref = "sha256:" + hashlib.sha256(allocation_bytes).hexdigest()
         context = manifest_bytes([asdict(item) for item in program.resolved_inputs(unit_id)])
@@ -169,16 +207,39 @@ def advance_work_unit(
             operation = store.observe(
                 operation_id, receipt_fence, f"accepted:{receipt_handle}", "accepted", reference=receipt_handle
             )
+    candidate_status = terminal_outcome(store, attempt, operation)
+    if candidate_status is not None and operation.status != "terminal":
+        if operation.status != "accepted" or operation.accepted_reference is None:
+            raise ValueError("terminal outcome has no matching accepted runtime")
+        operation = store.observe(
+            operation_id,
+            operation.fence,
+            f"terminal:{operation_id}",
+            "terminal",
+            reference=operation.accepted_reference,
+        )
+    if operation.status == "terminal":
+        if program.attempt(attempt_id).status is AttemptStatus.EXECUTING:
+            program = store.admit(
+                program.program_id, f"finish:{attempt_id}", FinishAttempt(program.revision, "worker", attempt_id)
+            )
+        if candidate_status == "absent":
+            return "terminal_no_candidate"
+        if candidate_status == "not_requested":
+            return "terminal_candidate_unknown"
     if operation.status in {"dispatched", "unknown"}:
         if operation.lease_until is not None and now < operation.lease_until:
             return "waiting"
         lookup = runtime.reconcile(key, operation.accepted_reference)
+        if cancel_requested is not None:
+            cancel_requested()
+        reconciled_at = decision_clock()
         operation = store.reconcile(
             operation_id,
             operation.fence,
             lookup.presence.value,
-            now=now,
-            evidence=f"runtime-lookup:{now}:{lookup.presence.value}",
+            now=reconciled_at,
+            evidence=f"runtime-lookup:{reconciled_at}:{lookup.presence.value}",
             reference=lookup.handle,
             matched_digest=key.request_digest if lookup.presence is Presence.FOUND else None,
             authoritative_absence=lookup.presence is Presence.ABSENT,
@@ -186,7 +247,11 @@ def advance_work_unit(
         if lookup.presence is Presence.UNKNOWN:
             return "unknown"
     if operation.status == "intent" or operation.retry_proof is not None:
-        fence = store.claim(operation_id, now=now, lease_seconds=1)
+        if deadline is not None and decision_clock() >= deadline:
+            return "expired"
+        if cancel_requested is not None and cancel_requested():
+            return "cancel_requested"
+        fence = store.claim(operation_id, now=decision_clock(), lease_seconds=1)
         operation = store.operation(operation_id)
         request = ExecutionRequest(
             key,
@@ -207,10 +272,14 @@ def advance_work_unit(
             allocation,
         )
         handle = runtime.start(request)
+        if cancel_requested is not None:
+            cancel_requested()
         fault("send")
         # Publish the native handle and configuration together before accepting
         # the receipt. A process crash cannot retain one while losing the other.
-        started = runtime.observe(handle, now=now)
+        started = runtime.observe(handle, now=decision_clock())
+        if cancel_requested is not None:
+            cancel_requested()
         if started.handle != handle or not identity_matches(
             started.identity, allocation, attempt.agent_definition_reference, require_resolved=False, legacy=legacy
         ):
@@ -248,7 +317,11 @@ def advance_work_unit(
     )
     if restore is not None:
         restore(request, handle)
-    observation = runtime.observe(handle, now=now)
+        if cancel_requested is not None:
+            cancel_requested()
+    observation = runtime.observe(handle, now=decision_clock())
+    if cancel_requested is not None:
+        cancel_requested()
     observation_data = manifest_bytes(asdict(observation))
     store.finalize_artifact(
         operation_id, f"observation:{hashlib.sha256(observation_data).hexdigest()}", observation_data
@@ -264,6 +337,7 @@ def advance_work_unit(
     ):
         return "identity_unavailable"
     persisted_identity = store.find_artifact(operation_id, "identity")
+    recorded: RuntimeIdentity | None
     if persisted_identity is None:
         original = (
             receipt_identity if receipt_identity is not None and receipt_identity.resolved is not None else identity
@@ -271,8 +345,13 @@ def advance_work_unit(
         if not identity_matches(
             original, allocation, attempt.agent_definition_reference, require_resolved=True, legacy=legacy
         ):
-            return "identity_unavailable"
-        store.finalize_artifact(operation_id, "identity", manifest_bytes(asdict(original)))
+            if observation.activity is not Activity.TERMINAL:
+                return "identity_unavailable"
+            # Exact-handle terminality does not prove model resolution or acceptance.
+            recorded = None
+        else:
+            store.finalize_artifact(operation_id, "identity", manifest_bytes(asdict(original)))
+            recorded = original
     else:
         # The immutable Operation owns the accepted handle and its original runtime
         # resolution. A restored adapter's unknown identity cannot erase that fact.
@@ -291,17 +370,59 @@ def advance_work_unit(
             recorded=recorded,
         ):
             return "identity_unavailable"
+    if receipt is None and receipt_identity is None and recorded is not None:
+        # A proved exact-operation lookup can recover a lost reply. Publish only
+        # independently validated original resolution, never requested identity.
+        store.finalize_artifact(
+            operation_id,
+            "runtime-receipt",
+            manifest_bytes({"version": 1, "handle": handle, "fence": operation.fence, "identity": asdict(recorded)}),
+        )
     if observation.activity is not Activity.TERMINAL:
-        return observation.activity.value
-    candidate = runtime.candidate(handle)
-    if candidate is None:
-        return "unknown"
-    collection = collector.collect(request, candidate, now=now)
+        return "terminal_candidate_unknown" if operation.status == "terminal" else observation.activity.value
+    retrieval_unknown = False
+    try:
+        candidate = None if cancel_requested is not None and cancel_requested() else runtime.candidate(handle)
+    except ExecutionConflict:
+        candidate = None
+        retrieval_unknown = True
+    if cancel_requested is not None:
+        cancel_requested()
     if program.attempt(attempt_id).status is AttemptStatus.EXECUTING:
+        store.finalize_artifact(
+            operation_id,
+            "terminal-outcome",
+            manifest_bytes(
+                {
+                    "version": 1,
+                    "attempt": attempt.digest,
+                    "handle": handle,
+                    "fence": operation.fence,
+                    "candidate": "not_requested"
+                    if cancel_requested is not None and cancel_requested()
+                    else "unknown"
+                    if retrieval_unknown
+                    else "present"
+                    if candidate is not None
+                    else "absent",
+                }
+            ),
+        )
         store.observe(operation_id, operation.fence, f"terminal:{operation_id}", "terminal", reference=handle)
         program = store.admit(
             program.program_id, f"finish:{attempt_id}", FinishAttempt(program.revision, "worker", attempt_id)
         )
+    if cancel_requested is not None and cancel_requested():
+        return "cancel_requested"
+    if retrieval_unknown:
+        return "terminal_candidate_unknown"
+    if candidate is None:
+        return "terminal_no_candidate"
+    if recorded is None:
+        return "identity_unavailable"
+    if deadline is not None and decision_clock() >= deadline:
+        return "expired"
+    collection = collector.collect(request, candidate, now=decision_clock())
     unit = program.spec.work_unit(unit_id)
     proposal = CandidateResult(
         f"candidate:{attempt_id}", candidate, tuple((name, artifact_path) for name in sorted(unit.outputs))
@@ -318,6 +439,7 @@ def advance_work_unit(
         verifier_id="verifier",
         reference_id=f"accepted:{attempt_id}",
         now=now,
+        clock=decision_clock,
     )
     data = manifest_bytes(asdict(result))
     digest = hashlib.sha256(data).hexdigest()
@@ -329,6 +451,11 @@ def advance_work_unit(
             {"manifest": reference, "reason": "verification failed; bounded run paused"},
         )
         return "rejected"
+    if cancel_requested is not None and cancel_requested():
+        return "cancel_requested"
+    accepted_at = decision_clock()
+    if deadline is not None and accepted_at >= deadline:
+        return "expired"
     admit_accepted(
         program,
         result,
@@ -337,7 +464,7 @@ def advance_work_unit(
         repository=collection.repository,
         base_revision=collection.base,
         head_revision=collection.head,
-        now=now,
+        now=accepted_at,
     )
     store.admit_with_intent(
         program.program_id,

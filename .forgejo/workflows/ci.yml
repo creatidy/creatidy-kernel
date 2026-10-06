@@ -30,6 +30,8 @@ jobs:
           version: "0.9.30"
           python-version: "3.12"
           enable-cache: false
+          # Forgejo's automatic token is not GitHub download authentication.
+          github-token: ""
       - name: Install locked tooling
         run: uv sync --locked
       - name: Prepare SQLite integration-test directory

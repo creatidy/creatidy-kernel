@@ -3,6 +3,7 @@
 
 import json
 import time
+from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
 from typing import cast
@@ -66,12 +67,14 @@ def deliver_reference_pr(
     schema: str = "reference-pr-v1",
     title: str = "Bounded two-node reference result",
     body: str | None = None,
+    authorize_dispatch: Callable[[], bool] = lambda: True,
 ) -> dict[str, object]:
     """Called by the trusted application only after exact-head acceptance.
 
     A supplied live Forge owns its own bounded authorization and transport. The default
     uses Forgejo's real normalization against a durable synthetic server, without network.
     Unknown creation without a retained reference stays unknown; there is no blind retry.
+    Dispatch authority is checked before claim and apply, not required for read-only reconciliation.
     """
     oid(head)
     if not acceptance_reference:
@@ -118,6 +121,8 @@ def deliver_reference_pr(
     now = int(time.time())
     first_delivery = operation.attempts == 0
     if first_delivery:
+        if not authorize_dispatch():
+            return result
         store.claim(operation_id, now=now, lease_seconds=1)
         operation = store.operation(operation_id)
     effect = Effect(
@@ -140,6 +145,8 @@ def deliver_reference_pr(
             transport = DurableSyntheticForge(remote_store)
             forge = ForgejoForge(transport, transport, lambda proposed: proposed == effect)
         if first_delivery:
+            if not authorize_dispatch():
+                return {**result, "status": "unknown"}
             receipt = forge.apply(effect)
             if fault == "pr-send":
                 return {**result, "status": "unknown", "interrupted": "pr-send"}

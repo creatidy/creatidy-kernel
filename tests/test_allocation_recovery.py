@@ -23,6 +23,7 @@ from creatidy_kernel.core.domain import (
 )
 from creatidy_kernel.core.execution import (
     Activity,
+    ArtifactManifest,
     Candidate,
     ExecutionRequest,
     Lookup,
@@ -148,6 +149,38 @@ def step(
         fault=interrupt,
         restore=runtime.restore,
     )
+
+
+@pytest.mark.parametrize("present", [False, True])
+def test_unknown_resolution_can_terminalize_original_handle_without_acceptance(
+    sqlite_tmp_path: Path, present: bool
+) -> None:
+    class TerminalWithoutResolution(RecordingRuntime):
+        candidate_calls = 0
+
+        def observe(self, handle: str, *, now: int) -> RuntimeObservation:
+            return RuntimeObservation(handle, Activity.TERMINAL, now, now, self.requests[0].identity, False)
+
+        def candidate(self, handle: str) -> Candidate | None:
+            assert handle == "handle:first"
+            self.candidate_calls += 1
+            if present:
+                attempt = self.requests[0].attempt
+                return Candidate(attempt.attempt_id, attempt.spec_digest, ArtifactManifest(WORKSPACE.key, ()))
+            return None
+
+    runtime = TerminalWithoutResolution()
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
+        initial(store)
+        condition = "identity_unavailable" if present else "terminal_no_candidate"
+        assert step(store, CountingAllocator(), runtime) == condition
+        assert step(store, CountingAllocator(None), runtime, now=12) == condition
+        assert store.load("reference").attempt("reference:first").status is AttemptStatus.FINISHED
+        assert store.operation(OPERATION).status == "terminal"
+        assert store.find_artifact(OPERATION, "identity") is None
+        assert decode_runtime_receipt(store.artifact(OPERATION, "runtime-receipt"))[2].resolved is None
+    assert len(runtime.requests) == 1
+    assert runtime.candidate_calls == (2 if present else 1)
 
 
 @pytest.mark.parametrize(
