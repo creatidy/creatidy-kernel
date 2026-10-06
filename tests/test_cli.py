@@ -6,7 +6,9 @@ import os
 import signal
 import subprocess
 import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -226,11 +228,34 @@ def test_cli_task_run_prints_lifecycle(
 
     tasks = {"143": task}
     control = sqlite_tmp_path / "control"
+    real_sleep = time.sleep
+    original_wait = subprocess.Popen[bytes].wait
+    waits = 0
+    polls = 0
+
+    def wait(process: subprocess.Popen[Any], timeout: float | None = None) -> int:
+        nonlocal waits
+        waits += 1
+        assert time.sleep is real_sleep
+        return original_wait(process, timeout=timeout)
+
+    def poll(_seconds: float) -> None:
+        nonlocal polls
+        polls += 1
+        assert connection.starts == 1 and connection.status == "inProgress"
+        attempt = cast("list[dict[str, object]]", export_task(control)["attempts"])[0]
+        assert cast("dict[str, object]", attempt["attempt"])["status"] == "executing"
+        if interrupt is True:
+            raise KeyboardInterrupt()
+
+    # Replace only the CLI binding, never the time module used by subprocess/Git.
+    clock = SimpleNamespace(time=time.time, sleep=poll)
     with (
         patch.dict("os.environ", live_environment("zai/glm-5.3/low"), clear=True),
         patch("creatidy_kernel.adapters.cli.compose_task_live", return_value=components),
         patch("creatidy_kernel.adapters.cli.TASKS", tasks),
-        patch("creatidy_kernel.adapters.cli.time.sleep", side_effect=KeyboardInterrupt if interrupt is True else None),
+        patch("creatidy_kernel.adapters.cli.time", clock),
+        patch.object(subprocess.Popen, "wait", wait),
     ):
         assert (
             main(
@@ -250,6 +275,9 @@ def test_cli_task_run_prints_lifecycle(
             == 0
         )
     output = capsys.readouterr().out
+    assert waits > 0 and time.sleep is real_sleep
+    if interrupt is True:
+        assert polls == 1
     assert "task admitted: owner-approved frozen task" in output
     if interrupt:
         assert ("condition=cancel_uncertain" if interrupt == "startup" else "condition=cancelled") in output
