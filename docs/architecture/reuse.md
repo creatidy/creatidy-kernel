@@ -40,6 +40,26 @@ evidence leaves a **candidate**, not an approved library, command, protocol or p
 Permission, inference and live service evidence are separately scoped; this documentation task grants
 no product call. ACP's candidacy does not authorize a custom harness, protocol or VS Code plugin.
 
+## Verification-Only Utility Adoption
+
+Under the owner's 2026-10-07 decision for [#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50),
+[ADR 0008](../adr/0008-linux-bubblewrap-verification.md) selects separate invocation of bubblewrap
+v0.11.0 at `9ca3b05ec787acfb4b17bed37db5719fa777834f`, not a copied or reimplemented sandbox.
+Its LGPL-2.0-or-later source/licence was read at that exact public pin; commercial invocation is
+permitted. Kernel distributes no bubblewrap source/binary. Anyone separately redistributing that
+utility must meet its notice/licence/corresponding-source obligations and its dependencies' terms.
+
+The narrow wrapper owns explicit resources, current authorization and negative reception, because
+upstream supplies construction mechanisms rather than a complete policy. Installed libseccomp is
+used through its maintained compiler ABI, not copied filter-generation code. Kernel's Python code
+does not include either library's implementation or a model/credential catalogue. The optional
+locked Meson/Ninja group builds the pinned external utility, not a product daemon/image runtime.
+
+The received boundary is verification/test-child execution only. Native controls alone, HAR
+worktrees, OpenHands workspace defaults and prior CI containers were not treated as equivalent
+controller/credential/socket denial receipts. Whole-worker/harness isolation and rootless OCI
+remain deferred; exact native test/configuration receipts and residual limits are in ADR 0008.
+
 ## Development Workflow Adaptation
 
 Issue [#64](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/64) adapts the current local

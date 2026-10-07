@@ -30,6 +30,35 @@ project installation and package checks use that environment without a second is
 advisory/package-index access. The ordinary tests/example do not contact models or services.
 Format intentional edits with `uv run --locked ruff format .`; do not weaken checks to make them pass.
 
+### Native Verification Proof
+
+The optional verification-only profile needs a separately provisioned unprivileged Linux x86-64
+bubblewrap 0.11.0 and libseccomp 2.5.5+ plus an explicit trusted runtime closure. No root installation,
+daemon or host security-setting changes are needed or performed. Native tests never download/build
+dependencies. Missing native setup is explicitly skipped/unproved in normal pytest; `make native-proof`
+requires `CREATIDY_TEST_BWRAP_BIN` and fails on missing enforcement instead of skipping acceptance.
+
+For an offline build, first obtain the exact public source archive for commit
+`9ca3b05ec787acfb4b17bed37db5719fa777834f` (SHA-256 in ADR 0008), and extract matching public libcap
+development/runtime packages into an owned prefix without installation. Inspect upstream source
+before executing its build. The repository setup tool verifies the archive, builds only the utility
+using locked optional tooling, and prints provenance metadata, not a denial receipt:
+
+```sh
+uv run --locked --group sandbox-build python tools/setup_bubblewrap.py \
+  --archive /path/to/pinned-source.tar.gz --output /owned/parent/new-build \
+  --libcap-prefix /path/to/extracted-libcap-prefix
+CREATIDY_TEST_BWRAP_BIN=/owned/parent/new-build/build/bwrap make native-proof
+```
+
+Supply the managed binary in the same closed operational environment for `make check package-check
+audit` when claiming native reception. Unsupported namespace/platform/libseccomp/resource prerequisites
+refuse; never relax flags or run unsandboxed to make this proof green. The initial test closure is
+Ubuntu 24.04 amd64 Python 3.12; other closures need their own exact resources and native receipts.
+No binary or upstream source is included in wheel/sdist. Redistributing the external utility/libraries
+has separate LGPL/source compliance obligations. CI infrastructure setup and independent whole-PR
+security review remain separate gates, not claims from a local build or green mocks.
+
 Use core-owned immutable values and protocols. Adapters depend inward; core must not depend on
 private systems, vendor SDKs, a forge or a coding harness. The existing application layer is shared by
 the CLI compositions; future entrances must consume it rather than duplicate semantics. The allocator

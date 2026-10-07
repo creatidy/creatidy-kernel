@@ -259,7 +259,40 @@ def verify_candidate(
     required = (*policy.checks, *(("independent_review",) if policy.reviewer_required else ()))
     if len(set(required)) != len(required):
         raise InvalidDomainValue("independent review check cannot duplicate deterministic checks")
-    observations = tuple(producer.check(name, subject) for name in required)
+    # A producer may execute candidate code. Validate each prerequisite before
+    # asking it for the next check; absent observations are not failure receipts.
+    observations: list[Evidence | None] = []
+    for name in required:
+        decision_time = clock() if clock is not None else now
+        if type(decision_time) is not int:
+            raise InvalidDomainValue("trusted decision time required")
+        if any(
+            type(previous) is not Evidence or not previous.observed_at <= decision_time <= previous.fresh_until
+            for previous in observations
+        ):
+            break
+        item = producer.check(name, subject)
+        observations.append(item)
+        decision_time = clock() if clock is not None else now
+        if type(decision_time) is not int:
+            raise InvalidDomainValue("trusted decision time required")
+        if not (
+            type(item) is Evidence
+            and item.check == name
+            and item.subject == subject
+            and item.producer != attempt.actor_id
+            and item.observed_at <= decision_time <= item.fresh_until
+            and item.passed
+            and (
+                name != "independent_review"
+                or (
+                    item.reviewer_session is not None
+                    and item.reviewer_session != spec.attempt_id
+                    and item.producer != verifier_id
+                )
+            )
+        ):
+            break
     if clock is not None:
         now = clock()
         if type(now) is not int:
@@ -268,7 +301,8 @@ def verify_candidate(
     if len({item.evidence_id for item in evidence}) != len(evidence):
         raise InvalidDomainValue("duplicate evidence IDs")
     findings: list[Finding] = []
-    for name, item in zip(required, observations, strict=True):
+    for index, name in enumerate(required):
+        item = observations[index] if index < len(observations) else None
         valid = (
             type(item) is Evidence
             and item.check == name
@@ -290,7 +324,9 @@ def verify_candidate(
                     f"{candidate.candidate_id}:{name}",
                     name,
                     subject,
-                    "missing, stale, mismatched or failing trusted evidence",
+                    "not run: prerequisite rejected"
+                    if index >= len(observations)
+                    else "missing, stale, mismatched or failing trusted evidence",
                 )
             )
     if findings:

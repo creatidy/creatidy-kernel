@@ -72,6 +72,16 @@ The installed smoke exercises actual preparation/approval/refusal/reopen with sy
 it is not live ordinary execution. See [README Ordinary Preparation](../../README.md#ordinary-preparation)
 and [Local Intake Reception](contracts.md#local-intake-reception) for the received path and limits.
 
+## Verification Compatibility
+
+Verification changes under #50 preserve the original Task #143/#166 payloads, policy references,
+spec/Attempt/candidate digests, allocation and recovery encodings. Core verification now stops before
+later producer effects after a failed prerequisite. Historical accepted evidence still has all checks;
+new rejected results never manufacture evidence for unrun checks. No database migration is introduced.
+`VerificationProfile.LINUX_BUBBLEWRAP` is a new explicitly composed child-test executor, not a new
+worker `TrustMode` or profile-file default. Existing trusted-development stays non-isolated and is
+never automatically upgraded. See [ADR 0008](../adr/0008-linux-bubblewrap-verification.md).
+
 ## Historical Second-Pass Mapping
 
 ## Scarcity Router

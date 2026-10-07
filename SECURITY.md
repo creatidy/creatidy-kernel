@@ -1,10 +1,12 @@
 # Security
 
 This is a pre-alpha controller with bounded trusted-development Codex execution, not a proved
-hostile-worker/test/reviewer sandbox or production security product. A closed child environment and
-post-hoc diff allowlist do not isolate same-user host access. Current verification can execute candidate
-tooling despite a scope failure; [#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50)
-tracks trusted preconditions and actual denial evidence. No live execution is authorized by these docs.
+whole hostile-worker/reviewer sandbox or production security product. A closed environment and
+diff allowlist do not isolate same-user host access. Verification now rejects trusted preconditions
+before candidate commands. The separate opt-in [ADR 0008](docs/adr/0008-linux-bubblewrap-verification.md)
+Linux bubblewrap boundary covers untrusted verification/test children only, not their parent harness
+or model context. Native reception is required on the selected platform; unsupported enforcement
+refuses, never falls back. No live execution is authorized by these docs.
 The [threat model](docs/architecture/threat-model.md) separates target controls from implemented code.
 
 Report vulnerabilities through the mirror's

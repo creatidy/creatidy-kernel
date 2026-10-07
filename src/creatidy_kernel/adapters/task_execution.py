@@ -920,7 +920,22 @@ class TaskChecks:
         )
 
     def check(self, name: str, subject: EvidenceSubject) -> Evidence | None:
-        if subject.head_revision != self.head:
+        if (
+            subject.head_revision != self.head
+            or subject.base_revision != self.base
+            or subject.repository != str(self.workspace)
+            or subject.policy_digest != POLICY.reference.digest
+        ):
+            return None
+        program = self.store.load(PROGRAM_ID)
+        attempt = program.attempt(ATTEMPT_ID)
+        if (
+            subject.spec_digest != program.spec.digest
+            or subject.attempt_digest != attempt.spec.digest
+            or attempt.status is not AttemptStatus.FINISHED
+            or program.state(UNIT_ID).status is not WorkUnitStatus.READY
+            or program.spec.digest != task_program_spec(self.task).digest
+        ):
             return None
         evidence = self._check(name, subject)
         if evidence is not None:
@@ -940,6 +955,21 @@ class TaskChecks:
                 name, subject, passed, {"changed_paths": list(self.paths), "allowed_paths": sorted(allowed)}
             )
         if name == "verification-commands":
+            # POLICY's shipped order/digest is durable. Enforce the structural
+            # prerequisite here as well, including direct producer calls.
+            actual_paths = _changed_paths(self.workspace, self.base, self.head)
+            if (
+                not self.authorized()
+                or not actual_paths
+                or set(actual_paths) != set(self.paths)
+                or not set(actual_paths) <= self.task.allowed_paths
+                or git_text(self.workspace, "rev-parse", "HEAD") != self.head
+                or _porcelain(self.workspace)
+            ):
+                return self._evidence(name, subject, False, {"runs": [], "reason": "execution precondition rejected"})
+            structural = self.check("structural", subject)
+            if structural is None or not structural.passed:
+                return self._evidence(name, subject, False, {"runs": [], "reason": "structural prerequisite rejected"})
             self.lifecycle.append(
                 f"verification started: {sum(c.repeats for c in self.task.verification)} run(s) of "
                 f"{len(self.task.verification)} trusted command(s)"

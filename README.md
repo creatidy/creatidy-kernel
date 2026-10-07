@@ -234,9 +234,10 @@ from the TaskSpec canonical repository. Cache acquisition/refresh does write loc
 checks explicit `--repo` identity, while shared dispatch enforcement remains #61. Work happens in a disposable clone;
 the controller itself creates the candidate commit from the workspace tree. The base is durably
 frozen, and recovery uses that exact base even if a source branch moves. Changed paths must remain
-inside the task's frozen allowed set for acceptance. That is a post-hoc gate, not a sandbox:
-verification currently runs all checks even after a scope failure, and capture is truncated only
-after buffering command output. [#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50) and
+inside the task's frozen allowed set for acceptance. That is not a worker sandbox. Verification
+now validates trusted evidence in order and rejects changed-path/structural preconditions before
+candidate commands; trusted-development capture still truncates after buffering output.
+[#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50) and
 [#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56) cover safe preconditions,
 isolation and full execution bounds. Task-owned argv-only commands have per-command timeouts.
 Task `143` retains targeted cancellation checks, exactly
@@ -315,6 +316,13 @@ native integration under [#53](https://forgejo.creatidy.com/Creatidy/creatidy-ke
 promised detached recovery features. [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48)
 supplies the bounded owned-session repair.
 Native-shaped offline fixtures are not live model or remote-Forge acceptance.
+
+The separately opt-in [ADR 0008 verification-only profile](docs/adr/0008-linux-bubblewrap-verification.md)
+uses native Linux bubblewrap and libseccomp for untrusted test children, including such execution
+for review. A trusted controller supplies exact subjects/recipes/resources and current authorization;
+candidate JSON or prompt text cannot select mounts or native policy. It is not activated by `task run`,
+ordinary preparation, a profile migration or Codex workspace-write. Trusted-development remains
+non-isolated; worker/harness and cold-reviewer model context isolation remain deferred.
 
 The separate `run_live_reference` Python composition has a 1-100 observation budget, original
 deadline recovery and a cancellation Operation. Its bounded exit does not prove remote descendants
