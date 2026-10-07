@@ -13,6 +13,13 @@ requires no-execution precondition evidence and existing-sandbox denial tests fo
 reviewer. Full output capture/process/whole-task bounds are [#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56).
 These are source findings, not executed exploit or live isolation proof.
 
+Issue #50's owner-selected slice now repairs ordered trusted preconditions and separately receives
+an opt-in Linux bubblewrap **verification/test-child** boundary. [ADR 0008](../adr/0008-linux-bubblewrap-verification.md)
+records actual native denials, fixed resources, exact local versions and limits. It does not isolate
+Codex/worker, the host controller or the cold reviewer's model/harness context, nor authenticate a
+remote approval channel. Those broader requirements remain deferred; no ordinary execution or
+trust-mode migration activates this profile. Historical source findings above retain their dated basis.
+
 [ADR 0007](../adr/0007-shared-harness-routing-observability.md) fixes shared ownership. ACP/native
 file/terminal operations need an actual identified executor; permission text is not enforcement.
 Cancel is not rollback, interrupt is not descendant settlement, UI closure is not process ownership.

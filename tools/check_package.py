@@ -58,6 +58,9 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
             "-c",
             "from creatidy_kernel.adapters.fixed_allocator import FixedAllocator; "
             "from creatidy_kernel.adapters.scarcity_router import ScarcityRouterAllocator; "
+            "from creatidy_kernel.adapters.bubblewrap_verification import BubblewrapVerifier; "
+            "from creatidy_kernel.ports.verification import VerificationProfile; "
+            "assert VerificationProfile.TRUSTED_DEVELOPMENT.value == 'trusted_development'; "
             "from creatidy_kernel.core.resources import Allocation, ResourceRequest; "
             "a = FixedAllocator(Allocation('runtime', 'local', 'model', frozenset(), 0, 'smoke')); "
             "assert a.select(ResourceRequest('unit', frozenset(), 0)).provider_id == 'local'",

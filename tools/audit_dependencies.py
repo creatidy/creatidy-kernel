@@ -12,6 +12,7 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-audit-") as directory:
             "uv",
             "export",
             "--locked",
+            "--all-groups",
             "--no-emit-project",
             "--format",
             "pylock.toml",

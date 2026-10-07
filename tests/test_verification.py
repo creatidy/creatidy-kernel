@@ -2,6 +2,7 @@
 """Synthetic exact-subject verification and remediation regressions for issue #7."""
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -315,3 +316,53 @@ def test_f_new_blockers_progress_oscillation_pause_and_authority_gate() -> None:
         assess_remediation((a,), max_changes=3, used=0, authorized=True, owner_decision_required=True).status
         is RemediationStatus.HUMAN_GATE
     )
+
+
+@pytest.mark.parametrize("failure", ("missing", "fail", "stale", "worker", "subject", "unsupported"))
+def test_rejected_prerequisite_never_calls_later_producer(failure: str) -> None:
+    state = finish(program(), "one", "a1")
+    proposal, manifest = proposal_for(state, "a1")
+    calls: list[str] = []
+
+    class OrderedChecks(Checks):
+        def check(self, name: str, subject: EvidenceSubject) -> Evidence | None:
+            calls.append(name)
+            assert name == CHECKS[0], "candidate command must not execute"
+            if failure in {"missing", "unsupported"}:
+                return None
+            result = super().check(name, subject)
+            assert result is not None
+            if failure == "subject":
+                return replace(result, subject=replace(subject, head_revision="other"))
+            if failure == "worker":
+                return replace(result, producer="worker")
+            if failure == "stale":
+                return replace(result, fresh_until=1)
+            return replace(result, passed=False)
+
+    result = verify(state, proposal, manifest, OrderedChecks())
+    assert isinstance(result, RejectedResult)
+    assert calls == [CHECKS[0]]
+    assert len(result.evidence) == (0 if failure in {"missing", "unsupported"} else 1)
+    assert all(f.reason == "not run: prerequisite rejected" for f in result.findings[1:])
+
+
+def test_duplicate_evidence_refuses_before_independent_review_effect(tmp_path: Path) -> None:
+    state = finish(program(), "one", "a1")
+    proposal, manifest = proposal_for(state, "a1")
+    marker = tmp_path / "must-not-review"
+    calls: list[str] = []
+
+    class DuplicateChecks(Checks):
+        def check(self, name: str, subject: EvidenceSubject) -> Evidence | None:
+            calls.append(name)
+            if name == "independent_review":
+                marker.write_bytes(b"synthetic later producer effect")
+            item = super().check(name, subject)
+            assert item is not None
+            return replace(item, evidence_id="same-evidence") if name in CHECKS else item
+
+    with pytest.raises(InvalidDomainValue, match="duplicate evidence IDs"):
+        verify(state, proposal, manifest, DuplicateChecks())
+    assert calls == list(CHECKS)
+    assert not marker.exists()
