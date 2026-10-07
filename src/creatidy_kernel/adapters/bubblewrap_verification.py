@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import platform
+import select
 import selectors
 import shutil
 import stat
@@ -188,6 +189,45 @@ def _pidfd_open(pid: int) -> int:
         return fd
     except AttributeError as error:
         raise VerificationRefused("pidfd_unavailable") from error
+
+
+def _process_status(pid: int) -> dict[str, str]:
+    """Read-only metadata of an already identified, owned native process."""
+    return dict(line.split(":", 1) for line in Path(f"/proc/{pid}/status").read_text().splitlines())
+
+
+def _filter_count(status: dict[str, str]) -> int:
+    count = int(status["Seccomp_filters"])
+    mode = int(status["Seccomp"])
+    if count < 0 or (mode != 2 if count else mode != 0):
+        raise ValueError("unsupported seccomp observation")
+    return count
+
+
+def _reaper_armed(pid: int, pidfd: int, monitor: subprocess.Popen[bytes], inherited_filters: int) -> bool:
+    # This indicator depends on the exact unmodified BWRAP_SOURCE, not a generic
+    # version string: do_init installs our sole filter AFTER its own pdeath setup
+    # (624/626). Bootstrap R proves only the other fork branch (3598/3605).
+    live = select.poll()
+    live.register(pidfd, select.POLLIN)
+    if monitor.poll() is not None or live.poll(0):
+        raise ValueError("owned native process exited")
+    parent = _process_status(monitor.pid)
+    reaper = _process_status(pid)
+    if (
+        int(parent["Pid"]) != monitor.pid
+        or int(parent["PPid"]) != os.getpid()
+        or int(reaper["Pid"]) != pid
+        or int(reaper["PPid"]) != monitor.pid
+        or tuple(map(int, reaper["NSpid"].split()))[0] != pid
+        or tuple(map(int, reaper["NSpid"].split()))[-1] != 1
+        or _filter_count(parent) != inherited_filters
+        or _filter_count(reaper) not in {inherited_filters, inherited_filters + 1}
+    ):
+        raise ValueError("inconsistent owned reaper observation")
+    if monitor.poll() is not None or live.poll(0):
+        raise ValueError("owned native process exited")
+    return _filter_count(reaper) == inherited_filters + 1
 
 
 def _seccomp(fd: int, library: Path) -> tuple[int, int, int]:
@@ -505,6 +545,8 @@ class BubblewrapVerifier:
                         init_exited = False
                         bootstrap_ready = False
                         owned_init = False
+                        init_pid: int | None = None
+                        inherited_filters: int | None = None
                         released = False
                         stopping: float | None = None
                         try:
@@ -521,19 +563,24 @@ class BubblewrapVerifier:
                                         process.kill()
                                         stopping = time.monotonic() + 5
                                 if stopping is None and bootstrap_ready and owned_init and not released:
-                                    # Both native reaper and trusted bootstrap
-                                    # have armed parent death by this handoff.
-                                    if (
-                                        process.poll() is not None
-                                        or cancelled()
-                                        or not self.authorize(invocation, self.clock())
-                                    ):
-                                        condition = "authorization_lost"
+                                    try:
+                                        if init_pid is None or init_pidfd is None or inherited_filters is None:
+                                            raise ValueError("missing owned reaper observation")
+                                        armed = _reaper_armed(init_pid, init_pidfd, process, inherited_filters)
+                                        if (
+                                            process.poll() is not None
+                                            or cancelled()
+                                            or not self.authorize(invocation, self.clock())
+                                        ):
+                                            condition = "authorization_lost"
+                                        elif armed:
+                                            os.write(gate_write, b"1")
+                                            released = True
+                                    except (OSError, ValueError, KeyError, IndexError):
+                                        condition = "enforcement_unavailable"
+                                    if condition != "completed":
                                         process.kill()
                                         stopping = time.monotonic() + 5
-                                    else:
-                                        os.write(gate_write, b"1")
-                                        released = True
                                 if stopping is not None and time.monotonic() >= stopping:
                                     break
                                 for key, _ in selector.select(0.05):
@@ -562,14 +609,11 @@ class BubblewrapVerifier:
                                                 # one direct namespace child. It
                                                 # cannot fork the candidate while
                                                 # our setup gate remains blocked.
-                                                status = Path(f"/proc/{pid}/status").read_text()
-                                                parent = next(
-                                                    line.split()[1]
-                                                    for line in status.splitlines()
-                                                    if line.startswith("PPid:")
-                                                )
-                                                if int(parent) != process.pid:
+                                                status = _process_status(pid)
+                                                if int(status["PPid"]) != process.pid:
                                                     raise ValueError("init ownership mismatch")
+                                                inherited_filters = _filter_count(_process_status(process.pid))
+                                                init_pid = pid
                                                 selector.register(init_pidfd, selectors.EVENT_READ, 4)
                                                 owned_init = True
                                             except (OSError, ValueError, KeyError, TypeError, StopIteration):

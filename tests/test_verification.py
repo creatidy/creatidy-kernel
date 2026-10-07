@@ -2,6 +2,7 @@
 """Synthetic exact-subject verification and remediation regressions for issue #7."""
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -344,3 +345,24 @@ def test_rejected_prerequisite_never_calls_later_producer(failure: str) -> None:
     assert calls == [CHECKS[0]]
     assert len(result.evidence) == (0 if failure in {"missing", "unsupported"} else 1)
     assert all(f.reason == "not run: prerequisite rejected" for f in result.findings[1:])
+
+
+def test_duplicate_evidence_refuses_before_independent_review_effect(tmp_path: Path) -> None:
+    state = finish(program(), "one", "a1")
+    proposal, manifest = proposal_for(state, "a1")
+    marker = tmp_path / "must-not-review"
+    calls: list[str] = []
+
+    class DuplicateChecks(Checks):
+        def check(self, name: str, subject: EvidenceSubject) -> Evidence | None:
+            calls.append(name)
+            if name == "independent_review":
+                marker.write_bytes(b"synthetic later producer effect")
+            item = super().check(name, subject)
+            assert item is not None
+            return replace(item, evidence_id="same-evidence") if name in CHECKS else item
+
+    with pytest.raises(InvalidDomainValue, match="duplicate evidence IDs"):
+        verify(state, proposal, manifest, DuplicateChecks())
+    assert calls == list(CHECKS)
+    assert not marker.exists()

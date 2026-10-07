@@ -159,21 +159,37 @@ Only consumed seccomp/native-info, PID-1 lifetime and anonymous bootstrap setup 
 passed. A fixed trusted Python `-P/-S` bootstrap (outside candidate code) signals readiness, waits
 for one anonymous exec token, closes its setup FDs, then execs the exact authorized recipe. EOF
 refuses execution. Bubblewrap's `--block-fd` is deliberately not used: its EOF also releases the
-command. The controller binds the native producer's exact direct init child with a pidfd, checks
-ownership, and rechecks current authorization after bootstrap readiness before releasing exec.
+command. Bootstrap readiness alone does not prove the reaper's parent-death setup: after the
+native fork, bootstrap and PID-1 take separate branches. The controller binds the native
+producer's exact direct init child with a pidfd and captures the exact owned monitor's inherited
+`Seccomp_filters` count. Before exec it checks PID/parent/namespace identity, monitor liveness,
+pidfd non-exit and consistent proc metadata before and after the observation. PID-1 must show
+exactly one additional filter relative to that unchanged monitor count, then current authorization
+is rechecked before releasing the token. Equal counts mean not ready, never elapsed-time readiness.
+
+This indicator is source-specific: in unmodified commit `9ca3b05ec787acfb4b17bed37db5719fa777834f`,
+`do_init()` performs its own parent-death setup at line 624 before installing the supplied filter
+at 626; the bootstrap branch instead performs those operations at 3598/3605. The fixed invocation
+supplies exactly one filter. Missing/inconsistent fields, wrong identity, changed monitor count,
+or exited native processes refuse execution; there is no timing or PPid-only substitute. It does
+not establish readiness of a different/fake binary from a matching version string. The source pin,
+caller-pinned executable provenance and trusted-parent assumptions above remain mandatory.
 The fixed bootstrap requires the declared Python/loader closure; it has no policy parser or model
 loop and implements no namespace, filesystem, network or seccomp enforcement itself.
 Stdout/stderr are drained
 continuously and retained at most 64 KiB each as private untrusted data, never public diagnostics
 or authority. Timeout/cancel kills only the owned direct PID; parent-death handling terminates
-PID-1, whose namespace teardown kills descendants including setsid children. Both lifetime EOF
+PID-1 after its independently observed arming, whose namespace teardown kills descendants including
+setsid children. Before arming, killing the monitor need not terminate a paused PID-1; the exec
+gate remains closed, and pending namespace/scratch settlement must remain unknown. Both lifetime EOF
 and exact PID-1 pidfd exit readiness are required before cleanup: EOF alone can precede kernel
 descendant teardown. The managed Python 3.12.0 build lacks `os.pidfd_open`; the same required
 kernel operation is available through libc's maintained `pidfd_open` ABI, checked lazily before
 launch. Missing libc/kernel support refuses; there is no PID-polling or weaker-settlement substitute.
 Missing settlement is `settlement_unknown`, retains owned
 scratch and never becomes a passing command. This is not a host process census or a guarantee
-against uninterruptible kernel I/O. Parent crash can leave inert scratch for trusted owner cleanup.
+against uninterruptible kernel I/O. Parent crash before readiness can leave pending owned setup and
+scratch, not necessarily inert scratch; cleanup requires actual settlement evidence.
 
 Local actual native reception on 2026-10-07 used Ubuntu 24.04.5, Linux
 `6.18.33.2-microsoft-standard-WSL2`, x86-64 and the actual unprivileged user:
@@ -199,9 +215,24 @@ actual namespace-init pidfd settlement. Synthetic observer loss retains scratch 
 command exit; that injected observer test is not a native denial claim. A live synthetic bystander
 survives cancellation. Private stdout/stderr and snapshot bytes are excluded from object repr.
 
+PR #74 remediation reproduced the pre-arming ordering defect on the unchanged pinned native
+utility: a test-only owned FIFO passed through maintained `--lock-file` held PID-1 inside
+`do_init()` before 624, while bootstrap readiness had already occurred. The former gate released
+exec; an actual temporary marker and held setsid-descendant lock were observed while PID-1's
+filter count still equalled its monitor's. These are local observed effects, not an inference
+from a sleeping process or an exploit against host files. The final forced-interval regressions
+prove no exec token before arming, safe cancellation/unknown retained scratch, parent loss before
+readiness, positive post-arming execution, actual descendant-lock release and bystander survival.
+Fixtures add only temporary owned scheduling locks/markers and clean up with exact owned pidfds;
+production resources/flags and upstream source are unchanged. Injected missing/inconsistent
+observer metadata tests are refusal tests, not native denial or stronger isolation receipts.
+
 `test_verification_preconditions.py` proves forbidden Makefile/pyproject/tool/AGENTS changes cause
 no command marker effect and direct TaskChecks calls cannot bypass structural rejection. Core
-checks stop on invalid/missing/stale/worker/failing evidence before later producer calls. Unrun
+checks stop on invalid/missing/stale/worker/failing evidence before later producer calls. A repeated
+evidence ID raises the original `InvalidDomainValue` immediately when received, before requesting
+another producer; the harmless local regression reproduced the former later-review marker effect.
+Unrun
 checks receive findings, never invented evidence. Historical Task policy order/reference,
 #143/#166 digests and recovery encodings are unchanged; command-local prerequisites do not rewrite them.
 

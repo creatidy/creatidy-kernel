@@ -262,6 +262,7 @@ def verify_candidate(
     # A producer may execute candidate code. Validate each prerequisite before
     # asking it for the next check; absent observations are not failure receipts.
     observations: list[Evidence | None] = []
+    evidence_ids: set[str] = set()
     for name in required:
         decision_time = clock() if clock is not None else now
         if type(decision_time) is not int:
@@ -272,6 +273,10 @@ def verify_candidate(
         ):
             break
         item = producer.check(name, subject)
+        if type(item) is Evidence:
+            if item.evidence_id in evidence_ids:
+                raise InvalidDomainValue("duplicate evidence IDs")
+            evidence_ids.add(item.evidence_id)
         observations.append(item)
         decision_time = clock() if clock is not None else now
         if type(decision_time) is not int:
@@ -298,8 +303,6 @@ def verify_candidate(
         if type(now) is not int:
             raise InvalidDomainValue("trusted decision time required")
     evidence = tuple(item for item in observations if type(item) is Evidence)
-    if len({item.evidence_id for item in evidence}) != len(evidence):
-        raise InvalidDomainValue("duplicate evidence IDs")
     findings: list[Finding] = []
     for index, name in enumerate(required):
         item = observations[index] if index < len(observations) else None

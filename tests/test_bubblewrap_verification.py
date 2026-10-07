@@ -5,6 +5,7 @@ Set CREATIDY_TEST_BWRAP_BIN to the externally built pinned utility to run native
 reception. Missing setup is explicitly unproved, never a passing denial receipt.
 """
 
+import ctypes
 import fcntl
 import hashlib
 import os
@@ -16,6 +17,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
+from typing import Any, cast
 
 import pytest
 
@@ -744,3 +746,283 @@ def test_native_parent_crash_before_exec_handoff_has_no_candidate_effect(
             os.waitpid(child, 0)
         except ChildProcessError:
             pass
+
+
+def _kill_owned_pidfd(fd: int) -> None:
+    """Fixture cleanup only: exact owned PID, even when native pdeath is not armed."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.pidfd_send_signal.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+    libc.pidfd_send_signal.restype = ctypes.c_int
+    if libc.pidfd_send_signal(fd, signal.SIGKILL, None, 0) != 0:
+        assert ctypes.get_errno() == 3  # ESRCH: the exact owned process already exited.
+
+
+@pytest.mark.parametrize("loss", ("post-arm", "cancel", "controller-death"))
+def test_native_forced_reaper_prearming_interval(
+    native: tuple[BubblewrapVerifier, tuple[VerificationResource, ...]],
+    monkeypatch: pytest.MonkeyPatch,
+    loss: str,
+) -> None:
+    verifier, resources = native
+    snapshot = VerificationSnapshot(
+        (
+            (
+                "proof.py",
+                b"""
+import fcntl, os, pathlib, signal
+if os.fork() == 0:
+    os.setsid()
+    with open('/workspace/held-lock','w') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        pathlib.Path('/workspace/effect').write_text('actual candidate effect')
+        with open('/workspace/effect-pipe','wb',buffering=0) as notify:
+            notify.write(b'M')
+        signal.pause()
+else:
+    signal.pause()
+""",
+            ),
+        )
+    )
+    notify_read, notify_write = os.pipe()
+    command_read, command_write = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(notify_read)
+        os.close(command_write)
+        original_popen = subprocess.Popen
+        original_write = os.write
+        phase = [False, False]
+        cancel = [False]
+        init = [0]
+
+        def notify(message: str) -> None:
+            original_write(notify_write, (message + "\n").encode())
+
+        def spawn(argv: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+            if "--unshare-pid" in argv:
+                workspace = cast(Path, kwargs["cwd"]) / "workspace"
+                os.mkfifo(workspace / "pre-arm", mode=0o600)
+                os.mkfifo(workspace / "effect-pipe", mode=0o600)
+                notify("W" + str(workspace))
+                index = argv.index("--")
+                argv = [*argv[:index], "--lock-file", "/workspace/pre-arm", *argv[index:]]
+            return cast("subprocess.Popen[bytes]", original_popen(argv, **kwargs))
+
+        def pin(pid: int) -> int:
+            fd = open_pidfd(pid)
+            if pid != os.getpid():
+                init[0] = pid
+                notify("I" + str(pid))
+            return fd
+
+        def token(fd: int, data: bytes) -> int:
+            result = original_write(fd, data)
+            if data == b"1":
+                notify("T")
+            return result
+
+        class Checkpoint(selectors.EpollSelector):
+            def select(self, timeout: float | None = None) -> list[tuple[selectors.SelectorKey, int]]:
+                if phase[0] and init[0] and not phase[1]:
+                    phase[1] = True
+                    # This checkpoint is AFTER one full gate decision following
+                    # native bootstrap R, not a delay guessed to trigger a race.
+                    notify("Q")
+                    command = os.read(command_read, 1)
+                    cancel[0] = command == b"C"
+                events = super().select(timeout)
+                if any(key.data == 5 for key, _ in events):
+                    phase[0] = True
+                return events
+
+        monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification.subprocess.Popen", spawn)
+        monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification._pidfd_open", pin)
+        monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification.selectors.DefaultSelector", Checkpoint)
+        monkeypatch.setattr(os, "write", token)
+        try:
+            result = verifier.run(
+                replace(invocation(resources, snapshot), timeout_seconds=10), snapshot, cancelled=lambda: cancel[0]
+            )
+            notify("F" + result.condition + ":" + result.settlement)
+        finally:
+            os._exit(94)
+    os.close(notify_write)
+    os.close(command_read)
+    init_fd: int | None = None
+    monitor_fd: int | None = None
+    effect_fd: int | None = None
+    held_fd: int | None = None
+    pending = bytearray()
+    messages: list[str] = []
+    workspace: Path | None = None
+    bystander = subprocess.Popen(  # noqa: S603 - owned fixture, not a service or shared process group.
+        [sys.executable, "-c", "import signal; signal.pause()"],
+        env={"HOME": str(verifier.scratch_parent), "PATH": os.defpath},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        with selectors.DefaultSelector() as observer:
+            observer.register(notify_read, selectors.EVENT_READ)
+            while "Q" not in messages:
+                assert observer.select(5), "owned native checkpoint missing"
+                data = os.read(notify_read, 4096)
+                assert data, "fixture controller exited before checkpoint"
+                pending.extend(data)
+                while b"\n" in pending:
+                    line, _, rest = pending.partition(b"\n")
+                    pending = bytearray(rest)
+                    messages.append(line.decode())
+                if workspace is None:
+                    paths = [message[1:] for message in messages if message.startswith("W")]
+                    if paths:
+                        workspace = Path(paths[0])
+                        effect_fd = os.open(workspace / "effect-pipe", os.O_RDWR | os.O_NONBLOCK)
+            assert workspace is not None and effect_fd is not None
+            init_pid = int(next(message[1:] for message in messages if message.startswith("I")))
+            init_fd = open_pidfd(init_pid)
+            status = dict(line.split(":", 1) for line in Path(f"/proc/{init_pid}/status").read_text().splitlines())
+            monitor_pid = int(status["PPid"])
+            monitor_fd = open_pidfd(monitor_pid)
+            monitor_status = dict(
+                line.split(":", 1) for line in Path(f"/proc/{monitor_pid}/status").read_text().splitlines()
+            )
+            assert int(status["Seccomp_filters"]) == int(monitor_status["Seccomp_filters"]), (
+                "FIFO must hold exact init before 624/626"
+            )
+            if "T" in messages:
+                # Pre-fix evidence: actually executed descendant writes M and
+                # holds its own lock while PID-1 is still before pdeath arming.
+                with selectors.DefaultSelector() as effects:
+                    effects.register(effect_fd, selectors.EVENT_READ)
+                    assert effects.select(5), "premature exec did not reach candidate fixture"
+                    assert os.read(effect_fd, 1) == b"M"
+                assert (workspace / "effect").exists()
+                held_fd = os.open(workspace / "held-lock", os.O_RDONLY)
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert "T" not in messages, "actual candidate marker/held descendant observed before native PID-1 armed"
+            assert not (workspace / "effect").exists()
+            if loss == "controller-death":
+                os.kill(child, signal.SIGKILL)
+                os.waitpid(child, 0)
+                with selectors.DefaultSelector() as exited:
+                    exited.register(monitor_fd, selectors.EVENT_READ)
+                    assert exited.select(5), "owned monitor did not exit"
+                with selectors.DefaultSelector() as alive:
+                    alive.register(init_fd, selectors.EVENT_READ)
+                    assert not alive.select(0), "held pre-arm init must remain unknown, not be falsely settled"
+            else:
+                os.write(command_write, b"C" if loss == "cancel" else b"U")
+            if loss != "cancel":
+                subprocess.run(  # noqa: S603 - bounded handshake on our own synthetic FIFO.
+                    [
+                        sys.executable,
+                        "-c",
+                        "import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.close(fd)",
+                        str(workspace / "pre-arm"),
+                    ],
+                    env={"HOME": str(verifier.scratch_parent), "PATH": os.defpath},
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                    timeout=5,
+                )
+            if loss == "post-arm":
+                with selectors.DefaultSelector() as effects:
+                    effects.register(effect_fd, selectors.EVENT_READ)
+                    assert effects.select(5), "post-arm candidate did not execute"
+                    assert os.read(effect_fd, 1) == b"M"
+                armed = dict(line.split(":", 1) for line in Path(f"/proc/{init_pid}/status").read_text().splitlines())
+                assert int(armed["Seccomp_filters"]) > int(monitor_status["Seccomp_filters"])
+                held_fd = os.open(workspace / "held-lock", os.O_RDONLY)
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.kill(child, signal.SIGKILL)
+                os.waitpid(child, 0)
+            elif loss == "cancel":
+                while not any(message.startswith("F") for message in messages):
+                    assert observer.select(8), "bounded cancellation receipt missing"
+                    data = os.read(notify_read, 4096)
+                    assert data
+                    pending.extend(data)
+                    while b"\n" in pending:
+                        line, _, rest = pending.partition(b"\n")
+                        pending = bytearray(rest)
+                        messages.append(line.decode())
+                assert "Fsettlement_unknown:unknown" in messages
+                assert workspace.is_dir() and not (workspace / "effect").exists()
+                _kill_owned_pidfd(init_fd)
+            with selectors.DefaultSelector() as exited:
+                exited.register(init_fd, selectors.EVENT_READ)
+                assert exited.select(5), "owned namespace init failed to settle"
+            if held_fd is not None:
+                fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if loss != "post-arm":
+                assert not (workspace / "effect").exists()
+            assert bystander.poll() is None
+    finally:
+        try:
+            if init_fd is not None:
+                try:
+                    _kill_owned_pidfd(init_fd)
+                    with selectors.DefaultSelector() as exited:
+                        exited.register(init_fd, selectors.EVENT_READ)
+                        assert exited.select(5), "exact owned init cleanup failed"
+                    if held_fd is not None:
+                        fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(init_fd)
+        finally:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(child, 0)
+            except ChildProcessError:
+                pass
+            for descriptor in (monitor_fd, effect_fd, held_fd):
+                if descriptor is not None:
+                    os.close(descriptor)
+            os.close(notify_read)
+            os.close(command_write)
+            bystander.kill()
+            bystander.wait(timeout=5)
+
+
+@pytest.mark.parametrize("fault", ("missing", "mode", "count", "namespace"))
+def test_native_reaper_observation_fault_refuses_exec(
+    native: tuple[BubblewrapVerifier, tuple[VerificationResource, ...]],
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    from creatidy_kernel.adapters.bubblewrap_verification import (
+        _process_status as read_status,  # pyright: ignore[reportPrivateUsage] - owned metadata fault only.
+    )
+
+    verifier, resources = native
+    snapshot = VerificationSnapshot((("proof.py", b"print('MUST_NOT_EXECUTE')"),))
+
+    def unavailable(pid: int) -> dict[str, str]:
+        status = read_status(pid)
+        if status.get("NSpid", "").split()[-1:] == ["1"]:
+            if fault == "missing":
+                status.pop("Seccomp_filters", None)
+            elif fault == "mode":
+                status["Seccomp"] = "1"
+            elif fault == "count":
+                status["Seccomp_filters"] = "-1"
+            else:
+                status["NSpid"] = str(pid) + " 2"
+        return status
+
+    monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification._process_status", unavailable)
+    result = verifier.run(invocation(resources, snapshot), snapshot)
+    assert result.condition in {"enforcement_unavailable", "settlement_unknown"}
+    assert result.stdout == b""
+    # Injected observer faults are refusal regressions, NOT passing native
+    # denial receipts. Existing supported native tests independently prove it.
