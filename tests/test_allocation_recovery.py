@@ -301,6 +301,7 @@ def legacy_attempt(store: SQLiteProgramStore, *, effort: str | None = None, publ
     raw = asdict(allocation)
     raw["capabilities"] = sorted(allocation.capabilities)
     del raw["variant"], raw["decision_provenance"]
+    del raw["requirements_provenance"]
     data = manifest_bytes(raw)
     context = manifest_bytes([asdict(item) for item in program.resolved_inputs("first")])
     attempt = AttemptSpec(

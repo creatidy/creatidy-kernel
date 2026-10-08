@@ -12,6 +12,8 @@ class FixedAllocator(ResourceAllocator):
     allocation: Allocation
 
     def select(self, request: ResourceRequest) -> Allocation:
+        if request.requirements_handoff is not None:
+            raise AllocationUnavailable("fixed allocation cannot interpret ordinary requirements")
         if not request.required_capabilities <= self.allocation.capabilities:
             raise AllocationUnavailable("configured allocation lacks a required capability")
         if request.context_tokens > self.allocation.context_tokens:

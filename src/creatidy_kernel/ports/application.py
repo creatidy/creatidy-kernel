@@ -126,6 +126,8 @@ def advance_work_unit(
     attempt_id = f"{program.program_id}:{unit_id}"
     operation_id = f"runtime:{attempt_id}"
     if not any(item.spec.attempt_id == attempt_id for item in program.attempts):
+        if any(item.name == "ordinary-declaration" for item in program.spec.initial_inputs):
+            raise ValueError("ordinary dispatch is not supported by the reference composition")
         if cancel_requested is not None and cancel_requested():
             return "cancel_requested"
         if deadline is not None and decision_clock() >= deadline:

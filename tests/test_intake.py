@@ -48,6 +48,7 @@ from creatidy_kernel.core.intake import (
     IntakeRefused,
     IssueSubject,
     OwnerPolicy,
+    TranslationRefusal,
     encode,
 )
 from creatidy_kernel.ports.intake import OrdinaryIntake, draft_from
@@ -216,6 +217,7 @@ def test_inert_draft_approved_intact_real_translation_and_reopen(sqlite_tmp_path
         translator = ScarcityRouterAllocator
         with patch.object(ScarcityRouterAllocator, "_exchange", side_effect=AssertionError("no Router transport")):
             refusal = intake.handoff(OWNER, approved, policy(), translator)
+        assert isinstance(refusal, TranslationRefusal)
         assert refusal.reason == "ordinary_requirement_mapping_unavailable"
         assert refusal.handoff.draft.declaration.raw == original.raw
         assert refusal.handoff.draft.evidence == draft.evidence
@@ -1048,6 +1050,7 @@ def test_genuinely_new_identified_baseline_receipt_permits_fresh_age_after_reope
         ) as translator:
             refusal = intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
             translator.assert_called_once()
+        assert isinstance(refusal, TranslationRefusal)
         assert refusal.handoff.draft.evidence.baseline_reference == "fixture:baseline:genuinely-new"
         assert refusal.handoff.draft.evidence.observed_at == 201
         assert refusal.reason == "ordinary_requirement_mapping_unavailable"
@@ -1145,6 +1148,7 @@ def test_unchanged_lower_age_observation_survives_reopen_without_rewriting_draft
             assert intake.approve(OWNER, original, policy(), decision_id="original", expires_at=400) == approved
         else:
             refusal = intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+            assert isinstance(refusal, TranslationRefusal)
             assert refusal.handoff.draft == original
         assert intake.history("task") == (original,)
         assert store.artifact("ordinary:task:draft:1", "record") == raw
@@ -1265,6 +1269,7 @@ def test_retained_lower_age_is_idempotent_and_scoped_to_receipt_not_alias(sqlite
         assert fresh.evidence.observed_at == 151
         approved = intake.approve(OWNER, fresh, policy(), decision_id="fresh", expires_at=400)
         refusal = intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+        assert isinstance(refusal, TranslationRefusal)
         assert refusal.handoff.draft == fresh
         assert len(store.operations("ordinary:baseline-age:")) == 1
         assert intake.history("task")[0] == original
@@ -1576,7 +1581,9 @@ def test_nonabandoned_core_states_retain_replay_and_explicit_amendment_compatibi
         assert program.status is status
         replay = intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400)
         assert replay.program == program
-        assert intake.handoff(OWNER, replay, policy(), ScarcityRouterAllocator).handoff.draft == draft
+        refusal = intake.handoff(OWNER, replay, policy(), ScarcityRouterAllocator)
+        assert isinstance(refusal, TranslationRefusal)
+        assert refusal.handoff.draft == draft
         amended = intake.prepare(
             "task", SUBJECT, declaration(context=["explicit owner amendment"]), expected_parent=draft.digest
         )
@@ -1897,7 +1904,9 @@ def test_final_temporal_check_has_no_following_privileged_reads(sqlite_tmp_path:
             if action == "approve":
                 assert intake.approve(OWNER, draft, policy(), decision_id="original", expires_at=400) == approved
             else:
-                assert intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator).handoff.draft == draft
+                refusal = intake.handoff(OWNER, approved, policy(), ScarcityRouterAllocator)
+                assert isinstance(refusal, TranslationRefusal)
+                assert refusal.handoff.draft == draft
                 translator.assert_called_once()
         last_clock = len(trace) - 1 - trace[::-1].index("clock")
         assert "sql" in trace[:last_clock]

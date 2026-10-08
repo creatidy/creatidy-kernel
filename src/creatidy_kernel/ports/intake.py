@@ -36,7 +36,9 @@ from creatidy_kernel.core.intake import (
     object_from,
     strings,
 )
+from creatidy_kernel.core.resources import Allocation, ResourceRequest
 from creatidy_kernel.ports.program_store import ApplicationStore, OperationRecord, ProgramReadChanged
+from creatidy_kernel.ports.resources import ResourceAllocator
 
 
 class EvidenceReader(Protocol):
@@ -61,7 +63,11 @@ class BaselineReader(Protocol):
 
 
 class RequirementsTranslator(Protocol):
-    def translate_ordinary(self, handoff: RequirementsHandoff) -> TranslationRefusal: ...
+    def translate_ordinary(self, handoff: RequirementsHandoff) -> ResourceRequest | TranslationRefusal: ...
+
+
+class RequirementsAllocator(RequirementsTranslator, ResourceAllocator, Protocol):
+    pass
 
 
 class IntakeStore(ApplicationStore, Protocol):
@@ -687,7 +693,7 @@ class OrdinaryIntake:
 
     def handoff(
         self, principal: Principal, approved: ApprovedMeaning, policy: OwnerPolicy, translator: RequirementsTranslator
-    ) -> TranslationRefusal:
+    ) -> ResourceRequest | TranslationRefusal:
         current = self.reader.read(approved.draft.evidence.subject, approved.draft.declaration)
         decision = object_from(self.historical_decision(approved.decision_id))
         program = self.store.load(approved.program.program_id)
@@ -723,3 +729,19 @@ class OrdinaryIntake:
         return translator.translate_ordinary(
             RequirementsHandoff(approved.draft, approved.decision_id, approved.decision_bytes, program.spec.digest)
         )
+
+    def select(
+        self, principal: Principal, approved: ApprovedMeaning, policy: OwnerPolicy, allocator: RequirementsAllocator
+    ) -> Allocation | TranslationRefusal:
+        """Explicit recommendation only; recheck current authority after the external callback.
+
+        No activation, Attempt, grant or worker follows from this result. Controllers
+        must retain the returned Allocation as an original immutable Attempt input.
+        """
+        request = self.handoff(principal, approved, policy, allocator)
+        if isinstance(request, TranslationRefusal):
+            return request
+        allocation = allocator.select(request)
+        if self.handoff(principal, approved, policy, allocator) != request:
+            raise IntakeRefused("requirements changed during selection")
+        return allocation

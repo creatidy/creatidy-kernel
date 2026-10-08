@@ -331,9 +331,68 @@ remain readable as their actual kind. A legacy consumption occupying a new draft
 the disjoint `ordinary:record:ordinary-draft:<task>:<revision>` namespace without rewriting the
 legacy row. Accepted task IDs such as `draft`, `consumed`, `decision` and `baseline-age` remain usable.
 
-The installed package smoke and `tests/test_intake.py` receive the complete ordinary declaration at
-`ScarcityRouterAllocator.translate_ordinary`. Its static local refusal seam needs no configured
-model/binding or Router operation. The returned diagnostic retains the full `RequirementsHandoff`:
-original declaration bytes/provenance, draft/evidence subjects, revision, exact decision bytes and
-Program digest. Rich translation, execution, calibration and privacy enforcement remain unimplemented
-under #51/Router #175. No reference/L0 request is built for ordinary intake.
+The installed package smoke and intake tests receive the complete ordinary declaration at
+`ScarcityRouterAllocator.translate_ordinary`. Its static projection/refusal seam needs no configured
+model/binding or Router operation. Both the inert `ResourceRequest.requirements_handoff` and
+`TranslationRefusal.handoff` retain original declaration bytes/provenance, draft/evidence subjects,
+revision, exact decision bytes and Program digest. Unsupported prose, including the historical
+private-local fixture, still refuses before transport. No reference/L0 request is built for ordinary intake.
+
+### Approved Recommendation Reception (#51)
+
+Independently inspected producer: Router #175/PR #200 merge
+`5c48d51f1eb1f11424a5100eb2ccf20a6cba4581`, public raw GitHub source, D-075 and
+`kernel_requirements.py`, `selection_types.py`, `selection_app.py`, `selector.py`, `routing_core.py`,
+`tests/test_kernel_requirements.py`. This receives a bounded model-recommendation subset, not the
+producer's local executable `RouteRequest` or a gateway-conformance receipt.
+
+`requirement_markers` lets a trusted controller generate reviewable markers before approval.
+Quality must contain exactly one `scarcity-router.requirement.v1:` JSON object with required complete
+`requirement` and optional `profile_id`. Interface is empty or one `scarcity-router.request.v1:`
+existing `RequestBinding` object. Nested duplicate/nonfinite/oversized/deep JSON, unsupported dimensions,
+malformed types and contradictory pins refuse with safe field codes, not submitted content. The six
+producer dimensions and supplied 1..5 minima are validated, never classified, averaged or ranked here.
+Producer normalization omits optional null minima/identities and false booleans only; exact original
+bytes remain in the handoff. Nonempty textual context/unknowns cannot be erased by a typed marker.
+
+| Requirement | Recommendation reception |
+| --- | --- |
+| Quality/task level/hard model properties | Preserve the full producer-normalized `TaskRequirement`; no default profile, L0 or guessed floor |
+| Explicit model/variant | Intersect with quality's provider/model/variant; mismatch refuses before transport or at exact selected-identity check |
+| Tools/reasoning/context | OR positive tools/reasoning demands, combine independent context amounts by maximum; never weaken quality |
+| Structured output/streaming/reasoning controls | Retain the RequestBinding separately; require independently configured RuntimeSupport features |
+| Output allowance floor | Preserve producer hard minimum and require configured harness output allowance; never synthesize an execution ceiling |
+| Profile | Send existing `profile_id` plus full `tightening`, not `requirement`; require configured profile policy version and exact returned full expansion equality |
+| Alias/resource pin/output ceiling/access/channel/vision/privacy | Refuse unsupported meaning before recommendation transport; null known optional route-only fields mean no demand, unknown fields still refuse |
+| Result/criteria/recipes/paths/network/effects/provenance | Bind unchanged original handoff; never Router-derived grants, executed recipes or acceptance |
+
+For a profile marker all structural hard/pin demands must already be included in the approved
+quality requirement. An interface cannot mask an omitted profile floor. Router performs its existing
+monotone profile resolution; HTTP 400 is `request_invalid` (including unknown profiles or weakening),
+not no solution. Exact returned requirement equality refuses hidden profile additions or weakening;
+matching profile/version provenance is mandatory. Kernel does not import or reproduce profile policy.
+An explicitly supplied lower profile floor cannot be clamped locally or accepted as a weaker task.
+
+`OrdinaryIntake.select` is an explicit trusted-controller recommendation call, not part of preparation
+or approval. It calls the real handoff/allocator seam and revalidates current principal, issue/source/
+baseline/revision/decision/Program/expiry after the allocator returns. An inert handoff is not a reusable
+authority receipt: direct allocator callers remain trusted and must perform these current checks.
+Configured runtime support records are external controller assertions tied to an identified runtime
+version/evidence reference, not native negotiation or current executable gateway proof. Model-only
+recommendation cannot grant unsupported protocol features or turn scope requests into permission.
+
+Responses require machine schema 1, exact requirement/profile echo, positive catalog/resource-policy
+versions, dated catalogue and aware decision time, valid selected/refusal semantics, and exact configured
+provider/model/effort/variant plus harness compatibility. The existing bounded HTTP/strict JSON/credential
+scanner remains in use. Ordinary evidence containing the configured bearer is refused rather than
+persisted. Safe categories distinguish requirement problems, no eligible candidate, infrastructure and
+compatibility. Router refusal never triggers local fallback or alternative ranking.
+
+Ordinary Allocation version 2 retains complete original draft/decision/Program correlation, the actual
+sent request and separate structural/runtime compatibility facts alongside the original public decision
+(including catalog/policy/profile provenance). Existing atomic Attempt preparation binds these Allocation
+bytes before dispatch. Synthetic lost-receipt/reopen tests use existing journal/domain/recovery primitives
+and prove no reselection after unknown effects. No ordinary native dispatcher or execution engine is
+introduced; the reference composition refuses new ordinary allocation rather than silently sending L0.
+#52/#53, isolation and product acceptance remain separate receipts. This is offline producer-shaped
+transport/recovery evidence, not live adequacy, admission, privacy or execution authority.
