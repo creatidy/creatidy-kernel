@@ -382,12 +382,35 @@ trusted controller access. No same-UID hostile isolation or new authenticated ch
 
 `handoff(principal, approved, policy, ScarcityRouterAllocator)` revalidates current authority and
 delivers every original declaration field/byte, evidence subject, revision and decision to the real
-Router translator. Today it returns `ordinary_requirement_mapping_unavailable` with the full bound
-handoff before any transport. It never falls back to reference/L0. Rich mapping remains #51/Router #175;
-neither approval nor this refusal enables ordinary execution or changes frozen #143/#166.
+Router translator. Explicit typed markers received under #51/Router #175 return an inert
+`ResourceRequest` retaining the full handoff; unsupported textual meaning returns
+`ordinary_requirement_mapping_unavailable` with safe field-specific `problems`. Neither result performs
+transport or enables ordinary execution. The historical exact-encoding/private-local fixture still
+refuses intact, without reference/L0 fallback or changes to frozen #143/#166.
 
-`make package-check` exercises preparation, approval, intact refusal and reopen in an isolated installed
-wheel with synthetic Forgejo-shaped reads and real local Git objects. It also exercises offline
+The trusted controller's `adapters.scarcity_router.requirement_markers(owner_requirement,
+interface=owner_binding)` generates the single quality marker and optional interface marker for
+review **inside the original Declaration bytes before approval**. It does not choose/calibrate a
+profile or infer numerical minima from prose. The format follows Router
+`5c48d51f1eb1f11424a5100eb2ccf20a6cba4581` (D-075): complete `TaskRequirement` in
+`scarcity-router.requirement.v1:`, optional existing `profile_id`, and existing `RequestBinding` in
+`scarcity-router.request.v1:`. Nonempty textual `context` and `unknowns` refuse. Result criteria,
+recipes, path/network/effect requests and provenance stay bound to Kernel's original approval,
+not converted into Router permission.
+
+Only explicit `intake.select(principal, approved, policy, configured_allocator)` requests a model
+recommendation, rechecking current approval after transport before returning it. Configure exact
+`runtime_bindings` and independent `RuntimeSupport` facts (runtime/version/evidence, supported
+structural features, output allowance); Router cannot create harness support. Optional profiles
+require an independently configured `profile_policy_version`, the complete approved expanded floor,
+and exact returned profile/version/requirement equality. There is no local profile catalogue or
+floor lookup. Selection is not reservation, gateway admission, privacy enforcement, a worker grant
+or ordinary dispatch. The reference application refuses to allocate new ordinary work via its L0
+path. #52/#53 still own executable-route/native reception.
+
+`make package-check` exercises preparation, approval, intact refusal, typed recommendation over
+synthetic loopback HTTP and exact evidence reopen in an isolated installed wheel with synthetic
+Forgejo-shaped reads and real local Git objects. It also exercises offline
 host-qualified source acquisition, an owned use lease and the shared exact local admission gate.
 The preparation fixture is also runnable as
 `uv run --locked python tools/check_prepared.py <existing-empty-native-directory>`; it creates only
@@ -484,6 +507,18 @@ authentication and network failures raise `AllocationUnavailable`. No source/acc
 quota reservation or guaranteed future capacity is inferred. The transport's source revision,
 reuse decision and modifications are recorded in [the reuse record](docs/architecture/reuse.md)
 and [NOTICE](NOTICE); the Router package is not a runtime dependency.
+
+Ordinary model pins and supported tool/context/reasoning requirements tighten only existing
+`TaskRequirement` fields. Streaming/structured-output and harness feature demands are independently
+checked and retained separately, never invented as `/v1/select` wire fields. Executable resource pins,
+client profile aliases, explicit output ceilings, unsupported access/channel fields, vision and privacy
+demands refuse before transport. `null` optional minima mean no additional demand, not unknown
+adequacy; false booleans are not denials or grants. The selected exact model/variant/effort must still
+match controller facts. Safe categories distinguish unsupported/invalid requirements, no eligible
+selection, incompatible harness, unreachable endpoint, HTTP rejection and malformed response.
+Ordinary Allocation version 2 additionally retains the complete approved draft/revision/evidence,
+decision bytes, Program digest, actual sent request, interface and independent compatibility facts.
+Legacy/version-1 Allocation bytes stay unchanged and readable; old L0 decisions are never relabelled.
 
 Preparation atomically binds recoverable allocation/context bytes with the immutable Attempt and
 operation intent, before dispatch. Restart uses those original bytes and reconstructs missing

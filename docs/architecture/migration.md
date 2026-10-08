@@ -72,6 +72,22 @@ The installed smoke exercises actual preparation/approval/refusal/reopen with sy
 it is not live ordinary execution. See [README Ordinary Preparation](../../README.md#ordinary-preparation)
 and [Local Intake Reception](contracts.md#local-intake-reception) for the received path and limits.
 
+#51 adds an optional full `RequirementsHandoff` to in-memory ResourceRequest and a version-2
+Allocation only for newly translated ordinary recommendations. Its `requirements_provenance` retains
+exact approved bytes, draft/revision/evidence/decision/Program, sent request, separate interface and
+independent harness facts. Ordinary evidence is private controller state, not a Router wire field.
+The original public decision retains catalog, resource-policy and optional profile/version provenance.
+Version 2 requires nonempty requirements evidence; malformed/unknown versions fail closed.
+
+No database schema change or automatic migration occurs. Legacy unversioned and version-1 Allocation
+records remain readable; encoding an Allocation without ordinary evidence still yields the exact old
+version-1 field set/bytes. Original Attempt references, operation request digests, allocation/context
+bytes, task #143/#166 digests and L0 decision identities are never rewritten/relabelled. Recovery reads
+original immutable evidence and does not call a now-changed/unavailable allocator. Existing textual
+ordinary declarations remain historical meaning and explicit refusal, not auto-upgraded typed markers;
+new meaning requires the normal explicit draft amendment and fresh owner decision. Installed smoke
+receives typed selection via synthetic loopback HTTP and checks exact evidence after reopening.
+
 ## Verification Compatibility
 
 Verification changes under #50 preserve the original Task #143/#166 payloads, policy references,

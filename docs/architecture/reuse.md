@@ -200,6 +200,25 @@ The bounded K8 check selected **ADAPT**, not a Router package dependency. Source
 strict JSON mechanism in `scarcity_router/selection_app.py`, under Apache-2.0.
 `NOTICE` records the modifications and is distributed with the wheel and source archive.
 
+#51 additionally **ADAPTS** the strict explicit-marker/input-normalization subset from Router
+`5c48d51f1eb1f11424a5100eb2ccf20a6cba4581` (canonical #175/PR #200 merge metadata refreshed
+2026-10-08). Exact public mirror files independently read before adaptation:
+`scarcity_router/kernel_requirements.py`, `selection_types.py`, `selection_app.py`, `selector.py`,
+`routing_core.py`, `tests/test_kernel_requirements.py`, `docs/capability-model.md`, D-075 in
+`docs/decisions.md`, and `docs/machine-interfaces.md`. Raw GitHub exact-SHA reads succeeded;
+the exact LICENSE is Apache-2.0 and NOTICE is absent (404). Apache-2.0 permits modification,
+redistribution and commercial use with license/notices; upstream endorsement is not implied.
+
+Modified reception preserves Kernel's full approval subject and uses only existing recommendation
+v1 profile-XOR-requirement transport. It rejects route-only/resource/access/vision/privacy meaning
+that cannot be justified through this seam, and requires independently configured harness facts.
+Producer normalization is adapted; profile expansion, routing, admission, authorization, model
+catalogues, ranking and policies are **not** copied. The original public decision and actually sent
+request are durable evidence, not executable-route receipts. No Router package or other dependency
+is added; standard-library parsing/HTTP and locked tooling remain unchanged. Future producer drift
+requires exact-source/contract reception, not vocabulary growth or a policy fallback. Bounded
+synthetic fixtures and installed loopback HTTP smoke cover reception without provider calls.
+
 The decision ladder was evaluated narrowly for this integration:
 
 | Option | Decision |

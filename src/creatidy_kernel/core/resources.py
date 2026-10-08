@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """The intentionally narrow, in-process resource contract proved in A0."""
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from creatidy_kernel.core.intake import RequirementsHandoff
 
 
 def _validate_limits(capabilities: frozenset[str], context_tokens: int) -> None:
@@ -18,11 +24,18 @@ class ResourceRequest:
     work_unit_id: str
     required_capabilities: frozenset[str]
     context_tokens: int
+    requirements_handoff: RequirementsHandoff | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if type(self.work_unit_id) is not str or not self.work_unit_id.strip():
             raise ValueError("work_unit_id must be nonempty")
         _validate_limits(self.required_capabilities, self.context_tokens)
+        if self.requirements_handoff is not None:
+            # Intake uses Forge/Execution evidence; avoid an import-time cycle.
+            from creatidy_kernel.core.intake import RequirementsHandoff
+
+            if type(self.requirements_handoff) is not RequirementsHandoff:
+                raise ValueError("invalid ordinary requirements handoff")
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +51,7 @@ class Allocation:
     reasoning_effort: str | None = None
     variant: str | None = None
     decision_provenance: str | None = None
+    requirements_provenance: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if any(
@@ -49,7 +63,7 @@ class Allocation:
             type(self.reasoning_effort) is not str or not self.reasoning_effort.strip()
         ):
             raise ValueError("reasoning_effort must be nonempty when specified")
-        for value in (self.variant, self.decision_provenance):
+        for value in (self.variant, self.decision_provenance, self.requirements_provenance):
             if value is not None and (type(value) is not str or not value.strip()):
                 raise ValueError("optional allocation evidence must be nonempty when specified")
         _validate_limits(self.capabilities, self.context_tokens)

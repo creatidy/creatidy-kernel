@@ -41,19 +41,27 @@ def _object(data: bytes) -> dict[str, object]:
 def encode_allocation(allocation: Allocation) -> bytes:
     value = asdict(allocation)
     value["capabilities"] = sorted(allocation.capabilities)
-    return json.dumps({"version": 1, "allocation": value}, sort_keys=True, separators=(",", ":")).encode()
+    version = 2 if allocation.requirements_provenance is not None else 1
+    if version == 1:
+        del value["requirements_provenance"]
+    return json.dumps({"version": version, "allocation": value}, sort_keys=True, separators=(",", ":")).encode()
 
 
 def decode_allocation(data: bytes) -> Allocation:
     value = _object(data)
     if "version" in value:
-        if set(value) != {"version", "allocation"} or type(value["version"]) is not int or value["version"] != 1:
+        version = value["version"]
+        if set(value) != {"version", "allocation"} or type(version) is not int or version not in (1, 2):
             raise ValueError("unsupported allocation document version")
         raw = value["allocation"]
         if not isinstance(raw, dict):
             raise ValueError("invalid allocation document")
         value = cast(dict[str, object], raw)
         expected = _LEGACY_ALLOCATION | {"variant", "decision_provenance"}
+        if version == 2:
+            expected |= {"requirements_provenance"}
+            if type(value.get("requirements_provenance")) is not str or not value["requirements_provenance"]:
+                raise ValueError("ordinary allocation requires original requirements evidence")
     else:
         expected = _LEGACY_ALLOCATION
     if set(value) != expected:
@@ -76,6 +84,7 @@ def decode_allocation(data: bytes) -> Allocation:
         cast(str | None, value["reasoning_effort"]),
         cast(str | None, value.get("variant")),
         cast(str | None, value.get("decision_provenance")),
+        cast(str | None, value.get("requirements_provenance")),
     )
 
 

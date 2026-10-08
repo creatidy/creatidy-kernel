@@ -4,7 +4,7 @@
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import cast
@@ -291,16 +291,17 @@ class OwnerPolicy:
 class RequirementsHandoff:
     """Full received meaning and exact approval subject, not a ResourceRequest."""
 
-    draft: Draft
+    draft: Draft = field(repr=False)
     decision_id: str
-    decision_bytes: bytes
+    decision_bytes: bytes = field(repr=False)
     program_digest: str
 
 
 @dataclass(frozen=True, slots=True)
 class TranslationRefusal:
-    handoff: RequirementsHandoff
+    handoff: RequirementsHandoff = field(repr=False)
     reason: str = "ordinary_requirement_mapping_unavailable"
+    problems: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

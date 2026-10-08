@@ -3,10 +3,13 @@
 # 81b8e6393a1b2df8a6c7a9c6c3dcb8a7f6884e4e: scarcity_router/remote.py
 # and selection_app.py (strict JSON hooks). Modified for Kernel's select-only
 # port, optional credentials, bounded parsing, safe errors and runtime bindings.
+# Ordinary marker validation adapted from kernel_requirements.py,
+# selection_types.py and routing_core.py at 5c48d51f1eb1f11424a5100eb2ccf20a6cba4581.
+# Modified for recommendation-only projection and independent harness checks.
 """Optional public POST /v1/select client, not an execution or policy client.
 
-Only the finite reference capability is translated: tool use and the requested
-input context, with no inferred ordinal quality minima. Runtime bindings are
+The historical reference request and explicit approved ordinary markers are
+translated without inferred ordinal quality minima. Runtime bindings are
 controller assertions of executable limits, never candidates for local ranking.
 Opaque decision evidence is neither a reservation receipt nor an attestation.
 """
@@ -19,7 +22,7 @@ import math
 import re
 import socket
 import ssl
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
 from enum import StrEnum
 from threading import Timer
@@ -34,12 +37,20 @@ from creatidy_kernel.ports.resources import ResourceAllocator
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_JSON_DEPTH = 32
 _IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._:-]{0,63}\Z")
+PRODUCER_REVISION = "5c48d51f1eb1f11424a5100eb2ccf20a6cba4581"  # pragma: allowlist secret - public source Git SHA
+QUALITY_PREFIX = "scarcity-router.requirement.v1:"
+INTERFACE_PREFIX = "scarcity-router.request.v1:"
+_DIMENSIONS = frozenset(
+    {"reasoning", "coding", "scientific_methodological", "writing_editorial", "tool_use", "translation_multilingual"}
+)
+_FEATURES = frozenset({"tool_calls", "structured_output", "streaming", "reasoning_controls", "reasoning_mode"})
 
 
 class RouterFailureCategory(StrEnum):
     """Closed safe failure vocabulary; never response bodies, credentials or free text."""
 
     REQUEST_UNSUPPORTED = "request_unsupported"
+    REQUEST_INVALID = "request_invalid"
     ENDPOINT_UNREACHABLE = "endpoint_unreachable"
     HTTP_REJECTED = "http_rejected"
     INVALID_RESPONSE = "invalid_response"
@@ -228,7 +239,204 @@ def _parse(raw: bytes) -> dict[str, object]:
     )
 
 
-def _decision(document: dict[str, object], requirement: dict[str, object]) -> tuple[dict[str, object], str]:
+def _safe_id(value: object) -> str:
+    result = _string(value)
+    if not _IDENTIFIER.fullmatch(result):
+        raise ValueError("invalid identifier")
+    return result
+
+
+def _model(value: object) -> dict[str, object]:
+    model = _object(value)
+    if set(model) != {"provider", "model"} or model["provider"] not in ("openai", "zai"):
+        raise ValueError("invalid model")
+    _safe_id(model["model"])
+    return model
+
+
+def _requirement(value: object) -> dict[str, object]:
+    """Validate/normalize only the pinned public input vocabulary, never policy."""
+    requirement = _object(value)
+    if set(requirement) != {"task_level", "capability_minima", "hard_constraints"}:
+        raise ValueError("invalid requirement fields")
+    if requirement["task_level"] not in tuple(f"L{i}" for i in range(6)):
+        raise ValueError("invalid task level")
+    minima = _object(requirement["capability_minima"])
+    if set(minima) - _DIMENSIONS:
+        raise ValueError("unsupported dimension")
+    normalized: dict[str, object] = {}
+    for key, value in minima.items():
+        if value is not None:
+            if _integer(value, 1) > 5:
+                raise ValueError("invalid minimum")
+            normalized[key] = value
+    hard = _object(requirement["hard_constraints"])
+    numeric = {"minimum_input_context_tokens", "minimum_output_tokens"}
+    boolean = {"requires_tool_use", "requires_vision", "requires_reasoning_mode"}
+    identity = {"required_provider", "required_model", "required_variant", "privacy_constraint"}
+    if set(hard) - numeric - boolean - identity:
+        raise ValueError("unsupported hard constraint")
+    constraints: dict[str, object] = {}
+    for key, value in hard.items():
+        if key in boolean:
+            if type(value) is not bool:
+                raise ValueError("invalid boolean")
+            if value:
+                constraints[key] = True
+        elif value is not None:
+            if key in numeric:
+                _integer(value, 1)
+            elif key == "required_model":
+                _model(value)
+            else:
+                _safe_id(value)
+                if key == "required_provider" and value not in ("openai", "zai"):
+                    raise ValueError("unsupported provider")
+            constraints[key] = value
+    if "required_provider" in constraints and "required_model" in constraints:
+        if constraints["required_provider"] != _model(constraints["required_model"])["provider"]:
+            raise ValueError("contradictory model pin")
+    return {"task_level": requirement["task_level"], "capability_minima": normalized, "hard_constraints": constraints}
+
+
+def requirement_markers(
+    requirement: dict[str, object], *, profile_id: str | None = None, interface: dict[str, object] | None = None
+) -> dict[str, object]:
+    """Controller preparation helper; these generated strings must be approved in Declaration.raw.
+
+    Does not choose a profile, calibrate minima or replace any other declaration field.
+    Translation still validates unsupported interface meaning at the receiving seam.
+    """
+    payload: dict[str, object] = {"requirement": _requirement(requirement)}
+    if profile_id is not None:
+        payload["profile_id"] = _safe_id(profile_id)
+    return {
+        "quality": [QUALITY_PREFIX + _canonical(payload)],
+        "interface": [] if interface is None else [INTERFACE_PREFIX + _canonical(interface)],
+    }
+
+
+def _ordinary(handoff: RequirementsHandoff) -> tuple[dict[str, object], dict[str, object], str | None]:
+    """Bound model projection plus separate structural demands; no authority projection."""
+    data = handoff.draft.declaration.value
+    if data["unknowns"]:
+        raise ValueError("unknowns.unresolved")
+    if data["context"]:
+        raise ValueError("context.unsupported")
+    quality = _strings(data["quality"])
+    if len(quality) != 1 or not quality[0].startswith(QUALITY_PREFIX):
+        raise ValueError("quality.unsupported")
+    try:
+        payload = _parse(quality[0][len(QUALITY_PREFIX) :].encode())
+        if "requirement" not in payload or set(payload) - {"requirement", "profile_id"}:
+            raise ValueError("invalid marker fields")
+        requirement = _requirement(payload["requirement"])
+        profile = _safe_id(payload["profile_id"]) if "profile_id" in payload else None
+    except (ValueError, TypeError, KeyError):
+        raise ValueError("quality.invalid_requirement") from None
+    hard = _object(requirement["hard_constraints"])
+    approved_quality = _canonical(requirement)
+    if hard.get("requires_vision"):
+        raise ValueError("quality.vision_channel_unsupported")
+    if "privacy_constraint" in hard:
+        raise ValueError("quality.privacy_unsupported")
+    interface = _strings(data["interface"])
+    if not interface:
+        binding: dict[str, object] = {}
+    elif len(interface) == 1 and interface[0].startswith(INTERFACE_PREFIX):
+        try:
+            binding = _parse(interface[0][len(INTERFACE_PREFIX) :].encode())
+        except ValueError:
+            raise ValueError("interface.invalid_binding") from None
+    else:
+        raise ValueError("interface.unsupported")
+    booleans = {
+        "requires_tool_calls",
+        "requires_structured_output",
+        "requires_streaming",
+        "requires_reasoning_controls",
+    }
+    route_only = {"profile_alias", "pinned_target", "maximum_output_tokens"}
+    if set(binding) - booleans - {"minimum_input_context_tokens", "explicit_model", "explicit_variant"} - route_only:
+        # These existing route-core fields are NOT recommendation-v1 wire fields.
+        raise ValueError("interface.recommendation_unsupported")
+    if any(binding.get(key) is not None for key in route_only):
+        raise ValueError("interface.recommendation_unsupported")
+    try:
+        for key, value in binding.items():
+            if key in booleans:
+                if type(value) is not bool:
+                    raise ValueError("invalid boolean")
+            elif value is not None:
+                if key == "minimum_input_context_tokens":
+                    _integer(value, 1)
+                elif key == "explicit_model":
+                    model = _model(value)
+                    if (
+                        hard.get("required_model", model) != model
+                        or hard.get("required_provider", model["provider"]) != model["provider"]
+                    ):
+                        raise ValueError("contradictory pin")
+                    hard["required_model"] = model
+                else:
+                    _safe_id(value)
+                    if hard.get("required_variant", value) != value:
+                        raise ValueError("contradictory pin")
+                    hard["required_variant"] = value
+        if binding.get("requires_tool_calls"):
+            hard["requires_tool_use"] = True
+        if binding.get("requires_reasoning_controls"):
+            hard["requires_reasoning_mode"] = True
+        if binding.get("minimum_input_context_tokens") is not None:
+            hard["minimum_input_context_tokens"] = max(
+                _integer(hard.get("minimum_input_context_tokens", 0)),
+                _integer(binding["minimum_input_context_tokens"], 1),
+            )
+    except (ValueError, TypeError, KeyError):
+        raise ValueError("interface.invalid_or_contradictory_binding") from None
+    if profile is not None and _canonical(requirement) != approved_quality:
+        raise ValueError("quality.profile_requires_full_projection")
+    return requirement, binding, profile
+
+
+def _features(requirement: dict[str, object], binding: dict[str, object]) -> frozenset[str]:
+    hard = _object(requirement["hard_constraints"])
+    features = {
+        name.removeprefix("requires_")
+        for name, value in binding.items()
+        if name.startswith("requires_") and value is True
+    }
+    if hard.get("requires_tool_use"):
+        features.add("tool_calls")
+    if hard.get("requires_reasoning_mode"):
+        features.add("reasoning_mode")
+    return frozenset(features)
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeSupport:
+    """Independent trusted-controller harness facts, not Router-created capabilities."""
+
+    runtime_id: str
+    version: str
+    features: frozenset[str]
+    output_tokens: int
+    evidence_reference: str
+
+    def __post_init__(self) -> None:
+        for value in (self.runtime_id, self.version, self.evidence_reference):
+            _string(value)
+        if type(self.features) is not frozenset or self.features - _FEATURES:
+            raise ValueError("invalid runtime features")
+        _integer(self.output_tokens)
+
+
+def _decision(
+    document: dict[str, object],
+    requirement: dict[str, object],
+    profile_id: str | None = None,
+    profile_policy_version: int | None = None,
+) -> tuple[dict[str, object], str]:
     if type(document["schema_version"]) is not int or document["schema_version"] != 1:
         raise ValueError("unsupported schema")
     decision = _object(document["decision"])
@@ -240,7 +448,13 @@ def _decision(document: dict[str, object], requirement: dict[str, object]) -> tu
     instant = datetime.fromisoformat(_string(decision["evaluated_at"]))
     if instant.tzinfo is None or instant.utcoffset() is None or decision["selector_mode"] != "balanced":
         raise ValueError("invalid decision provenance")
-    if "profile_id" in decision or "profile_policy_version" in decision:
+    if profile_id is not None:
+        if (
+            decision["profile_id"] != profile_id
+            or _integer(decision["profile_policy_version"], 1) != profile_policy_version
+        ):
+            raise ValueError("profile expansion mismatch")
+    elif "profile_id" in decision or "profile_policy_version" in decision:
         raise ValueError("unexpected profile expansion")
     if type(decision["degraded"]) is not bool:
         raise ValueError("invalid decision degraded flag")
@@ -284,6 +498,8 @@ class ScarcityRouterAllocator(ResourceAllocator):
     runtime_bindings: tuple[Allocation, ...]
     api_key: str | None = field(default=None, repr=False)
     timeout_seconds: float = 10.0
+    runtime_support: tuple[RuntimeSupport, ...] = ()
+    profile_policy_version: int | None = None
     _scheme: str = field(init=False, repr=False)
     _hostname: str = field(init=False, repr=False)
     _port: int = field(init=False, repr=False)
@@ -328,6 +544,14 @@ class ScarcityRouterAllocator(ResourceAllocator):
                 raise ValueError("invalid timeout")
             if type(self.runtime_bindings) is not tuple or not self.runtime_bindings:
                 raise ValueError("runtime bindings required")
+            if type(self.runtime_support) is not tuple or any(
+                type(item) is not RuntimeSupport for item in self.runtime_support
+            ):
+                raise ValueError("invalid runtime support")
+            if len({item.runtime_id for item in self.runtime_support}) != len(self.runtime_support):
+                raise ValueError("ambiguous runtime support")
+            if self.profile_policy_version is not None:
+                _integer(self.profile_policy_version, 1)
             identities: set[tuple[str, str, str | None]] = set()
             for binding in self.runtime_bindings:
                 if type(binding) is not Allocation:
@@ -346,7 +570,11 @@ class ScarcityRouterAllocator(ResourceAllocator):
             raise ScarcityRouterUnavailable("invalid Scarcity Router allocator configuration")
 
     def _exchange(self, requirement: dict[str, object]) -> bytes:
-        payload = _canonical({"requirement": requirement}).encode("utf-8")
+        # The legacy internal call still passes a bare requirement; ordinary
+        # calls pass the exact existing profile-XOR-requirement wire document.
+        payload = _canonical(requirement if "task_level" not in requirement else {"requirement": requirement}).encode(
+            "utf-8"
+        )
         if self._scheme == "https":
             connection = http.client.HTTPSConnection(
                 self._hostname,
@@ -386,7 +614,12 @@ class ScarcityRouterAllocator(ResourceAllocator):
             response = connection.getresponse()
             if response.status != 200:
                 # http.client does not follow redirects. Never inspect or echo error bodies.
-                raise _ExchangeFailure(RouterFailureCategory.HTTP_REJECTED, "Router HTTP refusal")
+                category = (
+                    RouterFailureCategory.REQUEST_INVALID
+                    if response.status == 400
+                    else RouterFailureCategory.HTTP_REJECTED
+                )
+                raise _ExchangeFailure(category, "Router HTTP refusal")
             if response.getheader("Content-Encoding", "identity") != "identity":
                 raise _ExchangeFailure(RouterFailureCategory.INVALID_RESPONSE, "unsupported encoding")
             body = bytearray()
@@ -411,33 +644,73 @@ class ScarcityRouterAllocator(ResourceAllocator):
             connection.close()
 
     @staticmethod
-    def translate_ordinary(handoff: RequirementsHandoff) -> TranslationRefusal:
-        """Receive all approved meaning, then refuse before any Router transport.
-
-        Rich mapping is #51/Router #175, not the legacy L0/reference translator.
-        Keeping the original handoff in the result binds the diagnostic to every
-        requirement, evidence subject and owner decision without dropping fields.
-        """
-        return TranslationRefusal(handoff)
+    def translate_ordinary(handoff: RequirementsHandoff) -> ResourceRequest | TranslationRefusal:
+        """Inert projection from exact approved markers, retaining every original field."""
+        try:
+            requirement, binding, _ = _ordinary(handoff)
+            return ResourceRequest(
+                "ordinary",
+                _features(requirement, binding),
+                _integer(_object(requirement["hard_constraints"]).get("minimum_input_context_tokens", 0)),
+                handoff,
+            )
+        except ValueError as error:
+            return TranslationRefusal(handoff, problems=(str(error),))
 
     def select(self, request: ResourceRequest) -> Allocation:
-        if request.required_capabilities != frozenset({"reference"}):
+        ordinary = request.requirements_handoff
+        profile: str | None = None
+        interface: dict[str, object] = {}
+        requirement: dict[str, object]
+        wire: dict[str, object]
+        if ordinary is not None:
+            translated = self.translate_ordinary(ordinary)
+            if isinstance(translated, TranslationRefusal) or translated != request:
+                raise ScarcityRouterUnavailable(
+                    "ordinary requirements invalid or changed", category=RouterFailureCategory.REQUEST_UNSUPPORTED
+                )
+            requirement, interface, profile = _ordinary(ordinary)
+            if profile is not None and self.profile_policy_version is None:
+                raise ScarcityRouterUnavailable(
+                    "profile policy version must be configured", category=RouterFailureCategory.REQUEST_UNSUPPORTED
+                )
+            wire = (
+                {"requirement": requirement} if profile is None else {"profile_id": profile, "tightening": requirement}
+            )
+            if not any(self._compatible(binding, request, requirement) for binding in self.runtime_bindings):
+                raise ScarcityRouterUnavailable(
+                    "ordinary requirements incompatible with configured harness",
+                    category=RouterFailureCategory.SELECTION_INCOMPATIBLE,
+                )
+            if self.api_key is not None and (
+                _contains_credential(ordinary.draft.payload(), self.api_key)
+                or _contains_credential(_parse(ordinary.decision_bytes), self.api_key)
+                or _contains_credential(wire, self.api_key)
+                or _contains_credential(interface, self.api_key)
+            ):
+                raise ScarcityRouterUnavailable(
+                    "ordinary evidence contains configured credential",
+                    category=RouterFailureCategory.REQUEST_UNSUPPORTED,
+                )
+        elif request.required_capabilities != frozenset({"reference"}):
             raise ScarcityRouterUnavailable(
                 "unsupported Scarcity Router request capabilities",
                 category=RouterFailureCategory.REQUEST_UNSUPPORTED,
             )
-        hard: dict[str, object] = {"requires_tool_use": True}
-        if request.context_tokens:
-            hard["minimum_input_context_tokens"] = request.context_tokens
-        requirement: dict[str, object] = {"task_level": "L0", "capability_minima": {}, "hard_constraints": hard}
+        else:
+            hard: dict[str, object] = {"requires_tool_use": True}
+            if request.context_tokens:
+                hard["minimum_input_context_tokens"] = request.context_tokens
+            requirement = {"task_level": "L0", "capability_minima": {}, "hard_constraints": hard}
+            wire = {"requirement": requirement}
         failure = "Scarcity Router unavailable or invalid public response"
         category = RouterFailureCategory.INVALID_RESPONSE
         evidence: str | None = None
         try:
-            document = _parse(self._exchange(requirement))
+            document = _parse(self._exchange(wire if ordinary is not None else requirement))
             if self.api_key is not None and _contains_credential(document, self.api_key):
                 raise ValueError("response contains configured credential")
-            decision, provenance = _decision(document, requirement)
+            decision, provenance = _decision(document, requirement, profile, self.profile_policy_version)
             if decision["selected"] is None:
                 failure = "Scarcity Router returned no eligible allocation"
                 category = RouterFailureCategory.NO_ELIGIBLE_SELECTION
@@ -458,15 +731,48 @@ class ScarcityRouterAllocator(ResourceAllocator):
                 if len(matches) == 1:
                     binding = matches[0]
                     if (
-                        request.required_capabilities <= binding.capabilities
-                        and request.context_tokens <= binding.context_tokens
+                        self._compatible(binding, request, requirement)
                         and (binding.variant is None or binding.variant == variant)
+                        and _object(requirement["hard_constraints"]).get("required_variant", variant) == variant
                     ):
+                        requirements_provenance: str | None = None
+                        if ordinary is not None:
+                            support = next(
+                                item for item in self.runtime_support if item.runtime_id == binding.runtime_id
+                            )
+                            support_value = asdict(support)
+                            support_value["features"] = sorted(support.features)
+                            requirements_provenance = _canonical(
+                                {
+                                    "version": 1,
+                                    "producer_revision": PRODUCER_REVISION,
+                                    "draft": ordinary.draft.payload(),
+                                    "decision_id": ordinary.decision_id,
+                                    "decision_bytes": ordinary.decision_bytes.decode(),
+                                    "program_digest": ordinary.program_digest,
+                                    "sent_request": wire,
+                                    "interface": interface,
+                                    "runtime_support": support_value,
+                                    "runtime_binding": {
+                                        "runtime_id": binding.runtime_id,
+                                        "provider": binding.provider_id,
+                                        "model": binding.model_id,
+                                        "effort": binding.reasoning_effort,
+                                        "variant": binding.variant,
+                                        "context_tokens": binding.context_tokens,
+                                    },
+                                }
+                            )
+                            if self.api_key is not None and _contains_credential(
+                                _parse(requirements_provenance.encode()), self.api_key
+                            ):
+                                raise ValueError("evidence contains configured credential")
                         return replace(
                             binding,
                             variant=variant,
                             decision_provenance=provenance,
                             rationale="Scarcity Router: " + ", ".join(_strings(decision["reason_codes"])),
+                            requirements_provenance=requirements_provenance,
                         )
                 failure = "Scarcity Router selection is incompatible with configured runtime bindings"
                 category = RouterFailureCategory.SELECTION_INCOMPATIBLE
@@ -481,3 +787,25 @@ class ScarcityRouterAllocator(ResourceAllocator):
             pass
         # Raise outside the handler: no raw response/credential exception in even __context__.
         raise ScarcityRouterUnavailable(failure, evidence, category)
+
+    def _compatible(self, binding: Allocation, request: ResourceRequest, requirement: dict[str, object]) -> bool:
+        if request.context_tokens > binding.context_tokens:
+            return False
+        if request.requirements_handoff is None:
+            return request.required_capabilities <= binding.capabilities
+        hard = _object(requirement["hard_constraints"])
+        model = hard.get("required_model")
+        if (
+            hard.get("required_provider", binding.provider_id) != binding.provider_id
+            or model is not None
+            and model != {"provider": binding.provider_id, "model": binding.model_id}
+            or binding.variant is not None
+            and hard.get("required_variant", binding.variant) != binding.variant
+        ):
+            return False
+        support = next((item for item in self.runtime_support if item.runtime_id == binding.runtime_id), None)
+        return (
+            support is not None
+            and request.required_capabilities <= support.features
+            and _integer(hard.get("minimum_output_tokens", 0)) <= support.output_tokens
+        )

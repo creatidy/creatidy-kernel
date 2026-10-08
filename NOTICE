@@ -17,6 +17,19 @@ adapt the public wire-contract cases, not Router's implementation or policy.
 The upstream snapshot has no separate NOTICE file. The complete Apache-2.0
 license is distributed in LICENSE. No endorsement by upstream is implied.
 
+The same adapter's ordinary requirement marker validation and normalization,
+and tests/test_approved_requirements.py producer-shaped cases, additionally
+adapt Scarcity Router's Apache-2.0 contract implementation at revision
+5c48d51f1eb1f11424a5100eb2ccf20a6cba4581.
+Source files: scarcity_router/kernel_requirements.py; selection_types.py;
+selection_app.py; routing_core.py; tests/test_kernel_requirements.py.
+Modified for Kernel's complete immutable approval handoff, existing
+recommendation-only wire contract, independent configured harness checks,
+strict response echo and durable original-request evidence. Router policy,
+profile expansion, catalogues, ranking and admission are not incorporated.
+The exact public source has no separate NOTICE file; LICENSE distributes
+the complete Apache-2.0 license. No runtime dependency or endorsement implied.
+
 The repository development commands, supporting workflow guidance, read-only
 pr-reviewer definition and tests/test_workflow_contract.py are adapted from
 Model Intelligence, Copyright 2026 Creatidy, under the Apache License, Version 2.0.
