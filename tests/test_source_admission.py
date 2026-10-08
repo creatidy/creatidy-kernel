@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Synthetic native Git admission, immutable copy and literal recovery proofs."""
 
+import json
 import os
 import time
 from collections.abc import Callable, Mapping
@@ -93,6 +94,109 @@ def test_local_git_configuration_is_rejected_before_any_execution(sqlite_tmp_pat
     with pytest.raises(SourceAcquisitionError, match="checkout_unsuitable"):
         run(sqlite_tmp_path / "control", source, connection, task=fixture_task(repeats=1))
     assert connection.starts == 0 and not canary.exists()
+
+
+def test_indented_include_cannot_hide_executable_configuration(sqlite_tmp_path: Path) -> None:
+    source = make_source(sqlite_tmp_path)
+    (source / ".gitattributes").write_text("README.md filter=probe\n")
+    reference_git(source, "add", "-A")
+    reference_git(source, "commit", "-m", "synthetic filtered source")
+    marker = sqlite_tmp_path / "no-execution"
+    helper = sqlite_tmp_path / "filter"
+    helper.write_text(f"#!/bin/sh\n/usr/bin/touch '{marker}'\n/bin/cat\n")
+    helper.chmod(0o700)
+    included = sqlite_tmp_path / "included-config"
+    included.write_text(f'[filter "probe"]\n clean = {helper}\n')
+    config = source / ".git/config"
+    config.write_text(config.read_text() + f'\n[branch "benign"]\n remote = origin\n  [include]\n  path = {included}\n')
+    tracked = source / "README.md"
+    stamp = tracked.stat()
+    os.utime(tracked, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2000000000))
+    with pytest.raises(SourceAcquisitionError, match="checkout_unsuitable"):
+        task_execution.validate_task_source(source, fixture_task(repeats=1), {"PATH": os.defpath})
+    assert not marker.exists()
+
+
+def test_initialized_gitlink_cannot_execute_hidden_child_configuration(sqlite_tmp_path: Path) -> None:
+    source = make_source(sqlite_tmp_path)
+    child = make_source(sqlite_tmp_path / "child")
+    (child / ".gitattributes").write_text("README.md filter=probe\n")
+    reference_git(child, "add", "-A")
+    reference_git(child, "commit", "-m", "synthetic filtered child")
+    reference_git(source, "-c", "protocol.file.allow=always", "submodule", "add", str(child), "nested")
+    reference_git(source, "add", "-A")
+    reference_git(source, "commit", "-m", "synthetic gitlink")
+    reference_git(source, "config", "--remove-section", "submodule.nested")
+    marker = sqlite_tmp_path / "no-child-execution"
+    helper = sqlite_tmp_path / "filter"
+    helper.write_text(f"#!/bin/sh\n/usr/bin/touch '{marker}'\n/bin/cat\n")
+    helper.chmod(0o700)
+    reference_git(source / "nested", "config", "filter.probe.clean", str(helper))
+    tracked = source / "nested/README.md"
+    stamp = tracked.stat()
+    os.utime(tracked, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2000000000))
+    connection = FixtureConnection(lambda _: pytest.fail("gitlinks cannot start a model"))
+    with pytest.raises(SourceAcquisitionError, match="checkout_unsuitable"):
+        run(sqlite_tmp_path / "control", source, connection, task=fixture_task(repeats=1))
+    assert not marker.exists() and connection.starts == 0
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_cli_cancelled_pre_attempt_recovery_needs_no_fresh_source(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], changed: bool
+) -> None:
+    from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
+    from creatidy_kernel.adapters.task_execution import LiveTaskComponents
+
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    connection = FixtureConnection(lambda _: pytest.fail("cancelled work cannot start a model"))
+    task = fixture_task(repeats=1)
+    assert (
+        run(
+            control,
+            source,
+            connection,
+            task=task,
+            allocation=None,
+            allocator=FixedAllocator(ALLOCATION),
+            cancel_requested=True,
+        )["condition"]
+        == "cancelled_no_dispatch"
+    )
+    assert not (control / "objects.git").exists()
+    before = export_task(control)
+    if changed:
+        reference_git(source, "remote", "set-url", "origin", "https://other.invalid/Owner/repo")
+    else:
+        source.rename(sqlite_tmp_path / "retained-historical-source")
+    environment = live_environment("zai/glm-5.3")
+    environment.update(HOME=str(sqlite_tmp_path), PATH=os.defpath)
+
+    def effective(_args: object) -> dict[str, str]:
+        return environment
+
+    def selected(expected_base_sha: str | None) -> TaskSpec:
+        return replace(task, expected_base_sha=expected_base_sha)
+
+    monkeypatch.setattr(cli, "_effective_environment", effective)
+    monkeypatch.setitem(cli.TASKS, "143", selected)
+
+    def forge(_directory: Path):
+        pytest.fail("cancelled work cannot construct Forge")
+
+    def components(_config: TaskRuntimeConfig, _task: TaskSpec) -> LiveTaskComponents:
+        return LiveTaskComponents(FixedAllocator(ALLOCATION), lambda: connection, forge, frozenset())
+
+    monkeypatch.setattr(cli, "compose_task_live", components)
+    assert (
+        cli.main(
+            ["task", "run", "--task", "143", "--data-dir", str(control), "--approve", "--trusted-development", "--json"]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["condition"] == "cancelled_no_dispatch"
+    assert connection.starts == 0 and export_task(control) == before
 
 
 @pytest.mark.parametrize("configured", [False, True])

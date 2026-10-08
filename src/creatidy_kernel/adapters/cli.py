@@ -346,7 +346,9 @@ def _task(args: argparse.Namespace, environment: dict[str, str]) -> int:
     config = TaskRuntimeConfig.parse(environment_with_discovered_codex(environment)[0])
     directory, _source = task_paths(config, args.data_dir, args.repo, environ=environment)
     source = resolve_source(config, task, args.repo, environment=environment, directory=directory)
-    if not (directory / "objects.git").exists():
+    # Existing envelopes may be cancelled before any snapshot existed. The
+    # backend validates every actual new start, not read-only/stopped recovery.
+    if not (directory / "kernel.sqlite3").exists():
         validate_task_source(source, task, dict(config.child_environment))
     components = compose_task_live(config, task)
     connection = components.connection_factory()

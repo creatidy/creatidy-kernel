@@ -432,7 +432,8 @@ Normal operation requires no checkout-path, Codex, or state configuration:
   Unknown/corrupt/foreign entries and interrupted unique staging trees are retained, never deleted,
   replaced or adopted. Do not delete lock files or relabel unknown data to force readiness.
   Explicit source overrides are read-only; their local executable Git configuration, symlinked Git
-  paths, alternate objects and linked worktrees are refused before Git runs. No source hooks,
+  paths, alternate objects, linked worktrees and gitlinks/submodules are refused. Git's inert
+  no-include config listing validates the actual grammar before operational commands. No source hooks,
   filters, fsmonitor or ambient credential helpers run. Source transport keeps TLS verification and
   refuses redirects. A local mirror is an explicit advanced transport, not a new source identity.
   See [source compatibility](docs/architecture/migration.md#source-cache-compatibility).

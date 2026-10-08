@@ -101,7 +101,7 @@ choose a separate supported cache placement; automatic repair/deletion authority
 New JSON markers bind root/location, canonical repository, checkout/Git-directory and stable lock
 inodes, UID and a per-acquisition token matched to the controller's locked metadata. Lock files are
 never deleted or replaced. Interrupted metadata writes refuse and retain all checkout/staging bytes. Metadata or inode
-substitution, unsupported mounts, permissions, Git indirection and executable local configuration
+substitution, unsupported mounts, permissions, Git indirection, gitlinks/submodules and executable local configuration
 refuse with closed categories. This is a single trusted local controller/cooperative reader-writer
 protocol; it does not protect against an adversarial same-UID process or hostile remounts.
 

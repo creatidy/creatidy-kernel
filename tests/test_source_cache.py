@@ -527,7 +527,9 @@ def test_overflowing_native_git_retains_partial_clone_and_safe_diagnostics(
     root = sqlite_tmp_path / "cache"
     fake_git = sqlite_tmp_path / "bounded-git"
     fake_git.write_text(
-        "#!/usr/bin/python3\nimport pathlib, sys\n"
+        "#!/usr/bin/python3\nimport os, pathlib, sys\n"
+        "if sys.argv[1] != 'clone':\n"
+        "    os.execv('/usr/bin/git', ['/usr/bin/git', *sys.argv[1:]])\n"
         "(pathlib.Path(sys.argv[-1]) / 'partial-bytes').write_bytes(b'preserve me')\n"
         "sys.stderr.write('synthetic remote secret must not be echoed\\n')\n"
         "sys.stdout.write('x' * 200000)\n"

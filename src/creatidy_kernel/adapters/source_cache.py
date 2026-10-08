@@ -9,7 +9,6 @@ trusted local controller protocol, not protection against hostile same-UID code.
 
 from __future__ import annotations
 
-import configparser
 import ctypes
 import hashlib
 import json
@@ -150,10 +149,10 @@ def _write_new(path: Path, value: Mapping[str, object]) -> None:
 
 
 def validate_checkout(source: Path, *, bare: bool = False) -> None:
-    """Refuse executable local Git config BEFORE invoking Git; never write source.
+    """Refuse executable local config BEFORE operational Git; never write source.
 
     The small accepted grammar excludes includes, filters, fsmonitor, hooks,
-    credentials, URL rewrites, alternate objects and linked worktrees.
+    credentials, URL rewrites, alternate objects, linked worktrees and gitlinks.
     """
     _path(source)
     validate_local_storage(source)
@@ -194,6 +193,7 @@ def validate_checkout(source: Path, *, bare: bool = False) -> None:
         "objects/info/http-alternates",
         "info/grafts",
         "refs/replace",
+        "modules",
     ):
         if (gitdir / relative).exists():
             raise _refuse(SourceCategory.CHECKOUT_UNSUITABLE)
@@ -207,20 +207,31 @@ def validate_checkout(source: Path, *, bare: bool = False) -> None:
         raw = stream.read(MAX_GIT_OUTPUT_BYTES + 1)
     if len(raw) > MAX_GIT_OUTPUT_BYTES:
         raise _refuse(SourceCategory.CHECKOUT_UNSUITABLE)
-    config = configparser.RawConfigParser(strict=True)
-    try:
-        config.read_string(raw.decode("utf-8"))
-    except (configparser.Error, UnicodeError):
-        raise _refuse(SourceCategory.CHECKOUT_UNSUITABLE) from None
+    # Git's inert no-include listing is the grammar authority; INI continuation
+    # parsing can hide sections/options which Git would execute during status.
+    configured = source_git(source, "config", "--local", "--no-includes", "--null", "--list")
     allowed = {
-        "core": {"repositoryformatversion", "filemode", "bare", "logallrefupdates", "ignorecase", "precomposeunicode"},
-        'remote "origin"': {"url", "fetch"},
-        "extensions": {"objectformat"},
+        "core.repositoryformatversion",
+        "core.filemode",
+        "core.bare",
+        "core.logallrefupdates",
+        "core.ignorecase",
+        "core.precomposeunicode",
+        "remote.origin.url",
+        "remote.origin.fetch",
+        "extensions.objectformat",
     }
-    for section in config.sections():
-        keys = {"remote", "merge"} if section.startswith('branch "') and section.endswith('"') else allowed.get(section)
-        if keys is None or set(config[section]) - keys:
+    for entry in configured.split("\0"):
+        if not entry:
+            continue
+        key, separator, _value = entry.partition("\n")
+        branch_setting = key.startswith("branch.") and key.rsplit(".", 1)[-1] in {"remote", "merge"}
+        if not separator or (key not in allowed and not branch_setting):
             raise _refuse(SourceCategory.CHECKOUT_UNSUITABLE)
+    if not bare and any(
+        entry.startswith("160000 ") for entry in source_git(source, "ls-files", "--stage", "-z").split("\0")
+    ):
+        raise _refuse(SourceCategory.CHECKOUT_UNSUITABLE)
 
 
 @contextmanager
@@ -362,7 +373,7 @@ def source_use(source: Path, repository_url: str) -> Generator[Path]:
                 _owned(source, root, repository_url)
                 if before != (_identity(source), _identity(source / ".git")):
                     raise _refuse(SourceCategory.OWNERSHIP_UNPROVEN)
-        except (OSError, ValueError, configparser.Error, UnsupportedSQLiteConfiguration):
+        except (OSError, ValueError, UnsupportedSQLiteConfiguration):
             raise _refuse(SourceCategory.OWNERSHIP_UNPROVEN) from None
     else:
         yield source
@@ -618,5 +629,5 @@ def acquire_source(
             return target
     except SourceAcquisitionError:
         raise
-    except (OSError, ValueError, configparser.Error, UnsupportedSQLiteConfiguration):
+    except (OSError, ValueError, UnsupportedSQLiteConfiguration):
         raise _refuse(SourceCategory.OWNERSHIP_UNPROVEN) from None
