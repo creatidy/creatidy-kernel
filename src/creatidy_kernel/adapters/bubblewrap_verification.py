@@ -31,8 +31,8 @@ from creatidy_kernel.ports.verification import (
     VerificationSnapshot,
 )
 
-BWRAP_VERSION = "bubblewrap 0.11.0"
-BWRAP_SOURCE = "9ca3b05ec787acfb4b17bed37db5719fa777834f"  # pragma: allowlist secret - public upstream revision
+BWRAP_VERSION = "bubblewrap 0.13.0"
+BWRAP_SOURCE = "719a4fd474d44b26906bcf2b1b0fb6eddd8d56d0"  # pragma: allowlist secret - public upstream revision
 MAX_OUTPUT = 65536
 MAX_SNAPSHOT = 16 * 1024 * 1024
 # Trusted bootstrap consumes anonymous setup FDs before candidate exec. EOF is
@@ -206,8 +206,10 @@ def _filter_count(status: dict[str, str]) -> int:
 
 def _reaper_armed(pid: int, pidfd: int, monitor: subprocess.Popen[bytes], inherited_filters: int) -> bool:
     # This indicator depends on the exact unmodified BWRAP_SOURCE, not a generic
-    # version string: do_init installs our sole filter AFTER its own pdeath setup
-    # (624/626). Bootstrap R proves only the other fork branch (3598/3605).
+    # version string: do_init (bubblewrap.c:585) performs its pdeath setup via
+    # handle_die_with_parent (611) BEFORE installing our sole filter via
+    # seccomp_programs_apply (613). Bootstrap R proves only the other fork
+    # branch (3533/3539).
     live = select.poll()
     live.register(pidfd, select.POLLIN)
     if monitor.poll() is not None or live.poll(0):
