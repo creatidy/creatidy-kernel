@@ -389,7 +389,8 @@ class TestLifecycleAndAuthority:
                     ]
                 }
             )
-            marker = "desc-settle-probe.sh"
+            # One marker substring covers both the setsid shell and its python grandchild.
+            marker = "desc-settle-probe"
             assert _wait_for_marker(marker), "synthetic descendant never became visible on the host"
             assert harness.scan_host_for_marker(BYSTANDER_MARKER), "bystander missing before stop"
             runner.stop(result, grace_seconds=5)

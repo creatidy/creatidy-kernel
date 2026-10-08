@@ -77,7 +77,7 @@ skips** (plus 8 closed-environment authority/profile items), including:
 | Credentials | Three synthetic controller/provider/forge env canaries absent by name and by content; synthetic `HOME=/home/worker`, closed PATH; no host env inheritance |
 | Native commands | busybox shell and host-closure Python executed inside the same boundary |
 | Child processes | `setsid` shell + sleep grandchild spawned; after `podman stop`, host `/proc` scan proved descendant settlement; an unrelated host bystander survived untouched |
-| Network | IPv4 loopback, IPv4 private and IPv6 loopback connects denied; DNS resolution denied; no interfaces besides down `lo` |
+| Network | IPv4 loopback, IPv4 private and IPv6 loopback connects denied; DNS resolution denied; the network namespace contains only the loopback interface (observed `UP` with no external interface and no configured addressing) |
 | Host control sockets | `/var/run/docker.sock`, `/run/containerd/containerd.sock`, an unmounted host Unix socket and an abstract-socket connect all denied |
 | Runtime privileges | Observed in-container: `CapEff=0`, `NoNewPrivs=1`, `Seccomp=2` (deny-list filter), single-line `uid_map`, mounts limited to the enumerated allowlist, `unshare(CLONE_NEWUSER)` → `EPERM`, `pids.max=8` read inside the cgroup with fork flood denied |
 | Cancellation | `podman stop` targeted only the owned container; graceful SIGTERM recorded as `cancelled`; bystander preserved |

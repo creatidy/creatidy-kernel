@@ -106,11 +106,12 @@ def _run_command(step: dict[str, Any], status: dict[str, Any]) -> None:
 def _spawn_descendant(step: dict[str, Any], status: dict[str, Any]) -> None:
     marker = str(step["marker"])
     seconds = int(step.get("seconds", 120))
-    # The attempt-unique script path is visible in the descendant's host-visible cmdline,
-    # so the controller can prove descendant settlement by scanning /proc, not by assuming it.
-    # The script must not exec: the surviving shell carries the marker argv.
+    # The attempt-unique marker is carried in the cmdlines of BOTH the setsid shell and its
+    # long-running grandchild, so the controller can prove descendant settlement by scanning
+    # host /proc for the exact worker tree, not by assuming namespace teardown covers it.
+    # The script must not exec: the surviving shell keeps its marker argv.
     script = WORKSPACE / f"desc-{marker}.sh"
-    script.write_text(f"/bin/busybox sleep {seconds}\n")
+    script.write_text(f'/toolchain/bin/python3.12 -c "import time; time.sleep({seconds})  # desc-{marker}"\n')
     result = subprocess.run(
         ["/bin/busybox", "setsid", "/bin/busybox", "sh", str(script)],
         capture_output=True,

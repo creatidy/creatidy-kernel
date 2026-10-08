@@ -6,10 +6,12 @@ authorization for privileged installation: every component is pinned, hash-recor
 lives under a `0700` user-owned directory. The native receipt requires
 `CREATIDY_TEST_OCI_TOOLROOT=/tmp/kilo/kernel78-tooling`.
 
-The toolroot at `/tmp/kilo/kernel78-tooling` was provisioned 2026-10-08 and is fully
-described by its `provenance.json` (exact upstream pins, source archives, hashes, build
-flags and verification methods). The steps below reproduce it; they were executed as the
-normal unprivileged user with no host-global change.
+The toolroot at `/tmp/kilo/kernel78-tooling` was provisioned 2026-10-08. Its
+`provenance.json` records exact upstream pins, source archives, hashes, build flags and
+verification methods for podman, crun and conmon; the two later archive extractions
+(netavark, busybox) are pinned by the SHA-256 hashes in the table below. The steps below
+reproduce the setup; they were executed as the normal unprivileged user with no host-global
+change.
 
 ## Components
 
@@ -18,8 +20,8 @@ normal unprivileged user with no host-global change.
 | podman | 6.1.3 | Built from unmodified pinned upstream commit `85b994955e0b4e30fbce9c8351cab85676140ede` (`make bin/podman`, Go 1.26.8, CGO with libseccomp 2.5.5-1ubuntu3.1); Apache-2.0 |
 | crun | 1.30.1 | Official release asset, SHA-256 matched and GPG signature verified against the pinned source keyring; GPL-2.0-or-later (libcrun LGPL-2.1) |
 | conmon | 2.2.1 | Official release asset, SHA-256 matched; Apache-2.0 |
-| netavark | 1.4.0 | Ubuntu noble archive `netavark` package extracted with `dpkg -x` (podman 6.x requires the helper binary to be present even for `--network=none`); Apache-2.0 |
-| busybox | 1:1.36.1-6ubuntu3.1 | Ubuntu noble archive `busybox-static` package extracted with `dpkg -x`; image layer content; GPL-2.0 (BusyBox upstream; the package copyright references GPL-2) |
+| netavark | 1.4.0 | Ubuntu noble archive `netavark` package extracted with `dpkg -x` (podman 6.x requires the helper binary to be present even for `--network=none`); Apache-2.0; binary SHA-256 `b4344a1e60cf5614544df1cce0c9457219570f80aad7d7e039e724773c2841e6` |
+| busybox | 1:1.36.1-6ubuntu3.1 | Ubuntu noble archive `busybox-static` package extracted with `dpkg -x`; image layer content; GPL-2.0 (BusyBox upstream; the package copyright references GPL-2); binary SHA-256 `dbac288c29ba568459550a2da9e7ae0ded6b1fc728ee9fad3044c44e62d6ac14` |
 | policy.json | user-owned | `$XDG_CONFIG_HOME/containers/policy.json` (`insecureAcceptAnything`); podman 6.x reads the XDG path first, so no root-owned `/etc/containers/policy.json` is needed |
 
 Upstream maintenance at provisioning time: podman 6.1.3 (2026-09-29) and crun 1.30.1
