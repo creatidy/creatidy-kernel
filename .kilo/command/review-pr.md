@@ -37,7 +37,8 @@ Invoke `task` with `subagent_type: pr-reviewer`, `background: false`, no `task_i
 Pass only the PR number/URL, expected HEAD/base and fresh whole-PR review
 instructions including this checkout path. Do not pass implementation
 reasoning, previous findings or desired verdict. The agent definition owns the
-JSON result contract and GPT-6.1 Sol High selection. Never resume a past reviewer.
+JSON result contract and reviewer inheritance and explicit owner override policy.
+Never resume a past reviewer.
 
 Require JSON fields reviewed_head, reviewed_base, verdict, findings, limitations,
 checks_run as defined in `.kilo/agents/pr-reviewer.md`. Validate their types and
