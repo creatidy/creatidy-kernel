@@ -15,9 +15,10 @@ import sys
 import tarfile
 from pathlib import Path
 
-SOURCE = "9ca3b05ec787acfb4b17bed37db5719fa777834f"  # pragma: allowlist secret - public upstream revision
+SOURCE = "719a4fd474d44b26906bcf2b1b0fb6eddd8d56d0"  # pragma: allowlist secret - public upstream revision
+# bubblewrap 0.13.0 tag object; the maintained release carrying the CVE-2026-87766 fix.
 # Public upstream archive digest, not an authentication credential.
-ARCHIVE_SHA256 = "552cec9c79bb85c8ecd25ae3e55efca9af03390c17d829885ee45722dedada4f"  # pragma: allowlist secret
+ARCHIVE_SHA256 = "e55bdb06f051664ecd3297d449a8b679b7cd1c73adb292b73a81d9b03c5fc462"  # pragma: allowlist secret
 
 
 def main() -> None:
@@ -42,9 +43,14 @@ def main() -> None:
         members = source_archive.getmembers()
         if len(members) > 2000 or sum(member.size for member in members) > 32 * 1024 * 1024:
             raise SystemExit("setup refused: archive bounds")
+        # Only the two known upstream license links may deviate from regular files.
+        known_links = {
+            (f"bubblewrap-{SOURCE}/LICENSE", "COPYING"),
+            (f"bubblewrap-{SOURCE}/COPYING.LIB", "COPYING"),
+        }
         if any(
             not (member.isfile() or member.isdir())
-            and not (member.issym() and member.name == f"bubblewrap-{SOURCE}/LICENSE" and member.linkname == "COPYING")
+            and not (member.issym() and (member.name, member.linkname) in known_links)
             for member in members
         ):
             raise SystemExit("setup refused: archive topology")
@@ -92,7 +98,7 @@ def main() -> None:
         check=True,
         timeout=5,
     ).stdout.strip()
-    if version != b"bubblewrap 0.11.0":
+    if version != b"bubblewrap 0.13.0":
         raise SystemExit("setup refused: native version")
     # Receipt is build metadata, not a security verdict or source/binary signature.
     print(

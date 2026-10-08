@@ -44,9 +44,11 @@ no product call. ACP's candidacy does not authorize a custom harness, protocol o
 
 Under the owner's 2026-10-07 decision for [#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50),
 [ADR 0008](../adr/0008-linux-bubblewrap-verification.md) selects separate invocation of bubblewrap
-v0.11.0 at `9ca3b05ec787acfb4b17bed37db5719fa777834f`, not a copied or reimplemented sandbox.
-Its LGPL-2.0-or-later source/licence was read at that exact public pin; commercial invocation is
-permitted. Kernel distributes no bubblewrap source/binary. Anyone separately redistributing that
+v0.13.0 at `719a4fd474d44b26906bcf2b1b0fb6eddd8d56d0` (repinned 2026-10-08 from v0.11.0 via
+[#80](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/80) for GHSA-pxhw-h44j-8pfx /
+CVE-2026-87766), not a copied or reimplemented sandbox. Its LGPL-2.1-or-later source/licence was read
+at that exact public pin; commercial invocation is permitted. The 0.13.0 build refuses setuid
+execution outright. Kernel distributes no bubblewrap source/binary. Anyone separately redistributing that
 utility must meet its notice/licence/corresponding-source obligations and its dependencies' terms.
 
 The narrow wrapper owns explicit resources, current authorization and negative reception, because

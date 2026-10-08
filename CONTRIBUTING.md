@@ -33,13 +33,13 @@ Format intentional edits with `uv run --locked ruff format .`; do not weaken che
 ### Native Verification Proof
 
 The optional verification-only profile needs a separately provisioned unprivileged Linux x86-64
-bubblewrap 0.11.0 and libseccomp 2.5.5+ plus an explicit trusted runtime closure. No root installation,
+bubblewrap 0.13.0 and libseccomp 2.5.5+ plus an explicit trusted runtime closure. No root installation,
 daemon or host security-setting changes are needed or performed. Native tests never download/build
 dependencies. Missing native setup is explicitly skipped/unproved in normal pytest; `make native-proof`
 requires `CREATIDY_TEST_BWRAP_BIN` and fails on missing enforcement instead of skipping acceptance.
 
 For an offline build, first obtain the exact public source archive for commit
-`9ca3b05ec787acfb4b17bed37db5719fa777834f` (SHA-256 in ADR 0008), and extract matching public libcap
+`719a4fd474d44b26906bcf2b1b0fb6eddd8d56d0` (SHA-256 in ADR 0008), and extract matching public libcap
 development/runtime packages into an owned prefix without installation. Inspect upstream source
 before executing its build. The repository setup tool verifies the archive, builds only the utility
 using locked optional tooling, and prints provenance metadata, not a denial receipt:

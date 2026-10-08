@@ -595,7 +595,7 @@ def test_security_prerequisites_refuse_before_candidate_launch(
         monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification.subprocess.Popen", no_launch)
 
         def version(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-            return subprocess.CompletedProcess([], 0, b"bubblewrap 0.11.0\n")
+            return subprocess.CompletedProcess([], 0, b"bubblewrap 0.13.0\n")
 
         monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification.subprocess.run", version)
     if bad == "digest":
@@ -890,7 +890,7 @@ else:
                 line.split(":", 1) for line in Path(f"/proc/{monitor_pid}/status").read_text().splitlines()
             )
             assert int(status["Seccomp_filters"]) == int(monitor_status["Seccomp_filters"]), (
-                "FIFO must hold exact init before 624/626"
+                "FIFO must hold exact init before 611/613"
             )
             if "T" in messages:
                 # Pre-fix evidence: actually executed descendant writes M and

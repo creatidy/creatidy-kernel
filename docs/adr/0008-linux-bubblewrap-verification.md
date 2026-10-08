@@ -1,7 +1,8 @@
 # ADR 0008: Linux Bubblewrap Verification Boundary
 
-Status: owner-selected direction, 2026-10-07; local verification-only implementation and native
-reception below. Independent whole-PR review and canonical integration remain to prove.
+Status: owner-selected verification-only boundary, 2026-10-07; #50 implementation received
+through PR #74. The #80 security repin has separate native reception below; its current
+independent review and canonical integration are recorded in PR #82.
 Issue: [Kernel #50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50).
 
 ## Decision And Scope
@@ -24,13 +25,16 @@ as a dependency of this profile. No custom sandbox framework or credential store
 
 ## Existing Mechanism And Rights
 
-The inspected upstream basis is bubblewrap v0.11.0, exact public commit
-[`9ca3b05ec787acfb4b17bed37db5719fa777834f`](https://github.com/containers/bubblewrap/tree/9ca3b05ec787acfb4b17bed37db5719fa777834f).
-Its source and `COPYING` are LGPL-2.0-or-later. Commercial use is permitted. Kernel invokes the
-separate utility and does not copy or translate its implementation or bundle its binary into the
-Python package. Redistribution of bubblewrap itself would require its licence/notices and
-corresponding-source/build compliance; attribution alone would not suffice for copied code.
-Its libcap dependency and optional caller-side seccomp support have their own distribution terms.
+The inspected upstream basis is bubblewrap v0.13.0, exact public commit
+[`719a4fd474d44b26906bcf2b1b0fb6eddd8d56d0`](https://github.com/containers/bubblewrap/tree/719a4fd474d44b26906bcf2b1b0fb6eddd8d56d0)
+(the maintained release tag carrying the GHSA-pxhw-h44j-8pfx / CVE-2026-87766 fix; repinned from
+v0.11.0 on 2026-10-08, see the remediation section below). Its source and `COPYING` are
+LGPL-2.1-or-later (changed from the LGPL-2.0-or-later of 0.11.x upstream). Commercial use is
+permitted. Kernel invokes the separate utility and does not copy or translate its implementation or
+bundle its binary into the Python package. Redistribution of bubblewrap itself would require its
+licence/notices and corresponding-source/build compliance; attribution alone would not suffice for
+copied code. Its libcap dependency and the caller-side libseccomp support used by this profile have
+their own distribution terms. The 0.13.0 utility refuses setuid execution outright.
 
 The upstream README and SECURITY document a construction toolkit, not a security policy. Kernel
 owns the selected resource policy, authorization checks, invocation and reception evidence. The
@@ -167,13 +171,17 @@ pidfd non-exit and consistent proc metadata before and after the observation. PI
 exactly one additional filter relative to that unchanged monitor count, then current authorization
 is rechecked before releasing the token. Equal counts mean not ready, never elapsed-time readiness.
 
-This indicator is source-specific: in unmodified commit `9ca3b05ec787acfb4b17bed37db5719fa777834f`,
-`do_init()` performs its own parent-death setup at line 624 before installing the supplied filter
-at 626; the bootstrap branch instead performs those operations at 3598/3605. The fixed invocation
-supplies exactly one filter. Missing/inconsistent fields, wrong identity, changed monitor count,
-or exited native processes refuse execution; there is no timing or PPid-only substitute. It does
-not establish readiness of a different/fake binary from a matching version string. The source pin,
-caller-pinned executable provenance and trusted-parent assumptions above remain mandatory.
+This indicator is source-specific: in unmodified commit `719a4fd474d44b26906bcf2b1b0fb6eddd8d56d0`,
+`do_init()` (bubblewrap.c:585) performs its own parent-death setup via `handle_die_with_parent()` at
+line 611 before installing the supplied filter via `seccomp_programs_apply()` at 613; the bootstrap
+exec branch instead performs those operations at 3533/3539. The fixed invocation supplies exactly
+one filter (one `prctl(PR_SET_SECCOMP)` per program). Missing/inconsistent fields, wrong identity,
+changed monitor count, or exited native processes refuse execution; there is no timing or PPid-only
+substitute. It does not establish readiness of a different/fake binary from a matching version
+string. The source pin, caller-pinned executable provenance and trusted-parent assumptions above
+remain mandatory. Lock acquisition still precedes arming inside `do_init`, so the pre-arming
+ordering defect class rematerialising upstream remains covered by the forced-interval regressions
+below, which were re-proven on this pin.
 The fixed bootstrap requires the declared Python/loader closure; it has no policy parser or model
 loop and implements no namespace, filesystem, network or seccomp enforcement itself.
 Stdout/stderr are drained
@@ -192,16 +200,22 @@ against uninterruptible kernel I/O. Parent crash before readiness can leave pend
 scratch, not necessarily inert scratch; cleanup requires actual settlement evidence.
 
 Local actual native reception on 2026-10-07 used Ubuntu 24.04.5, Linux
-`6.18.33.2-microsoft-standard-WSL2`, x86-64 and the actual unprivileged user:
+`6.18.33.2-microsoft-standard-WSL2`, x86-64 and the actual unprivileged user. The 0.11.0 inputs of
+that reception are retained as history below; the 2026-10-08 [#80](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/80)
+repin re-ran the complete suite on the new pin with the same zero-skip requirement:
 
-| Input | Exact value |
-| --- | --- |
-| bubblewrap version/source | `0.11.0`, `9ca3b05ec787acfb4b17bed37db5719fa777834f` |
-| Source archive SHA-256 | `552cec9c79bb85c8ecd25ae3e55efca9af03390c17d829885ee45722dedada4f` |
-| Tested binary SHA-256 | `a75623409c0755c93ff5bba87ec4c407bf3dcb01d7b0d3c9802ee9a02a272e6f` |
-| Repository setup rebuild SHA-256 (also natively tested) | `8f928cda894d165a835f058e82e91cb84b5210a38b988fd25b305fba2eb0437d` |
-| Loaded libseccomp SHA-256 | `b4d9140a7797ccf3ac14f5d9d579b64f157111662940cb8330c632b11a8cea8e` |
-| Build tooling | Meson 1.12.1, Ninja 1.13.2, GCC 13.3.0, extracted libcap 2.66 development/runtime prefix |
+| Input | 0.11.0 reception (historical) | 0.13.0 reception (current pin) |
+| --- | --- | --- |
+| bubblewrap version/source | `0.11.0`, `9ca3b05ec787acfb4b17bed37db5719fa777834f` | `0.13.0`, `719a4fd474d44b26906bcf2b1b0fb6eddd8d56d0` |
+| Source archive SHA-256 | `552cec9c79bb85c8ecd25ae3e55efca9af03390c17d829885ee45722dedada4f` | `e55bdb06f051664ecd3297d449a8b679b7cd1c73adb292b73a81d9b03c5fc462` |
+| Tested binary SHA-256 | `a75623409c0755c93ff5bba87ec4c407bf3dcb01d7b0d3c9802ee9a02a272e6f` | `7c0da12cc27c4de4bac5bc1dcf50d19c62a445bdb5f30cb8c9740800b0b8b237` |
+| Repository setup rebuild SHA-256 (also natively tested) | `8f928cda894d165a835f058e82e91cb84b5210a38b988fd25b305fba2eb0437d` | `77a5060956dd8356f737c775174aa92c06264d0f3b2ccad43fd731e6d4caa827` |
+| Loaded libseccomp SHA-256 | `b4d9140a7797ccf3ac14f5d9d579b64f157111662940cb8330c632b11a8cea8e` | `b4d9140a7797ccf3ac14f5d9d579b64f157111662940cb8330c632b11a8cea8e` |
+| Build tooling | Meson 1.12.1, Ninja 1.13.2, GCC 13.3.0, extracted libcap 2.66 prefix | Meson 1.12.1, Ninja 1.13.2, GCC 13.3.0, extracted libcap 1:2.66-5ubuntu2.4 prefix (libseccomp-dev 2.5.5-1ubuntu3.1 present in the prefix; the utility itself links only libcap/libc and applies caller-built BPF via `prctl`) |
+
+Both 0.13.0 binaries were built by the repository setup tool from the pinned archive and each
+passed the complete native suite with zero skips; the two differing binary digests again
+demonstrate build-path variance, not a reproducible-binary claim.
 
 `test_bubblewrap_verification.py` runs Python and checks no-new-privileges/seccomp/zero capabilities,
 PID-1 layout and userns refusal; it attempts synthetic controller/artifact/credential/host-parent
@@ -242,7 +256,37 @@ unprivileged setup. Unavailable namespaces refuse without changing host security
 falling back. Local reception does not assert canonical CI, independent review or full G09 completion.
 
 The offline setup tool initially refused the upstream archive's `LICENSE -> COPYING` symlink.
-Inspection confirmed that exact internal link in the pinned archive; setup now permits only that
-known link and retains safe extraction/bounds. The subsequent repository-owned build and native
-reception succeeded. The two binary hashes differ with build paths; no reproducible native binary
-claim is made. Python wheel/sdist reproducibility remains a separate required package gate.
+Inspection confirmed that exact internal link in the pinned archive; setup permits only the known
+upstream licence links (`LICENSE -> COPYING`, joined in 0.13.0 by `COPYING.LIB -> COPYING`) and
+retains safe extraction/bounds. The repository-owned builds and native receptions succeeded on both
+pins. The binary hashes differ with build paths; no reproducible native binary claim is made.
+Python wheel/sdist reproducibility remains a separate required package gate.
+
+## CVE-2026-87766 Remediation (#80, 2026-10-08)
+
+[GHSA-pxhw-h44j-8pfx](https://github.com/containers/bubblewrap/security/advisories/GHSA-pxhw-h44j-8pfx)
+(CVE-2026-87766, published 2026-08-26, CVSS 3.1 8.8) affects all bubblewrap before 0.12.0,
+including the previously pinned 0.11.0. During sandbox setup the utility could resolve paths
+through parent symlinks into its host-side `/oldroot` staging tree, writing outside the sandbox as
+the invoking user. The advisory's own analysis and the profile facts bound the exposure here: it is
+a setup-time, same-privilege write primitive — not a runtime sandbox escape and not a privilege
+escalation for this unprivileged, capability-dropped, no-new-privileges profile — and the fixed
+mount points this profile supplies are controller-owned, not candidate-controlled. It was therefore
+recorded as a version-range finding, not an exploited or exploitable-by-the-candidate boundary
+breach, and remediated by pin.
+
+The pin moved to v0.13.0 (the current maintained release, 2026-09-22), which carries the 0.12.0
+fix: sandbox-setup path resolution via `openat2(RESOLVE_IN_ROOT)` with a fallback implementation
+for older kernels; this host's 6.18 kernel provides `openat2`. The 0.13.0 utility also removed
+setuid support outright. Licence moved upstream from LGPL-2.0-or-later to LGPL-2.1-or-later;
+the reuse record reflects this. Nothing else in the profile changed: namespaces, capability drop,
+no-new-privileges, seccomp policy construction, mount/resource policy, authorization checks,
+readiness gating (re-derived indicator lines above), parent-death/reaper semantics, settlement
+rules and every negative test are unchanged, and the complete native suite was re-executed on both
+newly built binaries with zero skips — the old pin's receipts are retained as history only and
+prove nothing about the changed binary.
+
+The separate [#79](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/79) retains its
+additional setup-time malicious-symlink/proc-magiclink no-canary-effect reception criteria.
+The #80 repin and runtime-suite rerun do not satisfy that additional proof. Required owner
+ordering is #80 before #79; neither delivery promotes this profile to whole-worker isolation.
