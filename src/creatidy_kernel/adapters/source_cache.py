@@ -434,15 +434,19 @@ def _git(
 
 
 def _origin(target: Path, binary: str, environment: Mapping[str, str], repository_url: str) -> None:
-    origin = _git(
+    origins = _git(
         binary,
         target,
         environment,
-        ("config", "--local", "--no-includes", "--get", "remote.origin.url"),
+        ("config", "--local", "--no-includes", "--null", "--get-all", "remote.origin.url"),
         failure=SourceCategory.REMOTE_MISMATCH,
         timeout=GIT_VERIFY_TIMEOUT_SECONDS,
-    ).stdout.strip()
-    if canonical_repository(origin) != canonical_repository(repository_url):
+    ).stdout.split("\0")
+    if (
+        len(origins) != 2
+        or origins[-1] != ""
+        or canonical_repository(origins[0]) != canonical_repository(repository_url)
+    ):
         raise _refuse(SourceCategory.REMOTE_MISMATCH)
 
 

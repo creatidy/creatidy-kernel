@@ -141,6 +141,29 @@ def test_initialized_gitlink_cannot_execute_hidden_child_configuration(sqlite_tm
     assert not marker.exists() and connection.starts == 0
 
 
+@pytest.mark.parametrize("ordering", ["foreign-first", "foreign-last", "canonical-duplicate"])
+def test_multiple_origin_urls_preserve_cache_and_never_dispatch(sqlite_tmp_path: Path, ordering: str) -> None:
+    task = fixture_task(repeats=1)
+    remote = make_source(sqlite_tmp_path / "remote")
+    foreign = make_source(sqlite_tmp_path / "foreign")
+    reference_git(foreign, "commit", "--allow-empty", "-m", "distinct foreign base")
+    root = sqlite_tmp_path / "cache"
+    source = acquire_source(task.repository_url, cache_root=root, clone_from=str(remote))
+    first = str(foreign) if ordering == "foreign-first" else task.repository_url
+    last = str(foreign) if ordering == "foreign-last" else task.repository_url
+    reference_git(source, "remote", "set-url", "origin", first)
+    reference_git(source, "config", "--add", "remote.origin.url", last)
+    before = {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    with pytest.raises(SourceAcquisitionError, match="remote_mismatch"):
+        acquire_source(task.repository_url, cache_root=root)
+    assert before == {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    connection = FixtureConnection(lambda _: pytest.fail("ambiguous origin cannot start a model"))
+    with pytest.raises(SourceAcquisitionError, match="remote_mismatch"):
+        run(sqlite_tmp_path / "control", source, connection, task=task)
+    assert connection.starts == 0
+    assert before == {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+
+
 @pytest.mark.parametrize("changed", [False, True])
 def test_cli_cancelled_pre_attempt_recovery_needs_no_fresh_source(
     sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], changed: bool

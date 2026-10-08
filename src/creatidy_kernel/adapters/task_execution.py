@@ -2410,8 +2410,14 @@ def validate_task_source(
         validate_checkout(source, bare=snapshot)
         if not snapshot:
             category = SourceCategory.REMOTE_MISMATCH
-            origin = source_git(source, "config", "--local", "--no-includes", "--get", "remote.origin.url").strip()
-            if canonical_repository(origin) != canonical_repository(task.repository_url):
+            origins = source_git(
+                source, "config", "--local", "--no-includes", "--null", "--get-all", "remote.origin.url"
+            ).split("\0")
+            if (
+                len(origins) != 2
+                or origins[-1] != ""
+                or canonical_repository(origins[0]) != canonical_repository(task.repository_url)
+            ):
                 raise ValueError("source origin differs")
             category = SourceCategory.CHECKOUT_DIRTY
             if source_git(source, "status", "--porcelain"):
