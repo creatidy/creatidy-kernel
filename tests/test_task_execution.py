@@ -20,6 +20,7 @@ from creatidy_kernel.adapters.fake_forge import SyntheticForgeTransport
 from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.scarcity_router import ScarcityRouterAllocator
+from creatidy_kernel.adapters.source_cache import SourceAcquisitionError
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.task_execution import (
     CODEX_METHODS,
@@ -142,6 +143,7 @@ def make_source(directory: Path) -> Path:
     source = directory / "source"
     source.mkdir(parents=True)
     reference_git(source, "init", "--initial-branch=develop")
+    reference_git(source, "remote", "add", "origin", "https://forge.invalid/BioMedical-IT/scarcity-router")
     (source / "tests").mkdir()
     (source / "tests" / "__init__.py").write_text("")
     (source / "tests" / "test_e2e_execution.py").write_text(BASE_TEST_FILE)
@@ -1231,13 +1233,21 @@ def test_structural_weakening_rejected(sqlite_tmp_path: Path, label: str, edit: 
     assert cast(list[str], structural["deterministic_findings"])
 
 
+def fixture_verification(source: Path, statement: str) -> tuple[str, ...]:
+    (source / "tests" / "verification_fixture.py").write_text(
+        "import pathlib\nimport unittest\nclass Checks(unittest.TestCase):\n"
+        f"    def test_fixture(self):\n        {statement}\n"
+    )
+    reference_git(source, "add", "tests/verification_fixture.py")
+    reference_git(source, "commit", "-m", "synthetic verification fixture")
+    return (sys.executable, "-m", "unittest", "tests.verification_fixture")
+
+
 def test_tracked_mutation_during_verification_rejected(sqlite_tmp_path: Path) -> None:
     source = make_source(sqlite_tmp_path)
-    touch = (
-        sys.executable,
-        "-c",
-        "import pathlib; p = pathlib.Path('tests/test_e2e_execution.py'); "
-        "p.write_text(p.read_text() + '# verification touched\\n')",
+    touch = fixture_verification(
+        source,
+        "p = pathlib.Path('tests/test_e2e_execution.py'); p.write_text(p.read_text() + '# verification touched\\n')",
     )
     task = TaskSpec(
         task_id="fixture-mutating",
@@ -1262,10 +1272,9 @@ def test_tracked_mutation_during_verification_rejected(sqlite_tmp_path: Path) ->
 
 def test_non_ignored_untracked_litter_during_verification_rejected(sqlite_tmp_path: Path) -> None:
     source = make_source(sqlite_tmp_path)
-    litter = (
-        sys.executable,
-        "-c",
-        "import pathlib; pathlib.Path('leftover-artifact.txt').write_text('verification residue')",
+    litter = fixture_verification(
+        source,
+        "pathlib.Path('leftover-artifact.txt').write_text('verification residue')",
     )
     task = TaskSpec(
         task_id="fixture-littering",
@@ -1297,10 +1306,9 @@ def test_non_ignored_untracked_litter_during_verification_rejected(sqlite_tmp_pa
 
 def test_ignored_cache_artifacts_do_not_reject_verification(sqlite_tmp_path: Path) -> None:
     source = make_source(sqlite_tmp_path)
-    cache_maker = (
-        sys.executable,
-        "-c",
-        "import pathlib; pathlib.Path('__pycache__').mkdir(exist_ok=True); "
+    cache_maker = fixture_verification(
+        source,
+        "pathlib.Path('__pycache__').mkdir(exist_ok=True); "
         "pathlib.Path('__pycache__/m.cpython-312.pyc').write_text('cache')",
     )
     task = TaskSpec(
@@ -1538,7 +1546,7 @@ def test_pinned_expected_base_enforced(sqlite_tmp_path: Path) -> None:
     result = run(control, source, FixtureConnection(deflake_edit), task=fixture_task(repeats=1, expected_base_sha=base))
     assert result["condition"] == "accepted"
     assert cast(dict[str, object], export_task(control)["candidate"])["base"] == base
-    with pytest.raises(ValueError, match="failed"):
+    with pytest.raises(SourceAcquisitionError, match="base_unavailable"):
         run(
             sqlite_tmp_path / "other",
             source,

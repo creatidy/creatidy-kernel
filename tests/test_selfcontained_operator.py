@@ -24,6 +24,7 @@ from creatidy_kernel.adapters.cli import main
 from creatidy_kernel.adapters.forgejo_transport import HTTPSForgejoTransport
 from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.scarcity_router import ScarcityRouterAllocator
+from creatidy_kernel.adapters.source_cache import source_cache_key
 from creatidy_kernel.adapters.task_execution import (
     PreflightReason,
     PreflightResult,
@@ -109,7 +110,7 @@ def provision_path_codex(directory: Path, version: str) -> Path:
 
 def install_remote(remote_location: Path, bases: dict[Path, str]) -> Path:
     remote = make_source(remote_location)
-    reference_git(remote, "remote", "add", "origin", CANONICAL + ".git")
+    reference_git(remote, "remote", "set-url", "origin", CANONICAL + ".git")
     bases[remote] = reference_git(remote, "rev-parse", "refs/heads/develop")
     return remote
 
@@ -137,7 +138,7 @@ def test_preflight_requires_no_checkout_configuration_across_unrelated_layouts(
     assert result.exact_base_sha == bases[remote]
     evidence = cast("dict[str, object]", result.evidence["source"])
     assert evidence["acquired"] is True
-    assert evidence["directory"] == str(cache_root(sqlite_tmp_path) / "BioMedical-IT" / "scarcity-router")
+    assert evidence["directory"] == str(cache_root(sqlite_tmp_path).joinpath(*source_cache_key(CANONICAL)))
     assert evidence["read_only"] is True
     assert not state.exists()
 
@@ -149,7 +150,7 @@ def test_preflight_acquisition_ignores_a_canonical_sibling_checkout(
     environment, bases = readiness_stub
     remote = install_remote(sqlite_tmp_path / "remote-anywhere" / "checkout", bases)
     sibling = make_source(sqlite_tmp_path / "neighbor" / "scarcity-router")
-    reference_git(sibling, "remote", "add", "origin", CANONICAL)
+    reference_git(sibling, "remote", "set-url", "origin", CANONICAL)
     (sibling / "operator-file.txt").write_text("operator-owned\n")
     sibling_head = reference_git(sibling, "rev-parse", "HEAD")
 
@@ -157,7 +158,7 @@ def test_preflight_acquisition_ignores_a_canonical_sibling_checkout(
 
     assert result.ready and result.exact_base_sha == bases[remote]
     evidence = cast("dict[str, object]", result.evidence["source"])
-    assert evidence["directory"] == str(cache_root(sqlite_tmp_path) / "BioMedical-IT" / "scarcity-router")
+    assert evidence["directory"] == str(cache_root(sqlite_tmp_path).joinpath(*source_cache_key(CANONICAL)))
     assert reference_git(sibling, "rev-parse", "HEAD") == sibling_head
     assert (sibling / "operator-file.txt").read_text() == "operator-owned\n"
 
@@ -411,7 +412,7 @@ def test_doctor_and_preflight_run_without_private_operator_or_checkout_configura
     assert payload["inference_performed"] is False and payload["forge_writes_performed"] is False
     evidence = cast("dict[str, object]", payload["evidence"]["source"])
     assert evidence["acquired"] is True
-    assert evidence["directory"] == str(cache_root(sqlite_tmp_path) / "BioMedical-IT" / "scarcity-router")
+    assert evidence["directory"] == str(cache_root(sqlite_tmp_path).joinpath(*source_cache_key(CANONICAL)))
     assert not (sqlite_tmp_path / "xdg-state").exists()
 
 

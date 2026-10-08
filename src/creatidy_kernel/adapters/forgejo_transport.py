@@ -18,8 +18,9 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import BinaryIO, Literal, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -34,6 +35,9 @@ from creatidy_kernel.adapters.forge_refs import (
     valid_branch,
 )
 from creatidy_kernel.core.forge import EffectStatus, ForgeConflict, Reference, UnsupportedForge
+
+GIT_LEASE_FDS: ContextVar[tuple[int, ...]] = ContextVar("git_lease_fds", default=())
+GIT_OUTPUT_ERRORS: ContextVar[Literal["strict", "replace"]] = ContextVar("git_output_errors", default="replace")
 
 
 def _https(url: str) -> None:
@@ -181,9 +185,16 @@ class HTTPSForgejoTransport:
 def run_git_bounded(
     argv: list[str], cwd: Path, env: dict[str, str], timeout: int, max_bytes: int
 ) -> subprocess.CompletedProcess[str]:
-    with subprocess.Popen(  # noqa: S603 - caller supplies fixed binary and controlled arguments/environment.
-        argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, start_new_session=True
-    ) as process:
+    process = subprocess.Popen(  # noqa: S603 - caller supplies fixed binary and controlled arguments/environment.
+        argv,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=True,
+        pass_fds=GIT_LEASE_FDS.get(),
+    )
+    try:
         if process.stdout is None or process.stderr is None:
             raise OSError("Git output pipes unavailable")
         output = {process.stdout: bytearray(), process.stderr: bytearray()}
@@ -211,13 +222,24 @@ def run_git_bounded(
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                process.wait()
+                process.wait(timeout=5)
         return subprocess.CompletedProcess(
             argv,
             process.returncode,
-            output[process.stdout].decode("utf-8", "replace"),
-            output[process.stderr].decode("utf-8", "replace"),
+            output[process.stdout].decode("utf-8", GIT_OUTPUT_ERRORS.get()),
+            output[process.stderr].decode("utf-8", GIT_OUTPUT_ERRORS.get()),
         )
+    finally:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 class ConditionalGitTransport:

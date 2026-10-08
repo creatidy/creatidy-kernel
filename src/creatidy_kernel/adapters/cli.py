@@ -40,6 +40,7 @@ from creatidy_kernel.adapters.task_execution import (
     run_task,
     task_paths,
     task_status,
+    validate_task_source,
 )
 
 _DOCTOR_HINTS: dict[str, str | dict[str | None, str]] = {
@@ -63,7 +64,13 @@ _DOCTOR_HINTS: dict[str, str | dict[str | None, str]] = {
         ),
         "fetch_failed": "refreshing the controller source cache failed; check remote reachability",
         "remote_mismatch": "the source origin must be exactly the task's canonical repository URL",
-        "unsuitable_cache": "delete the controller source cache directory (see doctor --json) and retry",
+        "unsuitable_cache": (
+            "preserve the refused cache; select a separate supported cache root or inspect ownership offline"
+        ),
+        "ownership_unproven": "preserve the entry and lock metadata; do not delete or relabel unknown data",
+        "source_busy": (
+            "another acquisition or object-copy lease owns this source; retry after that bounded operation settles"
+        ),
         "checkout_unsuitable": "an explicit --repo override must be an ordinary Git checkout",
         "checkout_dirty": "commit or revert local changes in the explicit --repo override checkout",
         "base_unavailable": "the task base branch must be resolvable in the source",
@@ -338,7 +345,9 @@ def _task(args: argparse.Namespace, environment: dict[str, str]) -> int:
     deadline = args.deadline
     config = TaskRuntimeConfig.parse(environment_with_discovered_codex(environment)[0])
     directory, _source = task_paths(config, args.data_dir, args.repo, environ=environment)
-    source = resolve_source(config, task, args.repo, environment=environment)
+    source = resolve_source(config, task, args.repo, environment=environment, directory=directory)
+    if not (directory / "objects.git").exists():
+        validate_task_source(source, task, dict(config.child_environment))
     components = compose_task_live(config, task)
     connection = components.connection_factory()
     lifecycle: list[str] = []

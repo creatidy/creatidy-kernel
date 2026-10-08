@@ -82,6 +82,37 @@ new rejected results never manufacture evidence for unrun checks. No database mi
 worker `TrustMode` or profile-file default. Existing trusted-development stays non-isolated and is
 never automatically upgraded. See [ADR 0008](../adr/0008-linux-bubblewrap-verification.md).
 
+## Source Cache Compatibility
+
+#61 introduces a separate host-qualified `source/v2/<origin-digest>/<owner>/<repository>` namespace,
+not an in-place identity migration. The digest is SHA-256 of the existing Forge canonical HTTPS
+origin (lower-case host, port 443 omitted); repository syntax uses the same Forge ref validator.
+TaskSpec repository/digest, policy, Program, Attempt, allocation, request/Operation/effect identities,
+exact pins and Source provenance subjects are unchanged. No profile or database codec is migrated.
+
+Historical hostless entries are preserved byte-for-byte in their original locations. Kernel does
+not rename, quarantine, reclassify, delete or adopt a tree based on cleanliness or a remote URL.
+The old `kernel-source-cache-v1` plain `1` marker is not sufficient ownership evidence. A new
+qualified acquisition is separate, including if the legacy entry belongs to another user/host or
+is corrupt. Failed acquisitions/publications retain their unique staging bytes; they are not
+published as usable checkouts. Corrupt qualified entries refuse and remain in place. Operators may
+choose a separate supported cache placement; automatic repair/deletion authority is not inferred.
+
+New JSON markers bind root/location, canonical repository, checkout/Git-directory and stable lock
+inodes, UID and a per-acquisition token matched to the controller's locked metadata. Lock files are
+never deleted or replaced. Interrupted metadata writes refuse and retain all checkout/staging bytes. Metadata or inode
+substitution, unsupported mounts, permissions, Git indirection and executable local configuration
+refuse with closed categories. This is a single trusted local controller/cooperative reader-writer
+protocol; it does not protect against an adversarial same-UID process or hostile remounts.
+
+Recovery loads the ORIGINAL mode `source` literal path when no override was supplied, not a new
+default namespace or a reacquired/re-routed repository. Existing receipt/terminal/cancellation/PR
+reconciliation uses its original frozen objects without a new live source/baseline requirement.
+A new native start still validates those exact controller objects. Missing original objects refuse;
+recovery never rewrites an old Source field, renews the deadline, or substitutes a fresh identity.
+New admissions validate source under a use lease and copy without hardlinks, validating the exact
+snapshot before dispatch. A returned acquisition Path carries no protected lifetime after release.
+
 ## Historical Second-Pass Mapping
 
 ## Scarcity Router

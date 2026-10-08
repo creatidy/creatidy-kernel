@@ -45,7 +45,17 @@ from creatidy_kernel.adapters.forgejo_transport import ConditionalGitTransport, 
 from creatidy_kernel.adapters.reference import reference_git, reference_git_bytes
 from creatidy_kernel.adapters.reference_forge import deliver_reference_pr
 from creatidy_kernel.adapters.scarcity_router import ScarcityRouterAllocator, ScarcityRouterUnavailable
-from creatidy_kernel.adapters.source_cache import SourceAcquisitionError, acquire_source, default_cache_root
+from creatidy_kernel.adapters.source_cache import (
+    SourceAcquisitionError,
+    SourceCategory,
+    acquire_source,
+    canonical_repository,
+    copy_source_objects,
+    default_cache_root,
+    source_git,
+    source_use,
+    validate_checkout,
+)
 from creatidy_kernel.adapters.sqlite_store import (
     OperationConflict,
     ProgramNotFound,
@@ -657,8 +667,7 @@ def _recover_task_pin(task: TaskSpec, mode: Mapping[str, object]) -> TaskSpec:
 
 
 def _git_failure(arguments: tuple[str, ...], error: subprocess.CalledProcessError) -> ValueError:
-    detail = error.stderr.decode("utf-8", "replace").strip() if error.stderr else ""
-    return ValueError(f"git {' '.join(arguments[:3])} failed: {detail}")
+    return ValueError("controller Git operation failed")
 
 
 def git_text(repository: Path, *arguments: str, timeout: int = 60, index_file: str | None = None) -> str:
@@ -684,14 +693,14 @@ def git_data(repository: Path, *arguments: str, data: bytes, timeout: int = 60) 
 
 def _resolve_base(source: Path, task: TaskSpec) -> tuple[str, str]:
     if task.expected_base_sha is not None:
-        resolved = git_text(source, "rev-parse", "--verify", f"{task.expected_base_sha}^{{commit}}")
+        resolved = source_git(source, "rev-parse", "--verify", f"{task.expected_base_sha}^{{commit}}").strip()
         if resolved != task.expected_base_sha:
             raise ValueError("expected base SHA is not the canonical commit identity")
         return resolved, "pinned"
     for ref in (f"refs/remotes/origin/{task.base_branch}", f"refs/heads/{task.base_branch}"):
         try:
-            return git_text(source, "rev-parse", "--verify", f"{ref}^{{commit}}"), ref
-        except ValueError:
+            return source_git(source, "rev-parse", "--verify", f"{ref}^{{commit}}").strip(), ref
+        except (ValueError, SourceAcquisitionError):
             continue  # an unresolvable candidate ref is an ordinary control outcome
     raise ValueError(f"source repository cannot resolve base branch {task.base_branch!r}")
 
@@ -725,8 +734,9 @@ def prepare_workspace(
     The owner's checkout is only read (clone source, ref resolution). The workspace
     and bare object source are controller-owned clones; no canonical branch moves.
     """
-    source = source.resolve()
-    if source.is_symlink() or not source.is_dir() or not (source / ".git").exists():
+    if not (directory / "objects.git").exists() and (
+        source.is_symlink() or not source.is_dir() or not (source / ".git").exists()
+    ):
         raise ValueError("source repository must be an existing non-symlink Git checkout")
     directory.mkdir(parents=True, exist_ok=True)
     if directory == source or directory.is_relative_to(source) or source.is_relative_to(directory):
@@ -755,7 +765,8 @@ def prepare_workspace(
         raise ValueError("task workspace/object paths must not be symlinks")
     if not objects.exists():
         objects.mkdir()
-        git_text(directory, "clone", "--bare", "--template=", str(source), str(objects), timeout=GIT_TIMEOUT_SECONDS)
+        copy_source_objects(source, objects)
+    validate_checkout(objects, bare=True)
     if git_text(objects, "rev-parse", "--is-bare-repository") != "true":
         raise ValueError("controller object source must be bare")
     if git_text(objects, "cat-file", "-t", base) != "commit":
@@ -1348,7 +1359,8 @@ def run_task(
     if deadline is not None and (type(deadline) is not int or deadline > now + 3600):
         raise ValueError("owner deadline must be within one hour ahead")
     _suitable_path(directory)
-    _suitable_path(source_repository)
+    if not (directory / "kernel.sqlite3").exists():
+        _suitable_path(source_repository)
     if (
         directory == source_repository
         or directory.is_relative_to(source_repository)
@@ -1515,9 +1527,41 @@ def run_task(
         attempt_exists = any(item.spec.attempt_id == ATTEMPT_ID for item in program.attempts)
         if cancellation_pending and not attempt_exists:
             return cancelled_without_attempt()
-        base, objects, workspace = prepare_workspace(
-            store, directory, source_repository, task, lifecycle, attempt_exists=attempt_exists
-        )
+        if not attempt_exists:
+            with source_use(source_repository, task.repository_url):
+                frozen_base = (
+                    _request(store, "task_execution:base")["base"] if (directory / "objects.git").exists() else None
+                )
+                base, _, _ = validate_task_source(
+                    source_repository,
+                    task,
+                    command_environment or {},
+                    base=str(frozen_base) if frozen_base is not None else None,
+                )
+                source_identity = (
+                    source_repository.stat().st_dev,
+                    source_repository.stat().st_ino,
+                    (source_repository / ".git").stat().st_ino,
+                )
+                base, objects, workspace = prepare_workspace(
+                    store, directory, source_repository, task, lifecycle, attempt_exists=attempt_exists
+                )
+                validate_task_source(source_repository, task, command_environment or {}, base=base)
+                if source_identity != (
+                    source_repository.stat().st_dev,
+                    source_repository.stat().st_ino,
+                    (source_repository / ".git").stat().st_ino,
+                ):
+                    raise SourceAcquisitionError(
+                        SourceCategory.CHECKOUT_UNSUITABLE, "source identity changed during object copy"
+                    )
+                validate_task_source(objects, task, command_environment or {}, base=base, snapshot=True)
+        else:
+            # Existing receipts/cancellation/PR reconciliation use the original
+            # frozen objects, never a fresh source/default placement or route.
+            base, objects, workspace = prepare_workspace(
+                store, directory, source_repository, task, lifecycle, attempt_exists=True
+            )
         crash("workspace-prepared")
         if cancellation_requested_now():
             cancellation_pending = True
@@ -1577,14 +1621,22 @@ def run_task(
                 )
 
             def authorize(request: ExecutionRequest) -> bool:
-                operation = store.operation(request.operation.operation_id)
-                return (
-                    not cancellation_requested_now()
-                    and int(time.time()) < deadline
-                    and operation.status == "dispatched"
-                    and operation.fence == request.fence
-                    and operation.request_digest == request.operation.request_digest
-                )
+                def current() -> bool:
+                    operation = store.operation(request.operation.operation_id)
+                    return (
+                        not cancellation_requested_now()
+                        and int(time.time()) < deadline
+                        and operation.status == "dispatched"
+                        and operation.fence == request.fence
+                        and operation.request_digest == request.operation.request_digest
+                    )
+
+                # This callback is used only for NEW starts, not restoration or
+                # read-only receipt reconciliation. Check after blocking callbacks.
+                if not current():
+                    return False
+                validate_task_source(objects, task, command_environment or {}, base=base, snapshot=True)
+                return current()
 
             runtime = CodexRuntime(
                 connection,
@@ -2241,6 +2293,7 @@ def resolve_source(
     source_repository: Path | None,
     *,
     environment: Mapping[str, str],
+    directory: Path | None = None,
 ) -> Path:
     """CLI override, then configured field, then the controller-owned canonical cache.
 
@@ -2251,6 +2304,12 @@ def resolve_source(
     source = source_repository if source_repository is not None else config.source_repository
     if source is not None:
         return source
+    if directory is not None and (directory / "kernel.sqlite3").exists():
+        with SQLiteProgramStore(directory / "kernel.sqlite3") as store:
+            mode = _request(store, "task_execution:mode")
+            if mode.get("task_digest") != task.digest or not isinstance(mode.get("source"), str):
+                raise ValueError("original source envelope unavailable")
+            return Path(str(mode["source"]))
     return acquire_source(task.repository_url, askpass=config.forge_askpass, environment=environment)
 
 
@@ -2285,7 +2344,7 @@ def _preflight_base(source: Path, directory: Path, task: TaskSpec) -> tuple[str,
                 task.expected_base_sha is not None and sha != task.expected_base_sha
             ):
                 raise ValueError("existing frozen base differs from task")
-            if git_text(source, "rev-parse", "--verify", f"{sha}^{{commit}}") != sha:
+            if source_git(source, "rev-parse", "--verify", f"{sha}^{{commit}}").strip() != sha:
                 raise ValueError("frozen base unavailable")
             return sha, "durable:" + str(request["ref"])
     return _resolve_base(source, task)
@@ -2294,14 +2353,13 @@ def _preflight_base(source: Path, directory: Path, task: TaskSpec) -> tuple[str,
 def _baseline(source: Path, base: str, task: TaskSpec, environment: Mapping[str, str]) -> dict[str, object]:
     contents: list[str] = []
     for path in sorted(task.allowed_paths):
-        mode = git_text(source, "ls-tree", base, "--", path).split(" ", 1)[0]
+        mode = source_git(source, "ls-tree", base, "--", path).split(" ", 1)[0]
         if mode not in {"100644", "100755"}:
             raise ValueError("allowed path must exist as an ordinary file at the exact base")
-        size = int(git_text(source, "cat-file", "-s", f"{base}:{path}"))
+        size = int(source_git(source, "cat-file", "-s", f"{base}:{path}"))
         if size > MAX_PATCH_BYTES:
             raise ValueError("task baseline exceeds limit")
-        raw = git_bytes(source, "cat-file", "blob", f"{base}:{path}")
-        contents.append(raw.decode("utf-8"))
+        contents.append(source_git(source, "cat-file", "blob", f"{base}:{path}", max_bytes=MAX_PATCH_BYTES))
     content = "\n".join(contents)
     for required in (*task.structural.required_names, *task.structural.required_tokens):
         if required not in content:
@@ -2329,6 +2387,55 @@ def _baseline(source: Path, base: str, task: TaskSpec, environment: Mapping[str,
         "verification_executed": False,
         "deferred_to_independent_review": list(task.structural.deferred_to_review),
     }
+
+
+def validate_task_source(
+    source: Path,
+    task: TaskSpec,
+    environment: Mapping[str, str],
+    *,
+    base: str | None = None,
+    base_resolver: Callable[[], tuple[str, str]] | None = None,
+    snapshot: bool = False,
+) -> tuple[str, str, dict[str, object]]:
+    """One local admission gate, shared with preflight; no native/network effects.
+
+    Snapshot mode is only for controller-owned bare objects already copied under
+    the source lease. It retains the frozen pin and Source subjects, not a new
+    provenance identity. Explicit source users must not mutate during this cut.
+    """
+    category = SourceCategory.CHECKOUT_UNSUITABLE
+    try:
+        _suitable_path(source)
+        validate_checkout(source, bare=snapshot)
+        if not snapshot:
+            category = SourceCategory.REMOTE_MISMATCH
+            origin = source_git(source, "config", "--local", "--no-includes", "--get", "remote.origin.url").strip()
+            if canonical_repository(origin) != canonical_repository(task.repository_url):
+                raise ValueError("source origin differs")
+            category = SourceCategory.CHECKOUT_DIRTY
+            if source_git(source, "status", "--porcelain"):
+                raise ValueError("source is dirty")
+        category = SourceCategory.BASE_UNAVAILABLE
+        if base is None:
+            base, ref = base_resolver() if base_resolver is not None else _resolve_base(source, task)
+        else:
+            oid(base)
+            if task.expected_base_sha is not None and task.expected_base_sha != base:
+                raise ValueError("source pin differs")
+            if source_git(source, "rev-parse", "--verify", f"{base}^{{commit}}").strip() != base:
+                raise ValueError("exact base unavailable")
+            ref = "pinned"
+        category = SourceCategory.BASELINE_INVALID
+        evidence = _baseline(source, base, task, environment)
+        return base, ref, evidence
+    except (OSError, ValueError, RuntimeError, SyntaxError, sqlite3.Error, KeyError, TypeError) as error:
+        if isinstance(error, SourceAcquisitionError) and error.category in {
+            SourceCategory.CHECKOUT_UNSUITABLE,
+            SourceCategory.OWNERSHIP_UNPROVEN,
+        }:
+            category = error.category
+        raise SourceAcquisitionError(category, f"source admission refused: {category.value}") from None
 
 
 CODEX_ENV_FIELDS = (LIVE_ENV["codex_bin"], LIVE_ENV["codex_version"])
@@ -2433,7 +2540,7 @@ def preflight_task(
             parent,
             database_path=directory / "kernel.sqlite3" if parent == directory else None,
         )
-        for name in ("workspace", "objects.git", "kernel.sqlite3", "artifacts"):
+        for name in ("workspace", "objects.git", "kernel.sqlite3", "kernel.sqlite3.artifacts"):
             if (directory / name).is_symlink():
                 raise ValueError("state child must not be a symlink")
         database = directory / "kernel.sqlite3"
@@ -2451,30 +2558,20 @@ def preflight_task(
         evidence["state"] = {"directory": str(directory), "filesystem": filesystem, "created": False}
     except (OSError, ValueError, RuntimeError):
         blockers.append(PreflightBlocker(PreflightReason.STATE))
-    source_category: str | None = None
-    checked_source: Path | None = None
     if source is not None:
         try:
-            _suitable_path(source)
-            if not source.is_dir() or not (source / ".git").is_dir() or (source / ".git").is_symlink():
-                source_category = "checkout_unsuitable"
-                raise ValueError("source must be an ordinary Git checkout")
-            origin = git_text(source, "config", "--get", "remote.origin.url")
-            if origin not in {task.repository_url, task.repository_url + ".git"}:
-                source_category = "remote_mismatch"
-                raise ValueError("source origin differs from the exact task repository")
-            if git_text(source, "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"):
-                source_category = "checkout_dirty"
-                raise ValueError("source checkout is not clean")
-            try:
-                base, ref = (
-                    _resolve_base(source, task)
-                    if any(blocker.reason is PreflightReason.STATE for blocker in blockers)
-                    else _preflight_base(source, directory, task)
+            with source_use(source, task.repository_url):
+                base, ref, task_evidence = validate_task_source(
+                    source,
+                    task,
+                    dict(config.child_environment),
+                    base_resolver=lambda: (
+                        _resolve_base(source, task)
+                        if any(blocker.reason is PreflightReason.STATE for blocker in blockers)
+                        else _preflight_base(source, directory, task)
+                    ),
                 )
-            except (OSError, ValueError, RuntimeError, sqlite3.Error, KeyError, TypeError):
-                source_category = "base_unavailable"
-                raise
+                evidence["task"] = task_evidence
             evidence["source"] = {
                 "directory": str(source),
                 "clean": True,
@@ -2485,14 +2582,11 @@ def preflight_task(
                     else {}
                 ),
             }
-            checked_source = source
-        except (OSError, ValueError, RuntimeError, sqlite3.Error, KeyError, TypeError):
-            blockers.append(PreflightBlocker(PreflightReason.SOURCE, category=source_category))
-    if base is not None and checked_source is not None:
-        try:
-            evidence["task"] = _baseline(checked_source, base, task, dict(config.child_environment))
-        except (OSError, ValueError, RuntimeError, SyntaxError):
-            blockers.append(PreflightBlocker(PreflightReason.TASK))
+        except SourceAcquisitionError as error:
+            reason = (
+                PreflightReason.TASK if error.category is SourceCategory.BASELINE_INVALID else PreflightReason.SOURCE
+            )
+            blockers.append(PreflightBlocker(reason, category=error.category.value))
     try:
         child = dict(config.child_environment)
         binary = config.codex_binary.resolve()

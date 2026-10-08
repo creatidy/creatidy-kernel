@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from test_task_execution import FixtureConnection, deflake_edit, fixture_task, make_source, run
+from test_task_execution import FixtureConnection, deflake_edit, fixture_task, fixture_verification, make_source, run
 
 from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.task_execution import TaskChecks, VerificationCommand
@@ -21,7 +21,7 @@ def test_actual_changed_make_recipe_has_no_effect(sqlite_tmp_path: Path) -> None
     reference_git(source, "add", "Makefile")
     reference_git(source, "commit", "-m", "synthetic trusted check recipe")
     marker = sqlite_tmp_path / "rejected-make-effect"
-    task = replace(fixture_task(repeats=1), verification=(VerificationCommand(("/usr/bin/make", "check"), 30),))
+    task = replace(fixture_task(repeats=1), verification=(VerificationCommand(("make", "check"), 30),))
 
     def edit(workspace: Path) -> None:
         deflake_edit(workspace)
@@ -37,11 +37,9 @@ def test_actual_changed_make_recipe_has_no_effect(sqlite_tmp_path: Path) -> None
 def test_forbidden_verification_tooling_cannot_run(sqlite_tmp_path: Path, forbidden: str) -> None:
     marker = sqlite_tmp_path / "unauthorized-effect"
     task = fixture_task(repeats=1)
-    command = replace(
-        task.verification[0], argv=(task.verification[0].argv[0], "-c", f"open({str(marker)!r},'w').close()")
-    )
-    task = replace(task, verification=(command,))
     source = make_source(sqlite_tmp_path)
+    command = replace(task.verification[0], argv=fixture_verification(source, f"open({str(marker)!r},'w').close()"))
+    task = replace(task, verification=(command,))
 
     def edit(workspace: Path) -> None:
         deflake_edit(workspace)
@@ -62,9 +60,7 @@ def test_direct_command_call_cannot_bypass_structural_gate(
     marker = sqlite_tmp_path / "unauthorized-effect"
     source = make_source(sqlite_tmp_path)
     task = fixture_task(repeats=1)
-    command = replace(
-        task.verification[0], argv=(task.verification[0].argv[0], "-c", f"open({str(marker)!r},'w').close()")
-    )
+    command = replace(task.verification[0], argv=fixture_verification(source, f"open({str(marker)!r},'w').close()"))
     task = replace(task, verification=(command,))
     called: list[bool] = []
     original = TaskChecks.check
