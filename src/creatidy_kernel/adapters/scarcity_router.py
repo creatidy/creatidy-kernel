@@ -409,7 +409,7 @@ def _features(requirement: dict[str, object], binding: dict[str, object]) -> fro
     if hard.get("requires_tool_use"):
         features.add("tool_calls")
     if hard.get("requires_reasoning_mode"):
-        features.add("reasoning_mode")
+        features.update({"reasoning_mode", "reasoning_controls"})
     return frozenset(features)
 
 
@@ -684,6 +684,7 @@ class ScarcityRouterAllocator(ResourceAllocator):
                 )
             if self.api_key is not None and (
                 _contains_credential(ordinary.draft.payload(), self.api_key)
+                or _contains_credential(ordinary.draft.declaration.value, self.api_key)
                 or _contains_credential(_parse(ordinary.decision_bytes), self.api_key)
                 or _contains_credential(wire, self.api_key)
                 or _contains_credential(interface, self.api_key)
@@ -742,31 +743,28 @@ class ScarcityRouterAllocator(ResourceAllocator):
                             )
                             support_value = asdict(support)
                             support_value["features"] = sorted(support.features)
-                            requirements_provenance = _canonical(
-                                {
-                                    "version": 1,
-                                    "producer_revision": PRODUCER_REVISION,
-                                    "draft": ordinary.draft.payload(),
-                                    "decision_id": ordinary.decision_id,
-                                    "decision_bytes": ordinary.decision_bytes.decode(),
-                                    "program_digest": ordinary.program_digest,
-                                    "sent_request": wire,
-                                    "interface": interface,
-                                    "runtime_support": support_value,
-                                    "runtime_binding": {
-                                        "runtime_id": binding.runtime_id,
-                                        "provider": binding.provider_id,
-                                        "model": binding.model_id,
-                                        "effort": binding.reasoning_effort,
-                                        "variant": binding.variant,
-                                        "context_tokens": binding.context_tokens,
-                                    },
-                                }
-                            )
-                            if self.api_key is not None and _contains_credential(
-                                _parse(requirements_provenance.encode()), self.api_key
-                            ):
+                            requirements_evidence: dict[str, object] = {
+                                "version": 1,
+                                "producer_revision": PRODUCER_REVISION,
+                                "draft": ordinary.draft.payload(),
+                                "decision_id": ordinary.decision_id,
+                                "decision_bytes": ordinary.decision_bytes.decode(),
+                                "program_digest": ordinary.program_digest,
+                                "sent_request": wire,
+                                "interface": interface,
+                                "runtime_support": support_value,
+                                "runtime_binding": {
+                                    "runtime_id": binding.runtime_id,
+                                    "provider": binding.provider_id,
+                                    "model": binding.model_id,
+                                    "effort": binding.reasoning_effort,
+                                    "variant": binding.variant,
+                                    "context_tokens": binding.context_tokens,
+                                },
+                            }
+                            if self.api_key is not None and _contains_credential(requirements_evidence, self.api_key):
                                 raise ValueError("evidence contains configured credential")
+                            requirements_provenance = _canonical(requirements_evidence)
                         return replace(
                             binding,
                             variant=variant,

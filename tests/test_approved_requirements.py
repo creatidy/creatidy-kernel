@@ -474,6 +474,61 @@ def test_credentials_never_become_ordinary_evidence(where: str) -> None:
         assert len(requests) == (0 if where == "declaration" else 1)
 
 
+def test_escaped_declaration_credential_refuses_before_transport() -> None:
+    from creatidy_kernel.core.intake import Declaration
+
+    token = "synthetic-bearer-credential"  # noqa: S105 - deliberately synthetic.
+    subject = handoff(provenance=[token])
+    escaped = "".join("\\u" + format(ord(character), "04x") for character in token)
+    raw = subject.draft.declaration.raw.replace(token.encode(), escaped.encode())
+    subject = replace(subject, draft=replace(subject.draft, declaration=Declaration(raw)))
+    assert subject.draft.declaration.value["provenance"] == [token] and token.encode() not in raw
+    with server(encode(response(CODING))) as (origin, requests):
+        with pytest.raises(ScarcityRouterUnavailable) as caught:
+            ScarcityRouterAllocator(origin, (BINDING,), runtime_support=(SUPPORT,), api_key=token).select(
+                translated(subject)
+            )
+        assert caught.value.category is RouterFailureCategory.REQUEST_UNSUPPORTED
+        assert caught.value.decision_provenance is None and requests == []
+        assert subject.draft.declaration.raw == raw
+
+
+def test_quality_reasoning_mode_requires_independent_reasoning_controls() -> None:
+    requirement = CODING | {
+        "hard_constraints": cast(dict[str, object], CODING["hard_constraints"]) | {"requires_reasoning_mode": True}
+    }
+    request = translated(handoff(requirement))
+    assert (
+        request.requirements_handoff is not None
+        and request.requirements_handoff.draft.declaration.value["interface"] == []
+    )
+    with server(encode(response(requirement))) as (origin, requests):
+        with pytest.raises(ScarcityRouterUnavailable) as caught:
+            ScarcityRouterAllocator(
+                origin,
+                (BINDING,),
+                runtime_support=(replace(SUPPORT, features=SUPPORT.features - {"reasoning_controls"}),),
+            ).select(request)
+        assert caught.value.category is RouterFailureCategory.SELECTION_INCOMPATIBLE and requests == []
+
+
+@pytest.mark.parametrize("authenticated", [False, True])
+def test_near_bound_declaration_has_identical_authenticated_evidence_outcome(authenticated: bool) -> None:
+    subject = handoff(provenance=["synthetic-padding-" + "x" * 261000])
+    assert len(subject.draft.declaration.raw) < 262144
+    token = "synthetic-bearer-credential"  # noqa: S105 - deliberately synthetic.
+    with server(encode(response(CODING))) as (origin, requests):
+        allocation = ScarcityRouterAllocator(
+            origin, (BINDING,), runtime_support=(SUPPORT,), api_key=token if authenticated else None
+        ).select(translated(subject))
+        assert len(requests) == 1 and allocation.requirements_provenance is not None
+        assert len(allocation.requirements_provenance.encode()) > 262144
+        assert (
+            json.loads(allocation.requirements_provenance)["draft"]["declaration"]
+            == subject.draft.declaration.raw.decode()
+        )
+
+
 def test_producer_null_false_normalization_preserves_original_bytes() -> None:
     requirement: dict[str, object] = {
         "task_level": "L2",
