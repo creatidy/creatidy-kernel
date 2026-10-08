@@ -67,6 +67,8 @@ def _self_observations() -> dict[str, Any]:
         "NSpid": fields.get("NSpid", "unknown"),
         "env_names": sorted(os.environ.keys()),
         "mounts": Path("/proc/self/mounts").read_text().splitlines(),
+        "network_interfaces": sorted(name for _index, name in socket.if_nameindex()),
+        "ipv4_routes": Path("/proc/net/route").read_text().splitlines(),
         "cgroup_pids_max": cgroup_value("pids.max"),
         "cgroup_memory_max": cgroup_value("memory.max"),
     }

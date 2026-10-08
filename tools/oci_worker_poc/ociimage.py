@@ -20,8 +20,8 @@ IMAGE_REF = "localhost/kernel78-worker:v1"
 
 # Default-allow with an explicit fail-closed deny set for namespace/mount/keyring/ptrace/
 # async-runtime surfaces, mirroring the ADR 0008 direction. clone-with-namespace-flags
-# cannot be expressed as a masked predicate in this profile format and stays a recorded
-# residual alongside the other shared-kernel syscalls.
+# remain allowed by this deny-list. OCI JSON supports masked argument predicates, but
+# enforcement across the configured native/compat architectures has not been received.
 SECCOMP_DENY_NAMES = (
     "unshare",
     "setns",

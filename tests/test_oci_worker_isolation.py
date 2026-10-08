@@ -173,7 +173,7 @@ class AttemptRunner:
     def dispose_all(self) -> None:
         for result in self.results:
             try:
-                if self.state(result) == "running":
+                if self.state(result) == "exists":
                     self.stop(result, grace_seconds=2)
                 result.relay.stop()
             except Exception:  # noqa: S110 - bounded best-effort disposal; native assertions already ran.
@@ -331,6 +331,9 @@ class TestNetworkDenial:
         assert result.returncode == 0, result.stderr_tail
         outcome = result.step(f"network:{label}").get("outcome", "")
         assert outcome.startswith("denied:"), f"{label} connectivity unexpectedly available: {outcome}"
+        # Loopback refusal alone proves no listener, not isolation from the host network.
+        assert result.observations["network_interfaces"] == ["lo"]
+        assert len(result.observations["ipv4_routes"]) == 1, "unexpected non-loopback IPv4 route"
 
     def test_dns_resolution_denied(self, runner: AttemptRunner) -> None:
         result = runner.run({"steps": [{"kind": "probe_dns", "name": "forgejo.creatidy.com"}]})
@@ -493,10 +496,10 @@ class TestLifecycleAndAuthority:
         os.kill(result.process.pid, signal.SIGKILL)
         result.process.wait(timeout=30)
         # After monitor death the Attempt terminality is unknown until reconciled by
-        # observation; the next read must produce a concrete observed state, never a guess.
+        # observation; existence is not liveness or terminality evidence.
         state = runner.state(result)
-        assert state in {"running", "absent"}, state
-        if state == "running":
+        assert state in {"exists", "absent"}, state
+        if state == "exists":
             runner.stop(result, grace_seconds=2)
         assert runner.state(result) == "absent"
         result.status = harness.worker_status(result.sandbox)

@@ -125,7 +125,7 @@ def container_state(toolchain: Toolchain, container_name: str) -> str:
         check=False,
         timeout=60,
     )  # noqa: S603 - fixed tool argv.
-    return "running" if result.returncode == 0 else "absent"
+    return "exists" if result.returncode == 0 else "absent"
 
 
 def scan_host_for_marker(marker: str) -> list[int]:

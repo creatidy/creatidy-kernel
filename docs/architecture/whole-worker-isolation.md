@@ -77,7 +77,7 @@ skips** (plus 8 closed-environment authority/profile items), including:
 | Credentials | Three synthetic controller/provider/forge env canaries absent by name and by content; synthetic `HOME=/home/worker`, closed PATH; no host env inheritance |
 | Native commands | busybox shell and host-closure Python executed inside the same boundary |
 | Child processes | `setsid` shell + sleep grandchild spawned; after `podman stop`, host `/proc` scan proved descendant settlement; an unrelated host bystander survived untouched |
-| Network | IPv4 loopback, IPv4 private and IPv6 loopback connects denied; DNS resolution denied; the network namespace contains only the loopback interface (observed `UP` with no external interface and no configured addressing) |
+| Network | IPv4 loopback, IPv4 private and IPv6 loopback connects refused; DNS resolution denied; the network namespace contains only the loopback interface (observed `UP`, no non-loopback addressing, empty IPv4 route table). Loopback `ECONNREFUSED` means no listener, not an enforcement errno; interface/route observations establish the network boundary separately. |
 | Host control sockets | `/var/run/docker.sock`, `/run/containerd/containerd.sock`, an unmounted host Unix socket and an abstract-socket connect all denied |
 | Runtime privileges | Observed in-container: `CapEff=0`, `NoNewPrivs=1`, `Seccomp=2` (deny-list filter), single-line `uid_map`, mounts limited to the enumerated allowlist, `unshare(CLONE_NEWUSER)` → `EPERM`, `pids.max=8` read inside the cgroup with fork flood denied |
 | Cancellation | `podman stop` targeted only the owned container; graceful SIGTERM recorded as `cancelled`; bystander preserved |
@@ -132,9 +132,10 @@ owner-visible-until-settled scratch resource, not as a revocable authority surfa
   mapping (setuid `newuidmap` or `/etc/subuid`-capable environment) is required before
   worker writes are separated from owner-file ownership by UID, not only by mount view.
 - **Shared kernel**: no VM boundary; kernel attack surface outside the seccomp deny-list
-  remains. `clone` with namespace flags cannot be masked in this profile format (only the
-  `unshare`/`setns`/`clone3` entry points are denied); a libseccomp-grade filter like ADR
-  0008's would close more.
+  remains. This deny-list does not block `clone` with namespace flags (only the
+  `unshare`/`setns`/`clone3` entry points are denied). OCI JSON supports masked argument
+  predicates, but native/compat-architecture runtime enforcement has not been proved;
+  tighter filtering remains a separate reception requirement.
 - **cgroup delegation requires an active systemd user session**; the harness fails closed on
   the silent cgroupfs fallback, but environments without a user session get no receipt.
 - **Trusted controller/toolroot**: the unisolated parent, the pinned toolchain and the host
