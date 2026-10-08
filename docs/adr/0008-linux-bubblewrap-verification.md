@@ -1,7 +1,8 @@
 # ADR 0008: Linux Bubblewrap Verification Boundary
 
-Status: owner-selected direction, 2026-10-07; local verification-only implementation and native
-reception below. Independent whole-PR review and canonical integration remain to prove.
+Status: owner-selected verification-only boundary, 2026-10-07; #50 implementation received
+through PR #74. The #80 security repin has separate native reception below; its current
+independent review and canonical integration are recorded in PR #82.
 Issue: [Kernel #50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50).
 
 ## Decision And Scope
@@ -284,3 +285,8 @@ readiness gating (re-derived indicator lines above), parent-death/reaper semanti
 rules and every negative test are unchanged, and the complete native suite was re-executed on both
 newly built binaries with zero skips — the old pin's receipts are retained as history only and
 prove nothing about the changed binary.
+
+The separate [#79](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/79) retains its
+additional setup-time malicious-symlink/proc-magiclink no-canary-effect reception criteria.
+The #80 repin and runtime-suite rerun do not satisfy that additional proof. Required owner
+ordering is #80 before #79; neither delivery promotes this profile to whole-worker isolation.
