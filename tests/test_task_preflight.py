@@ -48,7 +48,7 @@ pytest_plugins = ["test_sqlite_store"]
 @pytest.fixture
 def ready_inputs(sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, str], Path, Path]:
     source = make_source(sqlite_tmp_path)
-    reference_git(source, "remote", "add", "origin", fixture_task().repository_url + ".git")
+    reference_git(source, "remote", "set-url", "origin", fixture_task().repository_url + ".git")
     base = reference_git(source, "rev-parse", "refs/heads/develop")
     environment = live_environment("zai/glm-5.3/low")
     environment["CREATIDY_KERNEL_CODEX_BIN"] = str(write_fake_codex(sqlite_tmp_path, "1.2.3"))

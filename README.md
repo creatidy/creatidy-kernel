@@ -203,9 +203,9 @@ uv run --locked creatidy-kernel task export
 The normal path needs no local Scarcity Router checkout and no `creatidy-onprem` access:
 the controller acquires its own read-only source cache from the TaskSpec canonical
 repository, discovers Codex on `PATH`, and selects user-local state defaults. An explicit
-`--repo` remains an advanced override. Preflight checks its exact canonical origin and clean source;
-the current run path does not share all those checks. [#61](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/61)
-tracks enforcement before dispatch, cache ownership and host-qualified identity.
+`--repo` remains an advanced override. Preflight and every new native admission share the same
+local canonical-origin, clean-checkout, exact-base and frozen structural-baseline gate. Dispatch
+does not run the network/Router/Codex preflight. Readiness is never reused as execution authority.
 
 Preflight is quota-free: it validates runtime configuration, source/state suitability, exact base,
 frozen structural assumptions, allowed paths and verification command shapes; probes the pinned
@@ -231,7 +231,7 @@ dispatching work. Runtime-effect reconciliation remains owned by the bounded run
 
 Task work treats the source as read-only: normal operation uses the controller cache acquired
 from the TaskSpec canonical repository. Cache acquisition/refresh does write local files; preflight
-checks explicit `--repo` identity, while shared dispatch enforcement remains #61. Work happens in a disposable clone;
+and dispatch check explicit `--repo` identity. Work happens in a disposable clone;
 the controller itself creates the candidate commit from the workspace tree. The base is durably
 frozen, and recovery uses that exact base even if a source branch moves. Changed paths must remain
 inside the task's frozen allowed set for acceptance. That is not a worker sandbox. Verification
@@ -387,7 +387,9 @@ handoff before any transport. It never falls back to reference/L0. Rich mapping 
 neither approval nor this refusal enables ordinary execution or changes frozen #143/#166.
 
 `make package-check` exercises preparation, approval, intact refusal and reopen in an isolated installed
-wheel with synthetic Forgejo-shaped reads and real local Git objects. The fixture is also runnable as
+wheel with synthetic Forgejo-shaped reads and real local Git objects. It also exercises offline
+host-qualified source acquisition, an owned use lease and the shared exact local admission gate.
+The preparation fixture is also runnable as
 `uv run --locked python tools/check_prepared.py <existing-empty-native-directory>`; it creates only
 synthetic local state, not a real task or live approval. See [contract reception](docs/architecture/contracts.md#local-intake-reception)
 for the strict local declaration format and [migration](docs/architecture/migration.md#ordinary-record-compatibility).
@@ -416,10 +418,25 @@ Normal operation requires no checkout-path, Codex, or state configuration:
 
 - **Source.** Kernel acquires its own read-only controller cache from the TaskSpec canonical
   repository under `${XDG_CACHE_HOME:-~/.cache}/creatidy-kernel/source`, verifies the exact
-  canonical origin before every use, refreshes it with a bounded fetch, and fails closed if the
-  refresh fails. There is no sibling-directory or workspace-layout search; a dirty cache is refused.
-  Current foreign-entry replacement, hostless keys and lack of acquisition
-  locking are limitations under #61, not proved cleanup ownership or multi-task safety.
+  canonical origin before every new use, refreshes it with a bounded fetch, and fails closed if the
+  refresh fails. The location is `source/v2/<sha256(canonical HTTPS origin)>/<owner>/<repository>`:
+  hosts and non-default ports are distinct; explicit port 443 is equivalent to the default.
+  There is no sibling-directory or workspace-layout search; a dirty cache is refused.
+  Stable per-repository native `flock` files in `source/.locks-v2` coordinate processes and threads.
+  An acquisition/object-copy lease has a finite contention window (`source_busy`), not a lock held
+  throughout a healthy model session. Native Git children retain the same lease descriptor if the
+  controller dies while they still use the source; model sessions do not inherit it.
+  The JSON ownership marker binds canonical URL, root/location,
+  checkout/Git-directory/lock inodes and UID, with its token matched to the controller metadata
+  on the same locked inode; plain historical `1` markers are not proof.
+  Unknown/corrupt/foreign entries and interrupted unique staging trees are retained, never deleted,
+  replaced or adopted. Do not delete lock files or relabel unknown data to force readiness.
+  Explicit source overrides are read-only; their local executable Git configuration, symlinked Git
+  paths, alternate objects, linked worktrees and gitlinks/submodules are refused. Git's inert
+  no-include config listing validates the actual grammar before operational commands. No source hooks,
+  filters, fsmonitor or ambient credential helpers run. Source transport keeps TLS verification and
+  refuses redirects. A local mirror is an explicit advanced transport, not a new source identity.
+  See [source compatibility](docs/architecture/migration.md#source-cache-compatibility).
 - **Codex.** `CREATIDY_KERNEL_CODEX_BIN`/`VERSION` are optional: Kernel deterministically resolves
   the explicit override or the first `codex` on `PATH`, probes `codex --version` in the closed
   operational environment, and validates the version shape and native schema with the existing
@@ -428,6 +445,15 @@ Normal operation requires no checkout-path, Codex, or state configuration:
 - **State.** Task state defaults to `${XDG_STATE_HOME:-~/.local/state}/creatidy-kernel/task`;
   the SQLite storage-safety requirements are unchanged, and `--data-dir` remains the explicit
   override.
+
+Source leases cover local validation and copying exact objects into controller-owned bare storage
+with no hardlinks, then validate that snapshot before new thread/turn starts, including after
+blocking allocation/authorization callbacks. Explicit source owners must not move or modify their
+checkout during the copy cut; Kernel writes no lease/lockfiles there. The Path-returning acquisition
+API is an unleased compatibility handle; Python consumers use `source_use` through their own copy.
+Only supported native local Linux filesystems are accepted, using the existing storage topology
+gate. This is cooperative trusted-local-controller ownership, not hostile same-UID isolation, a
+multi-task controller proof, NFS support or an upgrade of the separate verification-only sandbox.
 
 Profiles are generic dotenv files of the same neutral runtime contract (literal `KEY=VALUE`
 values, never shell input). `--profile` values override the process environment for that

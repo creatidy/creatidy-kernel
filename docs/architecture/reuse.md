@@ -60,6 +60,36 @@ worktrees, OpenHands workspace defaults and prior CI containers were not treated
 controller/credential/socket denial receipts. Whole-worker/harness isolation and rootless OCI
 remain deferred; exact native test/configuration receipts and residual limits are in ADR 0008.
 
+## Source Ownership Mechanisms
+
+#61 retains Kernel's existing source acquisition, Forge HTTPS/ref canonicalization, bounded closed
+Git transport and native local storage topology gate. Publication follows the existing local atomic
+file/backup principle, with Linux atomic no-replace directory publication. Python standard-library
+`fcntl.flock` is a stable per-repository acquisition/current-use lease; readers and writers contend
+on the same never-unlinked inode, including independent opens in one process. No cache framework,
+discovery mechanism, shared database, dependency or product service was adopted.
+
+The existing bounded Git subprocess seam inherits only context-local source lease descriptors, so
+controller death cannot unlock an active native Git child. The normal bounded kill/wait path settles
+Git before release; failure to settle retains data. No such descriptors are passed to model sessions.
+Forced controller death with a still-active native child exercises the same real filesystem lock.
+
+Compared [Git v2.47.0 `lockfile.h`](https://github.com/git/git/blob/v2.47.0/lockfile.h) and
+[that revision's COPYING](https://github.com/git/git/blob/v2.47.0/COPYING), retrieved at the public
+version pin on 2026-10-08. Git's exclusive-create/atomic-rename lockfiles protect file writers;
+they explicitly do not block readers. That contract alone is insufficient for a source checkout's
+validation/copy lifetime. Kernel therefore keeps native `flock` coordination outside the checkout
+and releases it after the validated immutable-object copy, not after the model session. Git's
+GPL-2.0 source was inspected for behavior only: none was copied/adapted or redistributed; commercial
+utility invocation is distinct from copying GPL implementation. Existing Kernel notices still apply.
+
+Synthetic real-Git tests cover cross-host/port identity, default TLS-port equivalence, forced process
+and thread contention, incomplete publication, unique interrupted staging, ownership/inode and
+symlink refusal, local-helper non-execution and zero native starts for failed admission. The
+dependency-free installed-package smoke exercises acquisition and the same local source gate.
+Supported native local Linux mounts, trusted cooperative controllers and explicit read-only source
+owner cooperation during the snapshot cut remain limits, not NFS or hostile-worker guarantees.
+
 ## Development Workflow Adaptation
 
 Issue [#64](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/64) adapts the current local
