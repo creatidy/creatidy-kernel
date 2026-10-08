@@ -1,12 +1,13 @@
 .DEFAULT_GOAL := help
-.PHONY: help check package-check audit native-proof
+.PHONY: help check package-check audit native-proof oci-worker-proof
 
 help:
 	@printf '%s\n' 'Creatidy Kernel development' \
-	  '  make check          Locked tooling, formatting, lint, typing, boundaries, tests and secrets' \
-	  '  make package-check  Reproducible wheel/sdist and installed-package smoke checks' \
-	  '  make audit          Locked dependency advisory audit (network access required)' \
-	  '  make native-proof   Required native verification receipt (explicit pinned bwrap setup)' \
+	  '  make check            Locked tooling, formatting, lint, typing, boundaries, tests and secrets' \
+	  '  make package-check    Reproducible wheel/sdist and installed-package smoke checks' \
+	  '  make audit            Locked dependency advisory audit (network access required)' \
+	  '  make native-proof     Required native verification receipt (explicit pinned bwrap setup)' \
+	  '  make oci-worker-proof Required #78 whole-worker native receipt (CREATIDY_TEST_OCI_TOOLROOT)' \
 	  '' 'These are developer checks, not live task execution or deployment commands.'
 
 check:
@@ -28,3 +29,7 @@ audit:
 native-proof:
 	@test -n "$(CREATIDY_TEST_BWRAP_BIN)" || { printf '%s\n' 'Native boundary UNPROVED: CREATIDY_TEST_BWRAP_BIN required'; exit 1; }
 	uv run --locked pytest tests/test_bubblewrap_verification.py
+
+oci-worker-proof:
+	@test -n "$(CREATIDY_TEST_OCI_TOOLROOT)" || { printf '%s\n' 'Whole-worker isolation UNPROVED: CREATIDY_TEST_OCI_TOOLROOT required'; exit 1; }
+	uv run --locked pytest tests/test_oci_worker_isolation.py tests/test_oci_worker_authority.py
