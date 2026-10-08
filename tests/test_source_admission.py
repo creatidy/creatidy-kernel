@@ -233,6 +233,46 @@ def test_validated_snapshot_keeps_original_subject_when_source_moves(sqlite_tmp_
     assert (source / "README.md").read_text() == "changed after the immutable copy cut\n"
 
 
+@pytest.mark.parametrize("placement", ["refreshed", "nondefault", "remote-only-pin"])
+def test_dispatch_copies_exact_base_reachable_only_from_remote_refs(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, placement: str
+) -> None:
+    from creatidy_kernel.adapters import source_cache
+
+    remote = make_source(sqlite_tmp_path)
+    root = sqlite_tmp_path / "cache"
+    task = fixture_task(repeats=1)
+    if placement == "nondefault":
+        reference_git(remote, "branch", "default-other")
+        reference_git(remote, "commit", "--allow-empty", "-m", "new develop base")
+        reference_git(remote, "checkout", "default-other")
+    source = acquire_source(task.repository_url, cache_root=root, clone_from=str(remote))
+    if placement != "nondefault":
+        reference_git(remote, "commit", "--allow-empty", "-m", "refreshed develop base")
+        real_run = source_cache.run_git_bounded
+
+        def fetch(argv: list[str], cwd: Path, env: dict[str, str], timeout: int, max_bytes: int):
+            if argv[1] == "fetch":
+                argv = [argv[0], "fetch", "--prune", str(remote), "+refs/heads/*:refs/remotes/origin/*"]
+            return real_run(argv, cwd, env, timeout, max_bytes)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(source_cache, "run_git_bounded", fetch)
+            assert acquire_source(task.repository_url, cache_root=root) == source
+    base = reference_git(remote, "rev-parse", "refs/heads/develop")
+    assert reference_git(source, "rev-parse", "HEAD") != base
+    if placement == "remote-only-pin":
+        task = replace(task, expected_base_sha=base)
+    before = {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    control = sqlite_tmp_path / "control"
+    connection = FixtureConnection(deflake_edit)
+    result = run(control, source, connection, task=task)
+    assert result["condition"] == "accepted" and connection.starts == 1
+    assert cast(dict[str, object], export_task(control)["candidate"])["base"] == base
+    assert reference_git(control / "objects.git", "cat-file", "-t", base) == "commit"
+    assert before == {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+
+
 def test_source_lease_covers_copy_but_not_live_session(sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     remote = make_source(sqlite_tmp_path)
     root = sqlite_tmp_path / "cache"
@@ -240,11 +280,11 @@ def test_source_lease_covers_copy_but_not_live_session(sqlite_tmp_path: Path, mo
     original_copy = task_execution.copy_source_objects
     leased: list[bool] = []
 
-    def copy(source_path: Path, target: Path) -> None:
+    def copy(source_path: Path, target: Path, *, base: str) -> None:
         with pytest.raises(SourceAcquisitionError, match="source_busy"):
             acquire_source(fixture_task().repository_url, cache_root=root, clone_from=str(remote))
         leased.append(True)
-        original_copy(source_path, target)
+        original_copy(source_path, target, base=base)
 
     monkeypatch.setattr(task_execution, "copy_source_objects", copy)
     connection = FixtureConnection(deflake_edit)

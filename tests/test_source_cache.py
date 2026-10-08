@@ -571,6 +571,30 @@ def test_permission_and_native_mount_refusals_preserve_data(
     assert canary.read_bytes() == b"unchanged" and not (root / ".locks-v2").exists()
 
 
+@pytest.mark.parametrize("relative", [".git", ".git/objects"])
+@pytest.mark.parametrize("filesystem", ["nfs", "ext4"])
+def test_git_root_and_descendant_mounts_refuse_before_git(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: str, filesystem: str
+) -> None:
+    source = make_remote(sqlite_tmp_path / "source")
+    original_read = Path.read_text
+    table = Path("/proc/self/mountinfo")
+    simulated = original_read(table).rstrip("\n") + (
+        f"\n999999 1 0:999 / {source / relative} rw - {filesystem} synthetic:/repo rw\n"
+    )
+
+    def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        if path == table:
+            return simulated
+        return original_read(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    before = (source / ".git/config").read_bytes()
+    with pytest.raises(SourceAcquisitionError, match="checkout_unsuitable"):
+        source_cache.validate_checkout(source)
+    assert (source / ".git/config").read_bytes() == before
+
+
 @pytest.mark.parametrize("corrupt_lock", [False, True])
 def test_owned_marker_requires_the_original_locked_metadata_token(
     sqlite_tmp_path: Path,

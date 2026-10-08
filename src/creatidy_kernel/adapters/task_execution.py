@@ -765,7 +765,7 @@ def prepare_workspace(
         raise ValueError("task workspace/object paths must not be symlinks")
     if not objects.exists():
         objects.mkdir()
-        copy_source_objects(source, objects)
+        copy_source_objects(source, objects, base=base)
     validate_checkout(objects, bare=True)
     if git_text(objects, "rev-parse", "--is-bare-repository") != "true":
         raise ValueError("controller object source must be bare")

@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
 
-from creatidy_kernel.adapters.forge_refs import https_origin, repository_path
+from creatidy_kernel.adapters.forge_refs import https_origin, oid, repository_path
 from creatidy_kernel.adapters.forgejo_transport import GIT_LEASE_FDS, GIT_OUTPUT_ERRORS, run_git_bounded
 from creatidy_kernel.adapters.sqlite_store import UnsupportedSQLiteConfiguration, validate_local_storage
 from creatidy_kernel.core.forge import Reference
@@ -160,10 +160,13 @@ def validate_checkout(source: Path, *, bare: bool = False) -> None:
     _identity(source)
     gitdir = source if bare else source / ".git"
     _identity(gitdir)
+    validate_local_storage(gitdir)
     mounts = {
         line.split()[4].replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\")
         for line in Path("/proc/self/mountinfo").read_text().splitlines()
     }
+    if not bare and str(gitdir) in mounts:
+        raise _refuse(SourceCategory.CHECKOUT_UNSUITABLE)
     pending = [gitdir]
     count = 0
     device = gitdir.stat().st_dev
@@ -448,9 +451,10 @@ def source_git(source: Path, *arguments: str, max_bytes: int = MAX_GIT_OUTPUT_BY
     ).stdout
 
 
-def copy_source_objects(source: Path, target: Path) -> None:
+def copy_source_objects(source: Path, target: Path, *, base: str) -> None:
     """Copy, not hardlink, source objects using the same bounded closed Git seam."""
     validate_checkout(source)
+    oid(base)
     binary = shutil.which("git", path=os.defpath)
     if binary is None:
         raise _refuse(SourceCategory.CHECKOUT_UNSUITABLE)
@@ -462,6 +466,18 @@ def copy_source_objects(source: Path, target: Path) -> None:
         failure=SourceCategory.CLONE_FAILED,
         timeout=GIT_TIMEOUT_SECONDS,
     )
+    # A bare clone omits remote-tracking-only history. Transfer the admitted
+    # exact commit explicitly, and retain a local ref for the workspace clone.
+    _git(
+        binary,
+        target,
+        _git_environment(Path("/nonexistent"), os.defpath, None),
+        ("fetch", "--no-tags", "--no-write-fetch-head", str(source), f"+{base}:refs/heads/kernel-source-base"),
+        failure=SourceCategory.CLONE_FAILED,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if source_git(target, "rev-parse", "--verify", "refs/heads/kernel-source-base^{commit}").strip() != base:
+        raise _refuse(SourceCategory.BASE_UNAVAILABLE)
 
 
 def _publish(staging: Path, target: Path) -> None:
