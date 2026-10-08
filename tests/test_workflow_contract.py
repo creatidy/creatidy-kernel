@@ -5,6 +5,7 @@ Adapted from Model Intelligence for Kernel identity, gates and lint; see NOTICE.
 
 import re
 import unittest
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -350,7 +351,8 @@ class WorkflowContractTests(unittest.TestCase):
             "mode: subagent\n",
             'permission:\n  "*": deny\n',
             '  read:\n    "*": allow\n    "*.env*": deny\n    "*.task_progress.md": deny\n',
-            '  external_directory:\n    "/home/adrian/workspace/creatidy/creatidy-kernel-*/**": allow\n    "*": deny\n',
+            '  external_directory:\n    "/home/adrian/workspace/creatidy/creatidy-kernel/**": allow\n'
+            '    "/home/adrian/workspace/creatidy/creatidy-kernel-*/**": allow\n    "*": deny\n',
             "  edit: deny\n  write: deny\n  apply_patch: deny\n  task: deny\n",
             '  bash:\n    "*": deny\n',
         ):
@@ -378,3 +380,74 @@ class WorkflowContractTests(unittest.TestCase):
                 command = check.removeprefix("make ")
                 permission = f'{prefix} make -C /home/adrian/workspace/creatidy/creatidy-kernel-* {command}": allow'
                 self.assertIn(permission, reviewer)
+
+    def test_reviewer_read_only_allowances_cover_supported_checkout_forms(self) -> None:
+        reviewer = (ROOT / ".kilo/agents/pr-reviewer.md").read_text().split("---", 2)[1]
+        bash = reviewer.split("  bash:\n", 1)[1]
+        allowed = re.findall(r'^    "([^"\n]+)": allow$', bash, flags=re.MULTILINE)
+        git_environment = (
+            "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin "
+            "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "
+        )
+        check_environment = (
+            "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin "
+            "TMPDIR=/tmp LANG=C.UTF-8 UV_CACHE_DIR=/home/adrian/.cache/uv UV_OFFLINE=1 "
+            "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "
+        )
+        for checkout, path_pattern in (
+            ("/home/adrian/workspace/creatidy/creatidy-kernel", "/home/adrian/workspace/creatidy/creatidy-kernel"),
+            (
+                "/home/adrian/workspace/creatidy/creatidy-kernel-owner-approved-isolation",
+                "/home/adrian/workspace/creatidy/creatidy-kernel-*",
+            ),
+        ):
+            commands = [
+                f"git -C {checkout} {operation}"
+                for operation in (
+                    "remote -v",
+                    "status --short",
+                    "rev-parse HEAD",
+                    "merge-base HEAD origin/develop",
+                    "log -1",
+                    "show HEAD",
+                    "diff BASE HEAD",
+                    "ls-tree HEAD",
+                )
+            ]
+            commands += [
+                f"{git_environment}git -C {checkout} ls-remote "
+                f"https://forgejo.creatidy.com/Creatidy/creatidy-kernel{suffix} "
+                "refs/heads/develop refs/heads/issue-67-reviewer-checkout"
+                for suffix in ("", ".git")
+            ]
+            commands += [f"{check_environment}make -C {checkout} {gate}" for gate in ("check", "package-check")]
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertTrue(any(fnmatchcase(command, pattern) for pattern in allowed))
+            self.assertIn(f'"{path_pattern}/**": allow', reviewer)
+            for operation in ("fetch origin", "checkout develop", "commit -m change", "push origin develop"):
+                self.assertFalse(any(fnmatchcase(f"git -C {checkout} {operation}", pattern) for pattern in allowed))
+        self.assertFalse(
+            any(
+                fnmatchcase("git -C /home/adrian/workspace/creatidy/model-intelligence status --short", pattern)
+                for pattern in allowed
+            )
+        )
+        for denial in (
+            '"*--output*": deny',
+            '"*--ext-diff*": deny',
+            '"*--textconv*": deny',
+            '"*>*": deny',
+            '"*|*": deny',
+            '"*;*": deny',
+            '"*&*": deny',
+        ):
+            self.assertIn(denial, bash)
+
+    def test_shared_commands_use_inherited_reviewer_binding(self) -> None:
+        reviewer = (ROOT / ".kilo/agents/pr-reviewer.md").read_text().split("---", 2)[1]
+        self.assertNotRegex(reviewer, r"(?m)^model:|^variant:")
+        review = text(".kilo/command/review-pr.md")
+        self.assertIn("inheritance and explicit owner override policy", review)
+        for path in (ROOT / ".kilo/command").glob("*.md"):
+            self.assertNotRegex(path.read_text(), r"GPT-6\.1 Sol High selection")

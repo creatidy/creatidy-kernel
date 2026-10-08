@@ -12,6 +12,7 @@ permission:
   list: allow
   semantic_search: allow
   external_directory:
+    "/home/adrian/workspace/creatidy/creatidy-kernel/**": allow
     "/home/adrian/workspace/creatidy/creatidy-kernel-*/**": allow
     "*": deny
   edit: deny
@@ -24,6 +25,18 @@ permission:
   web-reader_webReader: allow
   bash:
     "*": deny
+    "git -C /home/adrian/workspace/creatidy/creatidy-kernel remote -v": allow
+    "git -C /home/adrian/workspace/creatidy/creatidy-kernel status --short": allow
+    "git -C /home/adrian/workspace/creatidy/creatidy-kernel rev-parse *": allow
+    "git -C /home/adrian/workspace/creatidy/creatidy-kernel merge-base *": allow
+    "git -C /home/adrian/workspace/creatidy/creatidy-kernel log *": allow
+    "git -C /home/adrian/workspace/creatidy/creatidy-kernel show *": allow
+    "git -C /home/adrian/workspace/creatidy/creatidy-kernel diff *": allow
+    "git -C /home/adrian/workspace/creatidy/creatidy-kernel ls-tree *": allow
+    "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C /home/adrian/workspace/creatidy/creatidy-kernel ls-remote https://forgejo.creatidy.com/Creatidy/creatidy-kernel refs/heads/develop refs/heads/*": allow
+    "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C /home/adrian/workspace/creatidy/creatidy-kernel ls-remote https://forgejo.creatidy.com/Creatidy/creatidy-kernel.git refs/heads/develop refs/heads/*": allow
+    "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin TMPDIR=/tmp LANG=C.UTF-8 UV_CACHE_DIR=/home/adrian/.cache/uv UV_OFFLINE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 make -C /home/adrian/workspace/creatidy/creatidy-kernel check": allow
+    "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin TMPDIR=/tmp LANG=C.UTF-8 UV_CACHE_DIR=/home/adrian/.cache/uv UV_OFFLINE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 make -C /home/adrian/workspace/creatidy/creatidy-kernel package-check": allow
     "git -C /home/adrian/workspace/creatidy/creatidy-kernel-* remote -v": allow
     "git -C /home/adrian/workspace/creatidy/creatidy-kernel-* status --short": allow
     "git -C /home/adrian/workspace/creatidy/creatidy-kernel-* rev-parse *": allow
