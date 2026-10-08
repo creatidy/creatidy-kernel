@@ -734,6 +734,8 @@ def prepare_workspace(
     The owner's checkout is only read (clone source, ref resolution). The workspace
     and bare object source are controller-owned clones; no canonical branch moves.
     """
+    if attempt_exists and not (directory / "objects.git").exists():
+        raise ValueError("original controller objects unavailable")
     if not (directory / "objects.git").exists() and (
         source.is_symlink() or not source.is_dir() or not (source / ".git").exists()
     ):

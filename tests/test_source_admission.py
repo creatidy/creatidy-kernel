@@ -451,6 +451,42 @@ def test_original_source_loader_never_reacquires_or_renews_terminal_work(
     assert export_task(control) == before
 
 
+@pytest.mark.parametrize("prepared", [False, True])
+def test_existing_attempt_refuses_missing_original_objects_without_copy_or_start(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prepared: bool
+) -> None:
+    task = fixture_task(repeats=1)
+    remote = make_source(sqlite_tmp_path)
+    source = acquire_source(task.repository_url, cache_root=sqlite_tmp_path / "cache", clone_from=str(remote))
+    control = sqlite_tmp_path / "control"
+    connection = FixtureConnection(deflake_edit)
+    connection.status = "inProgress"
+    if prepared:
+        with pytest.raises(task_execution.TaskInterrupted):
+            run(control, source, connection, task=task, fault="prepared")
+        assert connection.starts == 0
+    else:
+        assert run(control, source, connection, task=task)["condition"] in {"running", "waiting"}
+        assert connection.starts == 1
+    (control / "objects.git").rename(control / "retained-original-objects.git")
+    reference_git(source, "remote", "set-url", "origin", "https://other.invalid/Owner/repo")
+    before = export_task(control)
+    original_copy = task_execution.copy_source_objects
+    copied: list[Path] = []
+
+    def copy(source_path: Path, target: Path, *, base: str) -> None:
+        copied.append(source_path)
+        original_copy(source_path, target, base=base)
+
+    monkeypatch.setattr(task_execution, "copy_source_objects", copy)
+    recovered = FixtureConnection(deflake_edit)
+    recovered.status = "inProgress"
+    with pytest.raises(ValueError, match="original controller objects unavailable"):
+        run(control, source, recovered, task=task)
+    assert copied == [] and recovered.starts == 0 and not (control / "objects.git").exists()
+    assert export_task(control) == before
+
+
 @pytest.mark.parametrize("task_id", ["143", "166"])
 def test_historical_hostless_source_and_frozen_identity_survive_expired_recovery(
     sqlite_tmp_path: Path,
