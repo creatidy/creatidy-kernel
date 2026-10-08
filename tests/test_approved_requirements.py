@@ -529,6 +529,55 @@ def test_near_bound_declaration_has_identical_authenticated_evidence_outcome(aut
         )
 
 
+@pytest.mark.parametrize("authenticated,credential_in_policy", [(False, False), (True, False), (True, True)])
+def test_large_real_approval_decision_uses_intake_decoder(
+    sqlite_tmp_path: Path, authenticated: bool, credential_in_policy: bool
+) -> None:
+    token = "synthetic-bearer-credential"  # noqa: S105 - deliberately synthetic.
+    scenario = Scenario()
+    trusted = replace(
+        policy(),
+        paths=policy().paths
+        | frozenset(f"src/approved_component_{index:05d}.py" for index in range(10000))
+        | (frozenset({f"src/{token}.py"}) if credential_in_policy else frozenset()),
+    )
+    with SQLiteProgramStore(sqlite_tmp_path / "large-policy.db") as store:
+        intake = OrdinaryIntake(store, scenario.reader, lambda: 100)
+        draft = intake.prepare(
+            "large", SUBJECT, declaration(**requirement_markers(CODING), context=[]), expected_parent=None
+        )
+        approved = intake.approve(OWNER, draft, trusted, decision_id="large", expires_at=200)
+        original = approved.decision_bytes
+        assert len(original) > 262144
+        with server(encode(response(CODING))) as (origin, requests):
+            allocator = ScarcityRouterAllocator(
+                origin, (BINDING,), runtime_support=(SUPPORT,), api_key=token if authenticated else None
+            )
+            if credential_in_policy:
+                with pytest.raises(ScarcityRouterUnavailable) as caught:
+                    intake.select(OWNER, approved, trusted, allocator)
+                assert caught.value.category is RouterFailureCategory.REQUEST_UNSUPPORTED
+                assert caught.value.decision_provenance is None and requests == []
+            else:
+                result = intake.select(OWNER, approved, trusted, allocator)
+                assert isinstance(result, Allocation) and result.requirements_provenance is not None
+                assert len(requests) == 1
+                assert json.loads(result.requirements_provenance)["decision_bytes"] == original.decode()
+        assert intake.historical_decision("large") == original
+
+
+def test_invalid_local_approval_encoding_has_typed_safe_refusal() -> None:
+    token = "synthetic-bearer-credential"  # noqa: S105 - deliberately synthetic.
+    subject = replace(handoff(), decision_bytes=b"not a valid approval encoding")
+    with server(encode(response(CODING))) as (origin, requests):
+        with pytest.raises(ScarcityRouterUnavailable) as caught:
+            ScarcityRouterAllocator(origin, (BINDING,), runtime_support=(SUPPORT,), api_key=token).select(
+                translated(subject)
+            )
+        assert caught.value.category is RouterFailureCategory.REQUEST_UNSUPPORTED
+        assert caught.value.decision_provenance is None and requests == []
+
+
 def test_producer_null_false_normalization_preserves_original_bytes() -> None:
     requirement: dict[str, object] = {
         "task_level": "L2",

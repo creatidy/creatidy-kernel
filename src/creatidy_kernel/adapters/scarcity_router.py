@@ -30,7 +30,7 @@ from time import monotonic
 from typing import cast
 from urllib.parse import urlsplit
 
-from creatidy_kernel.core.intake import RequirementsHandoff, TranslationRefusal
+from creatidy_kernel.core.intake import RequirementsHandoff, TranslationRefusal, object_from
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.ports.resources import ResourceAllocator
 
@@ -682,10 +682,18 @@ class ScarcityRouterAllocator(ResourceAllocator):
                     "ordinary requirements incompatible with configured harness",
                     category=RouterFailureCategory.SELECTION_INCOMPATIBLE,
                 )
+            try:
+                decision_value = object_from(ordinary.decision_bytes)
+            except ValueError:
+                decision_value = None
+            if decision_value is None:
+                raise ScarcityRouterUnavailable(
+                    "ordinary approval encoding invalid", category=RouterFailureCategory.REQUEST_UNSUPPORTED
+                )
             if self.api_key is not None and (
                 _contains_credential(ordinary.draft.payload(), self.api_key)
                 or _contains_credential(ordinary.draft.declaration.value, self.api_key)
-                or _contains_credential(_parse(ordinary.decision_bytes), self.api_key)
+                or _contains_credential(decision_value, self.api_key)
                 or _contains_credential(wire, self.api_key)
                 or _contains_credential(interface, self.api_key)
             ):
