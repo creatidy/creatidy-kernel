@@ -814,6 +814,52 @@ class TestCollectionSafety:
         assert len(collection.refusals) == 1
         assert "entry-budget-exhausted" in collection.refusals.values()
 
+    def test_read_bound_holds_when_file_grows_after_open(self, tmp_path: Path) -> None:
+        from tools.codex_oci_proof import collect as collect_module
+
+        grown = tmp_path / "grows.bin"
+        grown.write_bytes(b"x" * 4096)  # fstat saw a small file; the read then finds more
+        fd = os.open(grown, os.O_RDONLY)
+        try:
+            assert collect_module.read_bounded_fd(fd, 0, 1024) is None
+            os.lseek(fd, 0, os.SEEK_SET)
+            assert collect_module.read_bounded_fd(fd, 4096, 8192) == b"x" * 4096
+            os.lseek(fd, 0, os.SEEK_SET)
+            assert collect_module.read_bounded_fd(fd, 8193, 8192) is None
+        finally:
+            os.close(fd)
+        from tools.codex_oci_proof.collect import read_bounded_regular
+
+        with pytest.raises(ValueError, match="read bound"):
+            read_bounded_regular(grown, limit=1024)
+
+    def test_traversal_depth_and_directory_budget_are_bounded(self, tmp_path: Path) -> None:
+        from tools.codex_oci_proof import collect as collect_module
+        from tools.codex_oci_proof.collect import collect_directory
+
+        deep = tmp_path / "deep-root"
+        current = deep
+        deep.mkdir(parents=True)
+        for _ in range(collect_module.MAX_DEPTH + 10):
+            current = current / "down"
+            current.mkdir()
+        (current / "bottom.txt").write_bytes(b"beyond the cap")
+        collection = collect_directory(deep)
+        assert "max-depth-exceeded" in collection.refusals.values()
+        assert all(not path.endswith("bottom.txt") for path in collection.files)
+
+        wide = tmp_path / "wide-root"
+        wide.mkdir()
+        for index in range(1500):
+            directory = wide / f"d{index:04d}"
+            directory.mkdir()
+            (directory / "inner.txt").write_bytes(b"x")
+            (wide / f"t{index:04d}.txt").write_bytes(b"x")
+        collection = collect_directory(wide)
+        assert collection.consumed <= collect_module.MAX_ENTRIES
+        assert len(collection.files) + len(collection.refusals) <= collect_module.MAX_ENTRIES
+        assert "entry-budget-exhausted" in collection.refusals.values()
+
     def test_bounded_regular_reader_refuses_symlink_and_oversize(self, tmp_path: Path) -> None:
         from tools.codex_oci_proof.collect import read_bounded_regular
 

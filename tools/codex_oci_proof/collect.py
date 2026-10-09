@@ -24,6 +24,7 @@ from pathlib import Path
 
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_ENTRIES = 4096
+MAX_DEPTH = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,10 +38,15 @@ class CollectedFile:
 
 @dataclass(slots=True)
 class SafeCollection:
-    """Collected regular files plus recorded refusals; refusals are failures, not skips."""
+    """Collected regular files plus recorded refusals; refusals are failures, not skips.
+
+    ``consumed`` counts every entry the traversal spent budget on (files, refusals and
+    descended directories), so traversal work — not only output size — is bounded.
+    """
 
     files: dict[str, CollectedFile] = field(default_factory=dict)
     refusals: dict[str, str] = field(default_factory=dict)
+    consumed: int = 0
 
     def digests(self) -> set[str]:
         return {record.sha256 for record in self.files.values()}
@@ -55,66 +61,99 @@ def _walk(
     dir_fd: int,
     prefix: str,
     exclude: frozenset[str],
+    depth: int,
     out: SafeCollection,
     sink: Callable[[str, bytes, CollectedFile], None] | None,
 ) -> None:
-    if len(out.files) + len(out.refusals) >= MAX_ENTRIES:
+    if out.consumed >= MAX_ENTRIES:
         out.refusals[prefix or "."] = "entry-budget-exhausted"
         return
-    for name in sorted(os.listdir(dir_fd)):
-        relative = prefix + name
-        if len(out.files) + len(out.refusals) >= MAX_ENTRIES:
-            out.refusals[relative] = "entry-budget-exhausted"
-            return
-        if prefix == "" and name in exclude:
-            continue  # collected separately under its own explicit root
+    if depth > MAX_DEPTH:
+        out.refusals[prefix or "."] = "max-depth-exceeded"
+        return
+    # scandir streams entries incrementally: a multi-million-entry directory cannot
+    # inflate controller memory before the entry budget stops the traversal.
+    with os.scandir(dir_fd) as entries:
+        for entry in entries:
+            if _walk_entry(dir_fd, entry.name, prefix, exclude, depth, out, sink):
+                return
+            if out.consumed >= MAX_ENTRIES:
+                out.refusals[prefix or "."] = "entry-budget-exhausted"
+                return
+
+
+def _walk_entry(
+    dir_fd: int,
+    name: str,
+    prefix: str,
+    exclude: frozenset[str],
+    depth: int,
+    out: SafeCollection,
+    sink: Callable[[str, bytes, CollectedFile], None] | None,
+) -> bool:
+    """Classify and handle one directory entry; True means the budget stopped the walk."""
+    if out.consumed >= MAX_ENTRIES:
+        out.refusals[prefix + name] = "entry-budget-exhausted"
+        return True
+    relative = prefix + name
+    if depth == 0 and name in exclude:
+        return False  # collected separately under its own explicit root
+    out.consumed += 1
+    try:
+        st = os.lstat(name, dir_fd=dir_fd)
+    except OSError as error:
+        out.refusals[relative] = f"lstat-denied:{_errno_label(error)}"
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        out.refusals[relative] = "symlink-refused"
+        return False
+    if stat.S_ISDIR(st.st_mode):
+        out.consumed += 1  # descending into a directory spends traversal budget too
         try:
-            st = os.lstat(name, dir_fd=dir_fd)
+            sub_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
         except OSError as error:
-            out.refusals[relative] = f"lstat-denied:{_errno_label(error)}"
-            continue
-        if stat.S_ISLNK(st.st_mode):
-            out.refusals[relative] = "symlink-refused"
-            continue
-        if stat.S_ISDIR(st.st_mode):
-            try:
-                sub_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
-            except OSError as error:
-                # ELOOP here means a directory entry was swapped to a symlink after lstat.
-                out.refusals[relative] = f"dir-open-denied:{_errno_label(error)}"
-                continue
-            try:
-                _walk(sub_fd, relative + "/", exclude, out, sink)
-            finally:
-                os.close(sub_fd)
-            continue
-        if not stat.S_ISREG(st.st_mode):
-            out.refusals[relative] = "not-regular-file"
-            continue
+            # ELOOP here means a directory entry was swapped to a symlink after lstat.
+            out.refusals[relative] = f"dir-open-denied:{_errno_label(error)}"
+            return False
         try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
-        except OSError as error:
-            out.refusals[relative] = f"open-denied:{_errno_label(error)}"
-            continue
-        try:
-            opened = os.fstat(fd)  # authoritative for the object this descriptor reads
-            if not stat.S_ISREG(opened.st_mode):
-                out.refusals[relative] = "not-regular-file"
-                continue
-            data = _read_bounded(fd, opened)
+            _walk(sub_fd, relative + "/", exclude, depth + 1, out, sink)
         finally:
-            os.close(fd)
-        if data is None:
-            out.refusals[relative] = "file-exceeds-size-bound"
-            continue
-        record = CollectedFile(relative, len(data), hashlib.sha256(data).hexdigest())
-        if sink is not None:
-            sink(relative, data, record)  # exact bytes delivered while still trusted in memory
-        out.files[relative] = record
+            os.close(sub_fd)
+        return out.consumed >= MAX_ENTRIES
+    if not stat.S_ISREG(st.st_mode):
+        out.refusals[relative] = "not-regular-file"
+        return False
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except OSError as error:
+        out.refusals[relative] = f"open-denied:{_errno_label(error)}"
+        return False
+    try:
+        opened = os.fstat(fd)  # authoritative for the object this descriptor reads
+        if not stat.S_ISREG(opened.st_mode):
+            out.refusals[relative] = "not-regular-file"
+            return False
+        data = read_bounded_fd(fd, opened.st_size, MAX_FILE_BYTES)
+    finally:
+        os.close(fd)
+    if data is None:
+        out.refusals[relative] = "file-exceeds-size-bound"
+        return False
+    record = CollectedFile(relative, len(data), hashlib.sha256(data).hexdigest())
+    if sink is not None:
+        sink(relative, data, record)  # exact bytes delivered while still trusted in memory
+    out.files[relative] = record
+    return False
 
 
-def _read_bounded(fd: int, opened: os.stat_result) -> bytes | None:
-    if opened.st_size > MAX_FILE_BYTES:
+def read_bounded_fd(fd: int, declared_size: int, limit: int) -> bytes | None:
+    """Read at most ``limit`` bytes from an already-pinned descriptor.
+
+    The pre-check bounds the declared (fstat) size and the loop bounds the actual read,
+    so a file that grows after ``fstat`` — the concurrent-growth race on a live worker's
+    file — is still refused instead of over-reading. ``None`` means the bound was hit.
+    """
+    if declared_size > limit:
         return None
     chunks: list[bytes] = []
     total = 0
@@ -123,7 +162,7 @@ def _read_bounded(fd: int, opened: os.stat_result) -> bytes | None:
         if not chunk:
             break
         total += len(chunk)
-        if total > MAX_FILE_BYTES:
+        if total > limit:
             return None
         chunks.append(chunk)
     return b"".join(chunks)
@@ -155,7 +194,7 @@ def collect_directory(
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         out = SafeCollection()
-        _walk(root_fd, "", exclude, out, sink)
+        _walk(root_fd, "", exclude, 0, out, sink)
         return out
     finally:
         os.close(root_fd)
@@ -177,13 +216,11 @@ def read_bounded_regular(path: Path, limit: int = 1024 * 1024) -> bytes:
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode):
             raise ValueError(f"worker-controlled path is not a regular file: {path}")
-        if opened.st_size > limit:
-            raise ValueError(f"worker-controlled path exceeds the read bound: {path}")
-        data = _read_bounded(fd, opened)
+        data = read_bounded_fd(fd, opened.st_size, limit)
     finally:
         os.close(fd)
     if data is None:
-        raise ValueError(f"worker-controlled path grew beyond the read bound: {path}")
+        raise ValueError(f"worker-controlled path exceeds or grew beyond the read bound: {path}")
     return data
 
 
@@ -217,11 +254,13 @@ def sha256_file(path: Path) -> str:
 
 
 __all__ = [
+    "MAX_DEPTH",
     "MAX_ENTRIES",
     "MAX_FILE_BYTES",
     "CollectedFile",
     "SafeCollection",
     "collect_directory",
+    "read_bounded_fd",
     "read_bounded_regular",
     "sha256_file",
     "stored_bytes_sink",
