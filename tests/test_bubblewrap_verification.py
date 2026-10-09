@@ -1218,6 +1218,10 @@ def _structural_verifier(tmp_path: Path) -> BubblewrapVerifier:
     )
 
 
+@pytest.mark.skipif(
+    os.getuid() == 0,
+    reason="the unprivileged composition refuses root before these receipts; honest skip, not a pass",
+)
 @pytest.mark.parametrize("reported", (b"bubblewrap 0.11.0", b"bubblewrap 0.13.0-fake", b"Bubblewrap 0.13.0"))
 def test_unsupported_or_fake_native_version_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reported: bytes
@@ -1238,6 +1242,10 @@ def test_unsupported_or_fake_native_version_refuses(
         verifier.run(exact, snapshot)
 
 
+@pytest.mark.skipif(
+    os.getuid() == 0,
+    reason="the unprivileged composition refuses root before these receipts; honest skip, not a pass",
+)
 @pytest.mark.parametrize("unsafe", ("group-writable", "world-writable", "symlinked", "not-directory"))
 def test_unsafe_scratch_tree_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe: str) -> None:
     scratch = tmp_path / "unsafe-scratch"
@@ -1267,6 +1275,10 @@ def test_unsafe_scratch_tree_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyP
         verifier.run(exact, snapshot)
 
 
+@pytest.mark.skipif(
+    os.getuid() == 0,
+    reason="the unprivileged composition refuses root before this receipt; honest skip, not a pass",
+)
 def test_fixed_invocation_keeps_fail_closed_setup_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin the composed invocation to the fail-closed profile: no fail-open
     --not-a-security-boundary mode, no weaker -try namespace variants, no host
@@ -1324,3 +1336,24 @@ def test_fixed_invocation_keeps_fail_closed_setup_profile(tmp_path: Path, monkey
     assert "--not-a-security-boundary" not in argv
     assert not any(argument.endswith("-try") for argument in argv)
     assert "--dev-bind" not in argv
+
+
+def test_root_runtime_refuses_before_any_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The unprivileged profile must refuse a root runtime before any launch.
+
+    Deterministic on every runner: the platform gate is exercised with a
+    synthesized root uid, so a root CI runner receives a positive refusal
+    receipt instead of eight unrelated failures.
+    """
+    verifier = _structural_verifier(tmp_path)
+    snapshot = VerificationSnapshot(())
+    exact = invocation(verifier.resources, snapshot)
+
+    def no_launch(*args: object, **kwargs: object) -> None:
+        pytest.fail("candidate launched from a refused root runtime")
+
+    monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification.os.getuid", lambda: 0)
+    monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification.subprocess.run", no_launch)
+    monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification.subprocess.Popen", no_launch)
+    with pytest.raises(VerificationRefused, match="platform_unsupported"):
+        verifier.run(exact, snapshot)
