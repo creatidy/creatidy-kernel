@@ -215,6 +215,30 @@ class TestNativeLifecycle:
         assert self_observations["NoNewPrivs"] == "1"
         assert self_observations["Seccomp"] == "2"
         assert len(self_observations["uid_map"].split()) == 3, self_observations["uid_map"]
+        # Closed environment: exactly the controller allowlist plus the runtime-injected
+        # container basics. A new name means the boundary env closure changed; update the
+        # pin deliberately with evidence, never by widening silently.
+        expected_env = {
+            "PATH",
+            "PYTHONHOME",
+            "LD_LIBRARY_PATH",
+            "LANG",
+            "LC_ALL",
+            "ATTEMPT_ID",
+            "HOME",
+            "TMPDIR",
+            "SHELL",
+            "CODEX_HOME",
+        }
+        runtime_injected = {"HOSTNAME", "PWD", "SHLVL", "container"}
+        observed_env = set(self_observations["env_names"])
+        assert observed_env == expected_env | runtime_injected, (
+            observed_env - (expected_env | runtime_injected),
+            (expected_env | runtime_injected) - observed_env,
+        )
+        # The cgroup bounds travel with the attempt (default budget 256 pids / 1 GiB).
+        assert self_observations["cgroup_pids_max"] == "256", self_observations["cgroup_pids_max"]
+        assert self_observations["cgroup_memory_max"] == "1073741824", self_observations["cgroup_memory_max"]
         # Native thread/turn lifecycle is durable in the synthetic CODEX_HOME rollout record.
         rollouts = list((attempt.resources.codex_home / "sessions").rglob("rollout-*.jsonl"))
         assert rollouts, "native session rollout missing from synthetic CODEX_HOME"
@@ -389,7 +413,8 @@ class TestHostBoundaryDenial:
                     " echo rc=$? >> /workspace/fs-probe-canary.txt"
                 ),
                 exec_step(
-                    "ls /home/adrian > /workspace/fs-probe-home.txt 2>&1; echo rc=$? >> /workspace/fs-probe-home.txt"
+                    "ls /home/unmounted-probe > /workspace/fs-probe-home.txt 2>&1;"
+                    " echo rc=$? >> /workspace/fs-probe-home.txt"
                 ),
                 exec_step("/toolchain/bin/python3.12 /workspace/network-probe.py"),
                 final_step("denial turn complete"),

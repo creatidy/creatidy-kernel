@@ -4,7 +4,9 @@
 Implements exactly the OpenAI Responses wire shape the pinned app-server consumes: one
 ``POST /v1/responses`` SSE stream per model request, with ``function_call`` items answered by
 the app-server's native tool execution and a terminal ``message`` item. The scenario is
-controller-authored and mounted read-only; the mock never invents network destinations and
+controller-authored and written into the disposable writable workspace before launch
+(the read-only mount covers only this module's source); the mock never invents network
+destinations and
 binds only the container-internal loopback. Its records (native tool inventory, request
 trail, scenario progress) are evidence, written into the disposable workspace.
 """
