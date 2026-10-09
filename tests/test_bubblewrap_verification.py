@@ -1187,13 +1187,20 @@ def test_native_setup_time_escape_has_no_host_canary_effect(
 
 
 def _structural_verifier(tmp_path: Path) -> BubblewrapVerifier:
-    """Offline verifier fixtures: synthetic provenance files, one valid resource."""
+    """Offline verifier fixtures: synthetic provenance files, one valid resource.
+
+    Explicit 0644 modes keep the fixtures acceptable topology regardless of the
+    invoking umask; a group-writable resource must refuse, not fail these tests.
+    """
     binary = tmp_path / "bwrap-fixture"
     binary.write_bytes(b"synthetic pinned utility bytes")
+    binary.chmod(0o644)
     library = tmp_path / "libseccomp-fixture"
     library.write_bytes(b"synthetic seccomp library bytes")
+    library.chmod(0o644)
     resource = tmp_path / "toolchain-file"
     resource.write_bytes(b"synthetic trusted resource")
+    resource.chmod(0o644)
     scratch = tmp_path / "scratch"
     scratch.mkdir(mode=0o700)
     return BubblewrapVerifier(
