@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help check package-check audit native-proof oci-worker-proof
+.PHONY: help check package-check audit native-proof oci-worker-proof codex-oci-proof
 
 help:
 	@printf '%s\n' 'Creatidy Kernel development' \
@@ -8,6 +8,7 @@ help:
 	  '  make audit            Locked dependency advisory audit (network access required)' \
 	  '  make native-proof     Required native verification receipt (explicit pinned bwrap setup)' \
 	  '  make oci-worker-proof Required #78 whole-worker native receipt (CREATIDY_TEST_OCI_TOOLROOT)' \
+	  '  make codex-oci-proof  Required #53 real-Codex whole-worker native receipt (toolroot + CREATIDY_TEST_CODEX_BIN)' \
 	  '' 'These are developer checks, not live task execution or deployment commands.'
 
 check:
@@ -33,3 +34,7 @@ native-proof:
 oci-worker-proof:
 	@test -n "$(CREATIDY_TEST_OCI_TOOLROOT)" || { printf '%s\n' 'Whole-worker isolation UNPROVED: CREATIDY_TEST_OCI_TOOLROOT required'; exit 1; }
 	uv run --locked pytest tests/test_oci_worker_isolation.py tests/test_oci_worker_authority.py
+
+codex-oci-proof:
+	@test -n "$(CREATIDY_TEST_OCI_TOOLROOT)" || { printf '%s\n' 'Real-Codex worker isolation UNPROVED: CREATIDY_TEST_OCI_TOOLROOT required'; exit 1; }
+	uv run --locked pytest tests/test_codex_oci_isolation.py
