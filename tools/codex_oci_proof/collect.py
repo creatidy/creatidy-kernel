@@ -78,7 +78,7 @@ def _walk(
             continue
         if stat.S_ISDIR(st.st_mode):
             try:
-                sub_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+                sub_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
             except OSError as error:
                 # ELOOP here means a directory entry was swapped to a symlink after lstat.
                 out.refusals[relative] = f"dir-open-denied:{_errno_label(error)}"
@@ -92,7 +92,7 @@ def _walk(
             out.refusals[relative] = "not-regular-file"
             continue
         try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
         except OSError as error:
             out.refusals[relative] = f"open-denied:{_errno_label(error)}"
             continue
@@ -170,7 +170,9 @@ def read_bounded_regular(path: Path, limit: int = 1024 * 1024) -> bytes:
     st = os.lstat(path)
     if stat.S_ISLNK(st.st_mode):
         raise ValueError(f"refusing symlinked worker-controlled path: {path}")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    # O_NONBLOCK: a swapped-in FIFO cannot block the open; the fstat S_ISREG check below
+    # refuses non-regular objects regardless, and O_NONBLOCK is a no-op for regular reads.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode):

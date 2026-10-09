@@ -369,8 +369,10 @@ class CodexAttempt:
         path = self.resources.workspace / "worker-observations.json"
         try:
             data = read_bounded_regular(path)
-        except (FileNotFoundError, ValueError):
-            return {}
+        except FileNotFoundError:
+            return {}  # pre-exec observations were never written: recorded as absence only
+        # Any other refusal (planted symlink, non-regular replacement, oversized or
+        # growing file) raises: worker tampering with the evidence path stays visible.
         return cast(dict[str, Any], json.loads(data.decode()))
 
     def close(self) -> None:

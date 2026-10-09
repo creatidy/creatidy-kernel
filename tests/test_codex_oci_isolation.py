@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import signal
+import stat
 import subprocess  # noqa: S603 - every call below uses fixed synthetic argv, no shell.
 import sys
 import time
@@ -156,6 +157,57 @@ def _proc_cmdline(pid: int) -> str:
         return ""
 
 
+def _read_worker_file(attempt: CodexAttempt, relative: str) -> bytes:
+    """Fail-closed read of one worker-controlled workspace file (test evidence plumbing).
+
+    The worker controls every entry of its writable workspace, so test-side reads use the
+    same trust boundary as collection: no symlink following, regular files only, bounded.
+    """
+    from tools.codex_oci_proof.collect import read_bounded_regular
+
+    return read_bounded_regular(attempt.resources.workspace / relative)
+
+
+def _worker_file_text(attempt: CodexAttempt, relative: str) -> str:
+    return _read_worker_file(attempt, relative).decode()
+
+
+def _wait_for_worker_file(attempt: CodexAttempt, relative: str, timeout: float = 30.0) -> bool:
+    """Wait until the entry exists as a regular file (lstat: symlinks never count)."""
+    deadline = time.monotonic() + timeout
+    target = attempt.resources.workspace / relative
+    while time.monotonic() < deadline:
+        try:
+            if stat.S_ISREG(os.lstat(target).st_mode):
+                return True
+        except OSError:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def _worker_file_size(attempt: CodexAttempt, relative: str) -> int | None:
+    try:
+        st = os.lstat(attempt.resources.workspace / relative)
+    except OSError:
+        return None
+    return st.st_size if stat.S_ISREG(st.st_mode) else None
+
+
+def _rollout_texts(attempt: CodexAttempt) -> list[str]:
+    """Fail-closed discovery+read of native session rollouts under the worker-controlled
+    codex-home: the collector enumerates (never following symlinks), the bounded reader
+    reads; both refuse rather than follow planted links."""
+    from tools.codex_oci_proof.collect import collect_directory, read_bounded_regular
+
+    collected = collect_directory(attempt.resources.codex_home)
+    texts: list[str] = []
+    for relative in sorted(collected.files):
+        if relative.startswith("sessions/") and "rollout-" in relative and relative.endswith(".jsonl"):
+            texts.append(read_bounded_regular(attempt.resources.codex_home / relative).decode())
+    return texts
+
+
 def _command_execution_items(attempt: CodexAttempt) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for notification in attempt.notifications:
@@ -260,11 +312,10 @@ class TestNativeLifecycle:
                 forbidden = PurePosixPath(prefix)
                 assert point != forbidden and forbidden not in point.parents, f"forbidden mount leaked: {line}"
         # Native thread/turn lifecycle is durable in the synthetic CODEX_HOME rollout record.
-        rollouts = list((attempt.resources.codex_home / "sessions").rglob("rollout-*.jsonl"))
+        rollouts = _rollout_texts(attempt)
         assert rollouts, "native session rollout missing from synthetic CODEX_HOME"
-        rollout_text = rollouts[0].read_text()
-        assert thread_id in rollout_text
-        assert (attempt.resources.workspace / "exec-marker.txt").read_text() == "written-in-boundary"
+        assert thread_id in rollouts[0]
+        assert _worker_file_text(attempt, "exec-marker.txt") == "written-in-boundary"
         attempt.dump_native_evidence(tmp_path / "evidence-lifecycle.json")
 
 
@@ -292,7 +343,7 @@ with open(f"/workspace/relay-{request_id}.json", "w") as handle:
 
 
 def _workspace_json(attempt: CodexAttempt, name: str) -> dict[str, Any]:
-    return json.loads((attempt.resources.workspace / name).read_text())
+    return json.loads(_read_worker_file(attempt, name))
 
 
 class TestWorkspaceTool:
@@ -314,9 +365,8 @@ class TestWorkspaceTool:
         attempt.thread_start()
         turn_id = attempt.start_turn("perform the synthetic workspace operation")
         assert attempt.wait_turn(turn_id) == "completed", attempt.turns[turn_id].statuses_seen
-        candidate = attempt.resources.workspace / "candidate-copy.txt"
-        assert candidate.read_text() == "seeded-synthetic-source\ntool-appended"
-        assert (attempt.resources.workspace / "source-input.txt").read_text() == "seeded-synthetic-source\n"
+        assert _worker_file_text(attempt, "candidate-copy.txt") == "seeded-synthetic-source\ntool-appended"
+        assert _worker_file_text(attempt, "source-input.txt") == "seeded-synthetic-source\n"
         # The read-only rootfs refused the native write outside the candidate workspace:
         # the observed command output carries the EROFS failure text, not a bare nonzero rc
         # (the container is gone after the run, so /bin itself can only be asserted inside).
@@ -357,10 +407,7 @@ class TestNativeTerminalAndSettlement:
             marker = f"KERNEL53-DESC-{attempt.attempt}"
             attempt.thread_start()
             turn_id = attempt.start_turn("spawn the descendant then hold the turn")
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline and not (attempt.resources.workspace / "in-flight.txt").exists():
-                time.sleep(0.3)
-            assert (attempt.resources.workspace / "in-flight.txt").exists(), "exec never became in-flight"
+            assert _wait_for_worker_file(attempt, "in-flight.txt"), "exec never became in-flight"
             assert _wait_for_marker(marker), "detached descendant never became host-visible"
             assert harness.scan_host_for_marker(BYSTANDER_MARKER), "bystander missing before stop"
             attempt.interrupt(turn_id)
@@ -445,11 +492,11 @@ class TestHostBoundaryDenial:
         turn_id = attempt.start_turn("probe forbidden host surfaces")
         assert attempt.wait_turn(turn_id) == "completed", attempt.turns[turn_id].statuses_seen
 
-        etcssh = (attempt.resources.workspace / "fs-probe-etcssh.txt").read_text()
+        etcssh = _worker_file_text(attempt, "fs-probe-etcssh.txt")
         assert "rc=1" in etcssh, etcssh  # No such file or directory: /etc/ssh is not mounted.
-        canary_probe = (attempt.resources.workspace / "fs-probe-canary.txt").read_text()
+        canary_probe = _worker_file_text(attempt, "fs-probe-canary.txt")
         assert "rc=1" in canary_probe, canary_probe
-        home_probe = (attempt.resources.workspace / "fs-probe-home.txt").read_text()
+        home_probe = _worker_file_text(attempt, "fs-probe-home.txt")
         assert "rc=1" in home_probe or "rc=2" in home_probe, home_probe
         # Host bytes are unchanged: the denials are real, not responses over a writable path.
         assert canary.read_text() == "host-synthetic-canary"
@@ -531,10 +578,7 @@ class TestRecovery:
         )
         attempt.thread_start()
         turn_id = attempt.start_turn("hold while the monitor dies")
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and not (attempt.resources.workspace / "in-flight.txt").exists():
-            time.sleep(0.3)
-        assert (attempt.resources.workspace / "in-flight.txt").exists()
+        assert _wait_for_worker_file(attempt, "in-flight.txt")
         monitors = [
             pid
             for pid in attempt.scan_marker(attempt.container)
@@ -554,7 +598,7 @@ class TestRecovery:
         if state == "exists":
             attempt.stop(grace_seconds=2)
         assert attempt.podman_state() == "absent"
-        assert (attempt.resources.workspace / "in-flight.txt").exists(), "workspace not retained across recovery"
+        assert _worker_file_size(attempt, "in-flight.txt") is not None, "workspace not retained across recovery"
         attempt.terminal = "reconciled-after-monitor-loss"
         attempt.close()
 
@@ -589,7 +633,7 @@ class TestCollection:
         # Publishable = exactly the controller-declared candidate root, with exact bytes
         # preserved under the controller-owned collected/ tree and digest-bound.
         assert set(collection.publishable.files) == {"candidate.txt", "candidate.sha256"}
-        in_container_digest = (attempt.resources.workspace / "candidate" / "candidate.sha256").read_text().strip()
+        in_container_digest = _worker_file_text(attempt, "candidate/candidate.sha256").strip()
         record = collection.publishable.files["candidate.txt"]
         assert record.sha256 == in_container_digest, "independent digests disagree"
         stored = attempt.collected_root / "candidate.txt"
@@ -605,10 +649,9 @@ class TestCollection:
         assert "attempt.json" in collection.private.files and "worker-observations.json" in collection.private.files
         assert "candidate.txt" not in collection.private.files, "candidate leaked into private inventory"
 
-        rollouts = list((attempt.resources.codex_home / "sessions").rglob("rollout-*.jsonl"))
+        rollouts = _rollout_texts(attempt)
         assert rollouts
-        rollout_text = rollouts[0].read_text()
-        assert turn_id in rollout_text and "candidate.txt" in rollout_text
+        assert turn_id in rollouts[0] and "candidate.txt" in rollouts[0]
         attempt.dump_native_evidence(tmp_path / "evidence-collection.json")
         evidence = json.loads((tmp_path / "evidence-collection.json").read_text())
         assert evidence["attempt"] == attempt.attempt
@@ -686,16 +729,17 @@ class TestInFlightEffects:
         )
         attempt.thread_start()
         attempt.start_turn("stream synthetic bytes to the workspace")
-        held = attempt.resources.workspace / "held.bin"
         deadline = time.monotonic() + 30
+        size_at_stop: int | None = None
         while time.monotonic() < deadline:
-            if held.exists() and held.stat().st_size >= 8192:
+            size_at_stop = _worker_file_size(attempt, "held.bin")
+            if size_at_stop is not None and size_at_stop >= 8192:
                 break
             time.sleep(0.2)
-        assert held.exists() and held.stat().st_size >= 8192, "native exec never streamed to the workspace"
-        size_at_stop = held.stat().st_size
+        assert size_at_stop is not None and size_at_stop >= 8192, "native exec never streamed to the workspace"
         attempt.stop(grace_seconds=0)
-        final_size = held.stat().st_size
+        final_size = _worker_file_size(attempt, "held.bin")
+        assert final_size is not None
         # Termination bounds the future and never retracts the past: the workspace bind is
         # static, so bytes already written (and any flush that raced the kill) persist.
         assert final_size >= size_at_stop, "workspace bytes were rolled back after termination"
