@@ -2,8 +2,10 @@
 
 Status: owner-selected verification-only boundary, 2026-10-07; #50 implementation received
 through PR #74. The #80 security repin has separate native reception below; its current
-independent review and canonical integration are recorded in PR #82.
-Issue: [Kernel #50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50).
+independent review and canonical integration are recorded in PR #82. The #79 setup-time
+escape reception is recorded at the end.
+Issue: [Kernel #50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50),
+[#79](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/79).
 
 ## Decision And Scope
 
@@ -286,7 +288,65 @@ rules and every negative test are unchanged, and the complete native suite was r
 newly built binaries with zero skips — the old pin's receipts are retained as history only and
 prove nothing about the changed binary.
 
-The separate [#79](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/79) retains its
-additional setup-time malicious-symlink/proc-magiclink no-canary-effect reception criteria.
-The #80 repin and runtime-suite rerun do not satisfy that additional proof. Required owner
-ordering is #80 before #79; neither delivery promotes this profile to whole-worker isolation.
+The separate [#79](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/79) addresses
+the setup-time escape class directly; the #80 repin and runtime-suite rerun alone do not
+satisfy that additional proof. Its reception follows. Neither delivery promotes this profile
+to whole-worker isolation.
+
+## Setup-Time Escape Reception (#79, 2026-10-09)
+
+The advisory's escape class is setup-time path traversal: while setup operations execute,
+the host root (`oldroot`) and the host proc bind are siblings of the future sandbox root
+(`newroot`) in the setup namespace, and pre-0.12 destination resolution could follow an
+absolute symlink planted in bound attacker-controlled content out to host paths. The pinned
+0.13.0 source resolves every sandbox-setup destination through `safe_openat` — `openat2`
+with `RESOLVE_IN_ROOT|RESOLVE_NO_MAGICLINKS` (safe_openat.c:316) and a readlink-verified
+fallback for kernels without `openat2`; this host's kernel takes the `openat2` path.
+
+**Applicability of the maintained invocation** (source-backed assessment, not a native
+denial receipt): the advisory precondition — the utility creating files or directories
+inside attacker-controlled bound content — cannot arise in the production invocation. The
+only candidate-visible writable bind is the regular-file snapshot workspace; the snapshot
+collector and `resource_digest` admit no symlinks; resources are digest-pinned,
+symlink-free and non-overlapping; every creation destination (`/proc`, `/proc/1`, `/dev`,
+`/tmp`, `/home/test`, `/workspace`, `/toolchain/*`) is a controller-fixed constant outside
+bound candidate content; and the FIFO lock used by the pre-arming regressions is a
+test-only fixture, never a production operation.
+
+**Native synthetic regression (AC3).** With the exact recorded binary (SHA-256
+`7c0da12cc27c4de4bac5bc1dcf50d19c62a445bdb5f30cb8c9740800b0b8b237`), a direct-utility
+fixture with the maintained namespace/capability profile binds a temporary owned
+attacker-content tree at `/content` and runs the maintained creation operation
+`--dir /content/subdir/escape-probe`. The positive control proves that operation genuinely
+writes through a writable bind of real content (the probe lands on the host bound
+directory). Both escape vectors then refuse: `subdir` as an absolute `/oldroot<tmp>` alias
+and as a live `/proc/<pid>/fd/<fd>` magic link into the canary's directory each die during
+setup with `Can't mkdir parents for /content/subdir/escape-probe`, the candidate never
+executes, and the synthetic host canary stays byte-identical with no new entry beside it.
+Seccomp and the PID-1 mask are runtime controls and are deliberately absent from these
+direct-utility fixtures; the unchanged runtime suite above remains required and passed with
+zero skips (67 `make native-proof` cases at this HEAD, including the three #79
+direct-utility escape regressions and the root-refusal receipt) on the same binary.
+
+**Refusal receipts (AC2).** Structural, without the native binary: an unsupported older
+version string and altered/fake version branding refuse (`native_version`) before any
+launch; a wrong native digest refuses (`native_provenance`); group-writable, world-writable,
+symlinked and non-directory scratch trees refuse (`scratch_ownership`); and the composed
+invocation is pinned to the fail-closed profile — explicit user/pid/net/ipc/uts/cgroup
+unsharing, `--disable-userns`, `--assert-userns-disabled`, `--cap-drop ALL`,
+`--new-session`, `--die-with-parent`, seccomp, sync/info descriptors, proc with the PID-1
+mask and root read-only remount — while the 0.13.0 fail-open setup flag
+`--not-a-security-boundary` (bubblewrap.c:2715), any `-try` namespace variant and
+`--dev-bind` are absent.
+
+**Reaper readiness re-receipt (AC4).** The readiness indicator stays bound to the exact
+re-derived source lines on this pin (`do_init` 585/611 before 613; bootstrap 3533/3539),
+and the forced-interval regressions plus the complete native suite pass with zero skips on
+the recorded binary digest; a matching version string or the retained 0.11 history proves
+nothing.
+
+**Licence (AC5).** Unchanged from the #80 repin record: LGPL-2.1-or-later, with archive
+links `LICENSE -> COPYING` and `COPYING.LIB -> COPYING` — the only permitted non-regular
+archive members, enforced by the setup tool's topology check.
+
+The profile stays verification/test-child only; #53's whole-worker gate remains separate.
