@@ -638,7 +638,11 @@ class TestCollection:
         # Publishable = exactly the controller-declared candidate root, with exact bytes
         # preserved under the controller-owned collected/ tree and digest-bound.
         assert set(collection.publishable.files) == {"candidate.txt", "candidate.sha256"}
-        in_container_digest = _worker_file_text(attempt, "candidate/candidate.sha256").strip()
+        # The in-container digest is read from the sink-preserved copy — controller-owned
+        # bytes captured through the collector's pinned descriptors, so no worker-controlled
+        # path component is ever resolved by the kernel — and still records the exec-side
+        # hashing the scenario performed inside the boundary.
+        in_container_digest = (attempt.collected_root / "candidate.sha256").read_text().strip()
         record = collection.publishable.files["candidate.txt"]
         assert record.sha256 == in_container_digest, "independent digests disagree"
         stored = attempt.collected_root / "candidate.txt"
