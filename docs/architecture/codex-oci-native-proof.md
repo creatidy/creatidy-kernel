@@ -52,7 +52,10 @@ available per cell (the matrix keeps explicit tighter-limit cells in #78's recor
 ## Required native proof — observed results
 
 Run: `CREATIDY_TEST_OCI_TOOLROOT=/tmp/kilo/kernel78-tooling make codex-oci-proof`
-(observed 2026-10-09 on the #78 host: 10 native items passed, 0 failed, 0 native skips).
+(observed 2026-10-09 at this record's delivered HEAD on the #78 host: **18 items passed,
+0 failed, 0 native skips** — the 11 native cells, including the post-remediation
+worker-symlink-refusal and hardened-collection cells, plus the 7 host-side collection-safety
+cells that gate the same collector in every `make check`).
 
 1. **Startup, handshake, thread and turn lifecycle inside OCI** — `initialize`/`initialized`
    handshake over the production `CodexStdio` transport through the generated wrapper;

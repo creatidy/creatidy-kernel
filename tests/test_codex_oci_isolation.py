@@ -195,16 +195,21 @@ def _worker_file_size(attempt: CodexAttempt, relative: str) -> int | None:
 
 
 def _rollout_texts(attempt: CodexAttempt) -> list[str]:
-    """Fail-closed discovery+read of native session rollouts under the worker-controlled
-    codex-home: the collector enumerates (never following symlinks), the bounded reader
-    reads; both refuse rather than follow planted links."""
-    from tools.codex_oci_proof.collect import collect_directory, read_bounded_regular
+    """Fail-closed native-session-rollout reads under the worker-controlled codex-home.
 
-    collected = collect_directory(attempt.resources.codex_home)
+    The bytes are captured through the collector's pinned descriptors via its sink —
+    enumerated and read in one fd-pinned pass, with no path re-resolution afterward —
+    so no worker-controlled path component is ever resolved by the kernel a second time.
+    """
+    from tools.codex_oci_proof.collect import CollectedFile, collect_directory
+
     texts: list[str] = []
-    for relative in sorted(collected.files):
+
+    def sink(relative: str, data: bytes, record: CollectedFile) -> None:
         if relative.startswith("sessions/") and "rollout-" in relative and relative.endswith(".jsonl"):
-            texts.append(read_bounded_regular(attempt.resources.codex_home / relative).decode())
+            texts.append(data.decode())
+
+    collect_directory(attempt.resources.codex_home, sink=sink)
     return texts
 
 
