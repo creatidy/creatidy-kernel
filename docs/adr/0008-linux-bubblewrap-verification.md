@@ -325,7 +325,8 @@ setup with `Can't mkdir parents for /content/subdir/escape-probe`, the candidate
 executes, and the synthetic host canary stays byte-identical with no new entry beside it.
 Seccomp and the PID-1 mask are runtime controls and are deliberately absent from these
 direct-utility fixtures; the unchanged runtime suite above remains required and passed with
-zero skips (66 native cases) on the same binary.
+zero skips (67 `make native-proof` cases at this HEAD, including the three #79
+direct-utility escape regressions and the root-refusal receipt) on the same binary.
 
 **Refusal receipts (AC2).** Structural, without the native binary: an unsupported older
 version string and altered/fake version branding refuse (`native_version`) before any
