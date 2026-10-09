@@ -1026,3 +1026,294 @@ def test_native_reaper_observation_fault_refuses_exec(
     assert result.stdout == b""
     # Injected observer faults are refusal regressions, NOT passing native
     # denial receipts. Existing supported native tests independently prove it.
+
+
+def _direct_profile_argv(
+    binary: Path,
+    resources: tuple[VerificationResource, ...],
+    fixtures: list[str],
+    command: list[str],
+) -> list[str]:
+    """Maintained fail-closed namespace/capability profile for direct utility fixtures.
+
+    Seccomp and the PID-1 proc mask are runtime controls, deliberately absent here:
+    the subject is upstream setup-time path resolution, which runs before either
+    exists. #79 regressions only; the production invocation is unchanged.
+    """
+    argv = [
+        str(binary),
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-net",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--disable-userns",
+        "--assert-userns-disabled",
+        "--cap-drop",
+        "ALL",
+        "--new-session",
+        "--die-with-parent",
+        "--clearenv",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",  # noqa: S108 - new private namespace mount, not host /tmp.
+        *fixtures,
+    ]
+    for key, value in {
+        "HOME": "/home/test",
+        "PATH": "/toolchain/bin",
+        "LANG": "C.UTF-8",
+        "TMPDIR": "/tmp",  # noqa: S108 - private namespace tmpfs, not host /tmp.
+        "PYTHONHOME": "/toolchain",
+    }.items():
+        argv.extend(("--setenv", key, value))
+    for resource in resources:
+        argv.extend(("--ro-bind", str(resource.source), str(resource.destination)))
+    argv.extend(("--remount-ro", "/", "--", *command))
+    return argv
+
+
+def _run_direct(argv: list[str], tmp_path: Path) -> subprocess.CompletedProcess[bytes]:
+    # Exact pinned binary with fixed synthetic fixtures; closed minimal environment.
+    return subprocess.run(  # noqa: S603 - exact pinned binary, fixed synthetic fixture argv.
+        argv,
+        cwd=tmp_path,
+        env={"HOME": str(tmp_path), "PATH": os.defpath},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=20,
+    )
+
+
+def test_native_setup_creation_writes_through_writable_bind(
+    native: tuple[BubblewrapVerifier, tuple[VerificationResource, ...]],
+    tmp_path: Path,
+) -> None:
+    """Positive control for the setup-time escape regressions below.
+
+    The same maintained creation op genuinely writes through a writable bind of
+    real attacker content, so the refusals below are the malicious topology,
+    not an inert profile. The probe lands on the bound host directory itself.
+    """
+    _, resources = native
+    binary = Path(os.environ["CREATIDY_TEST_BWRAP_BIN"]).resolve(strict=True)
+    content = tmp_path / "untrusted-content"
+    (content / "subdir").mkdir(parents=True)
+    argv = _direct_profile_argv(
+        binary,
+        resources,
+        ["--bind", str(content), "/content", "--dir", "/content/subdir/escape-probe"],
+        [
+            "/toolchain/ld.so",
+            "--library-path",
+            "/toolchain/lib",
+            "/toolchain/bin/python",
+            "-B",
+            "-P",
+            "-S",
+            "-c",
+            "print('SETUP_COMPLETE')",
+        ],
+    )
+    completed = _run_direct(argv, tmp_path)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == b"SETUP_COMPLETE\n"
+    assert (content / "subdir" / "escape-probe").is_dir()
+
+
+@pytest.mark.parametrize("vector", ("oldroot-alias", "proc-magiclink"))
+def test_native_setup_time_escape_has_no_host_canary_effect(
+    native: tuple[BubblewrapVerifier, tuple[VerificationResource, ...]],
+    tmp_path: Path,
+    vector: str,
+) -> None:
+    """Synthetic setup-time GHSA-pxhw-h44j-8pfx / CVE-2026-87766 regression.
+
+    Reconstructs the advisory precondition that the production invocation cannot
+    reach: attacker-controlled symlinked content bound into the sandbox plus a
+    maintained creation op targeting a path under it. The pinned patched utility
+    must die during setup with no effect on a synthetic host canary. The direct
+    escape aliases are exactly the two resolution vectors the fix confines:
+    the post-pivot host root (`/oldroot`, a sibling of the future sandbox root)
+    and a live host `/proc/<pid>/fd/<fd>` magic link.
+    """
+    _, resources = native
+    binary = Path(os.environ["CREATIDY_TEST_BWRAP_BIN"]).resolve(strict=True)
+    canary = tmp_path / "host-canary"
+    canary.write_bytes(b"synthetic host canary")
+    content = tmp_path / "untrusted-content"
+    content.mkdir()
+    escape_fd: int | None = None
+    if vector == "oldroot-alias":
+        (content / "subdir").symlink_to("/oldroot" + str(tmp_path))
+    else:
+        escape_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            (content / "subdir").symlink_to(f"/proc/{os.getpid()}/fd/{escape_fd}")
+        except OSError:
+            os.close(escape_fd)
+            raise
+    before = sorted(path.name for path in tmp_path.iterdir())
+    argv = _direct_profile_argv(
+        binary,
+        resources,
+        ["--bind", str(content), "/content", "--dir", "/content/subdir/escape-probe"],
+        [
+            "/toolchain/ld.so",
+            "--library-path",
+            "/toolchain/lib",
+            "/toolchain/bin/python",
+            "-B",
+            "-P",
+            "-S",
+            "-c",
+            "print('MUST_NOT_RUN')",
+        ],
+    )
+    try:
+        completed = _run_direct(argv, tmp_path)
+    finally:
+        if escape_fd is not None:
+            os.close(escape_fd)
+    assert completed.returncode != 0, completed.stdout
+    assert b"Can't mkdir parents for /content/subdir/escape-probe" in completed.stderr
+    assert completed.stdout == b""
+    assert canary.read_bytes() == b"synthetic host canary"
+    assert sorted(path.name for path in tmp_path.iterdir()) == before
+
+
+def _structural_verifier(tmp_path: Path) -> BubblewrapVerifier:
+    """Offline verifier fixtures: synthetic provenance files, one valid resource."""
+    binary = tmp_path / "bwrap-fixture"
+    binary.write_bytes(b"synthetic pinned utility bytes")
+    library = tmp_path / "libseccomp-fixture"
+    library.write_bytes(b"synthetic seccomp library bytes")
+    resource = tmp_path / "toolchain-file"
+    resource.write_bytes(b"synthetic trusted resource")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    return BubblewrapVerifier(
+        binary,
+        hashlib.sha256(binary.read_bytes()).hexdigest(),
+        library,
+        hashlib.sha256(library.read_bytes()).hexdigest(),
+        lambda req, now: True,
+        (
+            VerificationResource(
+                resource.resolve(), PurePosixPath("/toolchain/lib.so"), resource_digest(resource.resolve())
+            ),
+        ),
+        scratch,
+    )
+
+
+@pytest.mark.parametrize("reported", (b"bubblewrap 0.11.0", b"bubblewrap 0.13.0-fake", b"Bubblewrap 0.13.0"))
+def test_unsupported_or_fake_native_version_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reported: bytes
+) -> None:
+    verifier = _structural_verifier(tmp_path)
+    snapshot = VerificationSnapshot(())
+    exact = invocation(verifier.resources, snapshot)
+
+    def fake_version(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess([], 0, reported + b"\n")
+
+    def no_launch(*args: object, **kwargs: object) -> None:
+        pytest.fail("candidate launched after version refusal")
+
+    monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification.subprocess.run", fake_version)
+    monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification.subprocess.Popen", no_launch)
+    with pytest.raises(VerificationRefused, match="native_version"):
+        verifier.run(exact, snapshot)
+
+
+@pytest.mark.parametrize("unsafe", ("group-writable", "world-writable", "symlinked", "not-directory"))
+def test_unsafe_scratch_tree_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe: str) -> None:
+    scratch = tmp_path / "unsafe-scratch"
+    if unsafe == "symlinked":
+        target = tmp_path / "scratch-target"
+        target.mkdir(mode=0o700)
+        scratch.symlink_to(target)
+    elif unsafe == "not-directory":
+        scratch.write_bytes(b"not a directory")
+    else:
+        scratch.mkdir()
+        scratch.chmod(0o770 if unsafe == "group-writable" else 0o757)
+    verifier = _structural_verifier(tmp_path)
+    verifier.scratch_parent = scratch
+    snapshot = VerificationSnapshot(())
+    exact = invocation(verifier.resources, snapshot)
+
+    def correct_version(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess([], 0, b"bubblewrap 0.13.0\n")
+
+    def no_launch(*args: object, **kwargs: object) -> None:
+        pytest.fail("candidate launched after unsafe setup-tree refusal")
+
+    monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification.subprocess.run", correct_version)
+    monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification.subprocess.Popen", no_launch)
+    with pytest.raises(VerificationRefused, match="scratch_ownership"):
+        verifier.run(exact, snapshot)
+
+
+def test_fixed_invocation_keeps_fail_closed_setup_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the composed invocation to the fail-closed profile: no fail-open
+    --not-a-security-boundary mode, no weaker -try namespace variants, no host
+    device binds, and every required enforcement flag present at launch."""
+    verifier = _structural_verifier(tmp_path)
+    snapshot = VerificationSnapshot(())
+    exact = invocation(verifier.resources, snapshot)
+    captured: list[list[str]] = []
+
+    def correct_version(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess([], 0, b"bubblewrap 0.13.0\n")
+
+    def capture_launch(argv: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        captured.append([str(argument) for argument in argv])
+        raise AssertionError("launch recorded")
+
+    monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification.subprocess.run", correct_version)
+    monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification.subprocess.Popen", capture_launch)
+
+    def synthetic_seccomp(fd: int, library: Path) -> tuple[int, int, int]:
+        return (2, 5, 5)
+
+    monkeypatch.setattr("creatidy_kernel.adapters.bubblewrap_verification._seccomp", synthetic_seccomp)
+    with pytest.raises(AssertionError, match="launch recorded"):
+        verifier.run(exact, snapshot)
+    assert len(captured) == 1
+    argv = captured[0]
+    for flag in (
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-net",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--disable-userns",
+        "--assert-userns-disabled",
+        "--cap-drop",
+        "ALL",
+        "--new-session",
+        "--die-with-parent",
+        "--seccomp",
+        "--sync-fd",
+        "--info-fd",
+    ):
+        assert flag in argv, flag
+
+    def option_values(option: str) -> list[str]:
+        return [argv[index + 1] for index, argument in enumerate(argv) if argument == option]
+
+    assert option_values("--proc") == ["/proc"]
+    for value in ("/proc/1", "/tmp", "/home/test"):  # noqa: S108 - namespace tmpfs value, not host /tmp.
+        assert value in option_values("--tmpfs"), value
+    for value in ("/proc/1", "/"):
+        assert value in option_values("--remount-ro"), value
+    assert "--not-a-security-boundary" not in argv
+    assert not any(argument.endswith("-try") for argument in argv)
+    assert "--dev-bind" not in argv
