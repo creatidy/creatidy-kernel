@@ -62,7 +62,8 @@ def prepare_codex_sandbox(base: Path, attempt: str) -> tuple[Path, CodexResource
     scratch = root / "scratch"
     relay_dir = root / "relay"
     codex_home = workspace / "codex-home"
-    for directory in (workspace, home, scratch, relay_dir, codex_home):
+    candidate = workspace / "candidate"
+    for directory in (workspace, home, scratch, relay_dir, codex_home, candidate):
         directory.mkdir(parents=True, exist_ok=True)
     resources = CodexResources(
         attempt=attempt,

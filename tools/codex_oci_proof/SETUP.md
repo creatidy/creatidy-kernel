@@ -30,6 +30,16 @@ make codex-oci-proof
 `CREATIDY_TEST_CODEX_BIN` may be omitted when `codex` is on `PATH`. Missing components are
 explicitly UNPROVED (skips with precise reasons), never synthetic passes.
 
+## Collection trust boundary
+
+The isolated worker controls every path in its writable workspace, including symbolic links
+to host paths invisible in-boundary. Post-settlement collection is fail-closed
+(``tools/codex_oci_proof/collect.py``): publishable candidate artifacts come only from the
+controller-declared ``/workspace/candidate`` root, symlinks are refused in every component,
+exact publishable bytes are preserved and digest-bound under the attempt's controller-owned
+``collected/`` tree, and everything else (``codex-home``, ``mock``, specs, observations,
+scratch) is private runtime/evidence inventory retained under controller authority.
+
 ## What runs where
 
 - **Controller (outside the boundary):** attempt identity, synthetic scenario, relay

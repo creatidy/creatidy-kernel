@@ -9,6 +9,7 @@ credentials, no live model and no paid inference participate. Each Attempt recor
 outcomes into an evidence file beside its disposable workspace.
 """
 
+import hashlib
 import json
 import os
 import signal
@@ -559,15 +560,17 @@ class TestRecovery:
 
 
 class TestCollection:
-    def test_immutable_collection_and_independent_verification(self, runner: AttemptRunner, tmp_path: Path) -> None:
+    def test_candidate_snapshot_private_state_and_independent_verification(
+        self, runner: AttemptRunner, tmp_path: Path
+    ) -> None:
         attempt = runner.start(
             [
                 exec_step(
-                    "printf 'synthetic-candidate-bytes' > /workspace/candidate.txt"
+                    "printf 'synthetic-candidate-bytes' > /workspace/candidate/candidate.txt"
                     " && /toolchain/bin/python3.12 -c"
                     ' "import hashlib;'
-                    "print(hashlib.sha256(open('/workspace/candidate.txt','rb').read()).hexdigest())\""
-                    " > /workspace/candidate.sha256 2>&1"
+                    "print(hashlib.sha256(open('/workspace/candidate/candidate.txt','rb').read()).hexdigest())\""
+                    " > /workspace/candidate/candidate.sha256 2>&1"
                 ),
                 final_step("collection turn complete"),
             ]
@@ -575,16 +578,33 @@ class TestCollection:
         attempt.thread_start()
         turn_id = attempt.start_turn("produce the synthetic candidate")
         assert attempt.wait_turn(turn_id) == "completed", attempt.turns[turn_id].statuses_seen
+        # Collection refuses to race a live worker: settlement is a precondition.
+        with pytest.raises(RuntimeError, match="settlement"):
+            attempt.collect()
         attempt.stop(grace_seconds=5)
         assert attempt.podman_state() == "absent"
         attempt.close()
+        collection = attempt.collect()
 
-        manifest = attempt.collect_manifest()
-        assert "candidate.txt" in manifest and "candidate.sha256" in manifest
-        assert "codex-home/config.toml" in manifest, sorted(manifest)[:10]
-        in_container_digest = (attempt.resources.workspace / "candidate.sha256").read_text().strip()
-        host_digest = manifest["candidate.txt"]["sha256"]
-        assert in_container_digest == host_digest, "independent digests disagree"
+        # Publishable = exactly the controller-declared candidate root, with exact bytes
+        # preserved under the controller-owned collected/ tree and digest-bound.
+        assert set(collection.publishable.files) == {"candidate.txt", "candidate.sha256"}
+        in_container_digest = (attempt.resources.workspace / "candidate" / "candidate.sha256").read_text().strip()
+        record = collection.publishable.files["candidate.txt"]
+        assert record.sha256 == in_container_digest, "independent digests disagree"
+        stored = attempt.collected_root / "candidate.txt"
+        assert stored.read_bytes() == b"synthetic-candidate-bytes"
+        from tools.codex_oci_proof.collect import sha256_file
+
+        assert sha256_file(stored) == record.sha256, "stored copy is not bound to the record"
+
+        # Private runtime/evidence state is inventoried separately and never published.
+        assert "codex-home/config.toml" in collection.private.files, sorted(collection.private.files)[:12]
+        assert any(path.startswith("codex-home/sessions/") for path in collection.private.files)
+        assert "mock/state.json" in collection.private.files
+        assert "attempt.json" in collection.private.files and "worker-observations.json" in collection.private.files
+        assert "candidate.txt" not in collection.private.files, "candidate leaked into private inventory"
+
         rollouts = list((attempt.resources.codex_home / "sessions").rglob("rollout-*.jsonl"))
         assert rollouts
         rollout_text = rollouts[0].read_text()
@@ -592,7 +612,55 @@ class TestCollection:
         attempt.dump_native_evidence(tmp_path / "evidence-collection.json")
         evidence = json.loads((tmp_path / "evidence-collection.json").read_text())
         assert evidence["attempt"] == attempt.attempt
-        assert any(record["name"] == "codex" for record in evidence["tools"])
+        assert any(record_["name"] == "codex" for record_ in evidence["tools"])
+
+    def test_worker_created_symlinks_refused_and_host_target_never_collected(
+        self, runner: AttemptRunner, tmp_path: Path
+    ) -> None:
+        secret_dir = tmp_path / "host-only-secret"
+        secret_dir.mkdir()
+        secret = secret_dir / "controller-only.txt"
+        secret_bytes = b"SYNTHETIC-CONTROLLER-SECRET-9f2c7"
+        secret.write_bytes(secret_bytes)
+        secret_digest = hashlib.sha256(secret_bytes).hexdigest()
+        attempt = runner.start(
+            [
+                exec_step("printf 'legitimate-candidate-bytes' > /workspace/candidate/keep.txt"),
+                exec_step(
+                    f"ln -s {secret_dir} /workspace/candidate/leak-dir-link"
+                    f" && ln -s {secret} /workspace/candidate/leak-file-link"
+                    " && ln -s /workspace/mock /workspace/candidate/runtime-link"
+                    " && ln -s /workspace/candidate/keep.txt /workspace/candidate/self-link"
+                    " && ln -s /nonexistent-target /workspace/candidate/dangling-link"
+                    " && mkdir -p /workspace/candidate/inner && ln -s /etc /workspace/candidate/inner/escape"
+                ),
+                final_step("symlink turn complete"),
+            ]
+        )
+        attempt.thread_start()
+        turn_id = attempt.start_turn("create worker-side symlinks then finish")
+        assert attempt.wait_turn(turn_id) == "completed", attempt.turns[turn_id].statuses_seen
+        attempt.stop(grace_seconds=5)
+        assert attempt.podman_state() == "absent"
+        attempt.close()
+
+        collection = attempt.collect()
+        # Only the regular candidate file survives; every worker-created symlink is
+        # refused by name with an explicit reason.
+        assert set(collection.publishable.files) == {"keep.txt"}, sorted(collection.publishable.files)
+        refusals = collection.publishable.refusals
+        for name in ("leak-dir-link", "leak-file-link", "runtime-link", "self-link", "dangling-link"):
+            assert refusals.get(name) == "symlink-refused", (name, refusals.get(name))
+        assert "escape" not in collection.publishable.files
+        assert refusals.get("inner/escape") == "symlink-refused"
+        # The prohibited host target was never opened: its digest appears nowhere in any
+        # collected record or preserved byte, and the preserved tree holds no link entry.
+        assert secret_digest not in collection.publishable.digests()
+        assert secret_digest not in collection.private.digests()
+        assert not (attempt.collected_root / "leak-file-link").exists()
+        assert not (attempt.collected_root / "leak-dir-link").exists()
+        assert secret.read_bytes() == secret_bytes, "host target changed"
+        attempt.dump_native_evidence(tmp_path / "evidence-symlink-collection.json")
 
 
 APPEND_LOOP = """import time
@@ -634,3 +702,107 @@ class TestInFlightEffects:
         assert final_size < 100 * 4096, "unexpectedly complete stream; termination did not bound the writes"
         attempt.terminal = "terminated-with-inflight-writes"
         attempt.close()
+
+
+class TestCollectionSafety:
+    """Host-side fail-closed collection behavior: runs without the OCI toolroot.
+
+    The collector treats everything under its root as worker-controlled: a synthetic
+    tree exercises the same primitives the native collection uses, so symlink/refusal
+    behavior is gated even where the OCI receipt cannot run.
+    """
+
+    def test_symlinks_fifo_oversize_and_budget_are_refused_with_targets_unread(self, tmp_path: Path) -> None:
+        from tools.codex_oci_proof.collect import MAX_FILE_BYTES, collect_directory
+
+        root = tmp_path / "workspace-candidate"
+        secret = tmp_path / "host-secret" / "controller-only.txt"
+        secret.parent.mkdir()
+        secret.write_bytes(b"SYNTHETIC-CONTROLLER-SECRET-BYTES")
+        root.mkdir(parents=True)
+        (root / "keep.txt").write_bytes(b"legitimate")
+        (root / "leak-file-link").symlink_to(secret)
+        (root / "leak-dir-link").symlink_to(secret.parent)
+        (root / "dangling-link").symlink_to(tmp_path / "nonexistent-target")
+        (root / "inner").mkdir()
+        (root / "inner" / "escape-dir-link").symlink_to("/")
+        (root / "inner" / "inner.txt").write_bytes(b"behind-nothing")
+        os.mkfifo(root / "named-pipe")
+        (root / "oversize.bin").write_bytes(b"x" * (MAX_FILE_BYTES + 1))
+
+        collection = collect_directory(root)
+        assert set(collection.files) == {"keep.txt", "inner/inner.txt"}, sorted(collection.files)
+        assert collection.refusals["leak-file-link"] == "symlink-refused"
+        assert collection.refusals["leak-dir-link"] == "symlink-refused"
+        assert collection.refusals["dangling-link"] == "symlink-refused"
+        assert collection.refusals["inner/escape-dir-link"] == "symlink-refused"
+        assert collection.refusals["named-pipe"] == "not-regular-file"
+        assert collection.refusals["oversize.bin"] == "file-exceeds-size-bound"
+        assert hashlib.sha256(secret.read_bytes()).hexdigest() not in collection.digests()
+
+    def test_root_contract_failures_raise(self, tmp_path: Path) -> None:
+        from tools.codex_oci_proof.collect import collect_directory
+
+        real = tmp_path / "real-root"
+        real.mkdir()
+        (real / "f.txt").write_bytes(b"data")
+        link = tmp_path / "link-root"
+        link.symlink_to(real)
+        plain_file = tmp_path / "plain-file"
+        plain_file.write_bytes(b"not a dir")
+        with pytest.raises(ValueError, match="symbolic link"):
+            collect_directory(link)
+        with pytest.raises(ValueError, match="does not exist"):
+            collect_directory(tmp_path / "missing-root")
+        with pytest.raises(ValueError, match="not a directory"):
+            collect_directory(plain_file)
+
+    def test_entry_budget_stops_traversal(self, tmp_path: Path) -> None:
+        from tools.codex_oci_proof import collect as collect_module
+        from tools.codex_oci_proof.collect import collect_directory
+
+        root = tmp_path / "budget-root"
+        root.mkdir()
+        for index in range(collect_module.MAX_ENTRIES + 10):
+            (root / f"f{index:05d}.txt").write_bytes(b"x")
+        collection = collect_directory(root)
+        assert len(collection.files) == collect_module.MAX_ENTRIES
+        assert len(collection.refusals) == 1
+        assert "entry-budget-exhausted" in collection.refusals.values()
+
+    def test_bounded_regular_reader_refuses_symlink_and_oversize(self, tmp_path: Path) -> None:
+        from tools.codex_oci_proof.collect import read_bounded_regular
+
+        secret = tmp_path / "controller-only.txt"
+        secret.write_bytes(b"secret")
+        link = tmp_path / "worker-link"
+        link.symlink_to(secret)
+        with pytest.raises(ValueError, match="symlinked"):
+            read_bounded_regular(link)
+        big = tmp_path / "big.bin"
+        big.write_bytes(b"x" * 2049)
+        with pytest.raises(ValueError, match="bound"):
+            read_bounded_regular(big, limit=2048)
+        assert (
+            read_bounded_regular(
+                tmp_path / "ok.bin" if (tmp_path / "ok.bin").write_bytes(b"ok") is None else tmp_path / "ok.bin"
+            )
+            == b"ok"
+        )
+
+    def test_stored_sink_binds_bytes_and_rejects_mismatch(self, tmp_path: Path) -> None:
+        import dataclasses
+
+        from tools.codex_oci_proof.collect import CollectedFile, stored_bytes_sink
+
+        stored_root = tmp_path / "collected"
+        sink = stored_bytes_sink(stored_root)
+        record = CollectedFile(path="sub/artifact.txt", size=4, sha256=hashlib.sha256(b"data").hexdigest())
+        sink("sub/artifact.txt", b"data", record)
+        stored = stored_root / "sub" / "artifact.txt"
+        assert stored.read_bytes() == b"data"
+        with pytest.raises(RuntimeError, match="do not match the record"):
+            sink("sub/artifact.txt", b"tampered", record)
+        forged = dataclasses.replace(record, sha256="0" * 64)
+        with pytest.raises(RuntimeError, match="do not match the record"):
+            sink("sub/other.txt", b"data", forged)

@@ -42,6 +42,7 @@ from .boundary import (
     write_wrapper_script,
 )
 from .codexbin import CodexBinary, ProtocolInventory
+from .collect import SafeCollection, collect_directory, read_bounded_regular, stored_bytes_sink
 
 # Recorded verbatim into evidence: the thread is created with Codex's own approval machinery
 # configured to never ask and never self-restrict, so every observed enforcement below comes
@@ -55,6 +56,12 @@ THREAD_START_PARAMS: dict[str, object] = {
 }
 
 DANGEROUS_SANDBOX_POLICY: dict[str, object] = {"type": "dangerFullAccess"}
+
+# The only publishable candidate-artifact root inside the worker workspace. The worker can
+# write anywhere in /workspace (that is the #78 static boundary), but publication draws
+# exclusively from this controller-declared root; everything else is private runtime/evidence
+# state retained under controller authority and never presented as candidate artifacts.
+CANDIDATE_DIRNAME = "candidate"
 
 
 class AttemptExpired(RuntimeError):
@@ -86,6 +93,15 @@ def write_scenario(workspace: Path, steps: list[dict[str, Any]], attempt: str) -
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"steps": substitute(steps)}, indent=1, sort_keys=True) + "\n")
     return path
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptCollection:
+    """Post-settlement collection split by trust class (see CodexAttempt.collect)."""
+
+    publishable: SafeCollection
+    private: SafeCollection
+    collected_root: Path
 
 
 @dataclass(slots=True)
@@ -344,10 +360,18 @@ class CodexAttempt:
         return wait_settled(marker, timeout_seconds=timeout_seconds)
 
     def worker_observations(self) -> dict[str, Any]:
+        """Read the launcher's observation file without trusting worker-controlled paths.
+
+        The worker can replace or symlink any workspace file after launch, so this fixed
+        path is read with the fail-closed reader (no symlink following, regular files
+        only, bounded); a missing file means pre-exec observations were never written.
+        """
         path = self.resources.workspace / "worker-observations.json"
-        if not path.is_file():
+        try:
+            data = read_bounded_regular(path)
+        except (FileNotFoundError, ValueError):
             return {}
-        return cast(dict[str, Any], json.loads(path.read_text()))
+        return cast(dict[str, Any], json.loads(data.decode()))
 
     def close(self) -> None:
         if self.connection is not None:
@@ -372,15 +396,31 @@ class CodexAttempt:
             pass
 
     # -- collection ----------------------------------------------------------------------
-    def collect_manifest(self) -> dict[str, dict[str, object]]:
-        """Immutable collection of the disposable workspace from outside the boundary."""
-        manifest: dict[str, dict[str, object]] = {}
-        for path in sorted(self.resources.workspace.rglob("*")):
-            if not path.is_file():
-                continue
-            relative = path.relative_to(self.resources.workspace).as_posix()
-            manifest[relative] = {"size": path.stat().st_size, "sha256": sha256_path(path)}
-        return manifest
+    def collect(self) -> AttemptCollection:
+        """Fail-closed post-settlement collection, split by trust class.
+
+        Publishable candidate artifacts come only from the controller-declared
+        ``candidate/`` root; their exact bytes are durably preserved under the
+        controller-owned ``collected/`` tree and digest-bound to each record, making the
+        published set a collected artifact snapshot rather than a bare digest manifest.
+        Everything else in the workspace — the synthetic ``CODEX_HOME`` (sessions,
+        rollouts, config), the mock backend records, the attempt spec and launcher
+        observations, and any worker scratch — is private runtime/evidence state: it is
+        inventoried with the same fail-closed walker, retained in place under controller
+        authority, and never presented as candidate artifacts. The worker controls every
+        path in either class, so no lookup follows a symbolic link and no entry is
+        silently skipped; refusals are recorded and are failures, not passes.
+        """
+        if self.podman_state() == "exists":
+            raise RuntimeError("collection requires observed container settlement first")
+        candidate_root = self.resources.workspace / CANDIDATE_DIRNAME
+        publishable = collect_directory(candidate_root, sink=stored_bytes_sink(self.collected_root))
+        private = collect_directory(self.resources.workspace, exclude=frozenset({CANDIDATE_DIRNAME}))
+        return AttemptCollection(publishable=publishable, private=private, collected_root=self.collected_root)
+
+    @property
+    def collected_root(self) -> Path:
+        return self.root / "collected"
 
     def dump_native_evidence(self, path: Path) -> None:
         self.evidence.host_observations = {
@@ -402,7 +442,9 @@ class CodexAttempt:
 
 
 __all__ = [
+    "AttemptCollection",
     "AttemptExpired",
+    "CANDIDATE_DIRNAME",
     "CodexAttempt",
     "THREAD_START_PARAMS",
     "exec_step",

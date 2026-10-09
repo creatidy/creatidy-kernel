@@ -94,17 +94,47 @@ Run: `CREATIDY_TEST_OCI_TOOLROOT=/tmp/kilo/kernel78-tooling make codex-oci-proof
    retained across recovery; a deliberately dropped relay reply left the effect recorded
    `executed` at the relay and `reply_lost` at the worker — the receipt log, not worker
    belief, is the reconciliation truth.
-8. **Immutable candidate/artifact collection and independent verification** — post-settlement
-   host-side collection of the workspace (candidate artifacts, mock records, Codex session
-   rollout) into a SHA-256 manifest; the in-container-computed digest of the candidate file
-   (recorded by the native exec) equals the host-computed digest (two independent
-   computations agreeing); the rollout was cross-checked to contain the thread/turn ids and
-   executed commands.
+8. **Fail-closed candidate-artifact collection and independent verification** —
+   post-settlement collection never trusts worker-controlled path resolution: the collector
+   pins each directory by descriptor, looks up one component at a time, refuses symbolic
+   links at every level (including directory components), validates the opened object with
+   ``fstat`` on the descriptor it reads from (no check-then-open race), and applies size and
+   entry bounds. Publishable candidate artifacts come only from the controller-declared
+   ``candidate/`` root, with exact bytes durably preserved under the controller-owned
+   ``collected/`` tree and digest-bound to each record (a collected artifact snapshot, not a
+   bare digest manifest); everything else — the synthetic ``CODEX_HOME``, mock records,
+   attempt spec, launcher observations — is private runtime/evidence state inventoried
+   separately under controller authority and never published. A worker-created symlink to a
+   host-only path is refused by name, its target is never opened (target digest absent from
+   every record, no preserved bytes), and refusals are recorded failures. The
+   in-container-computed digest of the candidate file equals the host-computed digest and the
+   preserved-copy digest (three independent computations agreeing).
 
 Plus one carried matrix cell: **in-flight write effects** — a native exec streaming to the
 workspace at termination time persisted every byte written before the kill (never rolled
 back) and the stream was bounded by termination (never completed). Static writable binds are
 not dynamically revocable; this is recorded as fact, not claimed as revocation.
+
+## Collection trust boundary (owner-directed security correction, 2026-10-09)
+
+Independent source inspection found that the original post-settlement collector traversed
+the worker-controlled workspace with ``Path.rglob``/``is_file``/``stat`` — all
+symlink-following — so a worker-created symlink could point at a host path invisible inside
+the OCI boundary but readable to the trusted controller, causing an unauthorized host-side
+read during collection. Reproduced safely with synthetic files before remediation: a
+workspace symlink to a synthetic host-only file was collected with the target's digest.
+
+The delivered collector (``tools/codex_oci_proof/collect.py``) is fail-closed: explicitly
+authorized candidate roots only (publication draws exclusively from ``candidate/``),
+regular-file-only inputs, symbolic links refused in every component, descriptor-pinned
+single-component lookups with ``O_NOFOLLOW`` (no path re-validation race), ``fstat``
+validation of the exact object read, bounded reads and entries, refusals recorded as
+failures. Publishable artifacts are digest-bound preserved bytes; private Codex runtime
+state (``codex-home`` incl. sessions, mock records, attempt spec, launcher observations) is
+inventoried separately under controller authority and never published. Native regression
+tests create worker-side symlinks (to a host-only secret, to runtime state, self-links,
+dangling links, symlinked directory components) and prove the prohibited host target is
+never opened; a host-side safety suite gates the same collector in every ``make check``.
 
 ## Dispositions for the five outstanding #78 limitations
 
