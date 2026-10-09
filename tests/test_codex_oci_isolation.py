@@ -15,7 +15,7 @@ import signal
 import subprocess  # noqa: S603 - every call below uses fixed synthetic argv, no shell.
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 import pytest
@@ -29,6 +29,7 @@ from tools.codex_oci_proof.codexbin import (
 from tools.codex_oci_proof.driver import AttemptExpired, CodexAttempt, exec_step, final_step
 from tools.codex_oci_proof.ocimage import build_codex_image_archive
 from tools.oci_worker_poc import harness
+from tools.oci_worker_poc.profile import FORBIDDEN_BIND_PREFIXES
 from tools.oci_worker_poc.toolchain import Toolchain, read_provenance
 
 TOOLROOT_ENV = "CREATIDY_TEST_OCI_TOOLROOT"
@@ -239,6 +240,24 @@ class TestNativeLifecycle:
         # The cgroup bounds travel with the attempt (default budget 256 pids / 1 GiB).
         assert self_observations["cgroup_pids_max"] == "256", self_observations["cgroup_pids_max"]
         assert self_observations["cgroup_memory_max"] == "1073741824", self_observations["cgroup_memory_max"]
+        # Single-UID mapping and the mount allowlist are the properties the decision record
+        # cites: container root maps 1:1 onto the invoking host uid, and no mount point lies
+        # at or under a forbidden host prefix — except the profile's own synthetic HOME
+        # tmpfs at /home/worker (controller-issued, host-independent), the only intended
+        # mount under a forbidden prefix.
+        uid_map = self_observations["uid_map"].split()
+        assert len(uid_map) == 3 and uid_map[2] == "1", self_observations["uid_map"]
+        synthetic_home = PurePosixPath("/home/worker")
+        for line in self_observations["mounts"]:
+            fields = line.split()
+            if len(fields) < 2:
+                continue
+            point = PurePosixPath(fields[1])
+            if point == synthetic_home or synthetic_home in point.parents:
+                continue
+            for prefix in FORBIDDEN_BIND_PREFIXES:
+                forbidden = PurePosixPath(prefix)
+                assert point != forbidden and forbidden not in point.parents, f"forbidden mount leaked: {line}"
         # Native thread/turn lifecycle is durable in the synthetic CODEX_HOME rollout record.
         rollouts = list((attempt.resources.codex_home / "sessions").rglob("rollout-*.jsonl"))
         assert rollouts, "native session rollout missing from synthetic CODEX_HOME"
@@ -577,7 +596,7 @@ class TestCollection:
 
 
 APPEND_LOOP = """import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 path = Path("/workspace/held.bin")
 chunk = b"x" * 4096

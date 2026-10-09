@@ -36,8 +36,9 @@ class CodexResources:
     relay_socket: Path
     codex_home: Path  # Backed by workspace/codex-home; fresh synthetic CODEX_HOME, never owner state.
     # Codex's native async runtime spawns a thread per core plus executor helpers, so the
-    # bounded budget starts where the synthetic #78 worker ended; specific cells still pin
-    # tighter limits explicitly (e.g. the fork-flood denial).
+    # bounded budget starts where the synthetic #78 worker ended. The tighter-limit denial
+    # cells (fork flood et al.) live in the #78 record; every codex Attempt in this slice
+    # runs this single default budget (overridable per attempt, none tighter here).
     pids_limit: int = 256
     memory_bytes: int = 1024 * 1024 * 1024
     cpus: float = 1.0
