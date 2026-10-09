@@ -42,6 +42,13 @@ The native protocol inventory from the binary: `exec_command`, `write_stdin`,
 `request_user_input`, `view_image`, `multi_agent_v1` namespace tools, `get_goal`/`create_goal`/
 `update_goal`, `web_search` (typed tool), plus the direct `command/exec` terminal RPC.
 
+**Resource budget (deliberate, disclosed delta from #78):** the isolation policy flags
+(namespaces, caps, seccomp, read-only root, single writable bind, env closure, no engine
+socket) are flag-for-flag identical to the #78 synthetic worker profile; the cgroup budget is
+larger by design for the real harness's native thread needs — pids 256, memory 1 GiB,
+cpus 1.0, versus the #78 synthetic defaults of 64 / 256 MiB / 0.5. Tighter limits remain
+available per cell (the matrix keeps explicit tighter-limit cells in #78's record).
+
 ## Required native proof — observed results
 
 Run: `CREATIDY_TEST_OCI_TOOLROOT=/tmp/kilo/kernel78-tooling make codex-oci-proof`

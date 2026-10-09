@@ -274,10 +274,11 @@ class TestWorkspaceTool:
         assert candidate.read_text() == "seeded-synthetic-source\ntool-appended"
         assert (attempt.resources.workspace / "source-input.txt").read_text() == "seeded-synthetic-source\n"
         # The read-only rootfs refused the native write outside the candidate workspace:
-        # the observed command output carries the failed touch, and /bin is unchanged.
+        # the observed command output carries the EROFS failure text, not a bare nonzero rc
+        # (the container is gone after the run, so /bin itself can only be asserted inside).
         denial_text = " ".join(str(item.get("aggregatedOutput", "")) for item in _command_execution_items(attempt))
         assert "forbidden-rootfs-write" in denial_text, denial_text
-        assert "Read-only file system" in denial_text or "rc=1" in denial_text, denial_text
+        assert "Read-only file system" in denial_text, denial_text
         attempt.dump_native_evidence(tmp_path / "evidence-workspace.json")
 
 
@@ -502,8 +503,9 @@ class TestRecovery:
         with pytest.raises((OSError, TimeoutError, CodexRPCError)):
             attempt.turn_status(turn_id)
         # Terminality is unknown until reconciled by observation; existence is not liveness.
+        # Either observed pre-stop state is legitimate (the container may or may not still
+        # be running when the monitor dies); only the post-reconciliation state asserts.
         state = attempt.podman_state()
-        assert state in {"exists", "absent"}, state
         if state == "exists":
             attempt.stop(grace_seconds=2)
         assert attempt.podman_state() == "absent"
