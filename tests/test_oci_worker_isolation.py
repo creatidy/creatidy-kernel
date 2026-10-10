@@ -173,7 +173,9 @@ class AttemptRunner:
     def dispose_all(self) -> None:
         for result in self.results:
             try:
-                if self.state(result) == "exists":
+                if self.state(result) != "absent":
+                    # exists or unknown: bounded termination is the fail-safe action; only
+                    # a confirmed absent state justifies skipping it.
                     self.stop(result, grace_seconds=2)
                 result.relay.stop()
             except Exception:  # noqa: S110 - bounded best-effort disposal; native assertions already ran.
@@ -496,11 +498,72 @@ class TestLifecycleAndAuthority:
         os.kill(result.process.pid, signal.SIGKILL)
         result.process.wait(timeout=30)
         # After monitor death the Attempt terminality is unknown until reconciled by
-        # observation; existence is not liveness or terminality evidence.
+        # observation; existence is not liveness or terminality evidence, and an
+        # inconclusive podman observation is reported as "unknown", never as absence.
         state = runner.state(result)
-        assert state in {"exists", "absent"}, state
-        if state == "exists":
+        assert state in {"exists", "absent", "unknown"}, state
+        if state != "absent":
             runner.stop(result, grace_seconds=2)
         assert runner.state(result) == "absent"
         result.status = harness.worker_status(result.sandbox)
         result.relay.stop()
+
+
+class TestWorkerStatusFailClosed:
+    """Host-side regression for the shared worker-status reader (no podman needed).
+
+    The worker can replace or symlink any workspace path at any time, including to host
+    paths invisible inside the boundary: a planted symlink at worker-status.json must be
+    refused before any open, never followed host-side. Absence stays truthful; malformed
+    content and tampering raise instead of being masked.
+    """
+
+    @staticmethod
+    def _sandbox(workspace: Path) -> harness.Sandbox:
+        from tools.oci_worker_poc.profile import AttemptResources
+
+        return harness.Sandbox(
+            root=workspace.parent,
+            resources=AttemptResources(
+                attempt="probe",
+                workspace=workspace,
+                home=workspace.parent / "home",
+                scratch=workspace.parent / "scratch",
+                relay_socket=workspace.parent / "relay" / "effects.sock",
+            ),
+            worker_entry=workspace.parent / "worker_main.py",
+        )
+
+    def test_worker_symlink_cannot_leak_host_only_json(self, tmp_path: Path) -> None:
+        secret_dir = tmp_path / "host-only"
+        secret_dir.mkdir()
+        secret = secret_dir / "controller-status.json"
+        secret_bytes = b'{"host-only": "SYNTHETIC-SECRET-9f2c7"}'
+        secret.write_bytes(secret_bytes)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "worker-status.json").symlink_to(secret)
+
+        with pytest.raises(ValueError, match="symlinked"):
+            harness.worker_status(self._sandbox(workspace))
+        assert secret.read_bytes() == secret_bytes, "host target was opened or modified"
+
+    def test_absence_is_truthful_and_content_semantics_preserved(self, tmp_path: Path) -> None:
+        import json as json_module
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        sandbox = self._sandbox(workspace)
+        assert harness.worker_status(sandbox) == {"observed": False}
+        (workspace / "worker-status.json").write_bytes(b"{not json")
+        with pytest.raises(json_module.JSONDecodeError):
+            harness.worker_status(sandbox)
+        (workspace / "worker-status.json").write_bytes(b'{"terminal": "completed", "steps": {}}')
+        assert harness.worker_status(sandbox)["terminal"] == "completed"
+
+    def test_oversized_status_is_refused_not_read(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "worker-status.json").write_bytes(b"x" * (1024 * 1024 + 1))
+        with pytest.raises(ValueError, match="read bound"):
+            harness.worker_status(self._sandbox(workspace))

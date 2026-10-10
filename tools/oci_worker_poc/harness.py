@@ -20,6 +20,7 @@ from typing import Any
 from .evidence import UNPROVED, RunEvidence
 from .ociimage import IMAGE_REF, ImageRecord, build_image_archive, image_exists, load_archive
 from .profile import AttemptResources, WorkerProfile, build_profile, build_run_argv
+from .saferead import read_bounded_regular
 from .toolchain import Toolchain, resolve_toolchain
 
 
@@ -110,22 +111,45 @@ def stop_container(toolchain: Toolchain, container_name: str, grace_seconds: int
     return (result.stdout + result.stderr).strip()
 
 
+CONTAINER_EXISTS = "exists"
+CONTAINER_ABSENT = "absent"
+CONTAINER_UNKNOWN = "unknown"
+
+
 def container_state(toolchain: Toolchain, container_name: str) -> str:
+    """Observe owned-container existence without ever inventing terminality.
+
+    ``podman container exists`` distinguishes exit 0 (exists) and exit 1 (confirmed
+    absent) from every other outcome — podman 125-style engine/storage/access errors,
+    timeouts and lost observations are inconclusive by definition. Those map to
+    ``unknown``, never to a confirmed state. Callers must treat ``unknown`` as an
+    unresolved lifecycle observation: fail-closed for collection/publication and other
+    settlement authorization, and bounded-termination (not silent skipping) for disposal.
+    """
     argv = [
         str(toolchain.root / "bin/podman"),
         "container",
         "exists",
         container_name,
     ]
-    result = subprocess.run(
-        argv,
-        env=toolchain.env(),
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )  # noqa: S603 - fixed tool argv.
-    return "exists" if result.returncode == 0 else "absent"
+    try:
+        result = subprocess.run(
+            argv,
+            env=toolchain.env(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )  # noqa: S603 - fixed tool argv.
+    except subprocess.TimeoutExpired:
+        return CONTAINER_UNKNOWN
+    except OSError:
+        return CONTAINER_UNKNOWN
+    if result.returncode == 0:
+        return CONTAINER_EXISTS
+    if result.returncode == 1:
+        return CONTAINER_ABSENT
+    return CONTAINER_UNKNOWN
 
 
 def scan_host_for_marker(marker: str) -> list[int]:
@@ -156,10 +180,20 @@ def wait_settled(marker: str, timeout_seconds: float = 15.0) -> tuple[bool, list
 
 
 def worker_status(sandbox: Sandbox) -> dict[str, Any]:
+    """Read the worker-written status without following worker-controlled symlinks.
+
+    The worker can replace or symlink any workspace path at any time, including to host
+    paths invisible inside the boundary, so this fixed path is read with the shared
+    fail-closed bounded-regular reader. Absence is truthful (``{"observed": False}``);
+    tampering (planted symlink, non-regular replacement) or oversized content raises and
+    is never reported as absence; malformed JSON raises ``json.JSONDecodeError``.
+    """
     path = sandbox.resources.workspace / "worker-status.json"
-    if not path.is_file():
+    try:
+        data = read_bounded_regular(path)
+    except FileNotFoundError:
         return {"observed": False}
-    return json.loads(path.read_text())  # type: ignore[no-any-return]
+    return json.loads(data.decode())  # type: ignore[no-any-return]
 
 
 def new_evidence(attempt: str, toolchain: Toolchain | None, image: ImageRecord | None, argv: list[str]) -> RunEvidence:
@@ -191,6 +225,9 @@ def resolve_or_unproved() -> Toolchain | None:
 
 
 __all__ = [
+    "CONTAINER_ABSENT",
+    "CONTAINER_EXISTS",
+    "CONTAINER_UNKNOWN",
     "IMAGE_REF",
     "Sandbox",
     "UNPROVED",
