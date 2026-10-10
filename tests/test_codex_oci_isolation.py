@@ -17,7 +17,9 @@ import stat
 import subprocess  # noqa: S603 - every call below uses fixed synthetic argv, no shell.
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -596,11 +598,12 @@ class TestRecovery:
         # The transport is dead: the next native request fails closed instead of inventing state.
         with pytest.raises((OSError, TimeoutError, CodexRPCError)):
             attempt.turn_status(turn_id)
-        # Terminality is unknown until reconciled by observation; existence is not liveness.
-        # Either observed pre-stop state is legitimate (the container may or may not still
-        # be running when the monitor dies); only the post-reconciliation state asserts.
+        # Terminality is unknown until reconciled by observation; existence is not liveness,
+        # and an inconclusive podman observation never collapses into absence. Either
+        # non-absent observation terminates the owned container (fail-safe disposal); only
+        # the post-reconciliation confirmed-absent state settles the Attempt.
         state = attempt.podman_state()
-        if state == "exists":
+        if state != "absent":
             attempt.stop(grace_seconds=2)
         assert attempt.podman_state() == "absent"
         assert _worker_file_size(attempt, "in-flight.txt") is not None, "workspace not retained across recovery"
@@ -716,7 +719,8 @@ class TestCollection:
 
 
 APPEND_LOOP = """import time
-from pathlib import Path, PurePosixPath
+from pathlib import Path
+from types import SimpleNamespace
 
 path = Path("/workspace/held.bin")
 chunk = b"x" * 4096
@@ -905,3 +909,92 @@ class TestCollectionSafety:
         forged = dataclasses.replace(record, sha256="0" * 64)
         with pytest.raises(RuntimeError, match="do not match the record"):
             sink("sub/other.txt", b"data", forged)
+
+
+class TestContainerStateObservation:
+    """Deterministic synthetic regression for the shared container-state observer.
+
+    ``podman container exists`` distinguishes exit 0 (exists) and exit 1 (confirmed
+    absent) from every other outcome; podman 125-style engine/storage/access errors,
+    timeouts and lost observations are inconclusive and must surface as UNKNOWN — never
+    as absence, which is the only state that can authorize collection or settlement.
+    """
+
+    @staticmethod
+    def _fake_toolchain() -> Any:
+        toolchain = SimpleNamespace()
+        toolchain.root = Path("/dev/null")  # never executed: subprocess.run is replaced
+        toolchain.env = dict
+        return toolchain
+
+    @staticmethod
+    def _observe(monkeypatch: pytest.MonkeyPatch, fake_run: Any) -> str:
+        from tools.oci_worker_poc import harness
+
+        monkeypatch.setattr(harness.subprocess, "run", fake_run)
+        return harness.container_state(TestContainerStateObservation._fake_toolchain(), "some-container")
+
+    def test_exit_codes_map_to_exists_absent_or_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def run_for(returncode: int) -> Callable[..., SimpleNamespace]:
+            def run(*args: object, **kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(returncode=returncode, stdout="", stderr="")
+
+            return run
+
+        assert self._observe(monkeypatch, run_for(0)) == "exists"
+        assert self._observe(monkeypatch, run_for(1)) == "absent"
+        assert self._observe(monkeypatch, run_for(125)) == "unknown"
+        assert self._observe(monkeypatch, run_for(42)) == "unknown"
+        assert self._observe(monkeypatch, run_for(-9)) == "unknown"
+
+    def test_timeout_and_lost_observation_are_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def timeout(*args: object, **kwargs: object) -> object:
+            raise subprocess.TimeoutExpired(cmd="podman", timeout=60)
+
+        def lost(*args: object, **kwargs: object) -> object:
+            raise OSError(113, "unavailable storage/transport")
+
+        assert self._observe(monkeypatch, timeout) == "unknown"
+        assert self._observe(monkeypatch, lost) == "unknown"
+
+    @staticmethod
+    def _probe_attempt(tmp_path: Path, observed: str) -> tuple[CodexAttempt, list[int]]:
+        """A minimal Attempt carrying only what collect()/dispose() authorize on."""
+        from tools.codex_oci_proof.boundary import CodexResources
+
+        attempt = object.__new__(CodexAttempt)
+        attempt.root = tmp_path / "attempt-root"
+        attempt.root.mkdir(parents=True)
+        workspace = tmp_path / "workspace"
+        (workspace / "candidate").mkdir(parents=True)
+        attempt.resources = CodexResources(
+            attempt="probe",
+            workspace=workspace,
+            home=tmp_path / "home",
+            scratch=tmp_path / "scratch",
+            relay_socket=tmp_path / "relay" / "effects.sock",
+            codex_home=workspace / "codex-home",
+        )
+        stops: list[int] = []
+        attempt.podman_state = lambda: observed  # type: ignore[method-assign]
+        attempt.stop = lambda grace_seconds: stops.append(grace_seconds)  # type: ignore[method-assign]
+        return attempt, stops
+
+    def test_unknown_observation_cannot_authorize_collection(self, tmp_path: Path) -> None:
+        for observed in ("exists", "unknown"):
+            attempt, _ = self._probe_attempt(tmp_path / observed, observed)
+            with pytest.raises(RuntimeError, match="confirmed container settlement"):
+                attempt.collect()
+        (tmp_path / "workspace-absent" / "candidate").mkdir(parents=True)
+        attempt, _ = self._probe_attempt(tmp_path / "workspace-absent", "absent")
+        collection = attempt.collect()
+        assert collection.publishable.files == {} and collection.publishable.refusals == {}
+        assert collection.private.refusals == {}
+
+    def test_unknown_observation_cannot_count_as_settlement_for_disposal(self, tmp_path: Path) -> None:
+        attempt, stops = self._probe_attempt(tmp_path / "unknown", "unknown")
+        attempt.dispose()
+        assert stops == [2], "unknown observation must trigger bounded termination, not a skip"
+        absent_attempt, absent_stops = self._probe_attempt(tmp_path / "absent", "absent")
+        absent_attempt.dispose()
+        assert absent_stops == [], "confirmed absent state is the only skip justification"

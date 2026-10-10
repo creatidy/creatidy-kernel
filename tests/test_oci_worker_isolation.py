@@ -173,7 +173,9 @@ class AttemptRunner:
     def dispose_all(self) -> None:
         for result in self.results:
             try:
-                if self.state(result) == "exists":
+                if self.state(result) != "absent":
+                    # exists or unknown: bounded termination is the fail-safe action; only
+                    # a confirmed absent state justifies skipping it.
                     self.stop(result, grace_seconds=2)
                 result.relay.stop()
             except Exception:  # noqa: S110 - bounded best-effort disposal; native assertions already ran.
@@ -496,10 +498,11 @@ class TestLifecycleAndAuthority:
         os.kill(result.process.pid, signal.SIGKILL)
         result.process.wait(timeout=30)
         # After monitor death the Attempt terminality is unknown until reconciled by
-        # observation; existence is not liveness or terminality evidence.
+        # observation; existence is not liveness or terminality evidence, and an
+        # inconclusive podman observation is reported as "unknown", never as absence.
         state = runner.state(result)
-        assert state in {"exists", "absent"}, state
-        if state == "exists":
+        assert state in {"exists", "absent", "unknown"}, state
+        if state != "absent":
             runner.stop(result, grace_seconds=2)
         assert runner.state(result) == "absent"
         result.status = harness.worker_status(result.sandbox)

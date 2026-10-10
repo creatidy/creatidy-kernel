@@ -348,6 +348,12 @@ class CodexAttempt:
 
     # -- observation, termination, settlement -------------------------------------------
     def podman_state(self) -> str:
+        """Observed container state: exists, confirmed absent, or unknown.
+
+        An engine/storage/access error, timeout or lost observation is reported as
+        ``unknown`` and never collapses into a confirmed state; authorization decisions
+        below are fail-closed on it.
+        """
         return container_state(self.toolchain, self.container)
 
     def stop(self, grace_seconds: int = 5) -> str:
@@ -388,7 +394,9 @@ class CodexAttempt:
 
     def dispose(self) -> None:
         try:
-            if self.podman_state() == "exists":
+            if self.podman_state() != "absent":
+                # exists or unknown: bounded termination of the owned container is the
+                # fail-safe action; only a confirmed absent state justifies skipping it.
                 self.stop(grace_seconds=2)
         except Exception:  # noqa: BLE001, S110 - best-effort disposal after native assertions.
             pass
@@ -413,8 +421,15 @@ class CodexAttempt:
         path in either class, so no lookup follows a symbolic link and no entry is
         silently skipped; refusals are recorded and are failures, not passes.
         """
-        if self.podman_state() == "exists":
-            raise RuntimeError("collection requires observed container settlement first")
+        observed = self.podman_state()
+        if observed != "absent":
+            # Only a confirmed absent container authorizes collection: exists means the
+            # worker may still be writing, and unknown (engine/storage error, timeout,
+            # lost observation) can never be silently treated as settlement.
+            raise RuntimeError(
+                "collection requires confirmed container settlement; observed state: "
+                f"{observed!r} (unknown observations cannot authorize collection)"
+            )
         candidate_root = self.resources.workspace / CANDIDATE_DIRNAME
         publishable = collect_directory(candidate_root, sink=stored_bytes_sink(self.collected_root))
         private = collect_directory(self.resources.workspace, exclude=frozenset({CANDIDATE_DIRNAME}))

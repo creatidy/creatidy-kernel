@@ -110,22 +110,45 @@ def stop_container(toolchain: Toolchain, container_name: str, grace_seconds: int
     return (result.stdout + result.stderr).strip()
 
 
+CONTAINER_EXISTS = "exists"
+CONTAINER_ABSENT = "absent"
+CONTAINER_UNKNOWN = "unknown"
+
+
 def container_state(toolchain: Toolchain, container_name: str) -> str:
+    """Observe owned-container existence without ever inventing terminality.
+
+    ``podman container exists`` distinguishes exit 0 (exists) and exit 1 (confirmed
+    absent) from every other outcome — podman 125-style engine/storage/access errors,
+    timeouts and lost observations are inconclusive by definition. Those map to
+    ``unknown``, never to a confirmed state. Callers must treat ``unknown`` as an
+    unresolved lifecycle observation: fail-closed for collection/publication and other
+    settlement authorization, and bounded-termination (not silent skipping) for disposal.
+    """
     argv = [
         str(toolchain.root / "bin/podman"),
         "container",
         "exists",
         container_name,
     ]
-    result = subprocess.run(
-        argv,
-        env=toolchain.env(),
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )  # noqa: S603 - fixed tool argv.
-    return "exists" if result.returncode == 0 else "absent"
+    try:
+        result = subprocess.run(
+            argv,
+            env=toolchain.env(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )  # noqa: S603 - fixed tool argv.
+    except subprocess.TimeoutExpired:
+        return CONTAINER_UNKNOWN
+    except OSError:
+        return CONTAINER_UNKNOWN
+    if result.returncode == 0:
+        return CONTAINER_EXISTS
+    if result.returncode == 1:
+        return CONTAINER_ABSENT
+    return CONTAINER_UNKNOWN
 
 
 def scan_host_for_marker(marker: str) -> list[int]:
@@ -191,6 +214,9 @@ def resolve_or_unproved() -> Toolchain | None:
 
 
 __all__ = [
+    "CONTAINER_ABSENT",
+    "CONTAINER_EXISTS",
+    "CONTAINER_UNKNOWN",
     "IMAGE_REF",
     "Sandbox",
     "UNPROVED",

@@ -139,6 +139,19 @@ tests create worker-side symlinks (to a host-only secret, to runtime state, self
 dangling links, symlinked directory components) and prove the prohibited host target is
 never opened; a host-side safety suite gates the same collector in every ``make check``.
 
+**Fail-closed lifecycle observation (owner-directed correction, 2026-10-10).** The shared
+container-state observer originally mapped every nonzero ``podman container exists`` exit
+code to "absent", conflating confirmed absence (exit 1) with podman 125-style
+engine/storage/access errors, timeouts and lost observations. The observer now returns a
+typed outcome — ``exists`` (exit 0), ``absent`` (exit 1, confirmed), ``unknown`` (every
+other code, timeout, or lost/unavailable observation) — and both callers were reconciled:
+artifact collection is authorized **only** by confirmed absence (an ``unknown`` observation
+is a typed refusal and can never authorize collection or count as settlement), while
+disposal treats every non-absent observation as requiring bounded termination of the owned
+container (only confirmed absence justifies skipping it). Deterministic synthetic
+regression cells cover exit codes 0, 1, 125, other nonzeros, timeout and lost observation,
+and prove that code 125 can neither authorize collection nor silently count as settlement.
+
 ## Dispositions for the five outstanding #78 limitations
 
 | Limitation | Disposition | Evidence basis |
