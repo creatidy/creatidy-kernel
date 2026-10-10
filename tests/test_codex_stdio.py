@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -444,3 +445,21 @@ def test_split_command_uncertainty_closes_without_retry(command: tuple[str, ...]
             transport.request("thread/start", {})
     finally:
         transport.close()
+
+
+def test_worker_send_gate_runs_after_probe_and_refusal_prevents_launch(env_command: str) -> None:
+    def authorize(argv: tuple[str, ...], environment: Mapping[str, str]) -> bool:
+        assert Path(env_command + ".version.env").exists()
+        assert argv == (env_command, "worker") and environment == {}
+        return False
+
+    with pytest.raises(ValueError, match="authorization"):
+        CodexStdio(
+            (env_command, "app-server"),
+            "0.99.1",
+            environment={},
+            worker_command=(env_command, "worker"),
+            worker_environment={},
+            before_worker=authorize,
+        )
+    assert not Path(env_command + ".server.env").exists()

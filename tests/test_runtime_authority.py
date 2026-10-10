@@ -105,7 +105,12 @@ class Prepared:
 
 
 @pytest.fixture
-def prepared(sqlite_tmp_path: Path) -> Iterator[Prepared]:
+def grant_operations() -> frozenset[str]:
+    return frozenset({"execute"})
+
+
+@pytest.fixture
+def prepared(sqlite_tmp_path: Path, grant_operations: frozenset[str]) -> Iterator[Prepared]:
     root = sqlite_tmp_path / "workspace"
     root.mkdir()
     database = sqlite_tmp_path / "kernel.db"
@@ -190,7 +195,7 @@ def prepared(sqlite_tmp_path: Path) -> Iterator[Prepared]:
             root,
             frozenset({root}),
             frozenset(),
-            frozenset({"execute"}),
+            grant_operations,
             100,
             True,
         )

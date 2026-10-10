@@ -90,14 +90,31 @@ and stop then use only that ID, never a reusable name. Engine errors, timeouts a
 remain unknown, and a missing ID cannot establish absence. The caller supplies a bounded CLI executor
 and verified resources in a closed environment. Stop acknowledgement and confirmed container absence
 do not establish descendant settlement, cgroup enforcement, safe workspace cleanup or full isolation.
-This component does not launch a worker, adopt a security profile or enable `ISOLATED` Runtime support.
+Reconciliation alone does not launch a worker, adopt a security profile or enable `ISOLATED` Runtime support.
+
+Its optional trusted-development `connect` composition consumes controller-fixed `OCIResources`:
+raw native/config/seccomp pins, trusted read-only closure digests, protected controller paths and a
+private disposable workspace as the sole writable bind. It refuses extra, overlapping, unsafe or
+changed resources and unknown image identity, then launches by the exact immutable image ID. The
+existing resource digest is reused without promoting the verification-only bubblewrap profile;
+sockets and undeclared channels remain unsupported. Trusted host code must protect resource
+ancestors; this is not hostile same-UID race immunity or complete tool/configuration conformance.
+Opaque historical `WorkspaceSpec` identifiers are not silently treated as resource hashes.
+SQLite's `worker_authorizers` require the original durable request, same-controller claim, current
+fence/lease and live grant with explicit read/write/execute rights for the writable project bind.
+A distinct immutable worker-send stage is reserved before native send;
+lost startup/receipt or controller reopen cannot authorize another launch. This real composition
+rechecks resources and authority **after** the finite Codex version probe, immediately before worker
+startup. No continuous revocation, relay implementation, isolated Runtime or settlement is claimed.
 
 `CodexStdio` can also receive an explicit `worker_command` and `worker_environment`, separately
 from its pinned Codex version-probe command and environment. Both subprocess environments must be
 explicit in this mode; no ambient merging or shell interpretation occurs. The installed
 `attached_run_argv` serializer is shared with the native OCI proof. Construction starts the worker
 and initializes immediately, so trusted composition must establish current launch authority and
-verified resources **before** construction, not through later Runtime thread/turn checks. A host
+verified resources **before** construction, not through later Runtime thread/turn checks. The
+optional `before_worker` hook permits a last current check after the probe and before worker send;
+the trusted composition above consumes it, rather than treating a callback as authority. A host
 version probe does not attest the in-boundary executable. These seams do not supply launch admission,
 container/descendant settlement or an isolated Runtime; existing direct-Codex behavior is preserved.
 

@@ -40,6 +40,7 @@ class CodexStdio:
         *,
         worker_command: tuple[str, ...] | None = None,
         worker_environment: Mapping[str, str] | None = None,
+        before_worker: Callable[[tuple[str, ...], Mapping[str, str]], bool] | None = None,
     ) -> None:
         """Probe pinned Codex, then initialize either it or an explicitly composed worker.
 
@@ -47,6 +48,8 @@ class CodexStdio:
         trusted caller must authorize and verify resources BEFORE this constructor:
         it launches immediately, before Runtime thread/turn admission. This is not
         an isolation attestation, container receipt or descendant-settlement gate.
+        Controlled composition also uses before_worker to recheck current authority
+        and resources after the probe, immediately before the worker send.
         """
         if (
             len(command) != 2
@@ -74,6 +77,8 @@ class CodexStdio:
             raise ValueError("explicit absolute worker argv and closed probe/worker environments required")
         if worker_command is None and worker_environment is not None:
             raise ValueError("worker environment requires an explicit worker command")
+        if worker_command is None and before_worker is not None:
+            raise ValueError("worker authorization requires an explicit worker command")
         launch_environment = None if worker_environment is None else dict(worker_environment)
         if launch_environment is not None and any(
             type(name) is not str
@@ -126,6 +131,12 @@ class CodexStdio:
             raise ValueError("Codex executable version does not match expected_version")
 
         try:
+            if before_worker is not None and (
+                worker_command is None
+                or launch_environment is None
+                or before_worker(worker_command, dict(launch_environment)) is not True
+            ):
+                raise ValueError("worker launch authorization unavailable")
             self._process = subprocess.Popen(  # noqa: S603 - explicit trusted absolute executable, no shell.
                 command if worker_command is None else worker_command,
                 stdin=subprocess.PIPE,

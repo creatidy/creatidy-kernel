@@ -10,14 +10,18 @@ Trusted composition supplies verified resources and a bounded native CLI executo
 
 import hashlib
 import json
+import os
+import stat
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from subprocess import CompletedProcess, TimeoutExpired
 from types import MappingProxyType
 from typing import cast
 
-from creatidy_kernel.adapters.worker_profile import WorkerProfile, rootless_run_prefix
+from creatidy_kernel.adapters.bubblewrap_verification import resource_digest
+from creatidy_kernel.adapters.codex_stdio import CodexStdio
+from creatidy_kernel.adapters.worker_profile import WorkerProfile, attached_run_argv, rootless_run_prefix
 from creatidy_kernel.core.execution import ExecutionConflict, ExecutionRequest, Presence
 from creatidy_kernel.ports.allocation import encode_allocation
 from creatidy_kernel.ports.program_store import ApplicationStore
@@ -39,6 +43,7 @@ ENVIRONMENT_KEYS = frozenset(
         "CONTAINERS_STORAGE_CONF",
     }
 )
+WorkerAuthorizer = Callable[[ExecutionRequest, str, bytes], bool]
 
 
 def _bytes(value: object) -> bytes:
@@ -55,6 +60,130 @@ def _digest(value: object) -> bool:
     return type(value) is str and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
+@dataclass(frozen=True, slots=True)
+class OCIResources:
+    """Controller-selected pins, not inferred from opaque historical WorkspaceSpec strings.
+
+    Read-only closures use the existing trusted resource digest; raw tool/config
+    pins use SHA-256. Protected ancestors must remain under trusted host control.
+    This refuses sockets/extra channels rather than adopting a relay protocol.
+    """
+
+    workspace: Path
+    private_parent: Path
+    protected: tuple[Path, ...]
+    pins: tuple[tuple[Path, str], ...]
+    read_only: tuple[tuple[Path, str], ...]
+
+    def verify(self, owner: "OwnedOCI", codex: Path) -> bytes:
+        if any(type(value) is not tuple for value in (self.protected, self.pins, self.read_only)) or not self.protected:
+            raise ExecutionConflict("immutable explicit OCI resources required")
+        identities: dict[str, list[int]] = {}
+        for path in (self.private_parent, self.workspace):
+            if not path.is_absolute() or path == Path("/") or path.resolve() != path:
+                raise ExecutionConflict("OCI private resource path differs")
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                info = os.fstat(descriptor)
+                if (
+                    info.st_uid != os.getuid()
+                    or not stat.S_ISDIR(info.st_mode)
+                    or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
+                    or (path == self.private_parent and info.st_mode & 0o077)
+                    or (info.st_dev, info.st_ino) != (path.lstat().st_dev, path.lstat().st_ino)
+                ):
+                    raise ExecutionConflict("OCI private resource ownership differs")
+                identities[str(path)] = [info.st_dev, info.st_ino, info.st_uid]
+            finally:
+                os.close(descriptor)
+        if self.workspace == self.private_parent or not self.workspace.is_relative_to(self.private_parent):
+            raise ExecutionConflict("OCI workspace is outside its private parent")
+        pins, read_only = dict(self.pins), dict(self.read_only)
+        if len(pins) != len(self.pins) or len(read_only) != len(self.read_only):
+            raise ExecutionConflict("duplicate OCI resource pin")
+        required = {
+            owner.podman,
+            codex,
+            owner.profile.seccomp_path,
+            Path(owner.environment["CONTAINERS_CONF"]),
+            Path(owner.environment["CONTAINERS_STORAGE_CONF"]),
+        }
+        if not required <= pins.keys() or any(not _digest(digest) for digest in (*pins.values(), *read_only.values())):
+            raise ExecutionConflict("complete exact OCI resource pins required")
+        mounts = owner.profile.mounts
+        if [(item.source, str(item.destination)) for item in mounts if item.writable] != [
+            (self.workspace, "/workspace")
+        ] or {item.source for item in mounts if not item.writable} != read_only.keys():
+            raise ExecutionConflict("OCI mounts differ from the explicit resource closure")
+        for root in self.protected:
+            if not root.is_absolute() or root.resolve() != root:
+                raise ExecutionConflict("OCI protected resource path differs")
+        for index, mount in enumerate(mounts):
+            source, destination = mount.source, mount.destination
+            if any(source.is_relative_to(root) or root.is_relative_to(source) for root in self.protected):
+                raise ExecutionConflict("OCI mount exposes protected controller resources")
+            for reserved in ("/", "/proc", "/sys", "/dev", "/run", "/tmp", "/home/worker"):  # noqa: S108 - OCI tmpfs target.
+                if str(destination) == "/" or (
+                    reserved != "/"
+                    and (destination.is_relative_to(reserved) or PurePosixPath(reserved).is_relative_to(destination))
+                ):
+                    raise ExecutionConflict("OCI mount overlaps a runtime-managed destination")
+            for previous in mounts[:index]:
+                if (
+                    destination.is_relative_to(previous.destination)
+                    or previous.destination.is_relative_to(destination)
+                    or source.is_relative_to(previous.source)
+                    or previous.source.is_relative_to(source)
+                ):
+                    raise ExecutionConflict("OCI resources overlap")
+        for path, expected in (*pins.items(), *read_only.items()):
+            if path.is_relative_to(self.workspace) or self.workspace.is_relative_to(path):
+                raise ExecutionConflict("OCI writable workspace overlaps immutable resources")
+            info = path.lstat()
+            if path in pins:
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 256 * 1024 * 1024:
+                    raise ExecutionConflict("invalid OCI native/config resource")
+                expected = hashlib.sha256(b".\0" + bytes.fromhex(expected)).hexdigest()
+            actual = resource_digest(path)
+            if path in read_only and any(
+                item.is_file() and item.lstat().st_nlink != 1
+                for item in ((path, *path.rglob("*")) if path.is_dir() else (path,))
+            ):
+                raise ExecutionConflict("OCI read-only resources have mutable hardlink aliases")
+            if actual != expected:
+                raise ExecutionConflict("OCI resource content differs from the trusted pin")
+            after = path.lstat()
+            identity = [
+                info.st_dev,
+                info.st_ino,
+                info.st_uid,
+                info.st_mode,
+                info.st_nlink,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            ]
+            if identity != [
+                after.st_dev,
+                after.st_ino,
+                after.st_uid,
+                after.st_mode,
+                after.st_nlink,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ]:
+                raise ExecutionConflict("OCI resource identity changed while reading")
+            identities[str(path)] = identity
+        return _bytes(
+            {
+                "version": 1,
+                "identities": identities,
+                "pins": {str(path): digest for path, digest in pins.items()},
+                "read_only": {str(path): digest for path, digest in read_only.items()},
+                "protected": [str(path) for path in self.protected],
+            }
+        )
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class OwnedOCI:
     """One immutable Operation/Attempt generation, never ownership inferred from a name."""
@@ -62,6 +191,7 @@ class OwnedOCI:
     store: ApplicationStore
     request: ExecutionRequest
     podman: Path
+    profile: WorkerProfile
     environment: Mapping[str, str]
     name: str
     image: str
@@ -130,6 +260,7 @@ class OwnedOCI:
             ("request", request),
             ("invoke", invoke),
             ("podman", podman),
+            ("profile", profile),
             ("environment", MappingProxyType(supplied)),
             ("name", name),
             ("image", image),
@@ -242,3 +373,85 @@ class OwnedOCI:
         """Prove only this owned container is absent, not independent descendant settlement."""
         if self.state() is not Presence.ABSENT:
             raise ExecutionConflict("owned OCI container absence unproved")
+
+    def connect(
+        self,
+        resources: OCIResources,
+        codex: Path,
+        version: str,
+        entrypoint: tuple[str, ...],
+        probe_environment: Mapping[str, str],
+        schema_methods: frozenset[str],
+        authorizers: tuple[WorkerAuthorizer, WorkerAuthorizer],
+        clock: Callable[[], int],
+    ) -> CodexStdio:
+        """Trusted-development composition with real resource checks and a durable send gate.
+
+        This does not add an isolated Runtime, continuously revoke in-flight writes,
+        attest the in-boundary executable or prove descendants settled. Missing or
+        uncertain launch receipts remain retained, never a duplicate launch permit.
+        """
+        check, dispatch = authorizers
+        cwd = str(resources.workspace)
+        if check(self.request, cwd, _bytes({"version": 1, "owner": self.token})) is not True:
+            raise ExecutionConflict("OCI current launch authority unavailable")
+        evidence = resources.verify(self, codex)
+        probe = dict(probe_environment)
+        if not probe or not set(probe) <= {"HOME", "CODEX_HOME", "PATH", "LC_ALL", "LANG", "TMPDIR"}:
+            raise ExecutionConflict("closed OCI probe environment required")
+        if "HOME" not in probe or any(
+            not Path(probe[key]).is_relative_to(resources.private_parent)
+            or any(
+                Path(probe[key]).is_relative_to(root) or root.is_relative_to(Path(probe[key]))
+                for root in (resources.workspace, *resources.protected)
+            )
+            for key in ("HOME", "CODEX_HOME", "TMPDIR")
+            if key in probe
+        ):
+            raise ExecutionConflict("OCI probe state must be private and separate")
+        try:
+            result = self._call("image", "inspect", "--format", "{{.Id}}", self.image)
+            observed_image = result.stdout.decode("ascii").strip().removeprefix("sha256:")
+        except (OSError, TimeoutError, TimeoutExpired, ValueError) as error:
+            raise ExecutionConflict("exact loaded OCI image identity unavailable") from error
+        if result.returncode != 0 or result.stderr or observed_image != self.image:
+            raise ExecutionConflict("exact loaded OCI image identity unavailable")
+        command = attached_run_argv(self.podman, self.profile, self.name, self.image, entrypoint)
+        image_index = len(command) - len(entrypoint) - 1
+        label = ("--label", f"{LABEL}={self.token}")
+        command = (*command[:image_index], *label, *command[image_index:])
+        binding = _bytes(
+            {
+                "version": 1,
+                "owner": self.token,
+                "command": command,
+                "probe": str(codex),
+                "probe_environment": probe,
+                "resources": evidence.decode(),
+            }
+        )
+        if check(self.request, cwd, binding) is not True:
+            raise ExecutionConflict("OCI current launch authority unavailable")
+        self.bind_before_send(now=clock())
+
+        def before_worker(argv: tuple[str, ...], environment: Mapping[str, str]) -> bool:
+            if argv != command or environment != self.environment or resources.verify(self, codex) != evidence:
+                return False
+            return dispatch(self.request, cwd, binding)
+
+        connection = CodexStdio(
+            (str(codex), "app-server"),
+            version,
+            schema_methods=schema_methods,
+            schema_version=version,
+            environment=probe,
+            worker_command=command,
+            worker_environment=self.environment,
+            before_worker=before_worker,
+        )
+        try:
+            self.capture()
+        except BaseException:
+            connection.close()
+            raise
+        return connection

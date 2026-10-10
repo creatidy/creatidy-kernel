@@ -768,47 +768,7 @@ class SQLiteProgramStore:
             self._assert_writer_thread()
             if method not in {"thread/start", "turn/start"}:
                 return False
-            with self._gate:
-                try:
-                    operation, intent, frame = self._runtime_binding(request, cwd)
-                    now = clock()
-                    claim = self._connection.execute(
-                        "SELECT claimed_at FROM delivery_attempts WHERE operation_id = ? AND fence = ?",
-                        (operation.operation_id, operation.fence),
-                    ).fetchone()
-                    if (
-                        type(now) is not int
-                        or claim is None
-                        or now < claim["claimed_at"]
-                        or operation.status != "dispatched"
-                        or operation.attempts != 1
-                        or operation.lease_until is None
-                        or now >= operation.lease_until
-                        or (operation.operation_id, operation.fence) not in self._runtime_claims
-                    ):
-                        return False
-                    worker = Principal(request.attempt.attempt_id, "worker")
-                    self.check(worker, request.capability_reference, request.attempt, intent, now)
-                    prefix = f"runtime-dispatch:{operation.fence}:"
-                    name = prefix + ("thread" if method == "thread/start" else "turn")
-                    if self.find_artifact(operation.operation_id, name) is not None:
-                        return False  # Exact stage replay is metadata, never a new native send.
-                    if (
-                        method == "turn/start"
-                        and self.find_artifact(operation.operation_id, prefix + "thread") != frame
-                    ):
-                        return False
-                    self.finalize_artifact(operation.operation_id, name, frame)
-                    checked_at = clock()
-                    if type(checked_at) is not int or checked_at < now or checked_at >= operation.lease_until:
-                        return False
-                    self._authority_attempt(request.attempt)
-                    check_scope(
-                        self._authority_grant(request.capability_reference), request.attempt, intent, checked_at
-                    )
-                    return self.operation(operation.operation_id) == operation
-                except (AuthorityDenied, OperationConflict, ProgramNotFound, ValueError):
-                    return False
+            return self._runtime_stage(request, cwd, clock, "thread" if method == "thread/start" else "turn")
 
         def recovery(request: ExecutionRequest, handle: str, cwd: str) -> bool:
             self._assert_writer_thread()
@@ -845,6 +805,98 @@ class SQLiteProgramStore:
                     return False
 
         return dispatch, recovery
+
+    def worker_authorizers(
+        self, clock: Callable[[], int]
+    ) -> tuple[Callable[[ExecutionRequest, str, bytes], bool], Callable[[ExecutionRequest, str, bytes], bool]]:
+        """Current read-check and single-send reservation for an explicit worker binding.
+
+        Trusted composition supplies verified exact launch/resource bytes, not worker
+        assertions. This is separate from thread/turn admission and not isolation.
+        """
+        self._assert_writer_thread()
+
+        def check(request: ExecutionRequest, cwd: str, binding: bytes) -> bool:
+            return self._runtime_stage(request, cwd, clock, "worker", binding, reserve=False)
+
+        def dispatch(request: ExecutionRequest, cwd: str, binding: bytes) -> bool:
+            return self._runtime_stage(request, cwd, clock, "worker", binding)
+
+        return check, dispatch
+
+    def _runtime_stage(
+        self,
+        request: ExecutionRequest,
+        cwd: str,
+        clock: Callable[[], int],
+        stage: str,
+        binding: bytes | None = None,
+        *,
+        reserve: bool = True,
+    ) -> bool:
+        self._assert_writer_thread()
+        with self._gate:
+            try:
+                operation, intent, frame = self._runtime_binding(request, cwd)
+                if stage == "worker":
+                    if type(binding) is not bytes or not binding or len(binding) > 1024 * 1024:
+                        return False
+                    frame = canonical_json(
+                        {"version": 1, "runtime": frame.decode(), "launch": binding.decode()}
+                    ).encode()
+                now = clock()
+                claim = self._connection.execute(
+                    "SELECT claimed_at FROM delivery_attempts WHERE operation_id = ? AND fence = ?",
+                    (operation.operation_id, operation.fence),
+                ).fetchone()
+                if (
+                    type(now) is not int
+                    or claim is None
+                    or now < claim["claimed_at"]
+                    or operation.status != "dispatched"
+                    or operation.attempts != 1
+                    or operation.lease_until is None
+                    or now >= operation.lease_until
+                    or (operation.operation_id, operation.fence) not in self._runtime_claims
+                ):
+                    return False
+                self.check(
+                    Principal(request.attempt.attempt_id, "worker"),
+                    request.capability_reference,
+                    request.attempt,
+                    intent,
+                    now,
+                )
+                if (
+                    stage == "worker"
+                    and not {"read", "write", "execute"}
+                    <= self._authority_grant(request.capability_reference).operations
+                ):
+                    return False  # This worker composition exposes a readable, writable project bind.
+                prefix = f"runtime-dispatch:{operation.fence}:"
+                name = prefix + stage
+                if self.find_artifact(operation.operation_id, name) is not None:
+                    return False  # An uncertain stage or exact replay never authorizes another send.
+                if stage == "worker" and (
+                    any(
+                        self.find_artifact(operation.operation_id, prefix + prior) is not None
+                        for prior in ("thread", "turn")
+                    )
+                    or self.find_artifact(operation.operation_id, "runtime-receipt") is not None
+                ):
+                    return False  # Cannot move an already-started native Attempt into another worker.
+                if stage == "turn" and self.find_artifact(operation.operation_id, prefix + "thread") != frame:
+                    return False
+                if reserve:
+                    self.finalize_artifact(operation.operation_id, name, frame)
+                checked_at = clock()
+                if type(checked_at) is not int or checked_at < now or checked_at >= operation.lease_until:
+                    return False
+                self._authority_attempt(request.attempt)
+                check_scope(self._authority_grant(request.capability_reference), request.attempt, intent, checked_at)
+                return self.operation(operation.operation_id) == operation
+            except (AuthorityDenied, OperationConflict, ProgramNotFound, ValueError):
+                return False
 
     def _runtime_binding(self, request: ExecutionRequest, cwd: str) -> tuple[OperationRecord, OperationIntent, bytes]:
         if type(request) is not ExecutionRequest or type(cwd) is not str:
