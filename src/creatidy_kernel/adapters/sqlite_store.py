@@ -838,7 +838,7 @@ class SQLiteProgramStore:
         with self._gate:
             try:
                 operation, intent, frame = self._runtime_binding(request, cwd)
-                if stage == "worker":
+                if stage in {"worker", "worker-enter"}:
                     if type(binding) is not bytes or not binding or len(binding) > 1024 * 1024:
                         return False
                     frame = canonical_json(
@@ -868,7 +868,7 @@ class SQLiteProgramStore:
                     now,
                 )
                 if (
-                    stage == "worker"
+                    stage in {"worker", "worker-enter"}
                     and not {"read", "write", "execute"}
                     <= self._authority_grant(request.capability_reference).operations
                 ):
@@ -877,7 +877,7 @@ class SQLiteProgramStore:
                 name = prefix + stage
                 if self.find_artifact(operation.operation_id, name) is not None:
                     return False  # An uncertain stage or exact replay never authorizes another send.
-                if stage == "worker" and (
+                if stage in {"worker", "worker-enter"} and (
                     any(
                         self.find_artifact(operation.operation_id, prefix + prior) is not None
                         for prior in ("thread", "turn")
@@ -885,6 +885,8 @@ class SQLiteProgramStore:
                     or self.find_artifact(operation.operation_id, "runtime-receipt") is not None
                 ):
                     return False  # Cannot move an already-started native Attempt into another worker.
+                if stage == "worker-enter" and self.find_artifact(operation.operation_id, prefix + "worker") != frame:
+                    return False
                 if stage == "turn" and self.find_artifact(operation.operation_id, prefix + "thread") != frame:
                     return False
                 if reserve:
@@ -897,6 +899,24 @@ class SQLiteProgramStore:
                 return self.operation(operation.operation_id) == operation
             except (AuthorityDenied, OperationConflict, ProgramNotFound, ValueError):
                 return False
+
+    def worker_entry_authorizer(self, clock: Callable[[], int]) -> Callable[[ExecutionRequest, str, bytes], bool]:
+        """Fresh single-send permission before a gated namespace admits the actual harness."""
+        self._assert_writer_thread()
+
+        def dispatch(request: ExecutionRequest, cwd: str, binding: bytes) -> bool:
+            return self._runtime_stage(request, cwd, clock, "worker-enter", binding)
+
+        return dispatch
+
+    def worker_deadline(self, request: ExecutionRequest, cwd: str) -> int:
+        """Original immutable upper bound, not launch permission or a renewed lease."""
+        self._assert_writer_thread()
+        with self._gate:
+            operation, _, _ = self._runtime_binding(request, cwd)
+            if operation.lease_until is None:
+                raise AuthorityDenied("worker lease missing")
+            return min(operation.lease_until, self._authority_grant(request.capability_reference).expires_at)
 
     def _runtime_binding(self, request: ExecutionRequest, cwd: str) -> tuple[OperationRecord, OperationIntent, bytes]:
         if type(request) is not ExecutionRequest or type(cwd) is not str:

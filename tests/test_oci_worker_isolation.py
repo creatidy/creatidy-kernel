@@ -13,6 +13,7 @@ import dataclasses
 import json
 import os
 import platform
+import select
 import signal
 import socket
 import struct
@@ -26,19 +27,147 @@ from typing import Any
 
 import pytest
 
+from creatidy_kernel.adapters import oci_bootstrap
+from creatidy_kernel.adapters.oci_lifetime import LifetimeChannel
 from creatidy_kernel.adapters.worker_profile import WorkerMount, rootless_run_prefix
 from tools.codex_oci_proof.boundary import write_seccomp_profile
 from tools.oci_worker_poc import harness
 from tools.oci_worker_poc.evidence import ProbeRecord, RunEvidence, sha256_path
 from tools.oci_worker_poc.profile import WorkerProfile, build_profile, build_run_argv
 from tools.oci_worker_poc.relay import EffectsRelay
-from tools.oci_worker_poc.toolchain import Toolchain, read_provenance
+from tools.oci_worker_poc.toolchain import Toolchain, host_python_closure, read_provenance
 
 TOOLROOT_ENV = "CREATIDY_TEST_OCI_TOOLROOT"
 PINNED_PODMAN_VERSION = "podman version 6.1.3"
 PINNED_CRUN_VERSION = "crun version 1.30.1"
 PINNED_CONMON_VERSION = "conmon version 2.2.1"
 BYSTANDER_MARKER = "kernel78-bystander-marker"
+
+
+def test_kernel_authenticated_init_lifetime(toolchain: Toolchain, tmp_path: Path) -> None:
+    """Receive production bootstrap and actual kernel sender pidfd, not marker-based settlement."""
+    root = tmp_path.resolve()
+    workspace = root / "workspace"
+    workspace.mkdir()
+    python, (stdlib, loader, *libs) = host_python_closure()
+    bootstrap = Path(oci_bootstrap.__file__).resolve()
+    mounts = [
+        WorkerMount(python, PurePosixPath("/toolchain/bin/python3.12"), False),
+        WorkerMount(stdlib, PurePosixPath("/toolchain/lib/python3.12"), False),
+        WorkerMount(loader, PurePosixPath("/lib64/ld-linux-x86-64.so.2"), False),
+        WorkerMount(bootstrap, PurePosixPath("/worker/lifetime.py"), False),
+        WorkerMount(workspace, PurePosixPath("/workspace"), True),
+    ]
+    mounts.extend(WorkerMount(lib, PurePosixPath("/toolchain/lib") / lib.name, False) for lib in libs)
+    attempt, nonce = uuid.uuid4().hex, uuid.uuid4().hex + uuid.uuid4().hex
+    name = "kernel53-lifetime-" + attempt[:12]
+    profile = WorkerProfile(
+        attempt,
+        tuple(mounts),
+        (("PYTHONHOME", "/toolchain"), ("LD_LIBRARY_PATH", "/toolchain/lib")),
+        write_seccomp_profile(root / "seccomp.json"),
+        32,
+        256 * 1024 * 1024,
+        0.5,
+        30,
+    )
+    image = harness.ensure_image(toolchain, root / "image.tar")
+    channel = LifetimeChannel(nonce)
+    descriptor = channel.worker.fileno()
+    command = (
+        "import subprocess,time;from pathlib import Path;"
+        "subprocess.Popen(['/toolchain/bin/python3.12','-I','-S','-c','import time;time.sleep(60)'],"
+        "start_new_session=True);"
+        "Path('/workspace/ready').write_text('ready');time.sleep(60)"
+    )
+    argv = [
+        *rootless_run_prefix(toolchain.root / "bin/podman", profile, name),
+        f"--preserve-fd={descriptor}",
+        image.config_digest.removeprefix("sha256:"),
+        "/toolchain/bin/python3.12",
+        "-I",
+        "-S",
+        "/worker/lifetime.py",
+        str(descriptor),
+        nonce,
+        str(time.time() + 30),
+        "--",
+        "/toolchain/bin/python3.12",
+        "-I",
+        "-S",
+        "-c",
+        command,
+    ]
+    process: subprocess.Popen[bytes] | None = None
+    bystander = subprocess.Popen(  # noqa: S603 - own synthetic bystander, no shared server or owner state.
+        [sys.executable, "-I", "-S", "-c", "import time;time.sleep(60)"],
+        env={"HOME": str(root)},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        process = subprocess.Popen(  # noqa: S603 - fixed owned native namespace and inherited control descriptor.
+            argv,
+            env=toolchain.env(),
+            pass_fds=(descriptor,),  # noqa: S603
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        channel.worker.close()
+        identity = channel.receive(timeout=15)
+        inspected = subprocess.run(  # noqa: S603 - fixed owned native container inspection.
+            [str(toolchain.root / "bin/podman"), "container", "inspect", name],  # noqa: S603
+            env=toolchain.env(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        container = json.loads(inspected.stdout)[0]
+        assert container["State"]["Pid"] == identity["pid"] and container["Image"].removeprefix(
+            "sha256:"
+        ) == image.config_digest.removeprefix("sha256:")
+        assert not (workspace / "ready").exists(), "candidate ran before execution gate"
+        channel.release()
+        deadline = time.monotonic() + 10
+        while not (workspace / "ready").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert (workspace / "ready").read_text() == "ready"
+        channel.close_liveness()
+        assert channel.pidfd is not None
+        poll = select.poll()
+        poll.register(channel.pidfd, select.POLLIN)
+        assert poll.poll(10000), "kernel namespace init did not complete descendant teardown"
+        assert channel.exited()
+        process.communicate(timeout=10)
+        assert harness.container_state(toolchain, name) == "absent"
+        assert bystander.poll() is None
+        (root / "lifetime-receipt.json").write_text(
+            json.dumps(
+                {
+                    "identity": identity,
+                    "container": container["Id"],
+                    "namespace_exit": True,
+                    "container_absent": True,
+                    "bystander_alive": True,
+                }
+            )
+        )
+    finally:
+        channel.close_liveness()
+        if harness.container_state(toolchain, name) != "absent":
+            harness.stop_container(toolchain, name, grace_seconds=2)
+        if process is not None:
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=10)
+        channel.close()
+        bystander.kill()
+        bystander.wait(timeout=5)
 
 
 @pytest.fixture(scope="session")

@@ -41,6 +41,8 @@ class CodexStdio:
         worker_command: tuple[str, ...] | None = None,
         worker_environment: Mapping[str, str] | None = None,
         before_worker: Callable[[tuple[str, ...], Mapping[str, str]], bool] | None = None,
+        worker_fds: tuple[int, ...] = (),
+        after_worker: Callable[[subprocess.Popen[bytes]], bool] | None = None,
     ) -> None:
         """Probe pinned Codex, then initialize either it or an explicitly composed worker.
 
@@ -79,6 +81,13 @@ class CodexStdio:
             raise ValueError("worker environment requires an explicit worker command")
         if worker_command is None and before_worker is not None:
             raise ValueError("worker authorization requires an explicit worker command")
+        if (
+            type(worker_fds) is not tuple
+            or any(type(fd) is not int or fd < 3 for fd in worker_fds)
+            or len(set(worker_fds)) != len(worker_fds)
+            or (worker_command is None and (worker_fds or after_worker is not None))
+        ):
+            raise ValueError("explicit worker descriptor and startup gate required")
         launch_environment = None if worker_environment is None else dict(worker_environment)
         if launch_environment is not None and any(
             type(name) is not str
@@ -144,7 +153,10 @@ class CodexStdio:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
                 env=self._environment if worker_command is None else launch_environment,
+                pass_fds=worker_fds,
             )
+            if after_worker is not None and after_worker(self._process) is not True:
+                raise ValueError("worker startup gate refused")
             self._exchange(
                 "initialize",
                 {"clientInfo": {"name": "creatidy_kernel", "title": "Creatidy Kernel", "version": "0.0.1"}},

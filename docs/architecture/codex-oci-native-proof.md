@@ -47,6 +47,32 @@ binary with the synthetic in-boundary model backend. No launch
 admission, in-boundary executable attestation, settlement or isolated Runtime support
 is inferred from this command-composition option.
 
+The later optional lifecycle increment adds a trusted, immutable PID-1 bootstrap and
+private inherited control descriptor. Linux `SO_PASSPIDFD`/`SCM_PIDFD` binds the actual
+ready sender without the stale-inspect/numeric-PID acquisition race. Candidate code is
+not started before a fresh durable entry gate, does not inherit that descriptor, and
+cannot reopen the nondumpable init's private descriptors under the selected boundary.
+Controller EOF/original deadline exits init; retained process pidfd readiness observes
+kernel namespace-descendant teardown, not merely lifetime-file EOF. Full container
+identity, namespace init and the original launch remain corroborated. Cold numeric PID,
+clock-tick or inode reconstruction is not accepted; uncertain settlement retains data.
+
+A separate real native cell, `test_kernel_authenticated_init_lifetime`, passed on
+2026-10-10 (1 item, zero native skips, 1.14s): it used the installed bootstrap, exact
+pinned Podman/crun toolroot, a synthetic command with a detached descendant, held
+execution before GO, observed kernel init exit/container absence after controller EOF
+and preserved an unrelated bystander. The first attempt received the actual pidfd but
+its assertion mismatched Podman's bare image ID against an archive `sha256:` reference;
+the test was corrected to the producer's already-established normalization, not a
+weaker image check. This cell is lifecycle reception, not native conformance of the
+complete new resource/admission factory, full channel closure or product-profile GO.
+
+Candidate collection now requires exact retained settlement and the prebound candidate
+subtree, descriptor-pins private ancestry/workspace identity and durably stores exact
+bytes before the immutable proposal. It does not publish private runtime roots by
+default. General Git materialization, safe workspace deletion, complete Runtime
+integration and the other acceptance residuals remain unfinished.
+
 ## Verdict
 
 **PROVED for the exercised slice** — a real Codex app-server (codex-cli 0.159.3) ran inside

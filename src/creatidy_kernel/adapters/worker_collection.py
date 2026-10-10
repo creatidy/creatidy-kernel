@@ -174,11 +174,23 @@ def collect_directory(
         raise ValueError(f"collection root is not a directory: {root}")
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        out = SafeCollection()
-        _walk(root_fd, "", exclude, 0, out, sink)
-        return out
+        return collect_directory_fd(root_fd, exclude=exclude, sink=sink)
     finally:
         os.close(root_fd)
+
+
+def collect_directory_fd(
+    root_fd: int,
+    *,
+    exclude: frozenset[str] = frozenset(),
+    sink: Callable[[str, bytes, CollectedFile], None] | None = None,
+) -> SafeCollection:
+    """Collect through the caller's already ownership-checked, held root descriptor."""
+    if type(root_fd) is not int or root_fd < 0 or not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+        raise ValueError("pinned collection directory required")
+    out = SafeCollection()
+    _walk(root_fd, "", exclude, 0, out, sink)
+    return out
 
 
 def stored_bytes_sink(stored_root: Path) -> Callable[[str, bytes, CollectedFile], None]:
@@ -219,6 +231,7 @@ __all__ = [
     "CollectedFile",
     "SafeCollection",
     "collect_directory",
+    "collect_directory_fd",
     "read_bounded_fd",
     "read_bounded_regular",
     "sha256_file",

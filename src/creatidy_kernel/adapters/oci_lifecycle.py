@@ -13,6 +13,7 @@ import json
 import os
 import stat
 from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from subprocess import CompletedProcess, TimeoutExpired
@@ -21,8 +22,18 @@ from typing import cast
 
 from creatidy_kernel.adapters.bubblewrap_verification import resource_digest
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
+from creatidy_kernel.adapters.oci_lifetime import LifetimeChannel
+from creatidy_kernel.adapters.worker_collection import CollectedFile, collect_directory_fd
 from creatidy_kernel.adapters.worker_profile import WorkerProfile, attached_run_argv, rootless_run_prefix
-from creatidy_kernel.core.execution import ExecutionConflict, ExecutionRequest, Presence
+from creatidy_kernel.core.execution import (
+    Artifact,
+    ArtifactManifest,
+    Candidate,
+    ExecutionConflict,
+    ExecutionRequest,
+    Presence,
+    validate_relative_path,
+)
 from creatidy_kernel.ports.allocation import encode_allocation
 from creatidy_kernel.ports.program_store import ApplicationStore
 
@@ -44,6 +55,7 @@ ENVIRONMENT_KEYS = frozenset(
     }
 )
 WorkerAuthorizer = Callable[[ExecutionRequest, str, bytes], bool]
+WorkerDeadline = Callable[[ExecutionRequest, str], int]
 
 
 def _bytes(value: object) -> bytes:
@@ -74,8 +86,12 @@ class OCIResources:
     protected: tuple[Path, ...]
     pins: tuple[tuple[Path, str], ...]
     read_only: tuple[tuple[Path, str], ...]
+    candidate_root: PurePosixPath = PurePosixPath("candidate")
 
     def verify(self, owner: "OwnedOCI", codex: Path) -> bytes:
+        if type(self.candidate_root) is not PurePosixPath:
+            raise ExecutionConflict("explicit immutable OCI candidate subtree required")
+        validate_relative_path(str(self.candidate_root))
         if any(type(value) is not tuple for value in (self.protected, self.pins, self.read_only)) or not self.protected:
             raise ExecutionConflict("immutable explicit OCI resources required")
         identities: dict[str, list[int]] = {}
@@ -180,8 +196,29 @@ class OCIResources:
                 "pins": {str(path): digest for path, digest in pins.items()},
                 "read_only": {str(path): digest for path, digest in read_only.items()},
                 "protected": [str(path) for path in self.protected],
+                "candidate_root": str(self.candidate_root),
             }
         )
+
+
+@dataclass(frozen=True, slots=True)
+class LifetimeSpec:
+    """Controller-selected in-boundary Python and dedicated immutable bootstrap mount."""
+
+    python: PurePosixPath
+    script: PurePosixPath
+
+    def validate(self, profile: WorkerProfile) -> None:
+        source = Path(__file__).with_name("oci_bootstrap.py").resolve()
+        if (
+            not self.python.is_absolute()
+            or not self.script.is_absolute()
+            or not any(
+                mount.source == source and mount.destination == self.script and not mount.writable
+                for mount in profile.mounts
+            )
+        ):
+            raise ExecutionConflict("immutable installed OCI lifetime bootstrap mount required")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -199,6 +236,7 @@ class OwnedOCI:
     operation_id: str
     frame: bytes
     token: str
+    _lifetime: LifetimeChannel | None
 
     def __init__(
         self,
@@ -267,6 +305,7 @@ class OwnedOCI:
             ("operation_id", request.operation.operation_id),
             ("frame", frame),
             ("token", hashlib.sha256(frame).hexdigest()),
+            ("_lifetime", None),
         ):
             object.__setattr__(self, key, value)
 
@@ -317,6 +356,12 @@ class OwnedOCI:
 
     def capture(self) -> str:
         """Name lookup is inspection only; mutations use the durably captured full ID."""
+        item = self._inspection()
+        actual = cast(str, item["Id"])
+        self.store.finalize_artifact(self.operation_id, "oci-container", _bytes({"id": actual, "owner": self.token}))
+        return actual
+
+    def _inspection(self) -> dict[str, object]:
         identifier = self._receipt()
         try:
             result = self._call("container", "inspect", identifier if identifier is not None else self.name)
@@ -342,8 +387,7 @@ class OwnedOCI:
             or (identifier is not None and identifier != actual)
         ):
             raise ExecutionConflict("foreign OCI container; no mutation authorized")
-        self.store.finalize_artifact(self.operation_id, "oci-container", _bytes({"id": actual, "owner": self.token}))
-        return cast(str, actual)
+        return item
 
     def state(self) -> Presence:
         identifier = self._receipt()
@@ -374,6 +418,112 @@ class OwnedOCI:
         if self.state() is not Presence.ABSENT:
             raise ExecutionConflict("owned OCI container absence unproved")
 
+    def settled(self) -> bool:
+        """Require exact retained kernel init exit AND owned container absence, never cold PID guesses."""
+        identifier = self._receipt()
+        namespace = self.store.find_artifact(self.operation_id, "oci-init")
+        if identifier is None or namespace is None:
+            return False
+        record = _object(json.loads(namespace))
+        if record.get("owner") != self.token or record.get("container") != identifier:
+            raise ExecutionConflict("OCI namespace receipt differs from ownership")
+        witness = _bytes(
+            {
+                "version": 1,
+                "owner": self.token,
+                "container": identifier,
+                "namespace_reference": hashlib.sha256(namespace).hexdigest(),
+            }
+        )
+        previous = self.store.find_artifact(self.operation_id, "oci-namespace-settled")
+        if previous is not None:
+            if previous != witness:
+                raise ExecutionConflict("OCI settlement receipt differs")
+            return self.state() is Presence.ABSENT
+        lifetime = self._lifetime
+        if (
+            lifetime is None
+            or lifetime.identity != record.get("identity")
+            or not lifetime.exited()
+            or self.state() is not Presence.ABSENT
+        ):
+            return False
+        self.store.finalize_artifact(self.operation_id, "oci-namespace-settled", witness)
+        lifetime.close()
+        object.__setattr__(self, "_lifetime", None)
+        return True
+
+    def require_settled(self) -> None:
+        if not self.settled():
+            raise ExecutionConflict("owned OCI namespace settlement unproved")
+
+    def collect_candidate(self, resources: OCIResources) -> Candidate:
+        """Collect only the controller's prebound candidate subtree after exact settlement.
+
+        Private runtime state is not an implicit candidate root. This is a retained
+        proposal, not task acceptance or external publication. Workspace cleanup and
+        general source materialization remain separate, unsupported lifecycle work.
+        """
+        self.require_settled()
+        stage = _object(
+            json.loads(self.store.artifact(self.operation_id, f"runtime-dispatch:{self.request.fence}:worker"))
+        )
+        binding = stage.get("launch")
+        if type(binding) is not str:
+            raise ExecutionConflict("OCI launch resources missing")
+        launch = _object(json.loads(binding))
+        namespace = _object(json.loads(self.store.artifact(self.operation_id, "oci-init")))
+        if namespace.get("binding_reference") != hashlib.sha256(binding.encode()).hexdigest():
+            raise ExecutionConflict("OCI namespace differs from original launch")
+        retained = _object(json.loads(cast(str, launch.get("resources"))))
+        if retained.get("candidate_root") != str(resources.candidate_root):
+            raise ExecutionConflict("OCI candidate root differs from original launch")
+        identities = _object(retained.get("identities"))
+        artifacts: list[Artifact] = []
+
+        def sink(relative: str, data: bytes, record: CollectedFile) -> None:
+            name = "oci-candidate-file:" + hashlib.sha256(relative.encode()).hexdigest()
+            digest = self.store.finalize_artifact(self.operation_id, name, data)
+            if digest != f"sha256:{record.sha256}":
+                raise ExecutionConflict("OCI candidate bytes differ from collected digest")
+            artifacts.append(Artifact(relative, digest))
+
+        with ExitStack() as stack:
+            parent = resources.private_parent
+            if not parent.is_absolute() or parent.resolve() != parent or not resources.workspace.is_relative_to(parent):
+                raise ExecutionConflict("OCI private workspace ancestry differs")
+            descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            stack.callback(os.close, descriptor)
+            info = os.fstat(descriptor)
+            if (
+                identities.get(str(parent)) != [info.st_dev, info.st_ino, info.st_uid]
+                or info.st_uid != os.getuid()
+                or info.st_mode & 0o077
+            ):
+                raise ExecutionConflict("OCI private parent differs from original launch")
+            for part in resources.workspace.relative_to(parent).parts:
+                descriptor = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=descriptor
+                )
+                stack.callback(os.close, descriptor)
+            info = os.fstat(descriptor)
+            if identities.get(str(resources.workspace)) != [info.st_dev, info.st_ino, info.st_uid]:
+                raise ExecutionConflict("OCI workspace differs from original launch")
+            validate_relative_path(str(resources.candidate_root))
+            for part in resources.candidate_root.parts:
+                descriptor = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=descriptor
+                )
+                stack.callback(os.close, descriptor)
+            collected = collect_directory_fd(descriptor, sink=sink)
+            if collected.refusals:
+                raise ExecutionConflict("OCI candidate collection refused unsafe entries")
+        self.require_settled()
+        manifest = ArtifactManifest(self.request.workspace.key, tuple(sorted(artifacts, key=lambda item: item.path)))
+        candidate = Candidate(self.request.attempt.attempt_id, self.request.attempt.spec_digest, manifest)
+        self.store.finalize_artifact(self.operation_id, "oci-candidate", _bytes(asdict(candidate)))
+        return candidate
+
     def connect(
         self,
         resources: OCIResources,
@@ -384,6 +534,10 @@ class OwnedOCI:
         schema_methods: frozenset[str],
         authorizers: tuple[WorkerAuthorizer, WorkerAuthorizer],
         clock: Callable[[], int],
+        *,
+        lifetime: LifetimeSpec | None = None,
+        enter_authorizer: WorkerAuthorizer | None = None,
+        deadline: WorkerDeadline | None = None,
     ) -> CodexStdio:
         """Trusted-development composition with real resource checks and a durable send gate.
 
@@ -396,6 +550,10 @@ class OwnedOCI:
         if check(self.request, cwd, _bytes({"version": 1, "owner": self.token})) is not True:
             raise ExecutionConflict("OCI current launch authority unavailable")
         evidence = resources.verify(self, codex)
+        if lifetime is not None:
+            lifetime.validate(self.profile)
+            if enter_authorizer is None or deadline is None:
+                raise ExecutionConflict("durable OCI entry gate and original deadline required")
         probe = dict(probe_environment)
         if not probe or not set(probe) <= {"HOME", "CODEX_HOME", "PATH", "LC_ALL", "LANG", "TMPDIR"}:
             raise ExecutionConflict("closed OCI probe environment required")
@@ -416,9 +574,31 @@ class OwnedOCI:
             raise ExecutionConflict("exact loaded OCI image identity unavailable") from error
         if result.returncode != 0 or result.stderr or observed_image != self.image:
             raise ExecutionConflict("exact loaded OCI image identity unavailable")
-        command = attached_run_argv(self.podman, self.profile, self.name, self.image, entrypoint)
-        image_index = len(command) - len(entrypoint) - 1
+        channel: LifetimeChannel | None = None
+        attached_run_argv(self.podman, self.profile, self.name, self.image, entrypoint)
+        selected_entry = entrypoint
+        expiry: float | None = None
+        if lifetime is not None and deadline is not None:
+            expiry = min(deadline(self.request, cwd), clock() + self.profile.deadline_seconds)
+            if expiry <= clock():
+                raise ExecutionConflict("OCI original lifetime deadline expired")
+            channel = LifetimeChannel(self.token)
+            selected_entry = (
+                str(lifetime.python),
+                "-I",
+                "-S",
+                str(lifetime.script),
+                str(channel.worker.fileno()),
+                self.token,
+                str(expiry),
+                "--",
+                *entrypoint,
+            )
+        command = attached_run_argv(self.podman, self.profile, self.name, self.image, selected_entry)
+        image_index = len(command) - len(selected_entry) - 1
         label = ("--label", f"{LABEL}={self.token}")
+        if channel is not None:
+            label = (*label, f"--preserve-fd={channel.worker.fileno()}")
         command = (*command[:image_index], *label, *command[image_index:])
         binding = _bytes(
             {
@@ -428,6 +608,9 @@ class OwnedOCI:
                 "probe": str(codex),
                 "probe_environment": probe,
                 "resources": evidence.decode(),
+                "lifetime": {"expiry": expiry, "python": str(lifetime.python), "script": str(lifetime.script)}
+                if lifetime is not None
+                else None,
             }
         )
         if check(self.request, cwd, binding) is not True:
@@ -439,19 +622,63 @@ class OwnedOCI:
                 return False
             return dispatch(self.request, cwd, binding)
 
-        connection = CodexStdio(
-            (str(codex), "app-server"),
-            version,
-            schema_methods=schema_methods,
-            schema_version=version,
-            environment=probe,
-            worker_command=command,
-            worker_environment=self.environment,
-            before_worker=before_worker,
-        )
+        def after_worker(_process: object) -> bool:
+            if channel is None or enter_authorizer is None:
+                return False
+            try:
+                channel.worker.close()
+                identity = channel.receive(timeout=15)
+                identifier = self.capture()
+                state = _object(self._inspection().get("State"))
+                if state.get("Running") is not True or state.get("Pid") != identity["pid"]:
+                    raise ExecutionConflict("OCI init differs from authenticated bootstrap")
+                self.store.finalize_artifact(
+                    self.operation_id,
+                    "oci-init",
+                    _bytes(
+                        {
+                            "version": 1,
+                            "owner": self.token,
+                            "container": identifier,
+                            "identity": identity,
+                            "binding_reference": hashlib.sha256(binding).hexdigest(),
+                        }
+                    ),
+                )
+                object.__setattr__(self, "_lifetime", channel)
+                if (
+                    resources.verify(self, codex) != evidence
+                    or enter_authorizer(self.request, cwd, binding) is not True
+                ):
+                    return False
+                channel.release()
+                return True
+            except BaseException:
+                channel.close_liveness()
+                raise
+
+        connection: CodexStdio | None = None
         try:
-            self.capture()
+            connection = CodexStdio(
+                (str(codex), "app-server"),
+                version,
+                schema_methods=schema_methods,
+                schema_version=version,
+                environment=probe,
+                worker_command=command,
+                worker_environment=self.environment,
+                before_worker=before_worker,
+                worker_fds=(channel.worker.fileno(),) if channel is not None else (),
+                after_worker=after_worker if channel is not None else None,
+            )
+            if channel is None:
+                self.capture()
+            else:
+                connection.before_close = channel.close_liveness
         except BaseException:
-            connection.close()
+            if channel is not None:
+                channel.close_liveness()
+            if connection is not None:
+                connection.close()
             raise
         return connection

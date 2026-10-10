@@ -105,7 +105,27 @@ fence/lease and live grant with explicit read/write/execute rights for the writa
 A distinct immutable worker-send stage is reserved before native send;
 lost startup/receipt or controller reopen cannot authorize another launch. This real composition
 rechecks resources and authority **after** the finite Codex version probe, immediately before worker
-startup. No continuous revocation, relay implementation, isolated Runtime or settlement is claimed.
+startup. Without the opt-in gate below, no namespace settlement is supplied. Continuous revocation,
+relay implementation and isolated Runtime remain unsupported.
+
+An opt-in `LifetimeSpec` uses the installed read-only PID-1 bootstrap and one explicitly preserved
+private socket descriptor. Candidate/harness code waits for a distinct durable `worker-enter` gate
+after resource and authority revalidation. Linux `SO_PASSPIDFD` supplies the actual ready sender's
+process handle; numeric Podman PIDs, repeated inspect and namespace inode values alone are not an
+ownership handoff. The retained handle is corroborated against the owned container and dedicated
+PID namespace. Controller socket EOF or the original grant/lease deadline makes PID-1 exit and
+invokes kernel descendant teardown; candidate processes do not inherit the socket. Unsupported
+kernel/descriptor/proc coordinates refuse, without PID polling or cold numeric reacquisition.
+`settled()` requires that exact retained kernel exit and owned container absence, retaining a durable
+receipt for later recovery. Namespace termination does not attest cgroups, external helpers or full
+effect closure. These remain bounded optional engineering, not adopted product isolation.
+
+`collect_candidate` consumes this settlement gate and the candidate subtree fixed in the original
+resource binding. It pins private ancestry/workspace identity and traverses through held descriptors,
+rejects all collection refusals, durably stores exact bytes and then an immutable Candidate proposal.
+Private runtime roots are not implicitly published; changed roots/identities and absence-only claims
+refuse. This does not implement general Git materialization or workspace deletion. Those lifetime
+steps, continuous revocation and complete Runtime/Workspace/channel reception remain unfinished.
 
 `CodexStdio` can also receive an explicit `worker_command` and `worker_environment`, separately
 from its pinned Codex version-probe command and environment. Both subprocess environments must be
