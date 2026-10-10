@@ -82,6 +82,16 @@ inheritance, filesystem discovery or process launch. These are representation ch
 verified tool/image provenance, mount-overlap/ownership checks or actual cgroup/rootless
 enforcement. The deadline remains metadata here, not an expiry timer or admission decision.
 
+The opt-in installed `oci_lifecycle.OwnedOCI` adapter records one immutable Operation/Attempt,
+workspace, capability, runtime identity and explicit engine/profile binding in the existing artifact
+journal before a trusted caller sends anything. This reservation is not launch permission. Inspect
+must match the exact image, name and ownership label before capturing a full container ID; recovery
+and stop then use only that ID, never a reusable name. Engine errors, timeouts and diagnostic output
+remain unknown, and a missing ID cannot establish absence. The caller supplies a bounded CLI executor
+and verified resources in a closed environment. Stop acknowledgement and confirmed container absence
+do not establish descendant settlement, cgroup enforcement, safe workspace cleanup or full isolation.
+This component does not launch a worker, adopt a security profile or enable `ISOLATED` Runtime support.
+
 ## Why A Kernel?
 
 A coding agent does the work. Kernel is being designed to retain the intent, authority, durable

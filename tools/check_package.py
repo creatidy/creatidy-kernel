@@ -68,6 +68,7 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
             "from creatidy_kernel.adapters.worker_collection import collect_directory; "
             "from creatidy_kernel.adapters.worker_files import read_bounded_regular; "
             "from creatidy_kernel.adapters.worker_profile import WorkerProfile, rootless_run_prefix; "
+            "from creatidy_kernel.adapters.oci_lifecycle import OwnedOCI; "
             "prefix = rootless_run_prefix(Path('/explicit/podman'), "
             "WorkerProfile('synthetic', (), (), Path('/explicit/seccomp.json'), 1, 1024, 0.5, 1), 'owned'); "
             "assert prefix[:3] == ['/explicit/podman', 'run', '--pull=never']; "
