@@ -37,7 +37,17 @@ class CodexStdio:
         schema_version: str | None = None,
         environment: Mapping[str, str] | None = None,
         retain_notifications: bool = True,
+        *,
+        worker_command: tuple[str, ...] | None = None,
+        worker_environment: Mapping[str, str] | None = None,
     ) -> None:
+        """Probe pinned Codex, then initialize either it or an explicitly composed worker.
+
+        Worker composition requires closed environments for BOTH processes. The
+        trusted caller must authorize and verify resources BEFORE this constructor:
+        it launches immediately, before Runtime thread/turn admission. This is not
+        an isolation attestation, container receipt or descendant-settlement gate.
+        """
         if (
             len(command) != 2
             or not Path(command[0]).is_absolute()
@@ -53,11 +63,31 @@ class CodexStdio:
             or type(retain_notifications) is not bool
         ):
             raise ValueError("absolute Codex app-server command, pinned version and finite limits required")
+        if worker_command is not None and (
+            type(worker_command) is not tuple
+            or not worker_command
+            or any(type(part) is not str or "\x00" in part for part in worker_command)
+            or not Path(worker_command[0]).is_absolute()
+            or environment is None
+            or worker_environment is None
+        ):
+            raise ValueError("explicit absolute worker argv and closed probe/worker environments required")
+        if worker_command is None and worker_environment is not None:
+            raise ValueError("worker environment requires an explicit worker command")
+        launch_environment = None if worker_environment is None else dict(worker_environment)
+        if launch_environment is not None and any(
+            type(name) is not str
+            or not name
+            or "=" in name
+            or "\x00" in name
+            or type(value) is not str
+            or "\x00" in value
+            for name, value in launch_environment.items()
+        ):
+            raise ValueError("explicit worker environment must map valid names to string values")
         if environment is not None:
-            # An explicit environment replaces inheritance entirely for BOTH the
-            # version probe and the app-server process; it is never merged with the
-            # controller's ambient environment. Callers that need operational entries
-            # (home/config location, PATH, locale, temp) must supply them explicitly.
+            # Explicit mappings replace inheritance, never merge with ambient state.
+            # The direct-Codex path uses this environment for both subprocesses.
             supplied = dict(environment)
             if any(type(name) is not str or not name or type(value) is not str for name, value in supplied.items()):
                 raise ValueError("explicit Codex environment must map nonempty names to string values")
@@ -97,12 +127,12 @@ class CodexStdio:
 
         try:
             self._process = subprocess.Popen(  # noqa: S603 - explicit trusted absolute executable, no shell.
-                command,
+                command if worker_command is None else worker_command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
-                env=self._environment,
+                env=self._environment if worker_command is None else launch_environment,
             )
             self._exchange(
                 "initialize",

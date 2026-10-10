@@ -333,3 +333,114 @@ def test_invalid_explicit_environment_refused(env_command: str) -> None:
         CodexStdio((env_command, "app-server"), "0.99.1", environment={"": "x"})  # type: ignore[dict-item]
     with pytest.raises(ValueError, match="environment"):
         CodexStdio((env_command, "app-server"), "0.99.1", environment={"BAD": object()})  # type: ignore[dict-item]
+
+
+def test_split_probe_and_worker_are_closed_and_literal(
+    env_command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name, value in SENTINELS.items():
+        monkeypatch.setenv(name, value)
+    worker = tmp_path / "worker with spaces"
+    script = ENV_FAKE.replace(
+        "first = json.loads(sys.stdin.readline())",
+        'Path(sys.argv[0] + ".argv").write_text(json.dumps(sys.argv[1:]))\nfirst = json.loads(sys.stdin.readline())',
+    )
+    worker.write_text(script, encoding="utf-8")
+    worker.chmod(0o700)
+    canary = tmp_path / "must-not-be-created"
+    arguments = ("literal spaces", f"$(touch {canary})", ";", "")
+    probe_environment = {"HOME": str(tmp_path / "probe"), "LC_ALL": "C"}
+    worker_environment = {"HOME": str(tmp_path / "worker-home"), "LANG": "C.UTF-8"}
+    transport = CodexStdio(
+        (env_command, "app-server"),
+        "0.99.1",
+        environment=probe_environment,
+        worker_command=(str(worker), *arguments),
+        worker_environment=worker_environment,
+        schema_methods=frozenset({"thread/read"}),
+        schema_version="0.99.1",
+    )
+    try:
+        assert transport.request("thread/read", {}) == {"ok": True}
+        assert transport.methods == frozenset({"thread/read"})
+        assert _dumped(env_command, "version") == probe_environment
+        assert _dumped(str(worker), "server") == worker_environment
+        assert not Path(env_command + ".server.env").exists()
+        assert not Path(str(worker) + ".version.env").exists()
+        assert json.loads(Path(str(worker) + ".argv").read_text()) == list(arguments)
+        assert not canary.exists()
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize("expected,schema", [("0.99.2", "0.99.2"), ("0.99.1", "0.99.2")])
+def test_split_version_or_schema_refusal_never_starts_worker(env_command: str, expected: str, schema: str) -> None:
+    with pytest.raises(ValueError, match="version"):
+        CodexStdio(
+            (env_command, "app-server"),
+            expected,
+            environment={},
+            worker_command=(env_command, "worker"),
+            worker_environment={},
+            schema_methods=frozenset({"thread/read"}),
+            schema_version=schema,
+        )
+    assert not Path(env_command + ".server.env").exists()
+
+
+@pytest.mark.parametrize("worker", [(), ("relative", "worker"), ("/absolute/worker", "nul\x00argument")])
+def test_invalid_worker_argv_is_refused_before_probe(env_command: str, worker: tuple[str, ...]) -> None:
+    with pytest.raises(ValueError, match="worker argv"):
+        CodexStdio(
+            (env_command, "app-server"),
+            "0.99.1",
+            environment={},
+            worker_command=worker,
+            worker_environment={},
+        )
+    assert not Path(env_command + ".version.env").exists()
+
+
+@pytest.mark.parametrize("probe,worker", [(None, {}), ({}, None), (None, None)])
+def test_split_command_requires_both_closed_environments(
+    env_command: str, probe: dict[str, str] | None, worker: dict[str, str] | None
+) -> None:
+    with pytest.raises(ValueError, match="closed"):
+        CodexStdio(
+            (env_command, "app-server"),
+            "0.99.1",
+            environment=probe,
+            worker_command=(env_command, "worker"),
+            worker_environment=worker,
+        )
+    assert not Path(env_command + ".version.env").exists()
+
+
+@pytest.mark.parametrize("environment", [{"": "x"}, {"BAD=NAME": "x"}, {"GOOD": "nul\x00value"}])
+def test_invalid_worker_environment_is_refused_before_probe(env_command: str, environment: dict[str, str]) -> None:
+    with pytest.raises(ValueError, match="worker environment"):
+        CodexStdio(
+            (env_command, "app-server"),
+            "0.99.1",
+            environment={},
+            worker_command=(env_command, "worker"),
+            worker_environment=environment,
+        )
+    assert not Path(env_command + ".version.env").exists()
+
+
+def test_worker_environment_without_worker_command_is_refused(env_command: str) -> None:
+    with pytest.raises(ValueError, match="worker command"):
+        CodexStdio((env_command, "app-server"), "0.99.1", worker_environment={})
+    assert not Path(env_command + ".version.env").exists()
+
+
+def test_split_command_uncertainty_closes_without_retry(command: tuple[str, ...]) -> None:
+    transport = CodexStdio(command, "0.99.1", environment={}, worker_command=command, worker_environment={})
+    try:
+        with pytest.raises(OSError, match="uncorrelated"):
+            transport.request("wrong/id", {})
+        with pytest.raises(OSError, match="closed"):
+            transport.request("thread/start", {})
+    finally:
+        transport.close()

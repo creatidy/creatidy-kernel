@@ -92,6 +92,15 @@ and verified resources in a closed environment. Stop acknowledgement and confirm
 do not establish descendant settlement, cgroup enforcement, safe workspace cleanup or full isolation.
 This component does not launch a worker, adopt a security profile or enable `ISOLATED` Runtime support.
 
+`CodexStdio` can also receive an explicit `worker_command` and `worker_environment`, separately
+from its pinned Codex version-probe command and environment. Both subprocess environments must be
+explicit in this mode; no ambient merging or shell interpretation occurs. The installed
+`attached_run_argv` serializer is shared with the native OCI proof. Construction starts the worker
+and initializes immediately, so trusted composition must establish current launch authority and
+verified resources **before** construction, not through later Runtime thread/turn checks. A host
+version probe does not attest the in-boundary executable. These seams do not supply launch admission,
+container/descendant settlement or an isolated Runtime; existing direct-Codex behavior is preserved.
+
 ## Why A Kernel?
 
 A coding agent does the work. Kernel is being designed to retain the intent, authority, durable

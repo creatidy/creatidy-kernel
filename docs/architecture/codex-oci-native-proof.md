@@ -37,6 +37,16 @@ Separate regression execution on the strengthened profile passed 31 OCI worker p
 items and 22 real-Codex OCI proof items with no native skips; these are not retroactive
 changes to PR #84's historical receipt or review history.
 
+The subsequent transport-composition increment replaces the proof's generated wrapper
+with the installed `CodexStdio` explicit worker-command seam and shared inert attached
+OCI argv serializer. The host version probe and OCI attach use separate closed
+environments. The historical wrapper-based receipt below remains historical; current
+native regression reception of the direct seam passed **22 items, zero native skips**
+on 2026-10-10 (`make codex-oci-proof`, 127.85s), using the pinned toolroot and Codex
+binary with the synthetic in-boundary model backend. No launch
+admission, in-boundary executable attestation, settlement or isolated Runtime support
+is inferred from this command-composition option.
+
 ## Verdict
 
 **PROVED for the exercised slice** — a real Codex app-server (codex-cli 0.159.3) ran inside

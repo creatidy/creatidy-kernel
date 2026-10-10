@@ -43,7 +43,8 @@ scratch) is private runtime/evidence inventory retained under controller authori
 ## What runs where
 
 - **Controller (outside the boundary):** attempt identity, synthetic scenario, relay
-  authority, the production `CodexStdio` transport against a generated per-attempt wrapper,
+  authority, the production `CodexStdio` transport with an explicit attached worker command
+  and a separate pinned host version probe, both in closed environments,
   cancellation/expiry, settlement observation, immutable collection and verification.
 - **Inside one rootless OCI Attempt:** the in-boundary launcher (`worker_entry.py`), the
   controller-authored synthetic Responses model backend (`mockmodel.py`, container-internal

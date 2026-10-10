@@ -3,8 +3,8 @@
 
 The controller owns Attempt identity, the synthetic scenario, durable authority at the relay
 seam, cancellation/expiry, settlement observation, and immutable collection. The native
-app-server is reached through the production ``CodexStdio`` transport driven against the
-per-Attempt generated wrapper, so the transport under test is the repository's own; its
+app-server is reached through the production ``CodexStdio`` explicit worker-command seam,
+so the transport under test is the repository's own; its
 constructor performs the native ``initialize`` handshake and fails closed on mismatch. Every
 wait is bounded; nothing is assumed from a zero exit or an acknowledgment alone.
 """
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from creatidy_kernel.adapters.codex_stdio import CodexRPCError, CodexStdio
-from tools.oci_worker_poc.evidence import RunEvidence, sha256_path
+from tools.oci_worker_poc.evidence import RunEvidence
 from tools.oci_worker_poc.harness import (
     container_state,
     scan_host_for_marker,
@@ -39,7 +39,6 @@ from .boundary import (
     new_attempt_id,
     prepare_codex_sandbox,
     toolchain_records,
-    write_wrapper_script,
 )
 from .codexbin import CodexBinary, ProtocolInventory
 from .collect import SafeCollection, collect_directory, read_bounded_regular, stored_bytes_sink
@@ -161,20 +160,12 @@ class CodexAttempt:
             codex_binary,
             deadline_seconds,
         )
-        self.wrapper = write_wrapper_script(
-            self.root / "codex-wrapper.sh",
-            toolchain,
-            self.profile,
-            image,
-            self.container,
-            codex_binary.path,
-            self.root / "probe-home",
-        )
+        self.worker_command = tuple(build_run_argv(toolchain, self.profile, image.reference, self.container))
         self.evidence = RunEvidence(
             attempt=self.attempt,
             platform=f"{platform.system()} {platform.release()} {platform.machine()}",
             kernel=platform.release(),
-            podman_argv=build_run_argv(toolchain, self.profile, image.reference, self.container),
+            podman_argv=list(self.worker_command),
             tools=toolchain_records(toolchain, codex_binary.tool_records(str(codex_binary.path))),
         )
 
@@ -188,11 +179,19 @@ class CodexAttempt:
         Attempt fails closed (version mismatch, missing methods, dead app-server)."""
         self.relay.start()
         self.connection = CodexStdio(
-            (str(self.wrapper), "app-server"),
+            (str(self.codex_binary.path), "app-server"),
             expected_version=self.codex_binary.version,
             timeout=60,
             schema_methods=self.inventory.required_methods,
             schema_version=self.codex_binary.version,
+            environment={
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(self.root / "probe-home"),
+                "CODEX_HOME": str(self.root / "probe-home" / "codex-home"),
+                "LC_ALL": "C",
+            },
+            worker_command=self.worker_command,
+            worker_environment=self.toolchain.env(),
         )
         self._drain_notifications()
 
@@ -442,7 +441,7 @@ class CodexAttempt:
     def dump_native_evidence(self, path: Path) -> None:
         self.evidence.host_observations = {
             "container": self.container,
-            "wrapper_script_sha256": sha256_path(self.wrapper),
+            "worker_command": json.dumps(self.worker_command),
             "thread_start_params": json.dumps(THREAD_START_PARAMS, sort_keys=True),
             "thread_start_result": json.dumps(self.thread_start_result, sort_keys=True, default=str),
             "thread_id": self.thread_id or "",

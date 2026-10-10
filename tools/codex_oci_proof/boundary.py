@@ -5,21 +5,20 @@ Composes the exact #78 whole-worker profile (rootless single-OCI Attempt: dedica
 user/PID/IPC/UTS/network namespaces, empty-environment closure, read-only root plus
 enumerated read-only inputs, one writable disposable workspace, capability/seccomp/cgroup
 bounds, no engine socket) around the pinned Codex binary, its in-container exec shell, the
-in-boundary launcher and the synthetic model backend. The generated per-Attempt wrapper lets
-the production ``CodexStdio`` transport drive the in-boundary ``app-server`` unchanged.
+in-boundary launcher and the synthetic model backend. The production ``CodexStdio`` transport
+drives the explicit attached worker command separately from the pinned host version probe.
 """
 
 from __future__ import annotations
 
 import json
-import shlex
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile, rootless_run_prefix
+from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile, attached_run_argv
 from tools.oci_worker_poc.evidence import ToolRecord, sha256_path
-from tools.oci_worker_poc.ociimage import ImageRecord, seccomp_profile_json
+from tools.oci_worker_poc.ociimage import seccomp_profile_json
 from tools.oci_worker_poc.profile import AttemptResources, validate_resource_paths
 from tools.oci_worker_poc.toolchain import Toolchain, host_python_closure
 
@@ -176,62 +175,15 @@ def build_run_argv(toolchain: Toolchain, profile: WorkerProfile, image_ref: str,
     The policy flags are identical to the #78 synthetic worker profile; ``-i`` additionally
     attaches the controller's stdio to the in-boundary app-server.
     """
-    argv = rootless_run_prefix(toolchain.root / "bin/podman", profile, container)
-    argv.insert(2, "-i")
-    argv += [
-        image_ref,
-        "/bin/busybox",
-        "sh",
-        "-c",
-        "exec /toolchain/bin/python3.12 -S /worker/main.py",
-    ]
-    return argv
-
-
-def write_wrapper_script(
-    path: Path,
-    toolchain: Toolchain,
-    profile: WorkerProfile,
-    image_record: ImageRecord,
-    container: str,
-    codex_path: Path,
-    probe_home: Path,
-) -> Path:
-    """Generate the per-Attempt wrapper the production CodexStdio transport invokes.
-
-    ``--version`` probes the exact hash-pinned binary host-side; ``app-server`` execs the
-    closed-environment podman attach that runs the boundary. All values are embedded and
-    shell-quoted at generation time; the wrapper reads nothing else from its environment.
-    """
-    environment = toolchain.env()
-    podman_argv = build_run_argv(toolchain, profile, image_record.reference, container)
-    quoted_flags = " ".join(shlex.quote(part) for part in podman_argv[1:])
-    env_prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in environment.items())
-    stderr_log = Path(profile.seccomp_path).parent.parent / "podman-stderr.log"
-    script = f"""#!/bin/sh
-# Generated per-Attempt controller wrapper (creatidy-kernel #53 bounded native proof).
-# Invocation: <wrapper> --version   |   <wrapper> app-server
-set -eu
-case "${{1:-}}" in
-  --version)
-    exec env -i PATH=/usr/bin:/bin HOME={shlex.quote(str(probe_home))} \\
-      CODEX_HOME={shlex.quote(str(probe_home / "codex-home"))} LC_ALL=C \\
-      {shlex.quote(str(codex_path))} --version
-    ;;
-  app-server)
-    exec env -i {env_prefix} {shlex.quote(str(toolchain.root / "bin/podman"))} {quoted_flags} \\
-      2>>{shlex.quote(str(stderr_log))}
-    ;;
-  *)
-    echo "wrapper usage: --version | app-server" >&2
-    exit 2
-    ;;
-esac
-"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(script)
-    path.chmod(0o700)
-    return path
+    return list(
+        attached_run_argv(
+            toolchain.root / "bin/podman",
+            profile,
+            container,
+            image_ref,
+            ("/bin/busybox", "sh", "-c", "exec /toolchain/bin/python3.12 -S /worker/main.py"),
+        )
+    )
 
 
 def toolchain_records(toolchain: Toolchain, codex_records: list[ToolRecord]) -> list[ToolRecord]:
@@ -257,5 +209,4 @@ __all__ = [
     "new_attempt_id",
     "prepare_codex_sandbox",
     "toolchain_records",
-    "write_wrapper_script",
 ]

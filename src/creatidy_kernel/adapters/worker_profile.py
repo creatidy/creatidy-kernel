@@ -116,3 +116,27 @@ def rootless_run_prefix(podman: Path, profile: WorkerProfile, container_name: st
     for key, value in profile.env_allowlist:
         argv += ["--env", f"{key}={value}"]
     return argv
+
+
+def attached_run_argv(
+    podman: Path, profile: WorkerProfile, container_name: str, image: str, entrypoint: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Inert stdio-attached composition; resource verification/admission remain separate.
+
+    The trusted caller selects the image and in-boundary entrypoint. No worker
+    data may select native options, policy, mounts or shell interpretation.
+    """
+    if (
+        type(image) is not str
+        or not image
+        or image.startswith("-")
+        or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in image)
+        or type(entrypoint) is not tuple
+        or not entrypoint
+        or any(type(part) is not str or "\x00" in part for part in entrypoint)
+    ):
+        raise ValueError("explicit OCI image and immutable entrypoint required")
+    _validate_path(PurePosixPath(entrypoint[0]))
+    argv = rootless_run_prefix(podman, profile, container_name)
+    argv.insert(2, "-i")
+    return (*argv, image, *entrypoint)

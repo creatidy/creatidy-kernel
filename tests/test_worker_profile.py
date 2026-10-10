@@ -6,7 +6,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile, rootless_run_prefix
+from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile, attached_run_argv, rootless_run_prefix
 from tools.codex_oci_proof import boundary
 from tools.oci_worker_poc import profile as proof_profile
 from tools.oci_worker_poc.evidence import ToolRecord
@@ -80,6 +80,10 @@ def test_exact_fixed_prefix_and_shared_proof_builders(monkeypatch: pytest.Monkey
     )
     assert proof_profile.WorkerProfile is WorkerProfile and boundary.WorkerProfile is WorkerProfile
     assert proof_profile.WorkerMount is WorkerMount and boundary.WorkerMount is WorkerMount
+    assert boundary.attached_run_argv is attached_run_argv
+    assert attached_run_argv(
+        toolchain().root / "bin/podman", profile(), "owned-one", suffix[0], tuple(suffix[1:])
+    ) == tuple(expected[:2] + ["-i"] + expected[2:] + suffix)
     assert "fixture-must-not-be-inherited" not in " ".join(expected)
 
 
@@ -122,3 +126,15 @@ def test_duplicate_destinations_and_environment_are_refused() -> None:
     ):
         with pytest.raises(ValueError, match="environment"):
             rootless_run_prefix(Path("/explicit/podman"), replace(profile(), env_allowlist=entries), "owned")
+
+
+@pytest.mark.parametrize("image", ["", "-option", "image with spaces", "image\nname"])
+def test_attached_image_cannot_become_options(image: str) -> None:
+    with pytest.raises(ValueError, match="image"):
+        attached_run_argv(Path("/explicit/podman"), profile(), "owned", image, ("/explicit/entrypoint",))
+
+
+@pytest.mark.parametrize("entrypoint", [(), ("relative",), ("/absolute/entry", "nul\x00argument")])
+def test_attached_entrypoint_is_explicit_and_immutable(entrypoint: tuple[str, ...]) -> None:
+    with pytest.raises(ValueError, match="entrypoint|resource path"):
+        attached_run_argv(Path("/explicit/podman"), profile(), "owned", "image:v1", entrypoint)
