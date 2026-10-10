@@ -8,7 +8,7 @@ from creatidy_kernel.core.domain import AttemptSpec
 
 
 class AuthorityDenied(ValueError):
-    """The requested synthetic capability is not authorized."""
+    """The requested capability is not authorized."""
 
 
 WORKER_OPERATIONS = frozenset({"read", "write", "execute", "publish_candidate"})
@@ -43,8 +43,9 @@ class AuthorityGrant:
     def __post_init__(self) -> None:
         if not all((self.grant_id, self.issuer, self.subject, self.program_id, self.spec_digest, self.repository)):
             raise AuthorityDenied("grant identity is incomplete")
-        if not self.root.is_absolute() or not self.root.is_dir():
-            raise AuthorityDenied("grant root must be an existing absolute directory")
+        # An inert revocation snapshot may outlive the retired workspace.
+        if not self.root.is_absolute() or (not self.revoked and not self.root.is_dir()):
+            raise AuthorityDenied("grant root must be absolute and live unless revoked")
         if not self.paths or any(not path.is_relative_to(self.root) for path in self.paths):
             raise AuthorityDenied("paths must be within the repository root")
         if not self.operations or not self.operations <= WORKER_OPERATIONS:

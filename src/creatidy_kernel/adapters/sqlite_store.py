@@ -32,7 +32,17 @@ from creatidy_kernel.adapters.sqlite_codec import (
     validate_create_input,
     validate_history_input,
 )
+from creatidy_kernel.core.authority import (
+    WORKER_OPERATIONS,
+    AuthorityDenied,
+    AuthorityGrant,
+    OperationIntent,
+    Principal,
+    check_scope,
+)
 from creatidy_kernel.core.domain import (
+    AttemptSpec,
+    AttemptStatus,
     DomainCommandType,
     Program,
     ProgramSpec,
@@ -40,7 +50,7 @@ from creatidy_kernel.core.domain import (
 )
 from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _APPLICATION_ID = 0x43544B31
 _DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _LOCAL_FILESYSTEMS = {
@@ -101,6 +111,129 @@ class OperationConflict(SQLiteStoreError):
 
 
 _OBSERVATION_KINDS = frozenset({"accepted", "rejected", "running", "waiting", "terminal", "unknown"})
+
+
+def _authority_record_digest(payload: str) -> str:
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _authority_grant_json(grant: AuthorityGrant) -> str:
+    return canonical_json(
+        {
+            "version": 1,
+            "grant": {
+                "grant_id": grant.grant_id,
+                "issuer": grant.issuer,
+                "subject": grant.subject,
+                "program_id": grant.program_id,
+                "spec_digest": grant.spec_digest,
+                "repository": grant.repository,
+                "root": str(grant.root),
+                "paths": sorted(str(path) for path in grant.paths),
+                "network": sorted(grant.network),
+                "operations": sorted(grant.operations),
+                "expires_at": grant.expires_at,
+                "single_use": grant.single_use,
+            },
+        }
+    )
+
+
+def _authority_grant_data(payload: str) -> dict[str, object]:
+    """Validate persisted metadata without reopening historical workspace paths."""
+    try:
+        envelope: object = json.loads(payload)
+        if type(envelope) is not dict:
+            raise ValueError
+        record = cast(dict[str, object], envelope)
+        if set(record) != {"version", "grant"} or type(record["version"]) is not int or record["version"] != 1:
+            raise ValueError
+        if type(record["grant"]) is not dict or canonical_json(record) != payload:
+            raise ValueError
+        data = cast(dict[str, object], record["grant"])
+        text_fields = {"grant_id", "issuer", "subject", "program_id", "spec_digest", "repository", "root"}
+        if set(data) != text_fields | {"paths", "network", "operations", "expires_at", "single_use"}:
+            raise ValueError
+        if any(type(data[key]) is not str or not cast(str, data[key]).strip() for key in text_fields):
+            raise ValueError
+        if type(data["expires_at"]) is not int or data["expires_at"] <= 0 or type(data["single_use"]) is not bool:
+            raise ValueError
+        for key in ("paths", "network", "operations"):
+            values = data[key]
+            if type(values) is not list or any(
+                type(item) is not str or not item.strip() for item in cast(list[object], values)
+            ):
+                raise ValueError
+            strings = cast(list[str], values)
+            if strings != sorted(set(strings)):
+                raise ValueError
+        root = Path(cast(str, data["root"]))
+        if (
+            not root.is_absolute()
+            or not data["paths"]
+            or any(not Path(path).is_relative_to(root) for path in cast(list[str], data["paths"]))
+        ):
+            raise ValueError
+        operations = frozenset(cast(list[str], data["operations"]))
+        if (
+            not operations
+            or not operations <= WORKER_OPERATIONS
+            or any(value.strip() != value for value in cast(list[str], data["network"]))
+        ):
+            raise ValueError
+        return data
+    except (ValueError, TypeError, KeyError) as error:
+        raise CorruptHistory("invalid or unsupported authority grant record") from error
+
+
+def _authority_intent_json(intent: OperationIntent) -> str:
+    return canonical_json(
+        {
+            "version": 1,
+            "intent": {
+                "operation_id": intent.operation_id,
+                "effect_key": intent.effect_key,
+                "request_digest": intent.request_digest,
+                "operation": intent.operation,
+                "repository": intent.repository,
+                "path": str(intent.path) if intent.path is not None else None,
+                "destination": intent.destination,
+            },
+        }
+    )
+
+
+def _authority_intent_from_json(payload: str) -> OperationIntent:
+    try:
+        record = cast(dict[str, object], json.loads(payload))
+        if (
+            type(record) is not dict
+            or set(record) != {"version", "intent"}
+            or type(record["version"]) is not int
+            or record["version"] != 1
+        ):
+            raise ValueError
+        if type(record["intent"]) is not dict or canonical_json(record) != payload:
+            raise ValueError
+        data = cast(dict[str, object], record["intent"])
+        fields = {"operation_id", "effect_key", "request_digest", "operation", "repository"}
+        if set(data) != fields | {"path", "destination"} or any(
+            type(data[key]) is not str or not cast(str, data[key]).strip() for key in fields
+        ):
+            raise ValueError
+        if any(data[key] is not None and type(data[key]) is not str for key in ("path", "destination")):
+            raise ValueError
+        return OperationIntent(
+            cast(str, data["operation_id"]),
+            cast(str, data["effect_key"]),
+            cast(str, data["request_digest"]),
+            cast(str, data["operation"]),
+            cast(str, data["repository"]),
+            Path(cast(str, data["path"])) if data["path"] is not None else None,
+            cast(str | None, data["destination"]),
+        )
+    except (ValueError, TypeError, KeyError) as error:
+        raise CorruptHistory("invalid or unsupported authority intent record") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,7 +316,13 @@ class SQLiteProgramStore:
     _connection: sqlite3.Connection
     _startup_evidence: SQLiteStartupEvidence
 
-    def __init__(self, path: str | Path, *, busy_timeout_ms: int = _DEFAULT_BUSY_TIMEOUT_MS) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        busy_timeout_ms: int = _DEFAULT_BUSY_TIMEOUT_MS,
+        resolve_authority_intent: Callable[[OperationRecord], OperationIntent] | None = None,
+    ) -> None:
         if type(busy_timeout_ms) is not int or not 1 <= busy_timeout_ms <= 60_000:
             raise ValueError("busy_timeout_ms must be between 1 and 60000")
         raw_path = str(path)
@@ -207,6 +346,9 @@ class SQLiteProgramStore:
         self._busy_timeout_ms = busy_timeout_ms
         self._cache_mode = "private"
         self._closed = False
+        # Only trusted composition can interpret a producer's complete original request.
+        # Worker-supplied paths or a digest alone cannot define that interpretation.
+        self._resolve_authority_intent = resolve_authority_intent
         try:
             self._connection = sqlite3.connect(
                 f"{self._path.as_uri()}?cache=private",
@@ -229,6 +371,7 @@ class SQLiteProgramStore:
             self._migrate()
             self.rebuild_projections()
             self._validate_operation_records()
+            self._validate_authority_records()
             self._startup_evidence = self._read_startup_evidence()
         except BaseException:
             connection = getattr(self, "_connection", None)
@@ -465,6 +608,226 @@ class SQLiteProgramStore:
                 )
                 for row in rows
             )
+
+    def issue(self, principal: Principal, grant: AuthorityGrant) -> AuthorityGrant:
+        """Persist a grant from the stored Program owner, without a dispatchable outbox item."""
+        self._assert_writer_thread()
+        if type(principal) is not Principal or type(grant) is not AuthorityGrant:
+            raise AuthorityDenied("typed owner and grant required")
+        with self._gate, self._transaction():
+            program = self.load(grant.program_id)
+            if (
+                principal.role != "owner"
+                or principal.actor_id != program.spec.authority.owner_id
+                or grant.issuer != principal.actor_id
+                or grant.revoked
+            ):
+                raise AuthorityDenied("only the current Program owner can issue a fresh grant")
+            attempts = [item.spec for item in program.attempts if item.spec.digest == grant.subject]
+            if len(attempts) != 1 or attempts[0].spec_digest != grant.spec_digest:
+                raise AuthorityDenied("grant has no matching durable Attempt")
+            self._authority_attempt(attempts[0])
+            payload = _authority_grant_json(grant)
+            try:
+                _authority_grant_data(payload)
+            except CorruptHistory as error:
+                raise AuthorityDenied("invalid grant metadata") from error
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM authority_grants WHERE grant_id = ?", (grant.grant_id,)
+                ).fetchone()
+                is not None
+            ):
+                raise AuthorityDenied("grant identity already exists")
+            self._connection.execute(
+                "INSERT INTO authority_grants VALUES (?, ?, ?)",
+                (grant.grant_id, payload, _authority_record_digest(payload)),
+            )
+        return grant
+
+    def revoke(self, principal: Principal, grant_id: str) -> AuthorityGrant:
+        """Revocation is durable; previously consumed operations never restore authority."""
+        self._assert_writer_thread()
+        if type(principal) is not Principal:
+            raise AuthorityDenied("typed owner required")
+        with self._gate, self._transaction():
+            grant = self._authority_grant(grant_id, force_revoked=True)
+            program = self.load(grant.program_id)
+            if principal.role != "owner" or principal.actor_id != program.spec.authority.owner_id:
+                raise AuthorityDenied("only the current Program owner can revoke authority")
+            self._connection.execute(
+                "INSERT OR IGNORE INTO authority_revocations VALUES (?, ?)", (grant_id, principal.actor_id)
+            )
+        return grant
+
+    def check(
+        self, principal: Principal, grant_id: str, attempt: AttemptSpec, intent: OperationIntent, now: int
+    ) -> OperationIntent:
+        """Atomically bind/consume authority with the exact existing intent and outbox.
+
+        This does not claim or execute an effect. Dispatch still requires a current fence,
+        deadline and cancellation check; an uncertain effect still needs reconciliation.
+        """
+        self._assert_writer_thread()
+        if (
+            type(principal) is not Principal
+            or type(attempt) is not AttemptSpec
+            or type(intent) is not OperationIntent
+            or type(now) is not int
+            or principal.role != "worker"
+            or principal.actor_id != attempt.attempt_id
+        ):
+            raise AuthorityDenied("worker subject mismatch")
+        if self._resolve_authority_intent is None:
+            raise AuthorityDenied("trusted original-request interpretation required")
+        with self._gate, self._transaction():
+            grant = self._authority_grant(grant_id)
+            self._authority_attempt(attempt)
+            check_scope(grant, attempt, intent, now)
+            operation = self.operation(intent.operation_id)
+            if (
+                operation.effect_key != intent.effect_key
+                or operation.request_digest != intent.request_digest
+                or _authority_record_digest(operation.request_json) != operation.request_digest
+            ):
+                raise AuthorityDenied("operation differs from original durable request")
+            resolved = self._resolve_authority_intent(operation)
+            if (
+                type(resolved) is not OperationIntent
+                or resolved != intent
+                or self.operation(intent.operation_id) != operation
+            ):
+                raise AuthorityDenied("intent differs from trusted original-request interpretation")
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM operation_outbox WHERE operation_id = ?", (intent.operation_id,)
+                ).fetchone()
+                is None
+            ):
+                raise CorruptHistory("authority operation lacks its durable outbox")
+            payload = _authority_intent_json(intent)
+            existing = self._connection.execute(
+                "SELECT grant_id, attempt_digest, intent_json FROM authority_bindings WHERE operation_id = ?",
+                (intent.operation_id,),
+            ).fetchone()
+            if existing is not None:
+                if (existing["grant_id"], existing["attempt_digest"], existing["intent_json"]) != (
+                    grant_id,
+                    attempt.digest,
+                    payload,
+                ):
+                    raise AuthorityDenied("operation identity is bound to different authority")
+                return intent
+            if operation.status != "intent" or operation.attempts:
+                raise AuthorityDenied("authority cannot retroactively admit a dispatched effect")
+            if (
+                grant.single_use
+                and self._connection.execute(
+                    "SELECT 1 FROM authority_bindings WHERE grant_id = ?", (grant_id,)
+                ).fetchone()
+                is not None
+            ):
+                raise AuthorityDenied("single-use grant consumed")
+            # Reassert the original request in the SAME transaction as consumption.
+            request = cast(dict[str, object], json.loads(operation.request_json)["request"])
+            self._insert_intent(operation.operation_id, operation.effect_key, request)
+            self._connection.execute(
+                "INSERT INTO authority_bindings VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    intent.operation_id,
+                    grant_id,
+                    attempt.digest,
+                    intent.effect_key,
+                    payload,
+                    _authority_record_digest(payload),
+                ),
+            )
+        return intent
+
+    def _authority_attempt(self, attempt: AttemptSpec) -> None:
+        program = self.load(attempt.program_id)
+        matching = [item for item in program.attempts if item.spec == attempt]
+        if (
+            program.status is not ProgramStatus.ACTIVE
+            or program.spec.digest != attempt.spec_digest
+            or len(matching) != 1
+            or matching[0].status not in {AttemptStatus.PREPARED, AttemptStatus.EXECUTING}
+        ):
+            raise AuthorityDenied("Attempt or current Program authority changed")
+
+    def _authority_grant(self, grant_id: str, *, force_revoked: bool = False) -> AuthorityGrant:
+        row = self._connection.execute(
+            "SELECT grant_json, grant_digest FROM authority_grants WHERE grant_id = ?", (grant_id,)
+        ).fetchone()
+        if row is None:
+            raise AuthorityDenied("unknown grant")
+        if _authority_record_digest(row["grant_json"]) != row["grant_digest"]:
+            raise CorruptHistory("grant digest differs from durable record")
+        data = _authority_grant_data(row["grant_json"])
+        if data["grant_id"] != grant_id:
+            raise CorruptHistory("grant record identity differs")
+        revoked = force_revoked or (
+            self._connection.execute("SELECT 1 FROM authority_revocations WHERE grant_id = ?", (grant_id,)).fetchone()
+            is not None
+        )
+        return AuthorityGrant(
+            grant_id=cast(str, data["grant_id"]),
+            issuer=cast(str, data["issuer"]),
+            subject=cast(str, data["subject"]),
+            program_id=cast(str, data["program_id"]),
+            spec_digest=cast(str, data["spec_digest"]),
+            repository=cast(str, data["repository"]),
+            root=Path(cast(str, data["root"])),
+            paths=frozenset(Path(item) for item in cast(list[str], data["paths"])),
+            network=frozenset(cast(list[str], data["network"])),
+            operations=frozenset(cast(list[str], data["operations"])),
+            expires_at=cast(int, data["expires_at"]),
+            single_use=cast(bool, data["single_use"]),
+            revoked=revoked,
+        )
+
+    def _validate_authority_records(self) -> None:
+        grants: dict[str, dict[str, object]] = {}
+        for row in self._connection.execute("SELECT * FROM authority_grants"):
+            if _authority_record_digest(row["grant_json"]) != row["grant_digest"]:
+                raise CorruptHistory("grant digest differs from durable record")
+            data = _authority_grant_data(row["grant_json"])
+            if data["grant_id"] != row["grant_id"]:
+                raise CorruptHistory("grant record identity differs")
+            try:
+                program = self.load(cast(str, data["program_id"]))
+            except ProgramNotFound as error:
+                raise CorruptHistory("grant has no durable Program") from error
+            matching = [item.spec for item in program.attempts if item.spec.digest == data["subject"]]
+            specs = [item for item in program.spec_history if item.digest == data["spec_digest"]]
+            if (
+                len(matching) != 1
+                or matching[0].spec_digest != data["spec_digest"]
+                or len(specs) != 1
+                or specs[0].authority.owner_id != data["issuer"]
+            ):
+                raise CorruptHistory("grant differs from historical approved Program or Attempt")
+            grants[row["grant_id"]] = data
+        consumed: set[str] = set()
+        for row in self._connection.execute("SELECT * FROM authority_bindings"):
+            if _authority_record_digest(row["intent_json"]) != row["intent_digest"]:
+                raise CorruptHistory("authority intent digest differs")
+            intent = _authority_intent_from_json(row["intent_json"])
+            operation = self.operation(row["operation_id"])
+            grant = grants[row["grant_id"]]
+            if (
+                intent.operation_id != operation.operation_id
+                or intent.effect_key != operation.effect_key
+                or intent.effect_key != row["effect_key"]
+                or intent.request_digest != operation.request_digest
+                or row["attempt_digest"] != grant["subject"]
+                or intent.repository != grant["repository"]
+                or intent.operation not in cast(list[str], grant["operations"])
+                or (intent.destination is not None and intent.destination not in cast(list[str], grant["network"]))
+                or (grant["single_use"] and row["grant_id"] in consumed)
+            ):
+                raise CorruptHistory("authority binding differs from immutable operation or grant")
+            consumed.add(row["grant_id"])
 
     def intent(self, operation_id: str, effect_key: str, request: dict[str, object]) -> OperationRecord:
         """Commit the original logical effect and outbox together, independently of K2A admission."""
@@ -856,12 +1219,18 @@ class SQLiteProgramStore:
     def _verify_backup_manifest(directory: Path) -> None:
         try:
             manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-            if manifest["format"] != "creatidy-kernel-sqlite-backup" or manifest["schema_version"] not in (1, 2):
+            if (
+                manifest["format"] != "creatidy-kernel-sqlite-backup"
+                or type(manifest["schema_version"]) is not int
+                or manifest["schema_version"] not in (1, 2, 3)
+            ):
                 raise ValueError("unsupported backup manifest")
             with (directory / "kernel.sqlite3").open("rb") as stream:
                 if hashlib.file_digest(stream, "sha256").hexdigest() != manifest["database_sha256"]:
                     raise ValueError("backup database digest mismatch")
-            entries = cast(list[dict[str, object]], manifest["artifacts"]) if manifest["schema_version"] == 2 else []
+            entries = (
+                cast(list[dict[str, object]], manifest["artifacts"]) if manifest["schema_version"] in (2, 3) else []
+            )
             for entry in entries:
                 digest, size = entry["digest"], entry["size"]
                 if type(digest) is not str or len(digest) != 64 or type(size) is not int:
@@ -1195,6 +1564,9 @@ class SQLiteProgramStore:
             if version == 1:
                 self._migrate_1_to_2()
                 version = 2
+            if version == 2:
+                self._migrate_2_to_3()
+                version = 3
             if version != SCHEMA_VERSION:
                 raise UnsupportedSQLiteConfiguration(f"no migration path from schema version {version}")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -1346,6 +1718,30 @@ class SQLiteProgramStore:
                     f"BEGIN SELECT RAISE(ABORT, '{table} is immutable'); END"
                 )
 
+    def _migrate_2_to_3(self) -> None:
+        for statement in (
+            """CREATE TABLE authority_grants (
+                grant_id TEXT PRIMARY KEY, grant_json TEXT NOT NULL,
+                grant_digest TEXT NOT NULL CHECK(length(grant_digest) = 64)
+            ) WITHOUT ROWID""",
+            """CREATE TABLE authority_revocations (
+                grant_id TEXT PRIMARY KEY REFERENCES authority_grants(grant_id), actor_id TEXT NOT NULL
+            ) WITHOUT ROWID""",
+            """CREATE TABLE authority_bindings (
+                operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id),
+                grant_id TEXT NOT NULL REFERENCES authority_grants(grant_id),
+                attempt_digest TEXT NOT NULL, effect_key TEXT NOT NULL UNIQUE,
+                intent_json TEXT NOT NULL, intent_digest TEXT NOT NULL CHECK(length(intent_digest) = 64)
+            ) WITHOUT ROWID""",
+        ):
+            self._connection.execute(statement)
+        for table in ("authority_grants", "authority_revocations", "authority_bindings"):
+            for action in ("UPDATE", "DELETE"):
+                self._connection.execute(
+                    f"CREATE TRIGGER {table}_no_{action.lower()} BEFORE {action} ON {table} "
+                    f"BEGIN SELECT RAISE(ABORT, '{table} is immutable'); END"
+                )
+
     def _validate_schema(self) -> None:
         tables = {
             cast(str, row[0])
@@ -1364,6 +1760,9 @@ class SQLiteProgramStore:
             "operation_transports",
             "operation_reconciliations",
             "artifact_references",
+            "authority_grants",
+            "authority_revocations",
+            "authority_bindings",
         }
         if not required <= tables:
             raise UnsupportedSQLiteConfiguration("database schema is missing required K2 tables")
@@ -1394,6 +1793,16 @@ class SQLiteProgramStore:
                 "authoritative_absence",
             },
             "artifact_references": {"operation_id", "name", "digest", "size"},
+            "authority_grants": {"grant_id", "grant_json", "grant_digest"},
+            "authority_revocations": {"grant_id", "actor_id"},
+            "authority_bindings": {
+                "operation_id",
+                "grant_id",
+                "attempt_digest",
+                "effect_key",
+                "intent_json",
+                "intent_digest",
+            },
         }
         for table, expected in columns.items():
             actual = {cast(str, row["name"]) for row in self._connection.execute(f"PRAGMA table_info({table})")}
@@ -1413,6 +1822,9 @@ class SQLiteProgramStore:
                 "operation_transports",
                 "operation_reconciliations",
                 "artifact_references",
+                "authority_grants",
+                "authority_revocations",
+                "authority_bindings",
             )
             for action in ("update", "delete")
         }

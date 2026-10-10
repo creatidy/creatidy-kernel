@@ -45,6 +45,18 @@ recover the database even while an inert child still holds inherited descriptors
 The host must not remount, replace or move the data directory while the store is open; close the
 store before changing its storage topology.
 
+The same SQLite store now implements the local `AuthorityBroker` admission interface. Authenticated
+trusted composition supplies principals and an explicit `resolve_authority_intent` interpreter for
+the producer's complete original journal request. Issuance checks the stored Program owner and
+immutable Attempt; revocation and single-use operation bindings survive reopen. Consumption is
+committed atomically with validation of the exact existing intent/outbox, not with an external
+effect. A claim, current fence, deadline/cancellation checks and uncertain-effect reconciliation
+remain separate requirements. Grant-management records are not dispatchable outbox items.
+Schema 3 adds these records without rewriting historical request or Program bytes; schema 1/2
+migration and backup restoration remain supported. Retired workspace roots do not discard history
+or prevent owner revocation, but cannot renew execution authority. This is a controller-local
+admission increment, not native worker mediation, an isolated Runtime, or complete #53 reception.
+
 ## Why A Kernel?
 
 A coding agent does the work. Kernel is being designed to retain the intent, authority, durable
