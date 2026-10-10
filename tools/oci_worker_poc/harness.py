@@ -20,6 +20,7 @@ from typing import Any
 from .evidence import UNPROVED, RunEvidence
 from .ociimage import IMAGE_REF, ImageRecord, build_image_archive, image_exists, load_archive
 from .profile import AttemptResources, WorkerProfile, build_profile, build_run_argv
+from .saferead import read_bounded_regular
 from .toolchain import Toolchain, resolve_toolchain
 
 
@@ -179,10 +180,20 @@ def wait_settled(marker: str, timeout_seconds: float = 15.0) -> tuple[bool, list
 
 
 def worker_status(sandbox: Sandbox) -> dict[str, Any]:
+    """Read the worker-written status without following worker-controlled symlinks.
+
+    The worker can replace or symlink any workspace path at any time, including to host
+    paths invisible inside the boundary, so this fixed path is read with the shared
+    fail-closed bounded-regular reader. Absence is truthful (``{"observed": False}``);
+    tampering (planted symlink, non-regular replacement) or oversized content raises and
+    is never reported as absence; malformed JSON raises ``json.JSONDecodeError``.
+    """
     path = sandbox.resources.workspace / "worker-status.json"
-    if not path.is_file():
+    try:
+        data = read_bounded_regular(path)
+    except FileNotFoundError:
         return {"observed": False}
-    return json.loads(path.read_text())  # type: ignore[no-any-return]
+    return json.loads(data.decode())  # type: ignore[no-any-return]
 
 
 def new_evidence(attempt: str, toolchain: Toolchain | None, image: ImageRecord | None, argv: list[str]) -> RunEvidence:

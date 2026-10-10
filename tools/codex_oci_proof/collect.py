@@ -22,6 +22,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from tools.oci_worker_poc.saferead import read_bounded_fd, read_bounded_regular
+
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_ENTRIES = 4096
 MAX_DEPTH = 32
@@ -146,28 +148,6 @@ def _walk_entry(
     return False
 
 
-def read_bounded_fd(fd: int, declared_size: int, limit: int) -> bytes | None:
-    """Read at most ``limit`` bytes from an already-pinned descriptor.
-
-    The pre-check bounds the declared (fstat) size and the loop bounds the actual read,
-    so a file that grows after ``fstat`` — the concurrent-growth race on a live worker's
-    file — is still refused instead of over-reading. ``None`` means the bound was hit.
-    """
-    if declared_size > limit:
-        return None
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-        chunk = os.read(fd, 65536)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > limit:
-            return None
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
 def collect_directory(
     root: Path,
     *,
@@ -198,30 +178,6 @@ def collect_directory(
         return out
     finally:
         os.close(root_fd)
-
-
-def read_bounded_regular(path: Path, limit: int = 1024 * 1024) -> bytes:
-    """Read one worker-controlled file safely: no symlink, regular file only, bounded.
-
-    Used for fixed controller-designated paths inside the writable workspace (whose
-    content the worker may replace at any time, including with a symlink).
-    """
-    st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode):
-        raise ValueError(f"refusing symlinked worker-controlled path: {path}")
-    # O_NONBLOCK: a swapped-in FIFO cannot block the open; the fstat S_ISREG check below
-    # refuses non-regular objects regardless, and O_NONBLOCK is a no-op for regular reads.
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode):
-            raise ValueError(f"worker-controlled path is not a regular file: {path}")
-        data = read_bounded_fd(fd, opened.st_size, limit)
-    finally:
-        os.close(fd)
-    if data is None:
-        raise ValueError(f"worker-controlled path exceeds or grew beyond the read bound: {path}")
-    return data
 
 
 def stored_bytes_sink(stored_root: Path) -> Callable[[str, bytes, CollectedFile], None]:
