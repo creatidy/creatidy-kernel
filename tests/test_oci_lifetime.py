@@ -94,14 +94,17 @@ def test_authenticated_handle_retained_until_actual_exit_signal(
     assert identity["pid"] == 1234567 and identity["start_ticks"] == 12345
     assert lifetime.pidfd is not None and not os.get_inheritable(lifetime.pidfd)
     assert not lifetime.exited()
+    assert lifetime.live()
     lifetime.release()
     assert lifetime.worker.recv(16) == b"GO"
     os.write(writer, b"simulated pidfd exit readiness")
     assert lifetime.exited()
+    assert not lifetime.live()
     with pytest.raises(ExecutionConflict, match="not live"):
         lifetime.release()
     lifetime.close()
     assert not lifetime.exited()
+    assert not lifetime.live()
 
 
 @pytest.mark.parametrize("kind", ["nonce", "truncated", "credentials", "rights", "duplicate"])
@@ -150,3 +153,6 @@ def test_descriptor_errors_are_unknown_not_exit(
 
     monkeypatch.setattr(LifetimeChannel, "_exited", staticmethod(unknown))
     assert not lifetime.exited()
+    assert not lifetime.live()
+    with pytest.raises(ExecutionConflict, match="not live"):
+        lifetime.release()

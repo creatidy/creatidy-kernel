@@ -127,6 +127,19 @@ Private runtime roots are not implicitly published; changed roots/identities and
 refuse. This does not implement general Git materialization or workspace deletion. Those lifetime
 steps, continuous revocation and complete Runtime/Workspace/channel reception remain unfinished.
 
+After a successful lifetime-gated `connect`, `OwnedOCI.runtime` consumes only that owned connection
+through the existing `CodexRuntime`. Its controller-resolved cwd must equal the verified host workspace;
+native thread configuration instead receives the fixed `/workspace` bind destination. SQLite's
+`worker_active_authorizer` rechecks the exact admitted worker/entry binding, original lease and current
+grant without reserving a new send, including after receipt acceptance. Runtime observation/reconciliation
+checks current authority; expiry, revocation or resource drift retire the owned boundary rather than
+reading or collecting further work. Cancellation and uncertain starts also retire it, even when the
+interrupt RPC fails. Native terminality alone does not report boundary terminality or permit collection:
+both retained init exit and owned container absence are required. Exact confirmed completion is retained
+in the active adapter so settlement can finish after stdio closes. Cold native connection reconstruction
+remains unsupported. These are synthetic-composed regressions, not native conformance of the full
+factory, continuous effect mediation, independent review, complete AC4 or `ISOLATED` activation.
+
 `CodexStdio` can also receive an explicit `worker_command` and `worker_environment`, separately
 from its pinned Codex version-probe command and environment. Both subprocess environments must be
 explicit in this mode; no ambient merging or shell interpretation occurs. The installed

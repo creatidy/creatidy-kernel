@@ -8,7 +8,7 @@ import json
 import os
 import socket
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from subprocess import CompletedProcess, TimeoutExpired
@@ -20,13 +20,14 @@ from test_runtime_authority import Prepared
 
 from creatidy_kernel.adapters import oci_bootstrap
 from creatidy_kernel.adapters.bubblewrap_verification import resource_digest
+from creatidy_kernel.adapters.codex_runtime import CodexRuntime
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
 from creatidy_kernel.adapters.oci_lifecycle import LABEL, LifetimeSpec, OCIResources, OwnedOCI
 from creatidy_kernel.adapters.oci_lifetime import SO_PASSPIDFD, LifetimeChannel
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile
 from creatidy_kernel.core.authority import Principal
-from creatidy_kernel.core.execution import ExecutionConflict
+from creatidy_kernel.core.execution import Activity, ExecutionConflict, Presence
 
 pytest_plugins = ["test_runtime_authority"]
 
@@ -455,6 +456,43 @@ def test_worker_deadline_is_original_upper_bound_not_lease_renewal(launch: Launc
     assert launch.prepared.store.operation(launch.owner.operation_id).lease_until == 11
 
 
+def test_active_worker_check_requires_exact_entry_and_survives_receipt_without_new_send(launch: Launch) -> None:
+    prepared = launch.prepared
+    request, cwd, binding = prepared.request, str(prepared.root), b"exact bounded active binding"
+    active = prepared.store.worker_active_authorizer(lambda: launch.time[0])
+    _, dispatch = prepared.store.worker_authorizers(lambda: 1)
+    assert not active(request, cwd, binding)
+    assert dispatch(request, cwd, binding)
+    assert not active(request, cwd, binding)
+    assert prepared.store.worker_entry_authorizer(lambda: 1)(request, cwd, binding)
+    assert not active(request, cwd, b"different")
+    assert active(request, cwd, binding)
+    assert active(request, cwd, binding)
+    runtime, _ = prepared.runtime()
+    handle = runtime.start(request)
+    prepared.receipt(runtime, handle)
+    assert prepared.store.operation(launch.owner.operation_id).status == "accepted"
+    assert active(request, cwd, binding)
+    assert prepared.store.find_artifact(launch.owner.operation_id, "runtime-dispatch:1:worker-active") is None
+    launch.time[0] = 11
+    assert not active(request, cwd, binding)
+    assert prepared.store.operation(launch.owner.operation_id).lease_until == 11
+    assert launch.calls == launch.spawns == []
+
+
+def test_reopened_controller_cannot_adopt_active_worker_authority(launch: Launch) -> None:
+    prepared = launch.prepared
+    binding = b"original bounded binding"
+    _, dispatch = prepared.store.worker_authorizers(lambda: 1)
+    assert dispatch(prepared.request, str(prepared.root), binding)
+    assert prepared.store.worker_entry_authorizer(lambda: 1)(prepared.request, str(prepared.root), binding)
+    prepared.store.close()
+    with SQLiteProgramStore(prepared.database) as restarted:
+        assert not restarted.worker_active_authorizer(lambda: 1)(prepared.request, str(prepared.root), binding)
+        assert restarted.find_artifact(launch.owner.operation_id, "runtime-dispatch:1:worker-active") is None
+    assert launch.calls == launch.spawns == []
+
+
 def _retired(launch: Launch) -> OwnedOCI:
     """Simulated durable controller retirement; NOT a native namespace receipt."""
     launch.connect().close()
@@ -504,6 +542,7 @@ def test_retirement_gates_exact_controller_candidate_bytes_and_excludes_private_
     (launch.prepared.root / "private-runtime.json").write_bytes(b"must not be published")
     candidate = owner.collect_candidate(launch.resources)
     assert candidate.attempt_id == launch.prepared.request.attempt.attempt_id
+    assert candidate.spec_digest == launch.prepared.request.attempt.digest
     assert [item.path for item in candidate.artifacts.artifacts] == ["result.txt"]
     name = "oci-candidate-file:" + hashlib.sha256(b"result.txt").hexdigest()
     assert owner.store.artifact(owner.operation_id, name) == b"exact candidate bytes"
@@ -573,6 +612,7 @@ def test_real_composition_consumes_entry_gate_before_release(
     def receive(channel: LifetimeChannel, *, timeout: float) -> dict[str, object]:
         assert timeout == 15
         channel.pidfd = reader
+        channel.namespace_fd = os.open(launch.prepared.root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         channel.identity = identity
         if revoked:
             launch.prepared.store.revoke(
@@ -654,3 +694,244 @@ def test_real_composition_consumes_entry_gate_before_release(
         if lifetime is not None:
             lifetime.close()
         os.close(writer)
+
+
+@dataclass
+class RuntimeLaunch:
+    launch: Launch
+    runtime: CodexRuntime
+    connection: CodexStdio
+    exited: list[bool]
+    absent: list[bool]
+    calls: list[str]
+
+
+@pytest.fixture
+def runtime_launch(launch: Launch, monkeypatch: pytest.MonkeyPatch) -> Iterator[RuntimeLaunch]:
+    """Real stdio and journal admission; kernel lifetime/engine observations are simulated."""
+    script = FAKE.replace("assert sys.argv[1:] == ['app-server']", "assert sys.argv[1] == 'run'")
+    script = script.replace(
+        "print(json.dumps({'id': message['id'], 'result': {'ok': message['params']}}), flush=True)",
+        """method = message['method']
+        if method == 'thread/start':
+            assert message['params']['cwd'] == '/workspace'
+            result = {'thread': {'id': 'thread-one'}, 'model': 'model-one', 'modelProvider': 'provider-one'}
+        elif method == 'turn/start':
+            result = {'turn': {'id': 'turn-one'}}
+        elif method == 'turn/interrupt':
+            result = {}
+        else:
+            assert method == 'thread/read'
+            result = {'thread': {'id': 'thread-one', 'turns': [{'id': 'turn-one', 'status': 'completed'}]}}
+        print(json.dumps({'id': message['id'], 'result': result}), flush=True)""",
+    )
+    launch.owner.podman.write_text(script)
+    launch.resources = replace(
+        launch.resources,
+        pins=tuple((path, hashlib.sha256(path.read_bytes()).hexdigest()) for path, _ in launch.resources.pins),
+    )
+    connection = launch.owner.connect(
+        launch.resources,
+        launch.codex,
+        "0.99.1",
+        ("/explicit/entrypoint",),
+        {"HOME": str(launch.resources.private_parent / "probe-home")},
+        frozenset({"thread/start", "turn/start", "thread/read", "turn/interrupt"}),
+        launch.prepared.store.worker_authorizers(lambda: launch.time[0]),
+        lambda: launch.time[0],
+    )
+    original_option = socket.socket.setsockopt
+
+    def option(stream: socket.socket, level: int, name: int, value: int) -> None:
+        if name != SO_PASSPIDFD:
+            original_option(stream, level, name, value)
+
+    monkeypatch.setattr(socket.socket, "setsockopt", option)
+    channel = LifetimeChannel(launch.owner.token)
+    channel.identity = {"simulated": True}
+    reader, writer = os.pipe()
+    channel.pidfd = reader
+    channel.namespace_fd = os.open(launch.prepared.root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    exited, absent = [False], [False]
+
+    def namespace_exited(_channel: LifetimeChannel) -> bool:
+        return exited[0]
+
+    monkeypatch.setattr(LifetimeChannel, "exited", namespace_exited)
+
+    def namespace_live(value: LifetimeChannel) -> bool:
+        return value.pidfd is not None and value.namespace_fd is not None and not exited[0]
+
+    monkeypatch.setattr(LifetimeChannel, "live", namespace_live)
+    object.__setattr__(launch.owner, "_lifetime", channel)
+    connection.before_close = channel.close_liveness
+    stage = json.loads(launch.owner.store.artifact(launch.owner.operation_id, "runtime-dispatch:1:worker"))
+    assert launch.prepared.store.worker_entry_authorizer(lambda: 1)(
+        launch.prepared.request, str(launch.prepared.root), stage["launch"].encode()
+    )
+    launch.owner.store.finalize_artifact(
+        launch.owner.operation_id,
+        "oci-init",
+        json.dumps(
+            {
+                "owner": launch.owner.token,
+                "container": "a" * 64,
+                "identity": channel.identity,
+                "binding_reference": hashlib.sha256(stage["launch"].encode()).hexdigest(),
+            }
+        ).encode(),
+    )
+    original_invoke = launch.owner.invoke
+
+    def invoke(argv: tuple[str, ...], environment: Mapping[str, str]) -> CompletedProcess[bytes]:
+        if argv[1:3] == ("container", "exists"):
+            assert argv[-1] == "a" * 64
+            return CompletedProcess(argv, 1 if absent[0] else 0, b"", b"")
+        if argv[1] == "stop":
+            assert argv[-1] == "a" * 64
+            return CompletedProcess(argv, 0, b"", b"")
+        return original_invoke(argv, environment)
+
+    object.__setattr__(launch.owner, "invoke", invoke)
+    original_request = connection.request
+    calls: list[str] = []
+
+    def request(method: str, params: dict[str, object]) -> dict[str, object]:
+        calls.append(method)
+        return original_request(method, params)
+
+    monkeypatch.setattr(connection, "request", request)
+    original, _ = launch.prepared.runtime()
+    runtime = launch.owner.runtime(
+        launch.resources,
+        launch.codex,
+        resolve=original.resolve,
+        authorizers=launch.prepared.store.runtime_authorizers(lambda: launch.time[0]),
+        active_authorizer=launch.prepared.store.worker_active_authorizer(lambda: launch.time[0]),
+        clock=lambda: launch.time[0],
+    )
+    try:
+        yield RuntimeLaunch(launch, runtime, connection, exited, absent, calls)
+    finally:
+        connection.close()
+        channel.close()
+        os.close(writer)
+
+
+def test_owned_runtime_terminal_and_candidate_wait_for_both_retirement_witnesses(runtime_launch: RuntimeLaunch) -> None:
+    cell = runtime_launch
+    root = cell.launch.prepared.root / "candidate"
+    root.mkdir()
+    (root / "result").write_bytes(b"exact bounded result")
+    handle = cell.runtime.start(cell.launch.prepared.request)
+    assert cell.runtime.start(cell.launch.prepared.request) == handle
+    cell.launch.prepared.receipt(cell.runtime, handle)
+    assert cell.runtime.observe(handle, now=2).activity is Activity.UNKNOWN
+    assert cell.runtime.candidate(handle) is None
+    assert cell.calls.count("thread/start") == cell.calls.count("turn/start") == 1
+    cell.absent[0] = True
+    assert cell.runtime.observe(handle, now=3).activity is Activity.UNKNOWN
+    assert cell.runtime.candidate(handle) is None
+    cell.exited[0] = True
+    observation = cell.runtime.observe(handle, now=4)
+    assert observation.activity is Activity.TERMINAL
+    assert not observation.cancellation_requested
+    candidate = cell.runtime.candidate(handle)
+    assert candidate is not None and candidate.spec_digest == cell.launch.prepared.request.attempt.digest
+    assert cell.runtime.candidate(handle) == candidate
+    assert cell.launch.prepared.root.exists()
+    assert cell.runtime.reconcile(cell.launch.prepared.request.operation, handle).presence is Presence.UNKNOWN
+
+
+@pytest.mark.parametrize("mutation", ["expired", "revoked", "resource"])
+def test_owned_runtime_current_authority_refusal_retires_without_read_or_candidate(
+    runtime_launch: RuntimeLaunch, mutation: str
+) -> None:
+    cell = runtime_launch
+    handle = cell.runtime.start(cell.launch.prepared.request)
+    if mutation == "expired":
+        cell.launch.time[0] = 11
+    elif mutation == "revoked":
+        prepared = cell.launch.prepared
+        prepared.store.revoke(Principal(prepared.grant.issuer, "owner"), prepared.grant.grant_id)
+    else:
+        cell.launch.resources.pins[2][0].write_bytes(b"changed")
+    count = len(cell.calls)
+    observation = cell.runtime.observe(handle, now=2)
+    assert observation.activity is Activity.UNKNOWN and observation.cancellation_requested
+    assert len(cell.calls) == count
+    assert cell.runtime.candidate(handle) is None
+    assert cell.launch.prepared.root.exists()
+    cell.absent[0] = cell.exited[0] = True
+    assert cell.runtime.observe(handle, now=3).activity is Activity.TERMINAL
+    assert cell.runtime.candidate(handle) is None
+
+
+@pytest.mark.parametrize("lost_at", ["thread/start", "turn/start", "turn/interrupt"])
+def test_owned_runtime_uncertain_rpc_retires_only_its_boundary_without_retry(
+    runtime_launch: RuntimeLaunch, monkeypatch: pytest.MonkeyPatch, lost_at: str
+) -> None:
+    cell = runtime_launch
+    original = cell.connection.request
+
+    def request(method: str, params: dict[str, object]) -> dict[str, object]:
+        if method == lost_at:
+            raise OSError("synthetic lost response")
+        return original(method, params)
+
+    monkeypatch.setattr(cell.connection, "request", request)
+    if lost_at == "turn/interrupt":
+        handle = cell.runtime.start(cell.launch.prepared.request)
+        assert cell.runtime.cancel(handle).activity is Activity.UNKNOWN
+        assert cell.runtime.candidate(handle) is None
+        cell.exited[0] = cell.absent[0] = True
+        assert cell.runtime.cancel(handle).activity is Activity.TERMINAL
+    else:
+        with pytest.raises(OSError, match="lost response"):
+            cell.runtime.start(cell.launch.prepared.request)
+        with pytest.raises(ExecutionConflict, match="uncertain"):
+            cell.runtime.start(cell.launch.prepared.request)
+    assert cell.runtime.reconcile(cell.launch.prepared.request.operation).presence is Presence.UNKNOWN
+    assert cell.launch.prepared.root.exists()
+
+
+def test_non_gated_factory_connection_cannot_be_presented_as_owned_runtime(launch: Launch) -> None:
+    connection = launch.connect()
+    original, _ = launch.prepared.runtime()
+    try:
+        with pytest.raises(ExecutionConflict, match="gated OCI connection"):
+            launch.owner.runtime(
+                launch.resources,
+                launch.codex,
+                resolve=original.resolve,
+                authorizers=launch.prepared.store.runtime_authorizers(lambda: 1),
+                active_authorizer=launch.prepared.store.worker_active_authorizer(lambda: 1),
+                clock=lambda: 1,
+            )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("status", ["failed", "interrupted"])
+def test_failed_native_candidate_still_retires_owned_namespace(
+    runtime_launch: RuntimeLaunch, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    cell = runtime_launch
+    original = cell.connection.request
+
+    def request(method: str, params: dict[str, object]) -> dict[str, object]:
+        result = original(method, params)
+        if method == "thread/read":
+            return {"thread": {"id": "thread-one", "turns": [{"id": "turn-one", "status": status}]}}
+        return result
+
+    monkeypatch.setattr(cell.connection, "request", request)
+    handle = cell.runtime.start(cell.launch.prepared.request)
+    assert cell.runtime.candidate(handle) is None
+    with pytest.raises(OSError, match="transport closed"):
+        cell.connection.request("thread/read", {"threadId": "thread-one"})
+    assert cell.launch.owner.store.find_artifact(cell.launch.owner.operation_id, "oci-candidate") is None
+    assert cell.runtime.observe(handle, now=2).activity is Activity.UNKNOWN
+    cell.exited[0] = cell.absent[0] = True
+    assert cell.runtime.observe(handle, now=3).activity is Activity.TERMINAL
+    assert cell.runtime.candidate(handle) is None

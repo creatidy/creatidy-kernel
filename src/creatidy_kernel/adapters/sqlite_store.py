@@ -838,7 +838,7 @@ class SQLiteProgramStore:
         with self._gate:
             try:
                 operation, intent, frame = self._runtime_binding(request, cwd)
-                if stage in {"worker", "worker-enter"}:
+                if stage in {"worker", "worker-enter", "worker-active"}:
                     if type(binding) is not bytes or not binding or len(binding) > 1024 * 1024:
                         return False
                     frame = canonical_json(
@@ -849,11 +849,14 @@ class SQLiteProgramStore:
                     "SELECT claimed_at FROM delivery_attempts WHERE operation_id = ? AND fence = ?",
                     (operation.operation_id, operation.fence),
                 ).fetchone()
+                statuses = (
+                    {"dispatched", "accepted", "running", "waiting"} if stage == "worker-active" else {"dispatched"}
+                )
                 if (
                     type(now) is not int
                     or claim is None
                     or now < claim["claimed_at"]
-                    or operation.status != "dispatched"
+                    or operation.status not in statuses
                     or operation.attempts != 1
                     or operation.lease_until is None
                     or now >= operation.lease_until
@@ -868,12 +871,17 @@ class SQLiteProgramStore:
                     now,
                 )
                 if (
-                    stage in {"worker", "worker-enter"}
+                    stage in {"worker", "worker-enter", "worker-active"}
                     and not {"read", "write", "execute"}
                     <= self._authority_grant(request.capability_reference).operations
                 ):
                     return False  # This worker composition exposes a readable, writable project bind.
                 prefix = f"runtime-dispatch:{operation.fence}:"
+                if stage == "worker-active" and any(
+                    self.find_artifact(operation.operation_id, prefix + prior) != frame
+                    for prior in ("worker", "worker-enter")
+                ):
+                    return False
                 name = prefix + stage
                 if self.find_artifact(operation.operation_id, name) is not None:
                     return False  # An uncertain stage or exact replay never authorizes another send.
@@ -917,6 +925,15 @@ class SQLiteProgramStore:
             if operation.lease_until is None:
                 raise AuthorityDenied("worker lease missing")
             return min(operation.lease_until, self._authority_grant(request.capability_reference).expires_at)
+
+    def worker_active_authorizer(self, clock: Callable[[], int]) -> Callable[[ExecutionRequest, str, bytes], bool]:
+        """Recheck an admitted worker without reserving another native send or renewing its lease."""
+        self._assert_writer_thread()
+
+        def check(request: ExecutionRequest, cwd: str, binding: bytes) -> bool:
+            return self._runtime_stage(request, cwd, clock, "worker-active", binding, reserve=False)
+
+        return check
 
     def _runtime_binding(self, request: ExecutionRequest, cwd: str) -> tuple[OperationRecord, OperationIntent, bytes]:
         if type(request) is not ExecutionRequest or type(cwd) is not str:

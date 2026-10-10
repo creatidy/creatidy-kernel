@@ -72,6 +72,7 @@ class _Run:
     identity_provider: str | None = None
     identity_effort: str | None = None
     candidate: Candidate | None = None
+    retired: bool = False
 
     @property
     def handle(self) -> str | None:
@@ -124,12 +125,24 @@ class CodexRuntime(Runtime):
         clock: Callable[[], int] | None = None,
         authorize_resolved: Callable[[ExecutionRequest, str, str], bool] | None = None,
         authorize_recovery: Callable[[ExecutionRequest, str, str], bool] | None = None,
+        native_cwd: str | None = None,
+        authorize_active: Callable[[ExecutionRequest], bool] | None = None,
+        retire: Callable[[ExecutionRequest], None] | None = None,
+        settled: Callable[[ExecutionRequest], bool] | None = None,
     ) -> None:
         if not version or connection.version != version or freshness <= 0:
             raise UnsupportedExecution("Codex version mismatch or invalid freshness contract")
         required = {"thread/start", "turn/start", "thread/read", "turn/interrupt"}
         if not required <= connection.methods:
             raise UnsupportedExecution("Codex version lacks required native methods")
+        if any(value is not None for value in (native_cwd, authorize_active, retire, settled)) and (
+            native_cwd is None
+            or not Path(native_cwd).is_absolute()
+            or authorize_active is None
+            or retire is None
+            or settled is None
+        ):
+            raise ValueError("native workspace mapping requires owned authority and lifetime gates")
         if type(supported_efforts) is not frozenset or any(
             type(binding) is not tuple
             or len(binding) != 3
@@ -145,6 +158,10 @@ class CodexRuntime(Runtime):
         self.collect = collect
         self.freshness = freshness
         self.clock = clock
+        self.native_cwd = native_cwd
+        self.authorize_active = authorize_active
+        self.retire = retire
+        self.settled = settled
         # Trusted support evidence for this pinned connection version, never a
         # vocabulary inferred from an allocator's requested configuration.
         self.supported_efforts = supported_efforts
@@ -216,7 +233,7 @@ class CodexRuntime(Runtime):
             thread_params: dict[str, object] = {
                 "model": inputs.model,
                 "modelProvider": inputs.provider,
-                "cwd": inputs.cwd,
+                "cwd": inputs.cwd if self.native_cwd is None else self.native_cwd,
                 "sandbox": inputs.sandbox,
                 "approvalPolicy": inputs.approval_policy,
             }
@@ -248,9 +265,10 @@ class CodexRuntime(Runtime):
                 raise ExecutionConflict("resolved turn inputs lack current durable authority")
             turn = self.connection.request("turn/start", turn_params)
             run.turn = _field(_object(turn.get("turn")), "id")
-        except (OSError, TimeoutError, CodexRejected):
+        except BaseException:
             # A domain error might be definitive for one RPC, but thread creation or a
             # prior turn may already have happened; never issue another start here.
+            self._retire(run)
             raise
         run.uncertain = False
         handle = run.handle
@@ -300,8 +318,14 @@ class CodexRuntime(Runtime):
         run = self._by_handle.get(handle)
         if run is None:
             raise ExecutionConflict("unknown Codex receipt handle")
-        state = self._read(run)
-        observed_at = self.clock() if self.clock is not None else now
+        self._check_active(run)
+        state = (
+            (run.terminal_status, run.identity_model)
+            if run.retired and run.terminal_status is not None
+            else None
+            if run.retired
+            else self._read(run)
+        )
         activity = Activity.UNKNOWN
         if state is not None:
             status, _ = state
@@ -311,13 +335,19 @@ class CodexRuntime(Runtime):
                 run.terminal = True
                 run.terminal_status = status
                 activity = Activity.TERMINAL
+                self._retire(run)
             elif status == "inProgress":
                 activity = Activity.TERMINAL if run.terminal else Activity.RUNNING
+        if self.settled is not None and (run.terminal or run.cancelled):
+            activity = Activity.TERMINAL if self.settled(run.request) else Activity.UNKNOWN
+        observed_at = self.clock() if self.clock is not None else now
         return RuntimeObservation(
             handle,
             activity,
             observed_at,
-            observed_at + self.freshness if state else observed_at,
+            observed_at + self.freshness
+            if state and not (self.settled is not None and activity is Activity.UNKNOWN)
+            else observed_at,
             run.identity,
             run.cancelled,
         )
@@ -326,10 +356,23 @@ class CodexRuntime(Runtime):
         run = self._by_handle.get(handle)
         if run is None:
             raise ExecutionConflict("unknown Codex receipt handle")
+        self._check_active(run)
+        if self.retire is not None and run.cancelled:
+            return None
         if run.terminal_status in {"failed", "interrupted"}:
             return None
-        state = self._read(run)
+        state = (
+            (run.terminal_status, run.identity_model)
+            if run.retired and run.terminal_status is not None
+            else None
+            if run.retired
+            else self._read(run)
+        )
         if state is not None and state[0] in {"failed", "interrupted"}:
+            if self.retire is not None:
+                run.terminal = True
+                run.terminal_status = state[0]
+                self._retire(run)
             return None
         if state is None or state[0] != "completed":
             if not run.terminal:
@@ -337,6 +380,9 @@ class CodexRuntime(Runtime):
             raise ExecutionConflict("terminal candidate retrieval is uncertain")
         run.terminal = True
         run.terminal_status = "completed"
+        self._retire(run)
+        if self.settled is not None and not self.settled(run.request):
+            return None
         candidate = self.collect(run.request)
         if candidate is not None and (
             candidate.attempt_id != run.request.attempt.attempt_id
@@ -355,19 +401,39 @@ class CodexRuntime(Runtime):
         if run is None or run.thread is None or run.turn is None:
             raise ExecutionConflict("unknown Codex receipt handle")
         run.cancelled = True
-        if not run.terminal:
-            try:
+        try:
+            if not run.terminal and not run.retired:
                 self.connection.request("turn/interrupt", {"threadId": run.thread, "turnId": run.turn})
-            except (OSError, TimeoutError, CodexRejected, CodexRPCError):
-                pass  # Acknowledgment is not proof that cancellation completed.
+        except (OSError, TimeoutError, CodexRejected, CodexRPCError):
+            pass  # Acknowledgment is not proof that cancellation completed.
+        finally:
+            self._retire(run)
+        activity = Activity.TERMINAL if run.terminal else Activity.UNKNOWN
+        if self.settled is not None:
+            activity = Activity.TERMINAL if self.settled(run.request) else Activity.UNKNOWN
         return RuntimeObservation(
             handle,
-            Activity.TERMINAL if run.terminal else Activity.UNKNOWN,
+            activity,
             0,
             0,
             run.identity,
             True,
         )
+
+    def _retire(self, run: _Run) -> None:
+        if self.retire is not None and not run.retired:
+            self.retire(run.request)
+            run.retired = True
+
+    def _check_active(self, run: _Run) -> None:
+        if (
+            self.authorize_active is not None
+            and not run.retired
+            and not run.cancelled
+            and not self.authorize_active(run.request)
+        ):
+            run.cancelled = True
+            self._retire(run)
 
     def reconcile(self, operation: OperationKey, handle: str | None = None) -> Lookup:
         run = self._by_key.get(operation.effect_key)
@@ -376,5 +442,8 @@ class CodexRuntime(Runtime):
         if run.request.operation != operation:
             raise ExecutionConflict("reconciliation key differs from original Operation")
         if run.handle is None or run.uncertain or (handle is not None and handle != run.handle):
+            return Lookup(Presence.UNKNOWN)
+        self._check_active(run)
+        if run.retired:
             return Lookup(Presence.UNKNOWN)
         return Lookup(Presence.FOUND, run.handle) if self._read(run) is not None else Lookup(Presence.UNKNOWN)

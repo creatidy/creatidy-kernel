@@ -161,8 +161,17 @@ class LifetimeChannel:
         except OSError:
             return False
 
+    def live(self) -> bool:
+        if self.pidfd is None or self.namespace_fd is None or self.identity is None:
+            return False
+        try:
+            os.fstat(self.namespace_fd)
+            return self._exited(self.pidfd) is False
+        except OSError:
+            return False
+
     def release(self) -> None:
-        if self.pidfd is None or self.identity is None or self.exited():
+        if not self.live():
             raise ExecutionConflict("owned OCI init is not live at execution gate")
         self.controller.sendall(b"GO")
 

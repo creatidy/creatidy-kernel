@@ -408,3 +408,46 @@ def test_requested_resolution_claims_do_not_become_native_evidence_after_restore
     runtime.restore(request, "codex:thread-one:turn-one")
     identity = runtime.observe("codex:thread-one:turn-one", now=10).identity
     assert identity.resolved is None and identity.resolved_provider is None and identity.resolved_effort is None
+
+
+def test_native_cwd_mapping_keeps_host_authority_inputs() -> None:
+    connection, original, request = setup()
+    guards: list[tuple[str, str]] = []
+
+    def dispatch(_request: ExecutionRequest, cwd: str, method: str) -> bool:
+        guards.append((cwd, method))
+        return True
+
+    runtime = CodexRuntime(
+        connection,
+        version=connection.version,
+        resolve=original.resolve,
+        authorize=original.authorize,
+        authorize_resolved=dispatch,
+        collect=original.collect,
+        native_cwd="/workspace",
+        authorize_active=lambda _: True,
+        retire=lambda _: None,
+        settled=lambda _: False,
+    )
+    runtime.start(request)
+    assert connection.calls[0][1]["cwd"] == "/workspace"
+    assert guards == [("/sandbox/checkout", "thread/start"), ("/sandbox/checkout", "turn/start")]
+
+
+@pytest.mark.parametrize("missing", ["native_cwd", "authorize_active", "retire", "settled"])
+def test_partial_owned_lifetime_configuration_refuses(missing: str) -> None:
+    connection, original, _ = setup()
+    with pytest.raises(ValueError, match="lifetime gates"):
+        CodexRuntime(
+            connection,
+            version=connection.version,
+            resolve=original.resolve,
+            authorize=original.authorize,
+            collect=original.collect,
+            native_cwd=None if missing == "native_cwd" else "/workspace",
+            authorize_active=None if missing == "authorize_active" else lambda _: True,
+            retire=None if missing == "retire" else lambda _: None,
+            settled=None if missing == "settled" else lambda _: False,
+        )
+    assert connection.calls == []

@@ -21,6 +21,7 @@ from types import MappingProxyType
 from typing import cast
 
 from creatidy_kernel.adapters.bubblewrap_verification import resource_digest
+from creatidy_kernel.adapters.codex_runtime import CodexInputs, CodexRuntime
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
 from creatidy_kernel.adapters.oci_lifetime import LifetimeChannel
 from creatidy_kernel.adapters.worker_collection import CollectedFile, collect_directory_fd
@@ -237,6 +238,7 @@ class OwnedOCI:
     frame: bytes
     token: str
     _lifetime: LifetimeChannel | None
+    _connection: CodexStdio | None
 
     def __init__(
         self,
@@ -306,6 +308,7 @@ class OwnedOCI:
             ("frame", frame),
             ("token", hashlib.sha256(frame).hexdigest()),
             ("_lifetime", None),
+            ("_connection", None),
         ):
             object.__setattr__(self, key, value)
 
@@ -520,7 +523,7 @@ class OwnedOCI:
                 raise ExecutionConflict("OCI candidate collection refused unsafe entries")
         self.require_settled()
         manifest = ArtifactManifest(self.request.workspace.key, tuple(sorted(artifacts, key=lambda item: item.path)))
-        candidate = Candidate(self.request.attempt.attempt_id, self.request.attempt.spec_digest, manifest)
+        candidate = Candidate(self.request.attempt.attempt_id, self.request.attempt.digest, manifest)
         self.store.finalize_artifact(self.operation_id, "oci-candidate", _bytes(asdict(candidate)))
         return candidate
 
@@ -681,4 +684,98 @@ class OwnedOCI:
             if connection is not None:
                 connection.close()
             raise
+        object.__setattr__(self, "_connection", connection)
         return connection
+
+    def runtime(
+        self,
+        resources: OCIResources,
+        codex: Path,
+        *,
+        resolve: Callable[[ExecutionRequest], CodexInputs],
+        authorizers: tuple[Callable[[ExecutionRequest, str, str], bool], Callable[[ExecutionRequest, str, str], bool]],
+        active_authorizer: WorkerAuthorizer,
+        clock: Callable[[], int],
+        supported_efforts: frozenset[tuple[str, str, str]] = frozenset(),
+    ) -> CodexRuntime:
+        """Consume only this factory's gated connection through the existing Runtime.
+
+        Host cwd remains the authority subject; /workspace is only the native bind
+        destination. Observation-time revocation is not continuous effect mediation.
+        Cold connection reconstruction and isolated product activation remain unsupported.
+        """
+        connection, lifetime = self._connection, self._lifetime
+        if connection is None or lifetime is None or not lifetime.live():
+            raise ExecutionConflict("owned live gated OCI connection required")
+        stage = _object(
+            json.loads(self.store.artifact(self.operation_id, f"runtime-dispatch:{self.request.fence}:worker"))
+        )
+        binding = stage.get("launch")
+        if type(binding) is not str:
+            raise ExecutionConflict("OCI runtime launch binding unavailable")
+        launch = _object(json.loads(binding))
+        evidence = resources.verify(self, codex)
+        if launch.get("resources") != evidence.decode() or launch.get("owner") != self.token:
+            raise ExecutionConflict("OCI runtime resources differ from original launch")
+        dispatch, recovery = authorizers
+
+        def inputs(request: ExecutionRequest) -> CodexInputs:
+            if request != self.request:
+                raise ExecutionConflict("OCI Runtime request differs from owned Attempt")
+            value = resolve(request)
+            if value.cwd != str(resources.workspace):
+                raise ExecutionConflict("OCI Runtime host cwd differs from verified workspace")
+            return value
+
+        def retire(request: ExecutionRequest) -> None:
+            if request != self.request:
+                raise ExecutionConflict("OCI retirement request differs from owned Attempt")
+            lifetime.close_liveness()
+            try:
+                connection.close()
+            finally:
+                self.stop()
+
+        def active(request: ExecutionRequest) -> bool:
+            if request != self.request:
+                return False
+            try:
+                return (
+                    lifetime.live()
+                    and resources.verify(self, codex) == evidence
+                    and active_authorizer(request, str(resources.workspace), binding.encode()) is True
+                )
+            except (OSError, ValueError, ExecutionConflict):
+                return False
+
+        def authorize(request: ExecutionRequest) -> bool:
+            if active(request):
+                return True
+            retire(request)
+            return False
+
+        def authorize_resolved(request: ExecutionRequest, cwd: str, method: str) -> bool:
+            if not authorize(request):
+                return False
+            return dispatch(request, cwd, method)
+
+        def collect(request: ExecutionRequest) -> Candidate:
+            if request != self.request:
+                raise ExecutionConflict("OCI collection request differs from owned Attempt")
+            return self.collect_candidate(resources)
+
+        return CodexRuntime(
+            connection,
+            version=connection.version,
+            resolve=inputs,
+            authorize=authorize,
+            authorize_resolved=authorize_resolved,
+            authorize_recovery=recovery,
+            collect=collect,
+            clock=clock,
+            supported_efforts=supported_efforts,
+            native_cwd="/workspace",
+            authorize_active=active,
+            retire=retire,
+            settled=lambda _: self.settled(),
+        )
