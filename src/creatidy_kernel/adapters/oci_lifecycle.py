@@ -23,7 +23,9 @@ from typing import cast
 from creatidy_kernel.adapters.bubblewrap_verification import resource_digest
 from creatidy_kernel.adapters.codex_runtime import CodexInputs, CodexRuntime
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
+from creatidy_kernel.adapters.git_workspace import verify_generation
 from creatidy_kernel.adapters.oci_lifetime import LifetimeChannel
+from creatidy_kernel.adapters.source_cache import SourceAcquisitionError
 from creatidy_kernel.adapters.worker_collection import CollectedFile, collect_directory_fd
 from creatidy_kernel.adapters.worker_profile import WorkerProfile, attached_run_argv, rootless_run_prefix
 from creatidy_kernel.core.execution import (
@@ -88,6 +90,7 @@ class OCIResources:
     pins: tuple[tuple[Path, str], ...]
     read_only: tuple[tuple[Path, str], ...]
     candidate_root: PurePosixPath = PurePosixPath("candidate")
+    workspace_operation: str | None = None
 
     def verify(self, owner: "OwnedOCI", codex: Path) -> bytes:
         if type(self.candidate_root) is not PurePosixPath:
@@ -190,6 +193,19 @@ class OCIResources:
             ]:
                 raise ExecutionConflict("OCI resource identity changed while reading")
             identities[str(path)] = identity
+        materialization = (
+            verify_generation(
+                owner.store,
+                self.workspace_operation,
+                owner.request.workspace,
+                self.workspace,
+                self.private_parent,
+                self.candidate_root,
+                self.protected,
+            ).decode()
+            if self.workspace_operation is not None
+            else None
+        )
         return _bytes(
             {
                 "version": 1,
@@ -198,6 +214,7 @@ class OCIResources:
                 "read_only": {str(path): digest for path, digest in read_only.items()},
                 "protected": [str(path) for path in self.protected],
                 "candidate_root": str(self.candidate_root),
+                "materialization": materialization,
             }
         )
 
@@ -481,6 +498,21 @@ class OwnedOCI:
         retained = _object(json.loads(cast(str, launch.get("resources"))))
         if retained.get("candidate_root") != str(resources.candidate_root):
             raise ExecutionConflict("OCI candidate root differs from original launch")
+        materialization = retained.get("materialization")
+        if resources.workspace_operation is not None:
+            actual = verify_generation(
+                self.store,
+                resources.workspace_operation,
+                self.request.workspace,
+                resources.workspace,
+                resources.private_parent,
+                resources.candidate_root,
+                resources.protected,
+            ).decode()
+            if actual != materialization:
+                raise ExecutionConflict("OCI Workspace generation differs from original launch")
+        elif materialization is not None:
+            raise ExecutionConflict("OCI original Workspace generation missing")
         identities = _object(retained.get("identities"))
         artifacts: list[Artifact] = []
 
@@ -518,7 +550,9 @@ class OwnedOCI:
                     part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=descriptor
                 )
                 stack.callback(os.close, descriptor)
-            collected = collect_directory_fd(descriptor, sink=sink)
+            collected = collect_directory_fd(
+                descriptor, sink=sink, exclude=frozenset({".git"}) if materialization is not None else frozenset()
+            )
             if collected.refusals:
                 raise ExecutionConflict("OCI candidate collection refused unsafe entries")
         self.require_settled()
@@ -745,7 +779,7 @@ class OwnedOCI:
                     and resources.verify(self, codex) == evidence
                     and active_authorizer(request, str(resources.workspace), binding.encode()) is True
                 )
-            except (OSError, ValueError, ExecutionConflict):
+            except (OSError, ValueError, SourceAcquisitionError, ExecutionConflict):
                 return False
 
         def authorize(request: ExecutionRequest) -> bool:

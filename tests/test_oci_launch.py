@@ -22,8 +22,10 @@ from creatidy_kernel.adapters import oci_bootstrap
 from creatidy_kernel.adapters.bubblewrap_verification import resource_digest
 from creatidy_kernel.adapters.codex_runtime import CodexRuntime
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
+from creatidy_kernel.adapters.git_workspace import GitWorkspace
 from creatidy_kernel.adapters.oci_lifecycle import LABEL, LifetimeSpec, OCIResources, OwnedOCI
 from creatidy_kernel.adapters.oci_lifetime import SO_PASSPIDFD, LifetimeChannel
+from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile
 from creatidy_kernel.core.authority import Principal
@@ -928,6 +930,7 @@ def test_failed_native_candidate_still_retires_owned_namespace(
     monkeypatch.setattr(cell.connection, "request", request)
     handle = cell.runtime.start(cell.launch.prepared.request)
     assert cell.runtime.candidate(handle) is None
+
     with pytest.raises(OSError, match="transport closed"):
         cell.connection.request("thread/read", {"threadId": "thread-one"})
     assert cell.launch.owner.store.find_artifact(cell.launch.owner.operation_id, "oci-candidate") is None
@@ -935,3 +938,94 @@ def test_failed_native_candidate_still_retires_owned_namespace(
     cell.exited[0] = cell.absent[0] = True
     assert cell.runtime.observe(handle, now=3).activity is Activity.TERMINAL
     assert cell.runtime.candidate(handle) is None
+
+
+@pytest.fixture
+def source_bound_launch(launch: Launch, tmp_path_factory: pytest.TempPathFactory) -> GitWorkspace:
+    source = tmp_path_factory.mktemp("bound-source")
+    reference_git(source, "init", "--template=")
+    (source / "original.txt").write_bytes(b"exact materialized input")
+    reference_git(source, "add", "-A")
+    reference_git(source, "commit", "-m", "synthetic source")
+    reference_git(source, "remote", "add", "origin", "https://forge.invalid/Owner/repo")
+    original_request = launch.prepared.request
+    spec = replace(original_request.workspace.spec, base_revision=reference_git(source, "rev-parse", "HEAD").strip())
+    root = launch.prepared.root
+    root.rmdir()  # This generated fixture root is empty and has never been dispatched.
+    workspace = GitWorkspace(
+        launch.prepared.store,
+        source,
+        "https://forge.invalid/Owner/repo",
+        spec.repository,
+        root,
+        root.parent / "objects.git",
+    )
+    handle = workspace.materialize(original_request.workspace.key, spec)
+    launch.prepared.request = replace(original_request, workspace=handle)
+    prior = launch.owner
+    owner: OwnedOCI
+
+    def invoke(argv: tuple[str, ...], _environment: Mapping[str, str]) -> CompletedProcess[bytes]:
+        launch.calls.append(argv)
+        if argv[1:3] == ("image", "inspect"):
+            return CompletedProcess(argv, 0, ("sha256:" + owner.image + "\n").encode(), b"")
+        if argv[1:3] == ("container", "inspect"):
+            record = {
+                "Id": "a" * 64,
+                "Name": owner.name,
+                "Image": owner.image,
+                "Config": {"Labels": {LABEL: owner.token}},
+            }
+            return CompletedProcess(argv, 0, json.dumps([record]).encode(), b"")
+        assert argv[1:3] == ("container", "exists")
+        return CompletedProcess(argv, 1, b"", b"")
+
+    owner = OwnedOCI(
+        prior.store,
+        launch.prepared.request,
+        prior.podman,
+        prior.profile,
+        prior.name,
+        prior.image,
+        prior.environment,
+        invoke,
+    )
+    launch.owner = owner
+    resources = replace(launch.resources, protected=(*launch.resources.protected, workspace.objects))
+    launch.resources = workspace.bind(owner, resources)
+    return workspace
+
+
+def test_real_factory_consumes_source_generation_and_settlement_collection(
+    source_bound_launch: GitWorkspace, launch: Launch
+) -> None:
+    workspace = source_bound_launch
+    _retired(launch)
+    manifest = workspace.collect(launch.prepared.request.workspace)
+    assert {artifact.path for artifact in manifest.artifacts} == {"original.txt"}
+    assert all(not artifact.path.startswith(".git") for artifact in manifest.artifacts)
+    assert workspace.reconcile(launch.prepared.request.workspace.key).presence is Presence.FOUND
+    receipt = launch.prepared.store.artifact(launch.owner.operation_id, "oci-candidate")
+    assert receipt
+    assert workspace.objects.exists()
+
+
+@pytest.mark.parametrize("mutation", ["objects", "candidate", "unprotected", "mapping"])
+def test_source_generation_refusal_occurs_before_native_probe_or_worker(
+    source_bound_launch: GitWorkspace, launch: Launch, mutation: str
+) -> None:
+    workspace = source_bound_launch
+    if mutation == "objects":
+        (workspace.objects / "config").write_bytes(b"changed protected original")
+    elif mutation == "candidate":
+        candidate = launch.prepared.root / "candidate"
+        candidate.rename(candidate.with_name("retained-candidate"))
+        candidate.mkdir()
+    elif mutation == "unprotected":
+        launch.resources = replace(launch.resources, protected=(launch.prepared.database,))
+    else:
+        launch.resources = replace(launch.resources, candidate_root=PurePosixPath("different"))
+    with pytest.raises((ExecutionConflict, OSError, ValueError, RuntimeError)):
+        launch.connect()
+    assert launch.calls == []
+    assert not any(argv and argv[0] in {str(launch.codex), str(launch.owner.podman)} for argv in launch.spawns)

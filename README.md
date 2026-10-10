@@ -124,8 +124,8 @@ effect closure. These remain bounded optional engineering, not adopted product i
 resource binding. It pins private ancestry/workspace identity and traverses through held descriptors,
 rejects all collection refusals, durably stores exact bytes and then an immutable Candidate proposal.
 Private runtime roots are not implicitly published; changed roots/identities and absence-only claims
-refuse. This does not implement general Git materialization or workspace deletion. Those lifetime
-steps, continuous revocation and complete Runtime/Workspace/channel reception remain unfinished.
+refuse. General workspace deletion, continuous revocation and complete Runtime/Workspace/channel
+reception remain unfinished.
 
 After a successful lifetime-gated `connect`, `OwnedOCI.runtime` consumes only that owned connection
 through the existing `CodexRuntime`. Its controller-resolved cwd must equal the verified host workspace;
@@ -139,6 +139,21 @@ both retained init exit and owned container absence are required. Exact confirme
 in the active adapter so settlement can finish after stdio closes. Cold native connection reconstruction
 remains unsupported. These are synthetic-composed regressions, not native conformance of the full
 factory, continuous effect mediation, independent review, complete AC4 or `ISOLATED` activation.
+
+`GitWorkspace` supplies optional source-backed materialization before granting or exposing a workspace.
+The controller explicitly binds a historical repository ID to an existing checkout and qualified HTTPS
+origin; no repository ID is reinterpreted as a filesystem path. It copies the exact full base commit into
+protected original objects without hardlinks and creates a separate detached checkout under the bound
+Candidate subtree. Source configuration, origin and tree/byte bounds are checked before publication.
+The existing journal records the plan, reserved staging identities and completed generation; directory
+publication is no-replace and durable. Partial/unowned/replaced roots remain unknown and are preserved,
+not retried or adopted. Recovery verifies the original protected objects and generation without fetching
+or refilling them from a changed or missing source. `bind` makes the factory consume this record in its
+resource/launch binding and settlement-gated collection; only this source-backed path excludes its
+mutable `.git` metadata from the artifact proposal. The supported subset remains trusted-development
+without overlays or requested network/mount additions. Cleanup explicitly refuses even a caller's
+`worker_settled=True`; that boolean is not ownership or deletion proof. Native source/Git and synthetic
+factory tests do not establish full native Runtime/Workspace conformance or universal AC4.
 
 `CodexStdio` can also receive an explicit `worker_command` and `worker_environment`, separately
 from its pinned Codex version-probe command and environment. Both subprocess environments must be

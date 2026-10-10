@@ -466,6 +466,17 @@ def source_git(source: Path, *arguments: str, max_bytes: int = MAX_GIT_OUTPUT_BY
     ).stdout
 
 
+def validate_source_repository(source: Path, repository_url: str) -> None:
+    """Verify executable-config refusal and the exact qualified origin before copying."""
+    validate_checkout(source)
+    binary = shutil.which("git", path=os.defpath)
+    if binary is None:
+        raise _refuse(SourceCategory.CHECKOUT_UNSUITABLE)
+    _origin(
+        source, binary, _git_environment(Path("/nonexistent"), os.defpath, None), canonical_repository(repository_url)
+    )
+
+
 def copy_source_objects(source: Path, target: Path, *, base: str) -> None:
     """Copy, not hardlink, source objects using the same bounded closed Git seam."""
     validate_checkout(source)
@@ -495,7 +506,12 @@ def copy_source_objects(source: Path, target: Path, *, base: str) -> None:
         raise _refuse(SourceCategory.BASE_UNAVAILABLE)
 
 
-def _publish(staging: Path, target: Path) -> None:
+def directory_identity(path: Path) -> tuple[int, ...]:
+    """Trusted local directory identity with the source ownership/path checks."""
+    return tuple(_identity(path))
+
+
+def publish_directory(staging: Path, target: Path) -> None:
     """Linux atomic no-replace publication; no unchecked rename fallback."""
     parent_identity = _identity(target.parent)
     descriptor = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -516,6 +532,9 @@ def _publish(staging: Path, target: Path) -> None:
             raise _refuse(SourceCategory.OWNERSHIP_UNPROVEN)
     finally:
         os.close(descriptor)
+
+
+_publish = publish_directory
 
 
 def acquire_source(

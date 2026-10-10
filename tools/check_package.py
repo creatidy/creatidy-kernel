@@ -71,6 +71,8 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
             "WorkerProfile, attached_run_argv, rootless_run_prefix; "
             "from creatidy_kernel.adapters.oci_lifecycle import LifetimeSpec, OCIResources, OwnedOCI; "
             "from creatidy_kernel.adapters.oci_lifetime import LifetimeChannel; "
+            "from creatidy_kernel.adapters.git_workspace import GitWorkspace; "
+            "assert callable(GitWorkspace.materialize) and callable(GitWorkspace.reconcile); "
             "profile = WorkerProfile('synthetic', (), (), Path('/explicit/seccomp.json'), 1, 1024, 0.5, 1); "
             "prefix = rootless_run_prefix(Path('/explicit/podman'), profile, 'owned'); "
             "assert prefix[:3] == ['/explicit/podman', 'run', '--pull=never']; "
