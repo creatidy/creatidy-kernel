@@ -34,6 +34,8 @@ from creatidy_kernel.core.domain import (
 from creatidy_kernel.ports.authority import AuthorityBroker
 from creatidy_kernel.ports.program_store import OperationRecord
 
+pytest_plugins = ["test_sqlite_store"]
+
 
 def resolve(record: OperationRecord) -> OperationIntent:
     """Interpret this fixture producer's complete original bytes, not worker assertions."""
@@ -64,7 +66,8 @@ def original(store: SQLiteProgramStore, operation_id: str = "op-1") -> Operation
 
 
 @pytest.fixture
-def authority(tmp_path: Path) -> Iterator[tuple[SQLiteProgramStore, AttemptSpec, AuthorityGrant, Path]]:
+def authority(sqlite_tmp_path: Path) -> Iterator[tuple[SQLiteProgramStore, AttemptSpec, AuthorityGrant, Path]]:
+    tmp_path = sqlite_tmp_path
     (tmp_path / "work").mkdir()
     database = tmp_path / "kernel.db"
     with SQLiteProgramStore(database, resolve_authority_intent=resolve) as store:

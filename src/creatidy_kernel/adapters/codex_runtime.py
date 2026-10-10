@@ -122,6 +122,8 @@ class CodexRuntime(Runtime):
         freshness: int = 30,
         supported_efforts: frozenset[tuple[str, str, str]] = frozenset(),
         clock: Callable[[], int] | None = None,
+        authorize_resolved: Callable[[ExecutionRequest, str, str], bool] | None = None,
+        authorize_recovery: Callable[[ExecutionRequest, str, str], bool] | None = None,
     ) -> None:
         if not version or connection.version != version or freshness <= 0:
             raise UnsupportedExecution("Codex version mismatch or invalid freshness contract")
@@ -138,6 +140,8 @@ class CodexRuntime(Runtime):
         self.connection = connection
         self.resolve = resolve
         self.authorize = authorize
+        self.authorize_resolved = authorize_resolved
+        self.authorize_recovery = authorize_recovery
         self.collect = collect
         self.freshness = freshness
         self.clock = clock
@@ -204,6 +208,8 @@ class CodexRuntime(Runtime):
         inputs = self._inputs(request)
         if not self.authorize(request):
             raise ExecutionConflict("operation lacks a durable delivery claim")
+        if self.authorize_resolved is not None and not self.authorize_resolved(request, inputs.cwd, "thread/start"):
+            raise ExecutionConflict("resolved thread inputs lack current durable authority")
         run = _Run(request, uncertain=True)
         self._by_key[key] = run
         try:
@@ -238,6 +244,8 @@ class CodexRuntime(Runtime):
                 turn_params["effort"] = inputs.reasoning_effort
             if not self.authorize(request):
                 raise ExecutionConflict("operation authority expired before turn dispatch")
+            if self.authorize_resolved is not None and not self.authorize_resolved(request, inputs.cwd, "turn/start"):
+                raise ExecutionConflict("resolved turn inputs lack current durable authority")
             turn = self.connection.request("turn/start", turn_params)
             run.turn = _field(_object(turn.get("turn")), "id")
         except (OSError, TimeoutError, CodexRejected):
@@ -253,11 +261,13 @@ class CodexRuntime(Runtime):
 
     def restore(self, request: ExecutionRequest, handle: str) -> Lookup:
         """Bind an externally durable, accepted receipt before inspecting its native turn."""
-        self._inputs(request)
+        inputs = self._inputs(request)
         prefix = "codex:"
         parts = handle.removeprefix(prefix).split(":") if handle.startswith(prefix) else []
         if len(parts) != 2 or not all(parts):
             raise ExecutionConflict("invalid durable Codex receipt handle")
+        if self.authorize_recovery is not None and not self.authorize_recovery(request, handle, inputs.cwd):
+            raise ExecutionConflict("Codex recovery receipt is not owned by this operation")
         existing = self._by_key.get(request.operation.effect_key)
         if existing is not None and (existing.request != request or existing.handle != handle):
             raise ExecutionConflict("Codex receipt conflicts with immutable Operation")

@@ -15,7 +15,7 @@ import tempfile
 import threading
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import cast
 
@@ -47,6 +47,14 @@ from creatidy_kernel.core.domain import (
     Program,
     ProgramSpec,
     ProgramStatus,
+)
+from creatidy_kernel.core.execution import ExecutionRequest, TrustMode
+from creatidy_kernel.ports.allocation import (
+    decode_allocation,
+    decode_runtime_receipt,
+    identity_matches,
+    is_legacy_allocation,
+    load_attempt_inputs,
 )
 from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
 
@@ -349,6 +357,7 @@ class SQLiteProgramStore:
         # Only trusted composition can interpret a producer's complete original request.
         # Worker-supplied paths or a digest alone cannot define that interpretation.
         self._resolve_authority_intent = resolve_authority_intent
+        self._runtime_claims: set[tuple[str, int]] = set()
         try:
             self._connection = sqlite3.connect(
                 f"{self._path.as_uri()}?cache=private",
@@ -744,6 +753,182 @@ class SQLiteProgramStore:
             )
         return intent
 
+    def runtime_authorizers(
+        self, clock: Callable[[], int]
+    ) -> tuple[Callable[[ExecutionRequest, str, str], bool], Callable[[ExecutionRequest, str, str], bool]]:
+        """Guards for the existing Codex inputs and owned-receipt recovery hooks.
+
+        These guard trusted-development dispatch, not native effects or isolation.
+        Each native start stage is recorded BEFORE sending it, so reopening cannot
+        turn a live lease or a lost reply into another start permission.
+        """
+        self._assert_writer_thread()
+
+        def dispatch(request: ExecutionRequest, cwd: str, method: str) -> bool:
+            self._assert_writer_thread()
+            if method not in {"thread/start", "turn/start"}:
+                return False
+            with self._gate:
+                try:
+                    operation, intent, frame = self._runtime_binding(request, cwd)
+                    now = clock()
+                    claim = self._connection.execute(
+                        "SELECT claimed_at FROM delivery_attempts WHERE operation_id = ? AND fence = ?",
+                        (operation.operation_id, operation.fence),
+                    ).fetchone()
+                    if (
+                        type(now) is not int
+                        or claim is None
+                        or now < claim["claimed_at"]
+                        or operation.status != "dispatched"
+                        or operation.attempts != 1
+                        or operation.lease_until is None
+                        or now >= operation.lease_until
+                        or (operation.operation_id, operation.fence) not in self._runtime_claims
+                    ):
+                        return False
+                    worker = Principal(request.attempt.attempt_id, "worker")
+                    self.check(worker, request.capability_reference, request.attempt, intent, now)
+                    prefix = f"runtime-dispatch:{operation.fence}:"
+                    name = prefix + ("thread" if method == "thread/start" else "turn")
+                    if self.find_artifact(operation.operation_id, name) is not None:
+                        return False  # Exact stage replay is metadata, never a new native send.
+                    if (
+                        method == "turn/start"
+                        and self.find_artifact(operation.operation_id, prefix + "thread") != frame
+                    ):
+                        return False
+                    self.finalize_artifact(operation.operation_id, name, frame)
+                    checked_at = clock()
+                    if type(checked_at) is not int or checked_at < now or checked_at >= operation.lease_until:
+                        return False
+                    self._authority_attempt(request.attempt)
+                    check_scope(
+                        self._authority_grant(request.capability_reference), request.attempt, intent, checked_at
+                    )
+                    return self.operation(operation.operation_id) == operation
+                except (AuthorityDenied, OperationConflict, ProgramNotFound, ValueError):
+                    return False
+
+        def recovery(request: ExecutionRequest, handle: str, cwd: str) -> bool:
+            self._assert_writer_thread()
+            with self._gate:
+                try:
+                    operation, _, frame = self._runtime_binding(request, cwd)
+                    if operation.accepted_reference not in {None, handle}:
+                        return False
+                    prefix = f"runtime-dispatch:{operation.fence}:"
+                    if any(
+                        self.find_artifact(operation.operation_id, prefix + stage) != frame
+                        for stage in ("thread", "turn")
+                    ):
+                        return False
+                    receipt = self.find_artifact(operation.operation_id, "runtime-receipt")
+                    if receipt is None:
+                        return False
+                    owned_handle, fence, identity = decode_runtime_receipt(receipt)
+                    allocation_bytes, _ = load_attempt_inputs(self, request.attempt)
+                    allocation = decode_allocation(allocation_bytes)
+                    return (
+                        owned_handle == handle
+                        and fence == operation.fence
+                        and identity_matches(
+                            identity,
+                            allocation,
+                            request.identity.agent_definition_version,
+                            require_resolved=False,
+                            legacy=is_legacy_allocation(allocation_bytes),
+                            recorded=request.identity,
+                        )
+                    )
+                except (AuthorityDenied, OperationConflict, ProgramNotFound, ValueError):
+                    return False
+
+        return dispatch, recovery
+
+    def _runtime_binding(self, request: ExecutionRequest, cwd: str) -> tuple[OperationRecord, OperationIntent, bytes]:
+        if type(request) is not ExecutionRequest or type(cwd) is not str:
+            raise AuthorityDenied("typed request and native cwd required")
+        operation = self.operation(request.operation.operation_id)
+        if (
+            operation.operation_id != f"runtime:{request.attempt.attempt_id}"
+            or operation.effect_key != request.operation.effect_key
+            or operation.request_digest != request.operation.request_digest
+            or operation.fence != request.fence
+        ):
+            raise AuthorityDenied("runtime request differs from current operation")
+        program = self.load(request.attempt.program_id)
+        if not any(item.spec == request.attempt for item in program.attempts):
+            raise AuthorityDenied("runtime Attempt differs from immutable history")
+        grant = self._authority_grant(request.capability_reference, force_revoked=True)
+        workspace = request.workspace.spec
+        if (
+            grant.subject != request.attempt.digest
+            or grant.program_id != request.attempt.program_id
+            or grant.spec_digest != request.attempt.spec_digest
+            or grant.repository != workspace.repository
+            or Path(cwd) != grant.root
+            or workspace.trust_mode is not TrustMode.TRUSTED_DEVELOPMENT
+            or workspace.overlays
+            or workspace.network_destinations
+            or workspace.mounts
+        ):
+            raise AuthorityDenied("runtime workspace differs from supported granted scope")
+        allocation_bytes, _ = load_attempt_inputs(self, request.attempt)
+        allocation = decode_allocation(allocation_bytes)
+        if request.allocation != allocation or not identity_matches(
+            request.identity,
+            allocation,
+            request.identity.agent_definition_version,
+            require_resolved=False,
+            legacy=is_legacy_allocation(allocation_bytes),
+        ):
+            raise AuthorityDenied("runtime configuration differs from original allocation")
+        binding = self._connection.execute(
+            "SELECT * FROM authority_bindings WHERE operation_id = ?", (operation.operation_id,)
+        ).fetchone()
+        if (
+            binding is None
+            or binding["grant_id"] != grant.grant_id
+            or binding["attempt_digest"] != request.attempt.digest
+        ):
+            raise AuthorityDenied("runtime has no matching durable authority binding")
+        if _authority_record_digest(binding["intent_json"]) != binding["intent_digest"]:
+            raise CorruptHistory("runtime authority intent digest differs")
+        intent = _authority_intent_from_json(binding["intent_json"])
+        if (
+            intent.operation_id != operation.operation_id
+            or intent.effect_key != operation.effect_key
+            or intent.request_digest != operation.request_digest
+            or intent.repository != workspace.repository
+            or intent.operation != "execute"
+            or intent.path != Path(".")
+            or intent.destination is not None
+        ):
+            raise AuthorityDenied("runtime authority does not bind this original execute scope")
+        frame = canonical_json(
+            {
+                "version": 1,
+                "operation": asdict(request.operation),
+                "fence": request.fence,
+                "grant": request.capability_reference,
+                "attempt": request.attempt.digest,
+                "workspace": {
+                    "key": request.workspace.key,
+                    "repository": workspace.repository,
+                    "base_revision": workspace.base_revision,
+                    "toolchain_digest": workspace.toolchain_digest,
+                    "enforcement_profile": workspace.enforcement_profile,
+                    "trust_mode": workspace.trust_mode.value,
+                },
+                "cwd": cwd,
+                "context": request.context_reference,
+                "allocation": request.allocation_reference,
+                "identity": asdict(request.identity),
+            }
+        ).encode()
+        return operation, intent, frame
+
     def _authority_attempt(self, attempt: AttemptSpec) -> None:
         program = self.load(attempt.program_id)
         matching = [item for item in program.attempts if item.spec == attempt]
@@ -927,7 +1112,9 @@ class SQLiteProgramStore:
                 "INSERT INTO delivery_attempts (operation_id, fence, claimed_at, lease_until) VALUES (?, ?, ?, ?)",
                 (operation_id, fence, now, now + lease_seconds),
             )
-            return fence
+        if operation_id.startswith("runtime:"):
+            self._runtime_claims.add((operation_id, fence))
+        return fence
 
     def deliver_fake(
         self,

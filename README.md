@@ -57,6 +57,17 @@ migration and backup restoration remain supported. Retired workspace roots do no
 or prevent owner revocation, but cannot renew execution authority. This is a controller-local
 admission increment, not native worker mediation, an isolated Runtime, or complete #53 reception.
 
+For explicitly composed trusted-development Codex execution, `store.runtime_authorizers(clock)`
+returns guards for `CodexRuntime`'s optional `authorize_resolved` and `authorize_recovery` hooks.
+The dispatch guard requires pre-bound execute authority, the controller's own fresh claim, exact
+original Attempt inputs, a current fence/lease and the actual resolved cwd. It records each native
+`thread/start` and `turn/start` stage before sending, and rechecks revocation/expiry between them.
+A restarted controller cannot turn an inherited lease or an uncertain stage into a new start.
+Recovery instead checks the exact retained request, owned handle and durable receipt; expiry or
+cancellation does not turn inspection into dispatch permission. Cached duplicate receipt lookup
+does not send another native request. Existing default trusted-caller composition is unchanged;
+these hooks do not add CLI admission, native-effect mediation or `ISOLATED` support.
+
 ## Why A Kernel?
 
 A coding agent does the work. Kernel is being designed to retain the intent, authority, durable
