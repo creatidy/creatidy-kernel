@@ -17,9 +17,10 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile, rootless_run_prefix
 from tools.oci_worker_poc.evidence import ToolRecord, sha256_path
 from tools.oci_worker_poc.ociimage import ImageRecord, seccomp_profile_json
-from tools.oci_worker_poc.profile import AttemptResources, WorkerMount, WorkerProfile, validate_resource_paths
+from tools.oci_worker_poc.profile import AttemptResources, validate_resource_paths
 from tools.oci_worker_poc.toolchain import Toolchain, host_python_closure
 
 from .codexbin import CodexBinary
@@ -175,42 +176,8 @@ def build_run_argv(toolchain: Toolchain, profile: WorkerProfile, image_ref: str,
     The policy flags are identical to the #78 synthetic worker profile; ``-i`` additionally
     attaches the controller's stdio to the in-boundary app-server.
     """
-    argv = [
-        str(toolchain.root / "bin/podman"),
-        "run",
-        "-i",
-        "--pull=never",
-        "--rm",
-        "--name",
-        container,
-        "--hostname",
-        profile.attempt,
-        "--network=none",
-        "--cap-drop=all",
-        "--security-opt",
-        "no-new-privileges",
-        "--security-opt",
-        f"seccomp={profile.seccomp_path}",
-        "--read-only",
-        "--read-only-tmpfs",
-        "--tmpfs",
-        "/tmp:rw,size=32m,mode=1777",  # noqa: S108 - private in-container tmpfs, not host /tmp.
-        "--tmpfs",
-        "/home/worker:rw,size=8m,mode=700",
-        "--pids-limit",
-        str(profile.pids_limit),
-        "--memory",
-        str(profile.memory_bytes),
-        "--cpus",
-        f"{profile.cpus:g}",
-        "--stop-timeout",
-        "10",
-    ]
-    for mount in profile.mounts:
-        mode = "rw" if mount.writable else "ro"
-        argv += ["-v", f"{mount.source}:{mount.destination}:{mode}"]
-    for key, value in profile.env_allowlist:
-        argv += ["--env", f"{key}={value}"]
+    argv = rootless_run_prefix(toolchain.root / "bin/podman", profile, container)
+    argv.insert(2, "-i")
     argv += [
         image_ref,
         "/bin/busybox",

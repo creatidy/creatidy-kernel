@@ -75,6 +75,13 @@ and collector destinations, establish worker settlement, and treat any recorded 
 failed collection. The proof disk sink is not crash-durable artifact publication. Sharing these
 primitives does not activate the proof runner, supply an engineering image, or adopt its profile.
 
+The installed `worker_profile` module also provides the shared immutable OCI profile/mount values
+and fixed run-argument prefix used by both proof builders. It rejects ambiguous identities,
+paths, duplicate mount destinations/environment keys and invalid limits without environment
+inheritance, filesystem discovery or process launch. These are representation checks, not
+verified tool/image provenance, mount-overlap/ownership checks or actual cgroup/rootless
+enforcement. The deadline remains metadata here, not an expiry timer or admission decision.
+
 ## Why A Kernel?
 
 A coding agent does the work. Kernel is being designed to retain the intent, authority, durable

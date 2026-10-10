@@ -18,6 +18,8 @@ authorization seam. Rootless enforcement properties:
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile, rootless_run_prefix
+
 from .ociimage import seccomp_profile_json
 from .toolchain import Toolchain, host_python_closure
 
@@ -35,13 +37,6 @@ FORBIDDEN_BIND_PREFIXES = (
 
 
 @dataclass(frozen=True, slots=True)
-class WorkerMount:
-    source: Path
-    destination: PurePosixPath
-    writable: bool
-
-
-@dataclass(frozen=True, slots=True)
 class AttemptResources:
     """Controller-prepared disposable resources for exactly one Attempt."""
 
@@ -54,18 +49,6 @@ class AttemptResources:
     pids_limit: int = 64
     memory_bytes: int = 256 * 1024 * 1024
     cpus: float = 0.5
-
-
-@dataclass(frozen=True, slots=True)
-class WorkerProfile:
-    attempt: str
-    mounts: tuple[WorkerMount, ...]
-    env_allowlist: tuple[tuple[str, str], ...]
-    seccomp_path: Path
-    pids_limit: int
-    memory_bytes: int
-    cpus: float
-    deadline_seconds: int
 
 
 def validate_resource_paths(resources: AttemptResources) -> None:
@@ -134,41 +117,7 @@ def build_run_argv(
     container_name: str,
 ) -> list[str]:
     """Full rootless podman run argv for the worker boundary (stop/kill reuse the prefix)."""
-    argv = [
-        str(toolchain.root / "bin/podman"),
-        "run",
-        "--pull=never",
-        "--rm",
-        "--name",
-        container_name,
-        "--hostname",
-        profile.attempt,
-        "--network=none",
-        "--cap-drop=all",
-        "--security-opt",
-        "no-new-privileges",
-        "--security-opt",
-        f"seccomp={profile.seccomp_path}",
-        "--read-only",
-        "--read-only-tmpfs",
-        "--tmpfs",
-        "/tmp:rw,size=32m,mode=1777",  # noqa: S108 - private in-container tmpfs, not host /tmp.
-        "--tmpfs",
-        "/home/worker:rw,size=8m,mode=700",
-        "--pids-limit",
-        str(profile.pids_limit),
-        "--memory",
-        str(profile.memory_bytes),
-        "--cpus",
-        f"{profile.cpus:g}",
-        "--stop-timeout",
-        "10",
-    ]
-    for mount in profile.mounts:
-        mode = "rw" if mount.writable else "ro"
-        argv += ["-v", f"{mount.source}:{mount.destination}:{mode}"]
-    for key, value in profile.env_allowlist:
-        argv += ["--env", f"{key}={value}"]
+    argv = rootless_run_prefix(toolchain.root / "bin/podman", profile, container_name)
     argv += [
         image_ref,
         "/bin/busybox",
