@@ -12,6 +12,31 @@ boundary) and the [#78 whole-worker record](whole-worker-isolation.md) are uncha
 owner decision in [#53 comment 15606](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53#issuecomment-15606)
 (universal executor enforcement, AC4 preserved) remains the binding scope.
 
+The subsequent #53 integration branch adds generated per-bit OCI predicates for legacy
+`clone` namespace flags while retaining the Codex `clone3` ENOSYS compatibility rule.
+Source-shape and complete namespace-subset arithmetic tests are not native enforcement
+receipts. The historical native runs below used the earlier profile. The integration
+branch separately receives native Linux LP64 x86-64 predicates with the bounded C
+fixture in `tests/fixtures/oci_clone_probe.c`: raw non-namespace clone succeeds and is
+reaped, pthread create/join succeeds, and Codex clone3 returns ENOSYS. Nine namespace
+cases (each flag, NEWUSER|NEWNS, all seven) return EPERM under the production profile
+and EDOM under an otherwise-identical diagnostic profile. The diagnostic errno
+distinguishes the filter from ordinary kernel EPERM; no unfiltered control permits
+namespace creation. Both cases confirm the owned container is absent after exit.
+i386/x32 enforcement and positive controls remain **UNPROVED**. This narrow receipt
+does not receive complete control closure or adopt a product profile.
+
+The observed toolchain remains Podman 6.1.3 / crun 1.30.1 / conmon 2.2.1 with the
+previously recorded exact binary hashes; the probe runs on kernel
+`6.18.33.2-microsoft-standard-WSL2`. The probe binary SHA-256 was
+`652635b4f23645d740d7b723a7734cee0f5e68b91565a47b8d46b620fc1906fa`;
+production/diagnostic profiles were respectively
+`883af76c8c474d39fee5df16a371307e9514aebdc9bb203160b47587eb876067` and
+`a353b3d3d50cb4daead7b483b58ef54f320cef57bcc8f55da3fa73b30c6ca072`.
+Separate regression execution on the strengthened profile passed 31 OCI worker proof
+items and 22 real-Codex OCI proof items with no native skips; these are not retroactive
+changes to PR #84's historical receipt or review history.
+
 ## Verdict
 
 **PROVED for the exercised slice** — a real Codex app-server (codex-cli 0.159.3) ran inside
@@ -158,7 +183,7 @@ and prove that code 125 can neither authorize collection nor silently count as s
 
 | Limitation | Disposition | Evidence basis |
 | --- | --- | --- |
-| Incomplete seccomp restrictions for namespace-related `clone` | **UNPROVEN (unchanged), one compatibility correction delivered** | The deny entry points (`unshare`, `setns`, `clone3`) are still denied (in-boundary `unshare` → EPERM observed in the #78 matrix; filter present with `Seccomp=2` in every codex attempt). `clone3` now returns ENOSYS instead of EPERM — required because glibc's `pthread_create` only falls back to `clone` on ENOSYS (with EPERM every native thread spawn failed in-boundary; observed and fixed in this slice). The syscall remains denied and this is the upstream OCI default-profile practice. `clone` **with** namespace flags remains allowed by the deny-list; per-flag masked predicates are still not proved at the native/compat-architecture OCI runtime level. The missing mechanism (runtime-side filter support, seccomp-notify agent, or stronger executor) remains a named owner decision. |
+| Namespace-related legacy `clone` | **Historical PR #84 residual; subsequent LP64 x86-64 receipt above, compat ABIs UNPROVEN** | PR #84 retained namespace-bearing legacy `clone` without masked predicates, while denying `unshare`/`setns` and using `clone3` ENOSYS for thread compatibility. The subsequent integration branch adds the maintained OCI per-bit masked denials and receives the production/diagnostic x86-64 matrix with positive controls. It does not reinterpret the old receipt or prove i386/x32/other architectures. No custom seccomp-notify engine or stronger-executor adoption follows. |
 | Settlement previously demonstrated via cooperative command-line markers | **REMEDIATED for the exercised paths** | Settlement now rests on the container's authoritative lifecycle (PID-namespace teardown at `podman stop`; `podman container exists` as the identity gate) **corroborated** by host `/proc` scans for attempt-unique argv markers. The markers now ride on argv that the controller-authored scenario commands the real harness to run — the harness never cooperates with or knows about the marker mechanism. A process would have to escape its own PID namespace to outlive the container; none was observed. Residual: argv-marker attribution cannot name a marker-less process, which is why the container-state gate remains primary. |
 | No instantaneous revocation of already-open workspace file descriptors | **UNCHANGED — unsupported by design, recorded as fact** | The writable workspace bind is static; the in-flight-writes cell observed pre-termination bytes persisting and the stream bounded only by termination. Expiry/revocation prevent **new** authorized effects (relay refusals, controller refusal) and trigger bounded termination; no instantaneous-cancellation claim is made anywhere. |
 | Single-UID rootless mapping | **UNCHANGED — sufficient for this slice, deployment prerequisite overall** | Every codex attempt observed the single-line uid_map (`0 1000 1`); no setuid `newuidmap` exists on this host and installing one remains a privileged host change outside authorization. Sufficiency argument is unchanged from #78: the workspace is the sole writable surface and owner paths are unmounted (proved: no host paths in the mount list, host reads denied). Multi-UID confinement stays a named deployment prerequisite. |

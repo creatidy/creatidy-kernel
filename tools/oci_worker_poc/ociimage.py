@@ -19,9 +19,8 @@ from pathlib import Path
 IMAGE_REF = "localhost/kernel78-worker:v1"
 
 # Default-allow with an explicit fail-closed deny set for namespace/mount/keyring/ptrace/
-# async-runtime surfaces, mirroring the ADR 0008 direction. clone-with-namespace-flags
-# remain allowed by this deny-list. OCI JSON supports masked argument predicates, but
-# enforcement across the configured native/compat architectures has not been received.
+# async-runtime surfaces, mirroring the ADR 0008 direction. Legacy clone namespace
+# flags have separate per-bit predicates; native/compat enforcement remains unreceived.
 SECCOMP_DENY_NAMES = (
     "unshare",
     "setns",
@@ -56,6 +55,16 @@ SECCOMP_DENY_NAMES = (
     "ioperm",
 )
 
+CLONE_NAMESPACE_FLAGS = (
+    0x10000000,  # CLONE_NEWUSER
+    0x00020000,  # CLONE_NEWNS
+    0x40000000,  # CLONE_NEWNET
+    0x20000000,  # CLONE_NEWPID
+    0x08000000,  # CLONE_NEWIPC
+    0x04000000,  # CLONE_NEWUTS
+    0x02000000,  # CLONE_NEWCGROUP
+)
+
 
 def seccomp_profile_json() -> str:
     return json.dumps(
@@ -67,7 +76,16 @@ def seccomp_profile_json() -> str:
                     "names": list(SECCOMP_DENY_NAMES),
                     "action": "SCMP_ACT_ERRNO",
                     "errnoRet": 1,
-                }
+                },
+                *[
+                    {
+                        "names": ["clone"],
+                        "action": "SCMP_ACT_ERRNO",
+                        "errnoRet": 1,
+                        "args": [{"index": 0, "value": bit, "valueTwo": bit, "op": "SCMP_CMP_MASKED_EQ"}],
+                    }
+                    for bit in CLONE_NAMESPACE_FLAGS
+                ],
             ],
         },
         indent=1,

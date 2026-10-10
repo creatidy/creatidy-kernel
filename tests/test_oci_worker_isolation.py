@@ -8,22 +8,28 @@ no real credentials, private state, live model or remote effect is used. Each at
 records observed outcomes into an evidence file under its temporary directory.
 """
 
+import copy
 import dataclasses
 import json
 import os
+import platform
 import signal
 import socket
+import struct
 import subprocess  # noqa: S603 - every call below uses fixed synthetic argv, no shell.
 import sys
+import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
 
+from creatidy_kernel.adapters.worker_profile import WorkerMount, rootless_run_prefix
+from tools.codex_oci_proof.boundary import write_seccomp_profile
 from tools.oci_worker_poc import harness
-from tools.oci_worker_poc.evidence import ProbeRecord, RunEvidence
+from tools.oci_worker_poc.evidence import ProbeRecord, RunEvidence, sha256_path
 from tools.oci_worker_poc.profile import WorkerProfile, build_profile, build_run_argv
 from tools.oci_worker_poc.relay import EffectsRelay
 from tools.oci_worker_poc.toolchain import Toolchain, read_provenance
@@ -49,6 +55,175 @@ def toolchain() -> Toolchain:
 @pytest.fixture(scope="session")
 def provenance(toolchain: Toolchain) -> dict[str, Any]:
     return read_provenance(toolchain)
+
+
+@pytest.mark.parametrize("denial_errno", [1, 33], ids=["production", "diagnostic"])
+def test_native_clone_masks(toolchain: Toolchain, denial_errno: int) -> None:
+    assert toolchain.podman.version == PINNED_PODMAN_VERSION
+    assert toolchain.crun.version == PINNED_CRUN_VERSION
+    assert toolchain.conmon.version == PINNED_CONMON_VERSION
+    # Public executable SHA-256 pins from the existing bounded toolroot provenance, not credentials.
+    assert (
+        toolchain.podman.sha256
+        == "72b04715918065668d3025ba67fb87ad678d1a0fe099ebd8878f33443b281c31"  # pragma: allowlist secret
+    )
+    assert (
+        toolchain.crun.sha256
+        == "86d1e6a0e76945975d3aebfab39cbc6a26eea15f1c3fc66b6776d19e5dc346a0"  # pragma: allowlist secret
+    )
+    assert (
+        toolchain.conmon.sha256
+        == "a3baaea8adf23f94d9c2f3ee212a168876b25c335320bca23972a1bc3ed9f22e"  # pragma: allowlist secret
+    )
+    if sys.platform != "linux" or platform.machine() != "x86_64":
+        pytest.skip("clone enforcement UNPROVED: native Linux LP64 x86-64 required")
+    cc = Path("/usr/bin/cc")
+    parent = Path("/tmp/kilo")  # noqa: S108 - approved synthetic proof root, never owner state.
+    if not cc.is_file() or not parent.is_dir():
+        pytest.skip("clone enforcement UNPROVED: explicit public build tools/temp root unavailable")
+    root = Path(tempfile.mkdtemp(prefix="clone-proof-", dir=parent)).resolve()
+    home, scratch = root / "home", root / "scratch"
+    home.mkdir()
+    scratch.mkdir()
+    source = Path(__file__).parent / "fixtures" / "oci_clone_probe.c"
+    probe = root / "clone-probe"
+    built = subprocess.run(  # noqa: S603 - explicit public compiler and repository-authored bounded fixture.
+        [
+            str(cc),
+            "-std=c11",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-static",
+            "-fno-pie",
+            "-no-pie",
+            "-pthread",
+            str(source),
+            "-o",
+            str(probe),
+        ],
+        cwd=root,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(home), "TMPDIR": str(scratch), "LC_ALL": "C"},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    (root / "compile.log").write_text(built.stdout + built.stderr)
+    missing = ("cannot find -lc:", "cannot find -lpthread:", "cannot find crt1.o:", "cannot find crti.o:")
+    if built.returncode and any(value in built.stderr for value in missing):
+        pytest.skip(f"clone enforcement UNPROVED: static build prerequisites absent; {root}")
+    assert built.returncode == 0, f"probe build failed; no native receipt; {root}"
+    elf = probe.read_bytes()
+    assert elf[:6] == b"\x7fELF\x02\x01"
+    assert struct.unpack_from("<HH", elf, 16) == (2, 62)
+    phoff = struct.unpack_from("<Q", elf, 32)[0]
+    phsize, phcount = struct.unpack_from("<HH", elf, 54)
+    assert phsize == 56 and phcount > 0 and phoff + phsize * phcount <= len(elf)
+    assert all(struct.unpack_from("<I", elf, phoff + index * phsize)[0] != 3 for index in range(phcount)), (
+        "probe must be static"
+    )
+    seccomp = write_seccomp_profile(scratch / "seccomp.json")
+    production = json.loads(seccomp.read_text())
+    selected = copy.deepcopy(production)
+    clones = [group for group in selected["syscalls"] if group["names"] == ["clone"]]
+    assert len(clones) == 7
+    for group in clones:
+        assert group["action"] == "SCMP_ACT_ERRNO" and group["errnoRet"] == 1 and len(group["args"]) == 1
+        group["errnoRet"] = denial_errno
+    restored = copy.deepcopy(selected)
+    for group in restored["syscalls"]:
+        if group["names"] == ["clone"]:
+            group["errnoRet"] = 1
+    assert restored == production
+    seccomp.write_text(json.dumps(selected))
+    attempt = uuid.uuid4().hex[:12]
+    name = f"kernel53-clone-{attempt}"
+    profile = WorkerProfile(
+        attempt,
+        (WorkerMount(probe, PurePosixPath("/probe/clone"), False),),
+        (("HOME", "/home/worker"), ("TMPDIR", "/tmp"), ("LC_ALL", "C")),  # noqa: S108 - private container tmpfs.
+        seccomp,
+        64,
+        256 * 1024 * 1024,
+        0.5,
+        20,
+    )
+    image = harness.ensure_image(toolchain, root / "worker-image.tar")
+    inspected = subprocess.run(  # noqa: S603 - fixed explicit tool argv for this controller-built image.
+        [str(toolchain.root / "bin/podman"), "image", "inspect", "--format", "{{.Id}}", image.reference],
+        env=toolchain.env(),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert inspected.returncode == 0 and inspected.stdout.strip() == image.config_digest.removeprefix("sha256:"), (
+        "loaded image differs from fixed archive"
+    )
+    argv = rootless_run_prefix(toolchain.root / "bin/podman", profile, name) + [
+        image.reference,
+        "/probe/clone",
+        str(denial_errno),
+    ]
+    evidence = harness.new_evidence(attempt, toolchain, image, argv)
+    evidence.probes.append(
+        ProbeRecord(
+            "clone-inputs",
+            "exact fixture/profile",
+            "recorded",
+            json.dumps(
+                {
+                    "probe": sha256_path(probe),
+                    "seccomp": sha256_path(seccomp),
+                    "abi": "linux-x86_64-lp64",
+                }
+            ),
+        )
+    )
+    process = None
+    try:
+        process = harness.launch(argv, toolchain.env())
+        rc, stdout, stderr = harness.wait_container_exit(process, timeout=30)
+        (root / "stdout.txt").write_text(stdout)
+        (root / "stderr.txt").write_text(stderr)
+        assert "Falling back to --cgroup-manager=cgroupfs" not in stderr
+        assert rc == 0, f"native clone proof failed; evidence at {root}"
+        assert stdout.splitlines() == [
+            "RAW_CLONE_REAPED",
+            "PTHREAD_JOINED",
+            "CLONE3_ENOSYS",
+            *[f"DENIED {index} {denial_errno}" for index in range(9)],
+            "NO_CHILDREN",
+        ]
+        evidence.probes.append(
+            ProbeRecord(
+                "native-clone-matrix",
+                "reaped raw clone, joined pthread, clone3 ENOSYS, nine attributed namespace denials",
+                "passed",
+                stdout.strip(),
+            )
+        )
+    finally:
+        try:
+            if harness.container_state(toolchain, name) != "absent":
+                harness.stop_container(toolchain, name, grace_seconds=2)
+        finally:
+            if process is not None and process.poll() is None:
+                try:
+                    process.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate(timeout=10)
+            state = harness.container_state(toolchain, name)
+            evidence.probes.append(
+                ProbeRecord("owned-container", "confirmed absent", state, f"fixture retained at {root}")
+            )
+            evidence.dump(root / "evidence.json")
+        assert state == "absent", f"settlement UNPROVED; preserve resources at {root}"
 
 
 class AttemptResult:
