@@ -68,6 +68,13 @@ cancellation does not turn inspection into dispatch permission. Cached duplicate
 does not send another native request. Existing default trusted-caller composition is unchanged;
 these hooks do not add CLI admission, native-effect mediation or `ISOLATED` support.
 
+Descriptor-safe worker-file reads and bounded directory collection are available in installed
+adapters; the OCI proof tools import the same implementation. Leaf/directory symlink refusal,
+entry/depth/size bounds and exact-byte sinks remain intact. Callers must protect root ancestors
+and collector destinations, establish worker settlement, and treat any recorded refusal as a
+failed collection. The proof disk sink is not crash-durable artifact publication. Sharing these
+primitives does not activate the proof runner, supply an engineering image, or adopt its profile.
+
 ## Why A Kernel?
 
 A coding agent does the work. Kernel is being designed to retain the intent, authority, durable

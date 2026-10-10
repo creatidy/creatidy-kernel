@@ -63,7 +63,19 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
             "assert VerificationProfile.TRUSTED_DEVELOPMENT.value == 'trusted_development'; "
             "from creatidy_kernel.core.resources import Allocation, ResourceRequest; "
             "a = FixedAllocator(Allocation('runtime', 'local', 'model', frozenset(), 0, 'smoke')); "
-            "assert a.select(ResourceRequest('unit', frozenset(), 0)).provider_id == 'local'",
+            "assert a.select(ResourceRequest('unit', frozenset(), 0)).provider_id == 'local'; "
+            "from tempfile import TemporaryDirectory; from pathlib import Path; "
+            "from creatidy_kernel.adapters.worker_collection import collect_directory; "
+            "from creatidy_kernel.adapters.worker_files import read_bounded_regular; "
+            "import sys\n"
+            "with TemporaryDirectory() as directory:\n"
+            "    root = Path(directory); target = root / 'candidate'; target.write_bytes(b'bounded')\n"
+            "    assert read_bounded_regular(target) == b'bounded'\n"
+            "    (root / 'refused-link').symlink_to(target)\n"
+            "    collected = collect_directory(root)\n"
+            "    assert collected.files['candidate'].size == 7\n"
+            "    assert collected.refusals == {'refused-link': 'symlink-refused'}\n"
+            "    assert not any(name == 'tools' or name.startswith('tools.') for name in sys.modules)",
         ],
         cwd=work,
         check=True,
