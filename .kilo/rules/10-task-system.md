@@ -16,9 +16,18 @@
 - `/loop` delegates successive issue selection to its sole primary invocation
   context under `.kilo/command/loop.md`, not a second controller. Refresh all open
   canonical Kernel issues each cycle; exclude exact invalid/wontfix/duplicate labels
-  case-insensitively before historical PR interpretation, verify explicit gates,
-  then explicit priority/required ordering/oldest registration. Open PRs are not
-  planning authority. Unresolved owner decisions are ineligible; if a genuine
+  case-insensitively before historical PR interpretation. Refresh current canonical
+  dependency edges and required producer/contract evidence, recursively trace explicit
+  chains to the earliest executable predecessor, and verify gates before ordering by
+  explicit priority/required ordering/oldest registration. Closed state alone is not
+  acceptance evidence; do not infer edges from prose. Keep issue-local gates separate
+  from repository-wide inactivity so a gated candidate cannot block unrelated eligible
+  Kernel work. Unknown, changed, missing, inaccessible or contradictory evidence is
+  `UNVERIFIED`: it proves neither readiness nor a verified gate, and cannot justify
+  `QUEUE_EMPTY`. Continue confirmed eligible work; if none remains, use bounded
+  authorized recovery and the existing terminal rules, reporting the exact evidence
+  gap. `UNVERIFIED` is evidence classification, not a new workflow status. Open PRs are
+  not planning authority. Unresolved owner decisions are ineligible; if a genuine
   decision arises for selected work, STOP_AND_ASK terminates the entire loop.
   Preserve STOP_REVISE dispositions; an open PR cannot authorize restarting them.
   No issue registration is authorized merely to keep `/loop` running.
@@ -73,6 +82,9 @@ For `/loop`, apply post-selection eligibility revalidation before escalation:
 confirmed pre-implementation issue gates return nonterminal SELECT, not BLOCKED.
 Unavailable inspection is not proof of a gate; recover the tool/access first.
 Existing delivery and genuine new owner decisions retain their normal protections.
+Technical-recovery progress/status narration is nonterminal. Continue the same
+authorized invocation until an existing terminal condition is actually met; narration
+does not create a workflow status or authorize broader work.
 
 - A blocker is not automatically an owner decision. Class-A engineering/execution
   blockers include missing reviewer tools/runtime, secret-contaminated ambient
