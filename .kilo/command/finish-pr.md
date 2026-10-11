@@ -34,10 +34,13 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    use a clean authorized worktree when that resolves ordinary checkout contention.
    It is not an owner decision unless resolving it requires an owner-controlled action.
 2. Require the current PR branch to be clean and match MCP HEAD. Freeze exact
-   HEAD, base and merge base; run required `make check` and `make package-check`, prepare their offline locked
-   environment and inspect
-   reviewer permissions. Review frozen objects/current clean branch in this SAME
-   checkout. The parent must not edit/switch branches while the reviewer is active.
+   HEAD, base and merge base; run required `make check` and `make package-check`,
+   prepare their offline locked environment and inspect reviewer permissions. The
+   reviewer verifies canonical repository/PR/ref commit metadata through read-only
+   Forgejo MCP and checks those exact commits against this primary-prepared clean
+   local checkout. It does not need anonymous Git transport. Review frozen objects/
+   current clean branch in this SAME checkout. The parent must not edit/switch
+   branches while the reviewer is active.
    A missing native task/agent is a review-infrastructure failure: diagnose it and
    try an authorized independent read-only reviewer path with the same exact-HEAD
    contract. Never self-review, lower the contract, or use an unapproved service.
