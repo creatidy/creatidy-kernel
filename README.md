@@ -140,6 +140,18 @@ in the active adapter so settlement can finish after stdio closes. Cold native c
 remains unsupported. These are synthetic-composed regressions, not native conformance of the full
 factory, continuous effect mediation, independent review, complete AC4 or `ISOLATED` activation.
 
+The optional native factory suite now composes real source generations, live journal grants, kernel
+init handles, the pinned Codex binary and a synthetic in-boundary Responses backend. It receives
+final-only completion/collection, cancellation, observed revocation and controller-transport EOF,
+including retirement of a backend in a detached session. It also records an explicit **unmet native
+source-edit gate**: Codex `0.159.3` in `workspace-write/never` requires bubblewrap namespace creation,
+which the unchanged outer OCI policy denies. Providing the already pinned public helper fixes its
+initial missing-binary error, but does not resolve that policy conflict. Production and diagnostic
+denial errno reception attribute the refusal without permitting namespaces or changing sandbox mode.
+These negative tests passing means refusal was received, not that source editing or complete AC4
+works. `codex-oci-proof` requires the explicit `CREATIDY_TEST_BWRAP_BIN` as well as the OCI toolroot.
+Resolving this permission/boundary choice is not an automatic profile relaxation or adoption.
+
 `GitWorkspace` supplies optional source-backed materialization before granting or exposing a workspace.
 The controller explicitly binds a historical repository ID to an existing checkout and qualified HTTPS
 origin; no repository ID is reinterpreted as a filesystem path. It copies the exact full base commit into

@@ -23,7 +23,7 @@ from creatidy_kernel.adapters.bubblewrap_verification import resource_digest
 from creatidy_kernel.adapters.codex_runtime import CodexRuntime
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
 from creatidy_kernel.adapters.git_workspace import GitWorkspace
-from creatidy_kernel.adapters.oci_lifecycle import LABEL, LifetimeSpec, OCIResources, OwnedOCI
+from creatidy_kernel.adapters.oci_lifecycle import LABEL, MAX_NATIVE_PIN_BYTES, LifetimeSpec, OCIResources, OwnedOCI
 from creatidy_kernel.adapters.oci_lifetime import SO_PASSPIDFD, LifetimeChannel
 from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
@@ -1029,3 +1029,47 @@ def test_source_generation_refusal_occurs_before_native_probe_or_worker(
         launch.connect()
     assert launch.calls == []
     assert not any(argv and argv[0] in {str(launch.codex), str(launch.owner.podman)} for argv in launch.spawns)
+
+
+def test_native_raw_pin_and_readonly_closure_are_independently_verified(launch: Launch) -> None:
+    prior = launch.owner
+    profile = replace(
+        prior.profile,
+        mounts=(*prior.profile.mounts, WorkerMount(launch.codex, PurePosixPath("/toolchain/codex/codex"), False)),
+    )
+    owner = OwnedOCI(
+        prior.store, prior.request, prior.podman, profile, prior.name, prior.image, prior.environment, prior.invoke
+    )
+    resources = replace(
+        launch.resources, read_only=(*launch.resources.read_only, (launch.codex, resource_digest(launch.codex)))
+    )
+    assert resources.verify(owner, launch.codex)
+    changed = replace(
+        resources,
+        read_only=tuple((path, "f" * 64 if path == launch.codex else digest) for path, digest in resources.read_only),
+    )
+    with pytest.raises(ExecutionConflict, match="content differs"):
+        changed.verify(owner, launch.codex)
+    changed = replace(
+        resources, pins=tuple((path, "f" * 64 if path == launch.codex else digest) for path, digest in resources.pins)
+    )
+    with pytest.raises(ExecutionConflict, match="content differs"):
+        changed.verify(owner, launch.codex)
+    assert launch.calls == launch.spawns == []
+
+
+def test_pinned_native_byte_bound_refuses_before_probe_or_worker(
+    launch: Launch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = Path.lstat
+
+    def lstat(path: Path) -> os.stat_result:
+        info = original(path)
+        if path == launch.codex:
+            return os.stat_result((*info[:6], MAX_NATIVE_PIN_BYTES + 1, *info[7:]))
+        return info
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    with pytest.raises(ExecutionConflict, match="native/config resource"):
+        launch.connect()
+    assert launch.calls == launch.spawns == []

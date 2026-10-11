@@ -37,4 +37,5 @@ oci-worker-proof:
 
 codex-oci-proof:
 	@test -n "$(CREATIDY_TEST_OCI_TOOLROOT)" || { printf '%s\n' 'Real-Codex worker isolation UNPROVED: CREATIDY_TEST_OCI_TOOLROOT required'; exit 1; }
-	uv run --locked pytest tests/test_codex_oci_isolation.py
+	@test -n "$(CREATIDY_TEST_BWRAP_BIN)" || { printf '%s\n' 'Native factory sandbox reception UNPROVED: CREATIDY_TEST_BWRAP_BIN required'; exit 1; }
+	uv run --locked pytest tests/test_codex_oci_isolation.py tests/test_oci_runtime_conformance.py

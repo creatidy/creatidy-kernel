@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
@@ -112,6 +113,10 @@ class MockModel:
         self._record_tools(body)
         self._record_request(body)
         step = self._next_step()
+        delay = step.get("delay_seconds", 0)
+        if type(delay) is not int or not 0 <= delay <= 30:
+            raise ValueError("synthetic response delay must be bounded")
+        time.sleep(delay)
         if step.get("kind") == "exec":
             arguments = {
                 "cmd": str(step["cmd"]),

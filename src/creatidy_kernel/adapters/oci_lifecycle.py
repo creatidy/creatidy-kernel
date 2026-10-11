@@ -59,6 +59,7 @@ ENVIRONMENT_KEYS = frozenset(
 )
 WorkerAuthorizer = Callable[[ExecutionRequest, str, bytes], bool]
 WorkerDeadline = Callable[[ExecutionRequest, str], int]
+MAX_NATIVE_PIN_BYTES = 320 * 1024 * 1024
 
 
 def _bytes(value: object) -> bytes:
@@ -156,21 +157,22 @@ class OCIResources:
                     or previous.source.is_relative_to(source)
                 ):
                     raise ExecutionConflict("OCI resources overlap")
-        for path, expected in (*pins.items(), *read_only.items()):
+        for path in dict.fromkeys((*pins, *read_only)):
             if path.is_relative_to(self.workspace) or self.workspace.is_relative_to(path):
                 raise ExecutionConflict("OCI writable workspace overlaps immutable resources")
             info = path.lstat()
             if path in pins:
-                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 256 * 1024 * 1024:
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MAX_NATIVE_PIN_BYTES:
                     raise ExecutionConflict("invalid OCI native/config resource")
-                expected = hashlib.sha256(b".\0" + bytes.fromhex(expected)).hexdigest()
             actual = resource_digest(path)
+            if path in pins and actual != hashlib.sha256(b".\0" + bytes.fromhex(pins[path])).hexdigest():
+                raise ExecutionConflict("OCI resource content differs from the trusted pin")
             if path in read_only and any(
                 item.is_file() and item.lstat().st_nlink != 1
                 for item in ((path, *path.rglob("*")) if path.is_dir() else (path,))
             ):
                 raise ExecutionConflict("OCI read-only resources have mutable hardlink aliases")
-            if actual != expected:
+            if path in read_only and actual != read_only[path]:
                 raise ExecutionConflict("OCI resource content differs from the trusted pin")
             after = path.lstat()
             identity = [

@@ -63,14 +63,16 @@ def _self_observations() -> dict[str, Any]:
     }
 
 
-def _write_codex_config(port: int) -> None:
+def _write_codex_config(port: int, sandbox_mode: str = "danger-full-access") -> None:
     """Fresh synthetic provider config: loopback-only synthetic Responses backend."""
     CODEX_HOME.mkdir(parents=True, exist_ok=True)
+    if sandbox_mode not in {"danger-full-access", "workspace-write"}:
+        raise ValueError("unsupported synthetic proof sandbox mode")
     config = (
         'model = "synthetic-model"\n'
         'model_provider = "synthetic"\n'
         'approval_policy = "never"\n'
-        'sandbox_mode = "danger-full-access"\n'
+        f'sandbox_mode = "{sandbox_mode}"\n'
         "\n"
         "[model_providers.synthetic]\n"
         'name = "Synthetic (controller-authored; in-boundary loopback)"\n'
@@ -80,7 +82,7 @@ def _write_codex_config(port: int) -> None:
     (CODEX_HOME / "config.toml").write_text(config)
 
 
-def _start_mock(python: str, mock_source: str, scenario: str) -> int:
+def _start_mock(python: str, mock_source: str, scenario: str, *, detached: bool = False) -> int:
     PORT_FILE.parent.mkdir(parents=True, exist_ok=True)
     if PORT_FILE.exists():
         PORT_FILE.unlink()
@@ -93,7 +95,9 @@ def _start_mock(python: str, mock_source: str, scenario: str) -> int:
             "LANG": "C.UTF-8",
             "LC_ALL": "C",
         },
+        start_new_session=detached,
     )
+    (PORT_FILE.parent / "process.json").write_text(json.dumps({"pid": process.pid, "session": os.getsid(process.pid)}))
     deadline = time.monotonic() + 20.0
     while time.monotonic() < deadline:
         if PORT_FILE.exists():
@@ -128,8 +132,13 @@ def main() -> int:
         _record(observations)
         return 124
 
-    mock_port = _start_mock("/toolchain/bin/python3.12", "/worker/mockmodel.py", "/workspace/mock/scenario.json")
-    _write_codex_config(mock_port)
+    mock_port = _start_mock(
+        "/toolchain/bin/python3.12",
+        "/worker/mockmodel.py",
+        "/workspace/mock/scenario.json",
+        detached=spec.get("detached_mock") is True,
+    )
+    _write_codex_config(mock_port, str(spec.get("sandbox_mode", "danger-full-access")))
     observations["mock_port"] = mock_port
     observations["codex_home"] = str(CODEX_HOME)
     observations["config_written"] = (CODEX_HOME / "config.toml").is_file()
