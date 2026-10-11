@@ -30,7 +30,7 @@ from tools.codex_oci_proof.codexbin import (
     protocol_inventory,
     resolve_codex_binary,
 )
-from tools.codex_oci_proof.driver import AttemptExpired, CodexAttempt, exec_step, final_step
+from tools.codex_oci_proof.driver import AttemptExpired, CodexAttempt, TurnRecord, exec_step, final_step
 from tools.codex_oci_proof.ocimage import build_codex_image_archive
 from tools.oci_worker_poc import harness
 from tools.oci_worker_poc.profile import FORBIDDEN_BIND_PREFIXES
@@ -229,6 +229,41 @@ def _command_execution_items(attempt: CodexAttempt) -> list[dict[str, Any]]:
 
 def _command_execution_commands(attempt: CodexAttempt) -> list[str]:
     return [str(item.get("command", "")) for item in _command_execution_items(attempt)]
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed", "interrupted"])
+def test_hydrated_terminal_fallback_waits_for_matching_native_turn_event(
+    monkeypatch: pytest.MonkeyPatch, terminal: str
+) -> None:
+    attempt = object.__new__(CodexAttempt)
+    attempt.turns = {"turn-one": TurnRecord("turn-one", "synthetic")}
+    attempt.notifications = [
+        {"method": "turn/completed", "params": {"turn": {"id": "unrelated-turn", "status": "interrupted"}}}
+    ]
+    calls = 0
+
+    def status(turn: str) -> str:
+        nonlocal calls
+        assert turn == "turn-one"
+        calls += 1
+        if calls < 3:
+            return "interrupted"
+        if calls == 3:
+            attempt.notifications.append(
+                {"method": "turn/completed", "params": {"turn": {"id": turn, "status": terminal}}}
+            )
+        return terminal
+
+    clock = iter(range(10))
+
+    def sleep(_: float) -> None:
+        pass
+
+    monkeypatch.setattr(attempt, "turn_status", status)
+    monkeypatch.setattr(time, "monotonic", lambda: next(clock) / 10)
+    monkeypatch.setattr(time, "sleep", sleep)
+    assert attempt.wait_turn("turn-one", timeout_seconds=1) == terminal
+    assert calls == 4 and attempt.turns["turn-one"].status == terminal
 
 
 class TestProvenance:

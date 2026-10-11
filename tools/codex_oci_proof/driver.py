@@ -246,10 +246,12 @@ class CodexAttempt:
             record = self.turns.get(turn_id)
             if record is not None and (not record.statuses_seen or record.statuses_seen[-1] != status):
                 record.statuses_seen.append(status)
-            if status in {"completed", "failed", "interrupted"}:
-                # A terminal status must hold across consecutive reads: the deprecated
-                # hydration path was observed to report a transient fallback status on a
-                # turn that its own rollout record proves completed.
+            if (
+                status in {"completed", "failed", "interrupted"}
+                and self._turn_status_from_notifications(turn_id) == status
+            ):
+                # Hydration can repeat a fallback before the real turn completes.
+                # Require the matching native lifecycle event, then consecutive reads.
                 if stable_terminal == status:
                     if record is not None:
                         record.status = status
