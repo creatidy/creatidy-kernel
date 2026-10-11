@@ -53,14 +53,12 @@ def trace_dependency(issue: int, records: Mapping[int, DependencyEvidence]) -> t
     contract = record.get("contract")
     if contract == "unknown":
         return "UNVERIFIED", ()
-    if contract == "gated":
-        return "GATED", ()
     if record.get("state") == "closed":
         return ("SATISFIED", ()) if contract == "ready" else ("UNVERIFIED", ())
     if record.get("state") != "open":
         return "UNVERIFIED", ()
     predecessors: list[int] = []
-    gated = False
+    gated = contract == "gated"
     for dependency in record.get("dependencies", []):
         state, dependency_predecessors = trace_dependency(dependency, records)
         if state == "UNVERIFIED":
@@ -198,6 +196,27 @@ class WorkflowContractTests(unittest.TestCase):
         loop = text(".kilo/command/loop.md")
         self.assertIn("only the refreshed canonical open Kernel issue queue", loop)
         self.assertIn("it is not a claim that upstream repositories have no work", loop)
+
+    def test_local_gate_cannot_hide_unknown_dependency_evidence(self) -> None:
+        for evidence in ("missing", "changed", "inaccessible"):
+            with self.subTest(evidence=evidence):
+                records: dict[int, DependencyEvidence] = {
+                    88: {"state": "open", "evidence": "current", "contract": "gated", "dependencies": [87]},
+                    90: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": []},
+                }
+                if evidence != "missing":
+                    records[87] = {"state": "open", "evidence": evidence, "contract": "ready", "dependencies": []}
+                self.assertEqual(trace_dependency(88, records), ("UNVERIFIED", ()))
+                self.assertEqual(select_confirmed_eligible((88,), records), (None, "UNVERIFIED"))
+                self.assertEqual(select_confirmed_eligible((88, 90), records), (90, None))
+
+    def test_local_gate_is_retained_when_dependency_evidence_is_verified(self) -> None:
+        records: dict[int, DependencyEvidence] = {
+            87: {"state": "closed", "evidence": "current", "contract": "ready", "dependencies": []},
+            88: {"state": "open", "evidence": "current", "contract": "gated", "dependencies": [87]},
+        }
+        self.assertEqual(trace_dependency(88, records), ("GATED", ()))
+        self.assertEqual(select_confirmed_eligible((88,), records), (None, "QUEUE_EMPTY"))
 
     def test_recovery_progress_is_nonterminal_and_same_invocation_continues(self) -> None:
         loop = text(".kilo/command/loop.md")
