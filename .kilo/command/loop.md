@@ -54,14 +54,41 @@ records (not PRs). Apply these steps in order:
    the issue completely before gate or historical PR interpretation; it cannot
    block the queue. Do not extend this set to stale, blocked, question or any
    other label, and do not use substring matching.
-2. Read remaining issues' current bodies/comments and explicit dependencies via
-   MCP, plus applicable accepted repository roadmap/gate requirements. Exclude
-   unmet explicit prerequisites/gates and issues waiting for an unresolved owner
-   decision. Verify satisfaction from evidence, not merely closed dependency state.
-   Do not invent dependencies from similar prose. Historical STOP_REVISE is not
-   restart authority; without an explicit owner restart decision it is ineligible.
-   An open unrelated PR never supplies such a decision.
-3. Order eligible issues by explicit priority first, explicit required
+2. Read each remaining candidate's current canonical body/comments and explicit
+   dependency edges via MCP, plus applicable accepted Kernel roadmap/gate
+   requirements. Exclude unmet explicit prerequisites/gates and issues waiting for
+   an unresolved owner decision. Record the issue/ref, observed state, revision/commit where
+   available, and the evidence source/time used for each edge and required producer
+   contract. Refresh this evidence before deciding eligibility or any terminal
+   inactivity outcome; changed, missing, inaccessible, contradictory or stale
+   evidence is `UNVERIFIED`, not ready and not a verified gate. A closed dependency
+   is not satisfied merely because it is closed. Verify satisfaction from evidence,
+   not merely closed dependency state: confirm the accepted result against current
+   PR/source/test or producer-contract evidence. Do not invent dependencies from
+   similar prose.
+   Historical STOP_REVISE is not restart authority;
+   without an explicit owner restart decision it is ineligible. An open unrelated PR
+   never supplies such a decision.
+3. Walk each explicit dependency chain backward from the candidate, recursively
+   refreshing every edge and producer/contract observation, until reaching the
+   earliest open issue that is itself eligible to execute, or a verified satisfied
+   prerequisite. Select that executable predecessor before its dependent. A verified
+   unmet prerequisite/producer gate makes only the dependent chain ineligible for
+   this cycle; it does not gate unrelated eligible Kernel issues. A missing or
+   inaccessible chain member or producer is `UNVERIFIED`; it proves neither
+   readiness nor a gate and must not be silently treated as absent, satisfied or
+   blocked. Do not infer an edge where Forgejo has none.
+4. Distinguish issue-local gates from repository-wide inactivity. `QUEUE_EMPTY`
+   describes only the refreshed canonical open Kernel issue queue after exact-label
+   exclusions and verified gates; it is not a claim that upstream repositories have
+   no work. Do not report `QUEUE_EMPTY` while any in-scope candidate or required
+   dependency/producer evidence remains `UNVERIFIED`. Continue any independently
+   confirmed eligible Kernel work. If no eligible work remains and required evidence
+   is still unknown, continue bounded authorized recovery; only an exhausted
+   external inspection dependency or machinery failure without an authorized path
+   may end as `BLOCKED`, naming the exact evidence gap. `UNVERIFIED` is an evidence
+   classification, not a new terminal status or permission to proceed.
+5. Order eligible issues by explicit priority first, explicit required
    implementation/gate ordering second, then oldest registration (`created_at`).
    Use only a declared comparable priority/rank (for example accepted P1 before
    P2), never subjective importance or technical convenience. Explicitly ranked
@@ -72,7 +99,8 @@ records (not PRs). Apply these steps in order:
    Materially conflicting/incomparable priority declarations, cyclic ordering,
    or a canonical issue/repository requirement conflict without a safe deterministic
    interpretation require STOP_AND_ASK, not an invented ordering.
-4. If no eligible issue remains, report QUEUE_EMPTY with the excluded/gated reasons.
+6. If no eligible issue remains, report QUEUE_EMPTY only when all relevant evidence
+   is verified, with the excluded/gated reasons.
    This is not product completion or permission to create work. Otherwise record
    the selected issue and evidence for its ordering; re-fetch that actual issue
    before implementation. If its state/labels/gates changed, restart SELECT before
@@ -117,8 +145,9 @@ For a proven pre-implementation gate:
    not a permanent exclusion or authority from progress memory; revalidate gates
    against current canonical/upstream evidence each cycle.
 5. This transition is NONTERMINAL: a gated candidate alone never emits BLOCKED,
-   STOP_REVISE or STOP_AND_ASK. If all remaining issues are ineligible, QUEUE_EMPTY
-   reports their reasons. A single gated issue cannot block unrelated eligible work.
+   STOP_REVISE or STOP_AND_ASK. If all remaining issues are verified ineligible,
+   QUEUE_EMPTY reports their reasons. Unknown evidence remains in bounded recovery,
+   not QUEUE_EMPTY. A single gated issue cannot block unrelated eligible work.
 
 The following classification applies before ordinary blocker escalation. History
 is retained on every path; this is a command contract, not a new controller:
@@ -129,6 +158,7 @@ is retained on every path; this is a command contract, not a new controller:
 | missing_producer | SELECT | PRESERVE_DELIVERY | retain |
 | missing_contract_artifact | SELECT | PRESERVE_DELIVERY | retain |
 | known_dependency_gate | SELECT | PRESERVE_DELIVERY | retain |
+| unverified_required_evidence | RECOVER | RECOVER | retain |
 | all_ineligible_queue | QUEUE_EMPTY | NOT_APPLICABLE | retain |
 | genuine_owner_decision | STOP_AND_ASK | STOP_AND_ASK | retain |
 | eligible_execution_problem | RECOVER | RECOVER | retain |
@@ -153,6 +183,17 @@ and validation gates. Run focused checks and `make check` and `make package-chec
 run `make audit` only when relevant dependency/tooling changes require it,
 commit only intended files, push normally, use `Refs #N` and keep the issue open.
 Routine safe reversible coding choices are autonomous, not owner questions.
+
+Before `WAIT`/inactivity, `BLOCKED`, `STOP_AND_ASK` or `QUEUE_EMPTY`, refresh the
+current canonical issue/dependency evidence and every required producer/contract
+observation. Record changed or unavailable facts as `UNVERIFIED`; do not claim
+readiness, a verified gate or `QUEUE_EMPTY` from them. Continue confirmed unrelated
+eligible Kernel work. If no such work remains, perform bounded technical recovery and
+terminate only under the existing decision rules with the exact unresolved evidence
+gap. Progress/status narration such as “inspecting dependencies” or “recovering
+access” is nonterminal: continue the same authorized invocation until an existing
+terminal condition is actually met; narration does not create a new state or extend
+authority.
 
 Before any terminal status, classify the obstacle using
 `.kilo/rules/30-implementation-discipline.md`. A missing tool/runtime, unsafe
