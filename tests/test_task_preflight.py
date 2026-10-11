@@ -3,6 +3,7 @@
 
 import json
 import os
+import sqlite3
 import sys
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, replace
@@ -501,6 +502,24 @@ def test_preflight_refuses_unreconciled_state_without_reading_or_repairing_it(
         result = preflight_task(environment, task=fixture_task(), source_repository=source, directory=state)
     assert PreflightReason.STATE in {blocker.reason for blocker in result.blockers}
     assert sidecar.read_bytes() == b"synthetic unreconciled sidecar"
+
+
+@pytest.mark.parametrize("pragma", ["user_version=99", "application_id=12345"])
+def test_checkpointed_diagnostics_refuse_foreign_or_future_store_without_repair(
+    ready_inputs: tuple[dict[str, str], Path, Path], pragma: str
+) -> None:
+    environment, source, state = ready_inputs
+    with pytest.raises(TaskInterrupted):
+        run(state, source, FixtureConnection(deflake_edit), fault="workspace-prepared")
+    with sqlite3.connect(state / "kernel.sqlite3") as connection:
+        connection.execute("PRAGMA " + pragma)
+    original = {path.name: path.read_bytes() for path in state.iterdir() if path.is_file()}
+    with patch(
+        "creatidy_kernel.adapters.task_execution.SQLiteProgramStore", side_effect=AssertionError("no migration")
+    ):
+        readiness = preflight_task(environment, task=fixture_task(), source_repository=source, directory=state)
+    assert not readiness.ready
+    assert {path.name: path.read_bytes() for path in state.iterdir() if path.is_file()} == original
 
 
 def test_run_rejects_source_state_overlap_before_any_source_write(

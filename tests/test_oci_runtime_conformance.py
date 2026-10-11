@@ -74,6 +74,7 @@ class NativeRuntime:
     connection: CodexStdio
     scenario: str
     codex: CodexBinary
+    store_closed: bool = False
 
 
 @pytest.fixture
@@ -189,6 +190,7 @@ def native_runtime(
         )
 
     connection: CodexStdio | None = None
+    cell: NativeRuntime | None = None
     with SQLiteProgramStore(control / "kernel.db", resolve_authority_intent=decode) as store:
         workspace = GitWorkspace(
             store,
@@ -215,7 +217,18 @@ def native_runtime(
             )
         )
         steps = [final_step("bounded synthetic completion")]
-        if request.param in {"cancel", "revoke", "close", "lost-thread", "lost-turn", "cold"}:
+        if request.param in {
+            "cancel",
+            "revoke",
+            "close",
+            "lost-thread",
+            "lost-turn",
+            "cold",
+            "reopen",
+            "object-drift",
+            "candidate-drift",
+            "observer",
+        }:
             steps[0]["delay_seconds"] = 30
         if str(request.param).startswith("edit"):
             steps.insert(0, exec_step("printf 'native source edit\\n' > /workspace/candidate/result.txt"))
@@ -364,13 +377,17 @@ def native_runtime(
                 active_authorizer=store.worker_active_authorizer(lambda: int(time.time())),
                 clock=lambda: int(time.time()),
             )
-            yield NativeRuntime(
+            cell = NativeRuntime(
                 root, store, execution, owner, resources, runtime, connection, str(request.param), codex_binary
             )
+            yield cell
         finally:
             if connection is not None:
                 connection.close()
-            if store.find_artifact(operation_id, "oci-container") is not None:
+            if (
+                not (cell is not None and cell.store_closed)
+                and store.find_artifact(operation_id, "oci-container") is not None
+            ):
                 owner.stop()
                 deadline = time.monotonic() + 10
                 while not owner.settled() and time.monotonic() < deadline:
@@ -606,3 +623,137 @@ def test_cold_native_ownership_never_recreates_kernel_handles_or_launches(native
     assert cold.settled(), "only an already received exact retirement receipt can survive lost live handles"
     assert cell.store.operation(warm.operation_id).attempts == 1
     assert cell.resources.workspace.exists()
+
+
+@pytest.mark.parametrize("native_runtime", ["object-drift", "candidate-drift"], indirect=True)
+def test_active_original_generation_drift_retires_without_another_native_read(
+    native_runtime: NativeRuntime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = native_runtime
+    handle = cell.runtime.start(cell.request)
+    calls: list[str] = []
+    original = cell.connection.request
+
+    def request(method: str, params: dict[str, object]) -> dict[str, object]:
+        calls.append(method)
+        return original(method, params)
+
+    monkeypatch.setattr(cell.connection, "request", request)
+    if cell.scenario == "object-drift":
+        (cell.resources.protected[1] / "config").write_bytes(b"changed protected fixture original")
+    else:
+        candidate = cell.resources.workspace / cell.resources.candidate_root
+        candidate.rename(candidate.with_name("retained-original-candidate"))
+        candidate.mkdir()
+    observation = cell.runtime.observe(handle, now=int(time.time()))
+    deadline = time.monotonic() + 10
+    while observation.activity is not Activity.TERMINAL and time.monotonic() < deadline:
+        observation = cell.runtime.observe(handle, now=int(time.time()))
+        time.sleep(0.05)
+    assert observation.activity is Activity.TERMINAL and observation.cancellation_requested
+    assert calls == [] and cell.owner.settled()
+    assert cell.runtime.candidate(handle) is None
+    assert cell.resources.workspace.exists()
+
+
+@pytest.mark.parametrize("native_runtime", ["reopen"], indirect=True)
+def test_real_sqlite_reopen_retains_witness_but_not_worker_authority(native_runtime: NativeRuntime) -> None:
+    cell = native_runtime
+    handle = cell.runtime.start(cell.request)
+    cell.runtime.cancel(handle)
+    deadline = time.monotonic() + 10
+    while not cell.owner.settled() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert cell.owner.settled()
+    worker = cell.store.artifact(cell.owner.operation_id, f"runtime-dispatch:{cell.request.fence}:worker")
+    witness = cell.store.artifact(cell.owner.operation_id, "oci-namespace-settled")
+    binding = json.loads(worker)["launch"].encode()
+    operation = cell.store.operation(cell.owner.operation_id)
+    database = cell.resources.private_parent / "kernel.db"
+    cell.store.close()
+    cell.store_closed = True
+
+    def decode(record: OperationRecord) -> OperationIntent:
+        if record.request_json != operation.request_json:
+            raise ValueError("reopened native intent differs")
+        return OperationIntent(
+            record.operation_id,
+            record.effect_key,
+            record.request_digest,
+            "execute",
+            cell.request.workspace.spec.repository,
+            Path("."),
+        )
+
+    with SQLiteProgramStore(database, resolve_authority_intent=decode) as reopened:
+        assert reopened.operation(operation.operation_id) == operation
+        assert reopened.artifact(operation.operation_id, "oci-namespace-settled") == witness
+        assert reopened.artifact(operation.operation_id, f"runtime-dispatch:{cell.request.fence}:worker") == worker
+        assert not reopened.worker_active_authorizer(lambda: int(time.time()))(
+            cell.request,
+            str(cell.resources.workspace),
+            binding,
+        )
+        cold = OwnedOCI(
+            reopened,
+            cell.request,
+            cell.owner.podman,
+            cell.owner.profile,
+            cell.owner.name,
+            cell.owner.image,
+            cell.owner.environment,
+            cell.owner.invoke,
+        )
+        assert cold.settled()
+        with pytest.raises(ExecutionConflict, match="launch authority"):
+            cold.connect(
+                cell.resources,
+                cell.codex.path,
+                cell.codex.version,
+                ("/toolchain/bin/python3.12", "-S", "/worker/main.py"),
+                {"HOME": str(cell.resources.private_parent / "probe")},
+                cell.connection.methods,
+                reopened.worker_authorizers(lambda: int(time.time())),
+                lambda: int(time.time()),
+            )
+    assert cell.resources.workspace.exists()
+
+
+@pytest.mark.parametrize("native_runtime", ["observer"], indirect=True)
+def test_observer_state_disappearance_and_owned_cancel_leave_bystander_alive(native_runtime: NativeRuntime) -> None:
+    """Synthetic owner-served state lifetime, not a private/live IDE attachment."""
+    cell = native_runtime
+    python, _ = host_python_closure()
+    with subprocess.Popen(  # noqa: S603 - fixed synthetic process, closed environment.
+        [str(python), "-I", "-S", "-c", "import time; time.sleep(60)"],
+        env={"HOME": str(cell.root), "PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        start_new_session=True,
+    ) as bystander:
+        try:
+            handle = cell.runtime.start(cell.request)
+            operation = cell.store.operation(cell.owner.operation_id)
+            observer = {
+                "revision": cell.store.load(cell.request.attempt.program_id).revision,
+                "workspace": str(cell.resources.workspace),
+                "candidate": str(cell.resources.workspace / cell.resources.candidate_root),
+            }
+            assert (Path(cast(str, observer["candidate"])) / "original.txt").read_bytes() == b"exact bounded source\n"
+            del observer
+            assert cell.store.operation(cell.owner.operation_id) == operation
+            assert cell.owner.state() is Presence.FOUND and not cell.owner.settled()
+            observation = cell.runtime.cancel(handle)
+            deadline = time.monotonic() + 10
+            while observation.activity is not Activity.TERMINAL and time.monotonic() < deadline:
+                observation = cell.runtime.observe(handle, now=int(time.time()))
+                time.sleep(0.05)
+            assert observation.activity is Activity.TERMINAL and cell.owner.settled()
+            assert bystander.poll() is None
+            assert cell.resources.workspace.exists()
+            assert (cell.resources.workspace / "candidate/original.txt").read_bytes() == b"exact bounded source\n"
+        finally:
+            bystander.terminate()
+            try:
+                bystander.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                bystander.kill()
+                bystander.wait(timeout=5)

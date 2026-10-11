@@ -60,6 +60,7 @@ from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChan
 
 SCHEMA_VERSION = 3
 _APPLICATION_ID = 0x43544B31
+DATABASE_APPLICATION_ID = _APPLICATION_ID
 _DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _LOCAL_FILESYSTEMS = {
     "bcachefs",

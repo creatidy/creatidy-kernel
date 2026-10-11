@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Build both archives and verify a real, dependency-free installed wheel."""
 
+import argparse
 import email
+import importlib.metadata
 import json
 import os
 import subprocess
@@ -11,8 +13,22 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument(
+    "--native-runtime", action="store_true", help="Run synthetic native factory cells from the rebuilt installed wheel"
+)
+options = parser.parse_args()
+if options.native_runtime and any(
+    not os.environ.get(name)
+    for name in ("CREATIDY_TEST_OCI_TOOLROOT", "CREATIDY_TEST_CODEX_BIN", "CREATIDY_TEST_BWRAP_BIN")
+):
+    raise SystemExit("Installed native factory UNPROVED: explicit OCI, Codex and bwrap pins required")
 
-with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory:
+with tempfile.TemporaryDirectory(
+    prefix="creatidy-kernel-package-",
+    dir="/tmp/kilo" if options.native_runtime else None,  # noqa: S108 - approved retained native proof root.
+    delete=not options.native_runtime,
+) as directory:
     work = Path(directory)
     dist = work / "dist"
     build = ["uv", "build", "--no-sources", "--no-build-isolation", "--python", sys.executable]
@@ -49,7 +65,9 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
     subprocess.run(["uv", "venv", "--python", sys.executable, str(environment)], cwd=work, check=True)
     python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     subprocess.run(
-        ["uv", "pip", "install", "--python", str(python), "--no-deps", str(rebuilt_wheel)], cwd=work, check=True
+        ["uv", "pip", "install", "--python", str(python), "--no-deps", "--link-mode", "copy", str(rebuilt_wheel)],
+        cwd=work,
+        check=True,
     )
     subprocess.run(
         [
@@ -124,4 +142,56 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
         )
     with tempfile.TemporaryDirectory(prefix="source-", dir=storage_root) as source_directory:
         subprocess.run([str(python), "-I", str(ROOT / "tools/check_source.py"), source_directory], cwd=work, check=True)
+    if options.native_runtime:
+        requirements = work / "locked-development.txt"
+        subprocess.run(
+            [
+                "uv",
+                "export",
+                "--locked",
+                "--only-group",
+                "dev",
+                "--no-emit-project",
+                "--output-file",
+                str(requirements),
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--offline",
+                "--python",
+                str(python),
+                "--constraint",
+                str(requirements),
+                "pytest==" + importlib.metadata.version("pytest"),
+            ],
+            cwd=work,
+            check=True,
+        )
+        completed = subprocess.run(
+            [
+                str(python),
+                "-I",
+                "-c",
+                "import sys; from pathlib import Path; import creatidy_kernel; "
+                "assert Path(creatidy_kernel.__file__).resolve().is_relative_to(Path(sys.prefix)); "
+                f"sys.path.insert(0, {str(ROOT)!r}); "
+                "import pytest; "
+                f"result = pytest.main([{str(ROOT / 'tests/test_oci_runtime_conformance.py')!r}, "
+                "'-o', 'pythonpath=', '-o', 'addopts=', '-q', '--tb=short']); "
+                "assert all(Path(module.__file__).resolve().is_relative_to(Path(sys.prefix)) "
+                "for name, module in sys.modules.items() if name.startswith('creatidy_kernel') "
+                "and getattr(module, '__file__', None)); "
+                "raise SystemExit(result)",
+            ],
+            cwd=work,
+            check=True,
+        )
+        print(f"Installed native factory reception passed; wheel/environment retained at {work}")
 print("Package check: wheel metadata/license, sdist rebuild, isolated install and CLI replay/export passed.")

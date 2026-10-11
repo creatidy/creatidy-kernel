@@ -5,7 +5,8 @@ bounded native proof: the real, version-pinned Codex app-server executing inside
 [#78](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/78) rootless OCI boundary.
 Nothing here is a product dependency or a permanent service, and nothing privileged is
 installed. The native receipt requires the #78 toolroot (`CREATIDY_TEST_OCI_TOOLROOT`, see
-[oci_worker_poc/SETUP.md](../oci_worker_poc/SETUP.md)) and one real Codex binary.
+[oci_worker_poc/SETUP.md](../oci_worker_poc/SETUP.md)), one real Codex binary and the
+existing public ADR-pinned bubblewrap helper for the newer factory permission reception.
 
 ## Codex binary
 
@@ -24,11 +25,22 @@ and checked against the four methods the Kernel Runtime contract requires
 ```sh
 CREATIDY_TEST_OCI_TOOLROOT=/tmp/kilo/kernel78-tooling \
 CREATIDY_TEST_CODEX_BIN=/path/to/codex \
+CREATIDY_TEST_BWRAP_BIN=/path/to/pinned/bwrap \
 make codex-oci-proof
 ```
 
 `CREATIDY_TEST_CODEX_BIN` may be omitted when `codex` is on `PATH`. Missing components are
 explicitly UNPROVED (skips with precise reasons), never synthetic passes.
+
+The factory cells require the existing bubblewrap 0.13.0 public receipt pin
+`7c0da12cc27c4de4bac5bc1dcf50d19c62a445bdb5f30cb8c9740800b0b8b237` and a declared
+libcap closure. Supplying it does not resolve the workspace-write/outer namespace
+policy conflict: the source-edit negative cells deliberately retain an **UNMET**
+conformance gate. No syscall/profile relaxation or privileged installation is implied.
+The target also runs `tools/check_package.py --native-runtime`: it rebuilds from the
+sdist, copy-installs the wheel, installs only the lock-constrained pytest dependency
+closure offline, and asserts Kernel imports do not come from the checkout. This
+retains native package/proof roots for inspection rather than deleting uncertain state.
 
 ## Collection trust boundary
 

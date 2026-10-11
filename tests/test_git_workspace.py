@@ -227,3 +227,27 @@ def test_source_identity_and_executable_config_refuse_without_running_source(
         cell.workspace.materialize("workspace-one", cell.spec)
     assert not canary.exists()
     assert not cell.workspace.workspace.exists()
+
+
+@pytest.mark.parametrize("version", [True, 1.0, "1", 2])
+def test_ambiguous_or_future_generation_version_preserves_original_evidence(
+    materialization: Materialization, monkeypatch: pytest.MonkeyPatch, version: object
+) -> None:
+    cell = materialization
+    handle = cell.workspace.materialize("workspace-one", cell.spec)
+    operation = "workspace:" + hashlib.sha256(handle.key.encode()).hexdigest()
+    original = cell.store.find_artifact
+    received = cell.store.artifact(operation, "workspace-created")
+    receipt = json.loads(received)
+
+    def artifact(operation_id: str, name: str) -> bytes | None:
+        return (
+            json.dumps({**receipt, "version": version}).encode()
+            if name == "workspace-created"
+            else original(operation_id, name)
+        )
+
+    monkeypatch.setattr(cell.store, "find_artifact", artifact)
+    assert cell.workspace.reconcile(handle.key).presence is Presence.UNKNOWN
+    assert original(operation, "workspace-created") == received
+    assert (cell.workspace.workspace / "candidate/hello.txt").exists()

@@ -70,8 +70,65 @@ complete new resource/admission factory, full channel closure or product-profile
 Candidate collection now requires exact retained settlement and the prebound candidate
 subtree, descriptor-pins private ancestry/workspace identity and durably stores exact
 bytes before the immutable proposal. It does not publish private runtime roots by
-default. General Git materialization, safe workspace deletion, complete Runtime
-integration and the other acceptance residuals remain unfinished.
+default. The later source-backed materialization/factory reception is recorded below;
+safe workspace deletion, full executor conformance and the other acceptance residuals
+remain unfinished.
+
+## Subsequent Source And Factory Reception
+
+The active issue-53 integration branch adds installed `GitWorkspace`, `OCIResources`
+generation binding and owned `CodexRuntime` composition. The original PR84 verdict
+below still applies only to its historical danger-full-access slice. It must not be
+reinterpreted as permission compatibility or complete AC4 evidence for the newer
+`workspace-write/never` path.
+
+The later cells use the actual pinned Codex 0.159.3 binary/schema, original source
+objects and directory identities, current SQLite admission, authenticated kernel init
+handles and owned full container IDs. They receive final-only completion/collection,
+cancel, observed revocation, transport EOF, lost startup replies, cold custody refusal,
+active generation drift and SQLite-cookie loss on reopen. A synthetic observer-state
+copy can disappear without changing the owned controller; cancellation leaves an
+unrelated separately launched process alive. The latter is observer-state/bystander
+evidence, not private IDE attachment or detached-controller continuity.
+
+The source-backed layout is explicit: the Kernel-owned host workspace contains the
+editable source checkout under the bound `candidate` subtree. Native `/workspace`
+is a bind destination, never an interchangeable host/editor path. An editor/observer
+would consume the owner-served host paths; no Kilo/IDE state, credentials or session
+is inspected or taken over. There is no supported IDE attach/handoff implemented here.
+
+The rebuilt wheel also runs these actual native cells in an isolated environment;
+Kernel imports are required to originate in that environment before and after pytest,
+not in checkout `src/`. Exact locked pytest dependencies are installed offline.
+Package installation uses copy mode because mutable cache hardlinks are refused by
+the native resource boundary. Native environments and uncertain roots are retained.
+
+### Explicit Unmet Editing Gate
+
+The native edit scenario does **not** conform under the unchanged outer policy.
+Codex workspace-write requires bubblewrap namespace creation. Its initially missing
+helper was supplied from the existing public 0.13.0 ADR pin and a declared libcap
+closure, but native command execution still fails with namespace denial. Production
+EPERM and diagnostic EDOM receipts correlate the native command exit/output and
+attribute the refusal without allowing any previously denied syscall. Passing those
+negative cells means the incompatibility is received, not that source editing works.
+Changing to danger-full-access, permitting namespaces or adopting another product
+executor/profile is an owner-controlled boundary choice, not automatic remediation.
+
+Current authority is rechecked for newly collected bytes even after confirmed native
+completion and retirement. This still does not provide continuous per-syscall expiry
+or revocation mediation over the writable bind. Historical records remain inspectable;
+denied new collection cannot renew the original lease, issue another prompt or imply
+acceptance. Exact init exit plus confirmed owned-container absence authorizes retained
+settlement, not deletion. `GitWorkspace.cleanup` explicitly refuses caller boolean
+settlement claims; source objects, workspace and journal evidence remain preserved.
+
+Frozen-task `doctor`/preflight and `task status` retain their existing command scope.
+Preflight reads a checkpointed store immutably and refuses foreign/future state; it is
+not a generic OCI doctor and may perform its documented source/Router/Forge/native-init
+checks. Task status/export opens the normal store and is not advertised as byte-read-only
+or a concurrent served-view API. Neither path grants a fresh native launch or live IDE
+scope merely by inspecting records.
 
 ## Verdict
 
@@ -234,9 +291,10 @@ and prove that code 125 can neither authorize collection nor silently count as s
   methods), skills/plugins — must show each is either inside this boundary or refused before
   integration. (This slice's boundary confines the whole process tree regardless of channel,
   but per-channel evidence for the unexercised channels is not collected.)
-- **Kernel-side integration**: no `src/` port, Runtime, Workspace or authority code changed.
-  The isolated-worker Runtime/Workspace adapters, trust-mode plumbing and durable-authority
-  mapping remain to be implemented and separately reviewed.
+- **Kernel-side integration**: historical PR84 changed no `src/` port, Runtime, Workspace
+  or authority code. The subsequent reception above adds optional source/authority/lifecycle
+  composition, but does not activate an isolated-worker product path or satisfy all
+  executor/current-authority/channel criteria. Exact independent review remains required.
 - **Supported-version migration evidence** (AC #6 of #53): conformance against the Kernel's
   Runtime contract, duplicate/lost/replayed event behavior through the real adapter, and the
   #15612 falsification matrix reruns are future bounded deliveries.

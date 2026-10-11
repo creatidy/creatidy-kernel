@@ -94,7 +94,9 @@ def verify_generation(
     plan = _object(plan)
     if (
         set(record) != {"version", "plan_reference", "identities", "objects_digest"}
+        or type(record.get("version")) is not int
         or record.get("version") != 1
+        or type(plan.get("version")) is not int
         or plan.get("version") != 1
         or record.get("plan_reference") != hashlib.sha256(_bytes(plan)).hexdigest()
         or plan.get("key") != handle.key

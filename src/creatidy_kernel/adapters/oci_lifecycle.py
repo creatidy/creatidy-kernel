@@ -11,6 +11,7 @@ Trusted composition supplies verified resources and a bounded native CLI executo
 import hashlib
 import json
 import os
+import re
 import stat
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
@@ -447,7 +448,17 @@ class OwnedOCI:
         if identifier is None or namespace is None:
             return False
         record = _object(json.loads(namespace))
-        if record.get("owner") != self.token or record.get("container") != identifier:
+        if (
+            set(record) != {"version", "owner", "container", "identity", "binding_reference"}
+            or type(record.get("version")) is not int
+            or record.get("version") != 1
+            or record.get("owner") != self.token
+            or record.get("container") != identifier
+            or not isinstance(record.get("identity"), dict)
+            or not record.get("identity")
+            or type(record.get("binding_reference")) is not str
+            or re.fullmatch("[0-9a-f]{64}", cast(str, record["binding_reference"])) is None
+        ):
             raise ExecutionConflict("OCI namespace receipt differs from ownership")
         witness = _bytes(
             {
@@ -798,6 +809,11 @@ class OwnedOCI:
         def collect(request: ExecutionRequest) -> Candidate:
             if request != self.request:
                 raise ExecutionConflict("OCI collection request differs from owned Attempt")
+            if (
+                resources.verify(self, codex) != evidence
+                or active_authorizer(request, str(resources.workspace), binding.encode()) is not True
+            ):
+                raise ExecutionConflict("current OCI collection authority refused")
             return self.collect_candidate(resources)
 
         return CodexRuntime(

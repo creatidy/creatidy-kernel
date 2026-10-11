@@ -780,6 +780,7 @@ def runtime_launch(launch: Launch, monkeypatch: pytest.MonkeyPatch) -> Iterator[
                 "container": "a" * 64,
                 "identity": channel.identity,
                 "binding_reference": hashlib.sha256(stage["launch"].encode()).hexdigest(),
+                "version": 1,
             }
         ).encode(),
     )
@@ -1073,3 +1074,52 @@ def test_pinned_native_byte_bound_refuses_before_probe_or_worker(
     with pytest.raises(ExecutionConflict, match="native/config resource"):
         launch.connect()
     assert launch.calls == launch.spawns == []
+
+
+@pytest.mark.parametrize("late", ["expired", "revoked", "resource"])
+def test_new_collection_checks_authority_after_confirmed_terminal_retirement(
+    runtime_launch: RuntimeLaunch, late: str
+) -> None:
+    cell = runtime_launch
+    candidate = cell.launch.prepared.root / "candidate"
+    candidate.mkdir()
+    (candidate / "result").write_bytes(b"retained but not authorized for new collection")
+    handle = cell.runtime.start(cell.launch.prepared.request)
+    cell.runtime.observe(handle, now=2)
+    cell.exited[0] = cell.absent[0] = True
+    assert cell.runtime.observe(handle, now=3).activity is Activity.TERMINAL
+    before = tuple(cell.calls)
+    if late == "expired":
+        cell.launch.time[0] = 11
+    elif late == "revoked":
+        cell.launch.prepared.store.revoke(Principal("owner", "owner"), cell.launch.prepared.grant.grant_id)
+    else:
+        cell.launch.resources.pins[2][0].write_bytes(b"changed after retirement")
+    with pytest.raises(ExecutionConflict):
+        cell.runtime.candidate(handle)
+    assert tuple(cell.calls) == before
+    assert cell.launch.prepared.store.find_artifact(cell.launch.owner.operation_id, "oci-candidate") is None
+    assert (candidate / "result").read_bytes() == b"retained but not authorized for new collection"
+
+
+@pytest.mark.parametrize("mutation", ["unknown", "missing", "malformed"])
+def test_unsupported_init_shape_cannot_establish_settlement_or_collect(
+    launch: Launch, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    _retired(launch)
+    original = launch.prepared.store.find_artifact
+    namespace = json.loads(launch.prepared.store.artifact(launch.owner.operation_id, "oci-init"))
+    if mutation == "unknown":
+        namespace["version"] = 2
+    elif mutation == "missing":
+        del namespace["binding_reference"]
+    else:
+        namespace["binding_reference"] = True
+
+    def artifact(operation_id: str, name: str) -> bytes | None:
+        return json.dumps(namespace).encode() if name == "oci-init" else original(operation_id, name)
+
+    monkeypatch.setattr(launch.prepared.store, "find_artifact", artifact)
+    with pytest.raises(ExecutionConflict, match="namespace receipt"):
+        launch.owner.settled()
+    assert launch.prepared.root.exists()

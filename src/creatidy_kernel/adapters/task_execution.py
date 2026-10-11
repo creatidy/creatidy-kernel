@@ -57,6 +57,8 @@ from creatidy_kernel.adapters.source_cache import (
     validate_checkout,
 )
 from creatidy_kernel.adapters.sqlite_store import (
+    DATABASE_APPLICATION_ID,
+    SCHEMA_VERSION,
     OperationConflict,
     ProgramNotFound,
     SQLiteProgramStore,
@@ -2322,6 +2324,10 @@ def _preflight_base(source: Path, directory: Path, task: TaskSpec) -> tuple[str,
         # The state suitability gate refuses live/recovery sidecars first. Read the
         # checkpointed intent immutably, without creating WAL/SHM files or locks.
         with closing(sqlite3.connect(f"{database.as_uri()}?mode=ro&immutable=1", uri=True)) as connection:
+            schema = connection.execute("PRAGMA user_version").fetchone()[0]
+            application = connection.execute("PRAGMA application_id").fetchone()[0]
+            if schema not in range(1, SCHEMA_VERSION + 1) or application not in (0, DATABASE_APPLICATION_ID):
+                raise ValueError("unsupported or foreign checkpointed task database")
             mode = connection.execute(
                 "SELECT request_json FROM operations WHERE operation_id = ?",
                 ("task_execution:mode",),
