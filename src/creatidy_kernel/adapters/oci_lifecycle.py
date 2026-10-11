@@ -490,7 +490,9 @@ class OwnedOCI:
         if not self.settled():
             raise ExecutionConflict("owned OCI namespace settlement unproved")
 
-    def collect_candidate(self, resources: OCIResources) -> Candidate:
+    def collect_candidate(
+        self, resources: OCIResources, *, codex: Path | None = None, authorizer: WorkerAuthorizer | None = None
+    ) -> Candidate:
         """Collect only the controller's prebound candidate subtree after exact settlement.
 
         Private runtime state is not an implicit candidate root. This is a retained
@@ -506,6 +508,13 @@ class OwnedOCI:
             raise ExecutionConflict("OCI launch resources missing")
         launch = _object(json.loads(binding))
         namespace = _object(json.loads(self.store.artifact(self.operation_id, "oci-init")))
+        if codex is None or authorizer is None:
+            raise ExecutionConflict("current OCI collection authority unavailable")
+        if (
+            resources.verify(self, codex).decode() != launch.get("resources")
+            or authorizer(self.request, str(resources.workspace), binding.encode()) is not True
+        ):
+            raise ExecutionConflict("current OCI collection authority refused")
         if namespace.get("binding_reference") != hashlib.sha256(binding.encode()).hexdigest():
             raise ExecutionConflict("OCI namespace differs from original launch")
         retained = _object(json.loads(cast(str, launch.get("resources"))))
@@ -570,6 +579,11 @@ class OwnedOCI:
                 raise ExecutionConflict("OCI candidate collection refused unsafe entries")
         self.require_settled()
         manifest = ArtifactManifest(self.request.workspace.key, tuple(sorted(artifacts, key=lambda item: item.path)))
+        if (
+            resources.verify(self, codex).decode() != launch.get("resources")
+            or authorizer(self.request, str(resources.workspace), binding.encode()) is not True
+        ):
+            raise ExecutionConflict("current OCI collection authority refused")
         candidate = Candidate(self.request.attempt.attempt_id, self.request.attempt.digest, manifest)
         self.store.finalize_artifact(self.operation_id, "oci-candidate", _bytes(asdict(candidate)))
         return candidate
@@ -809,12 +823,7 @@ class OwnedOCI:
         def collect(request: ExecutionRequest) -> Candidate:
             if request != self.request:
                 raise ExecutionConflict("OCI collection request differs from owned Attempt")
-            if (
-                resources.verify(self, codex) != evidence
-                or active_authorizer(request, str(resources.workspace), binding.encode()) is not True
-            ):
-                raise ExecutionConflict("current OCI collection authority refused")
-            return self.collect_candidate(resources)
+            return self.collect_candidate(resources, codex=codex, authorizer=active_authorizer)
 
         return CodexRuntime(
             connection,

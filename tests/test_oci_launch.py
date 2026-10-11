@@ -500,6 +500,9 @@ def _retired(launch: Launch) -> OwnedOCI:
     launch.connect().close()
     owner = launch.owner
     stage = json.loads(owner.store.artifact(owner.operation_id, "runtime-dispatch:1:worker"))
+    assert launch.prepared.store.worker_entry_authorizer(lambda: launch.time[0])(
+        owner.request, str(launch.prepared.root), stage["launch"].encode()
+    )
     namespace = json.dumps(
         {
             "version": 1,
@@ -542,7 +545,11 @@ def test_retirement_gates_exact_controller_candidate_bytes_and_excludes_private_
     candidate_root.mkdir()
     (candidate_root / "result.txt").write_bytes(b"exact candidate bytes")
     (launch.prepared.root / "private-runtime.json").write_bytes(b"must not be published")
-    candidate = owner.collect_candidate(launch.resources)
+    candidate = owner.collect_candidate(
+        launch.resources,
+        codex=launch.codex,
+        authorizer=launch.prepared.store.worker_active_authorizer(lambda: launch.time[0]),
+    )
     assert candidate.attempt_id == launch.prepared.request.attempt.attempt_id
     assert candidate.spec_digest == launch.prepared.request.attempt.digest
     assert [item.path for item in candidate.artifacts.artifacts] == ["result.txt"]
@@ -583,7 +590,11 @@ def test_candidate_root_changes_refuse_without_manifest(launch: Launch, mutation
         launch.prepared.root.rename(old)
         launch.prepared.root.mkdir()
     with pytest.raises(ExecutionConflict):
-        owner.collect_candidate(launch.resources)
+        owner.collect_candidate(
+            launch.resources,
+            codex=launch.codex,
+            authorizer=launch.prepared.store.worker_active_authorizer(lambda: launch.time[0]),
+        )
     assert owner.store.find_artifact(owner.operation_id, "oci-candidate") is None
 
 
@@ -993,7 +1004,12 @@ def source_bound_launch(launch: Launch, tmp_path_factory: pytest.TempPathFactory
     )
     launch.owner = owner
     resources = replace(launch.resources, protected=(*launch.resources.protected, workspace.objects))
-    launch.resources = workspace.bind(owner, resources)
+    launch.resources = workspace.bind(
+        owner,
+        resources,
+        codex=launch.codex,
+        collection_authorizer=launch.prepared.store.worker_active_authorizer(lambda: launch.time[0]),
+    )
     return workspace
 
 
@@ -1123,3 +1139,57 @@ def test_unsupported_init_shape_cannot_establish_settlement_or_collect(
     with pytest.raises(ExecutionConflict, match="namespace receipt"):
         launch.owner.settled()
     assert launch.prepared.root.exists()
+
+
+@pytest.mark.parametrize("late", ["expired", "revoked", "resource", "reopened"])
+def test_direct_workspace_collection_cannot_bypass_current_authority(
+    source_bound_launch: GitWorkspace, launch: Launch, late: str
+) -> None:
+    workspace = source_bound_launch
+    owner = _retired(launch)
+    if late == "expired":
+        launch.time[0] = 11
+    elif late == "revoked":
+        launch.prepared.store.revoke(Principal("owner", "owner"), launch.prepared.grant.grant_id)
+    elif late == "resource":
+        launch.resources.pins[2][0].write_bytes(b"changed after namespace retirement")
+    else:
+        launch.prepared.store.close()
+        reopened = SQLiteProgramStore(launch.prepared.database)
+        try:
+            owner = OwnedOCI(
+                reopened,
+                owner.request,
+                owner.podman,
+                owner.profile,
+                owner.name,
+                owner.image,
+                owner.environment,
+                owner.invoke,
+            )
+            with pytest.raises(ExecutionConflict):
+                owner.collect_candidate(
+                    launch.resources, codex=launch.codex, authorizer=reopened.worker_active_authorizer(lambda: 1)
+                )
+            assert reopened.find_artifact(owner.operation_id, "oci-candidate") is None
+        finally:
+            reopened.close()
+        assert (workspace.workspace / "candidate/original.txt").read_bytes() == b"exact materialized input"
+        return
+    with pytest.raises(ExecutionConflict):
+        workspace.collect(launch.prepared.request.workspace)
+    with pytest.raises(ExecutionConflict):
+        owner.collect_candidate(
+            launch.resources,
+            codex=launch.codex,
+            authorizer=launch.prepared.store.worker_active_authorizer(lambda: launch.time[0]),
+        )
+    assert launch.prepared.store.find_artifact(owner.operation_id, "oci-candidate") is None
+    assert (workspace.workspace / "candidate/original.txt").read_bytes() == b"exact materialized input"
+
+
+def test_retirement_without_collection_authorizer_is_not_new_read_permission(launch: Launch) -> None:
+    owner = _retired(launch)
+    with pytest.raises(ExecutionConflict, match="authority unavailable"):
+        owner.collect_candidate(launch.resources)
+    assert launch.prepared.store.find_artifact(owner.operation_id, "oci-candidate") is None

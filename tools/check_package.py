@@ -184,7 +184,7 @@ with tempfile.TemporaryDirectory(
                 f"sys.path.insert(0, {str(ROOT)!r}); "
                 "import pytest; "
                 f"result = pytest.main([{str(ROOT / 'tests/test_oci_runtime_conformance.py')!r}, "
-                "'-o', 'pythonpath=', '-o', 'addopts=', '-q', '--tb=short']); "
+                "'-p', 'tools.native_reception', '-o', 'pythonpath=', '-o', 'addopts=', '-q', '--tb=short']); "
                 "assert all(Path(module.__file__).resolve().is_relative_to(Path(sys.prefix)) "
                 "for name, module in sys.modules.items() if name.startswith('creatidy_kernel') "
                 "and getattr(module, '__file__', None)); "

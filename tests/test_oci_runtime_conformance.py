@@ -333,6 +333,8 @@ def native_runtime(
                 tuple((path, hashlib.sha256(path.read_bytes()).hexdigest()) for path in pins),
                 readonly,
             ),
+            codex=codex_binary.path,
+            collection_authorizer=store.worker_active_authorizer(lambda: int(time.time())),
         )
         probe = control / "probe"
         probe.mkdir(mode=0o700)

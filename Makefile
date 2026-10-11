@@ -33,10 +33,10 @@ native-proof:
 
 oci-worker-proof:
 	@test -n "$(CREATIDY_TEST_OCI_TOOLROOT)" || { printf '%s\n' 'Whole-worker isolation UNPROVED: CREATIDY_TEST_OCI_TOOLROOT required'; exit 1; }
-	uv run --locked pytest tests/test_oci_worker_isolation.py tests/test_oci_worker_authority.py
+	uv run --locked python -m pytest -p tools.native_reception tests/test_oci_worker_isolation.py tests/test_oci_worker_authority.py
 
 codex-oci-proof:
 	@test -n "$(CREATIDY_TEST_OCI_TOOLROOT)" || { printf '%s\n' 'Real-Codex worker isolation UNPROVED: CREATIDY_TEST_OCI_TOOLROOT required'; exit 1; }
 	@test -n "$(CREATIDY_TEST_BWRAP_BIN)" || { printf '%s\n' 'Native factory sandbox reception UNPROVED: CREATIDY_TEST_BWRAP_BIN required'; exit 1; }
-	uv run --locked pytest tests/test_codex_oci_isolation.py tests/test_oci_runtime_conformance.py
+	uv run --locked python -m pytest -p tools.native_reception tests/test_codex_oci_isolation.py tests/test_oci_runtime_conformance.py
 	uv run --locked python tools/check_package.py --native-runtime

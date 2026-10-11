@@ -152,7 +152,9 @@ These negative tests passing means refusal was received, not that source editing
 works. `codex-oci-proof` requires the explicit `CREATIDY_TEST_BWRAP_BIN` as well as the OCI toolroot.
 Resolving this permission/boundary choice is not an automatic profile relaxation or adoption.
 
-New collection checks current grant/lease and the original resource binding even after confirmed
+The common `OwnedOCI.collect_candidate` boundary requires a trusted collection authorizer and the
+pinned Codex resource; absent inputs refuse. Both Runtime and `GitWorkspace.collect` consume this
+boundary. New collection checks current grant/lease and the original resource binding even after confirmed
 completion and retirement; historical inspection is not fresh collection authority. The rebuilt wheel
 receives the same native cells without checkout-source shadowing, using an isolated copy-install and
 only offline lock-constrained pytest dependencies. Generation drift and actual SQLite reopen preserve
@@ -160,6 +162,10 @@ original roots/witnesses but cannot inherit the previous controller's dispatch c
 observer-state disappearance does not cancel the controller; owned cancellation leaves an unrelated
 process alive. This is not live/private IDE attachment or controller handoff. Native retirement retains
 workspaces and protected source objects, and does not authorize destructive cleanup.
+
+Explicit native proof targets and installed-wheel native reception also reject skipped required cells
+or an empty received set. Ordinary `make check` retains its optional-native skips as UNPROVED;
+nonempty environment variables or pytest exit zero alone cannot establish native reception.
 
 `GitWorkspace` supplies optional source-backed materialization before granting or exposing a workspace.
 The controller explicitly binds a historical repository ID to an existing checkout and qualified HTTPS

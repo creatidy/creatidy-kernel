@@ -12,6 +12,7 @@ import os
 import stat
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, cast
@@ -34,6 +35,7 @@ from creatidy_kernel.adapters.worker_collection import MAX_DEPTH, MAX_ENTRIES, M
 from creatidy_kernel.core.execution import (
     ArtifactManifest,
     ExecutionConflict,
+    ExecutionRequest,
     Lookup,
     Presence,
     TrustMode,
@@ -193,6 +195,8 @@ class GitWorkspace(Workspace):
         self._operation_id: str | None = None
         self._owner: OwnedOCI | None = None
         self._resources: OCIResources | None = None
+        self._codex: Path | None = None
+        self._collection_authorizer: Callable[[ExecutionRequest, str, bytes], bool] | None = None
 
     def materialize(self, key: str, spec: WorkspaceSpec) -> WorkspaceHandle:
         if (
@@ -331,7 +335,14 @@ class GitWorkspace(Workspace):
             (self.objects,),
         )
 
-    def bind(self, owner: "OwnedOCI", resources: "OCIResources") -> "OCIResources":
+    def bind(
+        self,
+        owner: "OwnedOCI",
+        resources: "OCIResources",
+        *,
+        codex: Path | None = None,
+        collection_authorizer: Callable[[ExecutionRequest, str, bytes], bool] | None = None,
+    ) -> "OCIResources":
         if (
             owner.store is not self.store
             or owner.request.workspace != self._handle
@@ -345,13 +356,18 @@ class GitWorkspace(Workspace):
             raise ExecutionConflict("Workspace original objects must remain protected")
         selected = replace(resources, workspace_operation=self._operation_id)
         self._owner, self._resources = owner, selected
+        self._codex, self._collection_authorizer = codex, collection_authorizer
         return selected
 
     def collect(self, handle: WorkspaceHandle) -> ArtifactManifest:
         if handle != self._handle or self._owner is None or self._resources is None:
             raise ExecutionConflict("Workspace has no matching owned Runtime")
         self._verify()
-        return self._owner.collect_candidate(self._resources).artifacts
+        return self._owner.collect_candidate(
+            self._resources,
+            codex=self._codex,
+            authorizer=self._collection_authorizer,
+        ).artifacts
 
     def reconcile(self, key: str, handle: str | None = None) -> Lookup:
         if self._handle is None:
