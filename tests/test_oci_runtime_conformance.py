@@ -505,6 +505,42 @@ def test_real_factory_lifecycle_and_current_workspace_write_gate(
         )
 
 
+@pytest.mark.parametrize("native_runtime", ["final"], indirect=True)
+def test_real_final_thread_admission_revocation_retires_without_prompt(native_runtime: NativeRuntime) -> None:
+    cell = native_runtime
+
+    def clock() -> int:
+        return int(time.time())
+
+    dispatch, recovery = cell.store.runtime_authorizers(clock)
+
+    def revoke(request: ExecutionRequest, cwd: str, method: str) -> bool:
+        assert method == "thread/start"
+        cell.store.revoke(Principal("owner", "owner"), request.capability_reference)
+        return dispatch(request, cwd, method)
+
+    runtime = cell.owner.runtime(
+        cell.resources,
+        cell.codex.path,
+        resolve=cell.runtime.resolve,
+        authorizers=(revoke, recovery),
+        active_authorizer=cell.store.worker_active_authorizer(clock),
+        clock=clock,
+    )
+    with pytest.raises(ExecutionConflict, match="resolved thread inputs"):
+        runtime.start(cell.request)
+    with pytest.raises(OSError, match="transport closed"):
+        cell.connection.request("thread/start", {})
+    deadline = time.monotonic() + 10
+    while not cell.owner.settled() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert cell.owner.settled()
+    assert runtime.reconcile(cell.request.operation).presence is Presence.UNKNOWN
+    assert cell.store.find_artifact(cell.owner.operation_id, "runtime-dispatch:1:thread") is None
+    assert cell.store.find_artifact(cell.owner.operation_id, "oci-candidate") is None
+    assert (cell.resources.workspace / "candidate/original.txt").read_bytes() == b"exact bounded source\n"
+
+
 @pytest.mark.parametrize("native_runtime", ["cancel", "revoke", "close"], indirect=True)
 def test_real_factory_cancel_revocation_and_transport_loss_retire_detached_namespace(
     native_runtime: NativeRuntime,

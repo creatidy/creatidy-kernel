@@ -827,7 +827,13 @@ class OwnedOCI:
         def authorize_resolved(request: ExecutionRequest, cwd: str, method: str) -> bool:
             if not authorize(request):
                 return False
-            return dispatch(request, cwd, method)
+            permitted = False
+            try:
+                permitted = dispatch(request, cwd, method)
+            finally:
+                if not permitted:
+                    retire(request)
+            return permitted
 
         def collect(request: ExecutionRequest) -> Candidate:
             if request != self.request:

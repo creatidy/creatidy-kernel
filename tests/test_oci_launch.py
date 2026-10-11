@@ -29,7 +29,7 @@ from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile
 from creatidy_kernel.core.authority import Principal
-from creatidy_kernel.core.execution import Activity, ExecutionConflict, Presence
+from creatidy_kernel.core.execution import Activity, ExecutionConflict, ExecutionRequest, Presence
 
 pytest_plugins = ["test_runtime_authority"]
 
@@ -958,6 +958,45 @@ def test_owned_runtime_uncertain_rpc_retires_only_its_boundary_without_retry(
             cell.runtime.start(cell.launch.prepared.request)
     assert cell.runtime.reconcile(cell.launch.prepared.request.operation).presence is Presence.UNKNOWN
     assert cell.launch.prepared.root.exists()
+
+
+@pytest.mark.parametrize("mutation", ["expired", "revoked", "error"])
+def test_final_thread_admission_refusal_retires_prelaunched_owned_worker(
+    runtime_launch: RuntimeLaunch, mutation: str
+) -> None:
+    cell = runtime_launch
+    prepared = cell.launch.prepared
+    dispatch, recovery = prepared.store.runtime_authorizers(lambda: cell.launch.time[0])
+
+    def guarded(request: ExecutionRequest, cwd: str, method: str) -> bool:
+        assert method == "thread/start"
+        if mutation == "expired":
+            cell.launch.time[0] = 11
+        elif mutation == "revoked":
+            prepared.store.revoke(Principal("owner", "owner"), prepared.grant.grant_id)
+        else:
+            raise ExecutionConflict("synthetic final admission failure")
+        return dispatch(request, cwd, method)
+
+    runtime = cell.launch.owner.runtime(
+        cell.launch.resources,
+        cell.launch.codex,
+        resolve=cell.runtime.resolve,
+        authorizers=(guarded, recovery),
+        active_authorizer=prepared.store.worker_active_authorizer(lambda: cell.launch.time[0]),
+        clock=lambda: cell.launch.time[0],
+    )
+    lifetime = cell.launch.owner._lifetime  # pyright: ignore[reportPrivateUsage] - fixture-owned lifetime.
+    assert lifetime is not None and lifetime.controller.fileno() >= 0
+    with pytest.raises(ExecutionConflict):
+        runtime.start(prepared.request)
+    assert cell.calls == []
+    assert lifetime.controller.fileno() == -1
+    with pytest.raises(OSError, match="transport closed"):
+        cell.connection.request("thread/start", {})
+    assert runtime.reconcile(prepared.request.operation).presence is Presence.UNKNOWN
+    assert prepared.store.find_artifact(cell.launch.owner.operation_id, "oci-candidate") is None
+    assert prepared.root.exists()
 
 
 def test_non_gated_factory_connection_cannot_be_presented_as_owned_runtime(launch: Launch) -> None:
