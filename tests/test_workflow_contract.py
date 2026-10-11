@@ -5,10 +5,19 @@ Adapted from Model Intelligence for Kernel identity, gates and lint; see NOTICE.
 
 import re
 import unittest
+from collections.abc import Mapping
 from fnmatch import fnmatchcase
 from pathlib import Path
+from typing import TypedDict
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class DependencyEvidence(TypedDict, total=False):
+    state: str
+    evidence: str
+    contract: str
+    dependencies: list[int]
 
 
 def text(path: str) -> str:
@@ -34,6 +43,47 @@ def eligibility_transitions() -> dict[str, tuple[str, str, str]]:
             raise AssertionError("classification rows must be unique four-column rules")
         rows[cells[0]] = (cells[1], cells[2], cells[3])
     return rows
+
+
+def trace_dependency(issue: int, records: Mapping[int, DependencyEvidence]) -> tuple[str, tuple[int, ...]]:
+    """Return the evidence result and all executable leaves in verified dependency branches."""
+    record = records.get(issue)
+    if record is None or record.get("evidence") != "current":
+        return "UNVERIFIED", ()
+    contract = record.get("contract")
+    if contract == "unknown":
+        return "UNVERIFIED", ()
+    if record.get("state") == "closed":
+        return ("SATISFIED", ()) if contract == "ready" else ("UNVERIFIED", ())
+    if record.get("state") != "open":
+        return "UNVERIFIED", ()
+    predecessors: list[int] = []
+    gated = contract == "gated"
+    for dependency in record.get("dependencies", []):
+        state, dependency_predecessors = trace_dependency(dependency, records)
+        if state == "UNVERIFIED":
+            return state, ()
+        if state in ("GATED", "ELIGIBLE"):
+            gated = True
+            predecessors.extend(dependency_predecessors)
+    if gated:
+        return "GATED", tuple(dict.fromkeys(predecessors))
+    return "ELIGIBLE", (issue,)
+
+
+def select_confirmed_eligible(
+    repository_issues: tuple[int, ...], records: Mapping[int, DependencyEvidence]
+) -> tuple[int | None, str | None]:
+    """Use the loop's already-ordered queue; unknown evidence blocks empty claims."""
+    unverified = False
+    for issue in repository_issues:
+        state, _ = trace_dependency(issue, records)
+        if state == "ELIGIBLE":
+            return issue, None
+        unverified |= state == "UNVERIFIED"
+    if unverified:
+        return None, "UNVERIFIED"
+    return None, "QUEUE_EMPTY"
 
 
 def mcp_checkout_evidence_is_current(evidence: dict[str, object]) -> bool:
@@ -68,6 +118,119 @@ def mcp_checkout_evidence_is_current(evidence: dict[str, object]) -> bool:
 
 
 class WorkflowContractTests(unittest.TestCase):
+    def test_dependency_chain_selects_earliest_executable_predecessor(self) -> None:
+        records: dict[int, DependencyEvidence] = {
+            86: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": []},
+            87: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": [86]},
+            88: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": [87]},
+        }
+        self.assertEqual(trace_dependency(88, records), ("GATED", (86,)))
+        self.assertEqual(select_confirmed_eligible((88, 87, 86), records), (86, None))
+        loop = text(".kilo/command/loop.md")
+        for requirement in (
+            "Walk each explicit dependency chain backward",
+            "earliest open issue that is itself eligible to execute",
+            "Select that executable predecessor before its dependent",
+            "Do not infer an edge where Forgejo has none",
+        ):
+            self.assertIn(requirement, loop)
+
+    def test_branching_dependencies_use_canonical_order_not_edge_order(self) -> None:
+        records: dict[int, DependencyEvidence] = {
+            83: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": []},
+            84: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": []},
+            88: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": [84, 83]},
+        }
+        self.assertEqual(trace_dependency(88, records), ("GATED", (84, 83)))
+        self.assertEqual(select_confirmed_eligible((88, 83, 84), records), (83, None))
+
+    def test_issue_local_gate_does_not_block_unrelated_eligible_work(self) -> None:
+        records: dict[int, DependencyEvidence] = {
+            87: {"state": "open", "evidence": "current", "contract": "gated", "dependencies": []},
+            88: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": [87]},
+            90: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": []},
+        }
+        self.assertEqual(select_confirmed_eligible((88, 90), records), (90, None))
+        self.assertEqual(trace_dependency(88, records), ("GATED", ()))
+        loop = text(".kilo/command/loop.md")
+        self.assertIn("it does not gate unrelated eligible Kernel issues", loop)
+        self.assertIn("issue-local gates from repository-wide inactivity", loop)
+
+    def test_changed_or_missing_dependency_evidence_is_unverified_not_ready_or_gated(self) -> None:
+        records: dict[int, DependencyEvidence] = {
+            88: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": [87]},
+            87: {"state": "open", "evidence": "changed", "contract": "ready", "dependencies": []},
+        }
+        self.assertEqual(trace_dependency(88, records), ("UNVERIFIED", ()))
+        self.assertEqual(trace_dependency(88, {88: records[88]}), ("UNVERIFIED", ()))
+        unknown_contract: dict[int, DependencyEvidence] = {
+            88: {"state": "open", "evidence": "current", "contract": "unknown", "dependencies": []}
+        }
+        self.assertEqual(trace_dependency(88, unknown_contract), ("UNVERIFIED", ()))
+        self.assertEqual(select_confirmed_eligible((88,), records), (None, "UNVERIFIED"))
+        mixed_edges: dict[int, DependencyEvidence] = {
+            86: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": []},
+            87: {"state": "open", "evidence": "changed", "contract": "ready", "dependencies": []},
+            88: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": [86, 87]},
+        }
+        self.assertEqual(trace_dependency(88, mixed_edges), ("UNVERIFIED", ()))
+        loop = text(".kilo/command/loop.md")
+        self.assertIn("`UNVERIFIED`, not ready and not a verified gate", loop)
+        self.assertIn("Do not report `QUEUE_EMPTY` while any in-scope candidate", loop)
+        terminal_refresh = loop.split("Before `WAIT`/inactivity", 1)[1].split("Before any terminal status", 1)[0]
+        for requirement in (
+            "`BLOCKED`, `STOP_AND_ASK` or `QUEUE_EMPTY`",
+            "refresh the current canonical issue/dependency evidence",
+            "every required producer/contract observation",
+            "Record changed or unavailable facts as `UNVERIFIED`",
+        ):
+            self.assertIn(requirement, terminal_refresh)
+
+    def test_queue_exhaustion_is_limited_to_verified_kernel_issue_evidence(self) -> None:
+        kernel_records: dict[int, DependencyEvidence] = {
+            88: {"state": "open", "evidence": "current", "contract": "gated", "dependencies": []},
+        }
+        self.assertEqual(select_confirmed_eligible((88,), kernel_records), (None, "QUEUE_EMPTY"))
+        changed_records: dict[int, DependencyEvidence] = {88: {"state": "open", "evidence": "changed"}}
+        self.assertEqual(select_confirmed_eligible((88,), changed_records), (None, "UNVERIFIED"))
+        loop = text(".kilo/command/loop.md")
+        self.assertIn("only the refreshed canonical open Kernel issue queue", loop)
+        self.assertIn("it is not a claim that upstream repositories have no work", loop)
+
+    def test_local_gate_cannot_hide_unknown_dependency_evidence(self) -> None:
+        for evidence in ("missing", "changed", "inaccessible"):
+            with self.subTest(evidence=evidence):
+                records: dict[int, DependencyEvidence] = {
+                    88: {"state": "open", "evidence": "current", "contract": "gated", "dependencies": [87]},
+                    90: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": []},
+                }
+                if evidence != "missing":
+                    records[87] = {"state": "open", "evidence": evidence, "contract": "ready", "dependencies": []}
+                self.assertEqual(trace_dependency(88, records), ("UNVERIFIED", ()))
+                self.assertEqual(select_confirmed_eligible((88,), records), (None, "UNVERIFIED"))
+                self.assertEqual(select_confirmed_eligible((88, 90), records), (90, None))
+
+    def test_local_gate_is_retained_when_dependency_evidence_is_verified(self) -> None:
+        records: dict[int, DependencyEvidence] = {
+            87: {"state": "closed", "evidence": "current", "contract": "ready", "dependencies": []},
+            88: {"state": "open", "evidence": "current", "contract": "gated", "dependencies": [87]},
+        }
+        self.assertEqual(trace_dependency(88, records), ("GATED", ()))
+        self.assertEqual(select_confirmed_eligible((88,), records), (None, "QUEUE_EMPTY"))
+
+    def test_recovery_progress_is_nonterminal_and_same_invocation_continues(self) -> None:
+        loop = text(".kilo/command/loop.md")
+        for requirement in (
+            "Progress/status narration",
+            "is nonterminal",
+            "continue the same authorized invocation",
+            "until an existing terminal condition is actually met",
+            "narration does not create a new state or extend authority",
+        ):
+            self.assertIn(requirement, loop)
+        discipline = text(".kilo/rules/10-task-system.md")
+        self.assertIn("Technical-recovery progress/status narration is nonterminal", discipline)
+
     def test_pre_delivery_gates_refresh_queue_without_terminating_or_resetting_history(self) -> None:
         transitions = eligibility_transitions()
         gates = ("unmet_prerequisite", "missing_producer", "missing_contract_artifact", "known_dependency_gate")
@@ -100,7 +263,7 @@ class WorkflowContractTests(unittest.TestCase):
             "rebuild the FULL canonical issue queue, paging to exhaustion",
             "not a permanent exclusion or authority from progress memory",
             "revalidate gates against current canonical/upstream evidence each cycle",
-            "If all remaining issues are ineligible, QUEUE_EMPTY",
+            "If all remaining issues are verified ineligible, QUEUE_EMPTY",
             "a gated candidate alone never emits BLOCKED",
         ):
             self.assertIn(invariant, section)
@@ -114,6 +277,7 @@ class WorkflowContractTests(unittest.TestCase):
         for condition, expected in (
             ("genuine_owner_decision", "STOP_AND_ASK"),
             ("eligible_execution_problem", "RECOVER"),
+            ("unverified_required_evidence", "RECOVER"),
             ("exhausted_machinery_failure", "BLOCKED"),
         ):
             self.assertEqual(transitions[condition], (expected, expected, "retain"))
