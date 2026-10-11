@@ -9,8 +9,11 @@ Review the exact Forgejo PR: $ARGUMENTS
 Run in the primary context; do not require a separate owner-opened session.
 Fetch actual PR metadata and its linked issue through `forgejo-mcp`. Require an
 open, unmerged canonical Creatidy/creatidy-kernel PR targeting `develop`.
-Read AGENTS.md and its rules, verify canonical remote, fetch current Git objects,
-freeze exact HEAD/base/merge-base and inspect status/branches. Do not edit the PR.
+Read AGENTS.md and its rules, verify the canonical remote, and use normal Git to
+fetch current objects into the primary-prepared checkout. Independently verify and
+freeze exact current HEAD/base refs and commit IDs through read-only Forgejo MCP,
+then record local HEAD/base/merge-base and clean status. Do not rely on anonymous
+Git transport for the reviewer and do not edit the PR.
 
 Use the current clean checkout when safe. If switching would disturb another active
 checkout, use one owner-authorized isolated temporary worktree and record it; do not
@@ -32,6 +35,11 @@ Do not weaken isolation, permissions, validation, exact-HEAD checks or independe
 never self-review. Return a precise BLOCKED only after no authorized alternative
 remains, without an artificial owner question. Distinguish this from findings and
 evidence-backed reviewer judgment uncertainty.
+
+The fresh reviewer must verify the canonical repository, current open PR and exact
+head/base refs through read-only Forgejo MCP, then match those commit IDs to the
+primary-prepared clean local Git objects and inspect the complete merge-base-to-HEAD
+diff. Anonymous Git transport is not a prerequisite or reviewer operation.
 
 Invoke `task` with `subagent_type: pr-reviewer`, `background: false`, no `task_id`.
 Pass only the PR number/URL, expected HEAD/base and fresh whole-PR review

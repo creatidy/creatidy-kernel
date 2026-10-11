@@ -33,8 +33,6 @@ permission:
     "git -C /home/adrian/workspace/creatidy/creatidy-kernel show *": allow
     "git -C /home/adrian/workspace/creatidy/creatidy-kernel diff *": allow
     "git -C /home/adrian/workspace/creatidy/creatidy-kernel ls-tree *": allow
-    "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C /home/adrian/workspace/creatidy/creatidy-kernel ls-remote https://forgejo.creatidy.com/Creatidy/creatidy-kernel refs/heads/develop refs/heads/*": allow
-    "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C /home/adrian/workspace/creatidy/creatidy-kernel ls-remote https://forgejo.creatidy.com/Creatidy/creatidy-kernel.git refs/heads/develop refs/heads/*": allow
     "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin TMPDIR=/tmp LANG=C.UTF-8 UV_CACHE_DIR=/home/adrian/.cache/uv UV_OFFLINE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 make -C /home/adrian/workspace/creatidy/creatidy-kernel check": allow
     "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin TMPDIR=/tmp LANG=C.UTF-8 UV_CACHE_DIR=/home/adrian/.cache/uv UV_OFFLINE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 make -C /home/adrian/workspace/creatidy/creatidy-kernel package-check": allow
     "git -C /home/adrian/workspace/creatidy/creatidy-kernel-* remote -v": allow
@@ -45,17 +43,12 @@ permission:
     "git -C /home/adrian/workspace/creatidy/creatidy-kernel-* show *": allow
     "git -C /home/adrian/workspace/creatidy/creatidy-kernel-* diff *": allow
     "git -C /home/adrian/workspace/creatidy/creatidy-kernel-* ls-tree *": allow
-    "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C /home/adrian/workspace/creatidy/creatidy-kernel-* ls-remote https://forgejo.creatidy.com/Creatidy/creatidy-kernel refs/heads/develop refs/heads/*": allow
-    "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C /home/adrian/workspace/creatidy/creatidy-kernel-* ls-remote https://forgejo.creatidy.com/Creatidy/creatidy-kernel.git refs/heads/develop refs/heads/*": allow
     "kilo debug agent pr-reviewer": allow
     "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin TMPDIR=/tmp LANG=C.UTF-8 UV_CACHE_DIR=/home/adrian/.cache/uv UV_OFFLINE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 make -C /home/adrian/workspace/creatidy/creatidy-kernel-* check": allow
     "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin TMPDIR=/tmp LANG=C.UTF-8 UV_CACHE_DIR=/home/adrian/.cache/uv UV_OFFLINE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 make -C /home/adrian/workspace/creatidy/creatidy-kernel-* package-check": allow
     "*--output*": deny
     "*--ext-diff*": deny
     "*--textconv*": deny
-    "git ls-remote * -*": deny
-    "git ls-remote *\"-*": deny
-    "git ls-remote *'-*": deny
     "*>*": deny
     "*<*": deny
     "*|*": deny
@@ -119,16 +112,26 @@ authorized by the owner.
 The reviewer itself must never change its provider, model, reasoning level,
 permissions or execution path, and must never delegate review.
 
-First fetch current PR metadata via Forgejo MCP, then query the canonical HTTPS
-repository with `git ls-remote`, using `refs/heads/develop` and the exact head ref
-from metadata. Do not guess branch names, use alternate transports or add options.
-Require open/unmerged develop target and exact expected HEAD/base. Mismatch means
-COMMENT with actual SHAs; do not review a different range. Require the supplied
-checkout to be clean at expected HEAD. The task session may be rooted at another
-checkout, so use the allowed `git -C` and `make -C` commands to address the supplied
-path explicitly. Inspect exact frozen Git objects/current branch read-only. The
-primary owns Git fetch and checkout preparation. You must not fetch/switch/create
-branches, create worktrees, commit, push or mutate Git/Forgejo state.
+Verify the canonical repository and current PR through read-only Forgejo MCP before
+reviewing. Read canonical target repository metadata and the PR record, then read
+metadata for the PR's reported head repository and enumerate the reported base and
+head repositories' branches through MCP. Require the canonical
+`Creatidy/creatidy-kernel` identity, an open/unmerged PR
+whose base repository is canonical and target ref is `develop`, and exact base/head
+ref names and commit IDs matching both the PR metadata and supplied expected SHAs.
+Private repositories are valid when MCP returns matching current metadata; public
+visibility and anonymous Git access are not prerequisites. Page branch reads to
+exhaustion when needed; do not guess ref names. Missing, inaccessible or mismatched
+evidence means COMMENT with observed SHAs; never review a different range.
+
+Require the primary-prepared checkout to be clean at the expected HEAD and contain
+the exact expected head/base commit objects. Independently compute the local merge
+base and inspect the complete merge-base-to-HEAD diff and relevant source/tests
+read-only. The task session may be rooted at another checkout, so use the allowed
+`git -C` and `make -C` commands to address the supplied path explicitly. The primary
+owns all Git fetch and checkout preparation. You must not fetch/switch/create
+branches, create worktrees, commit, push or mutate Git/Forgejo state. Recheck PR and
+ref metadata through MCP plus local HEAD/clean status before returning.
 
 Read the linked issue and relevant referenced acceptance context, AGENTS.md and
 all applicable rules, and the COMPLETE merge-base-to-HEAD diff/current implementation.

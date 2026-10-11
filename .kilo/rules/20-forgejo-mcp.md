@@ -18,6 +18,12 @@
   Standalone `/review-pr` is read-only; `/finish-pr` cannot merge/close issues.
   Never substitute curl, wget, custom HTTP scripts
   or direct REST when MCP supports the required operation. Read repository contents locally.
+- Independent PR reviewers use read-only Forgejo MCP repository, PR and branch metadata to verify
+  canonical identity, current refs and exact head/base commit IDs. Match those records against the
+  primary-prepared clean local Git objects and inspect the full frozen diff; anonymous Git transport
+  is not a prerequisite. Reviewer MCP permissions never include file writes or repository mutation,
+  and Git fetch/branch/commit/push remain primary-owned operations. MCP credentials stay inside the
+  tool boundary and must never be copied into reviewer shell arguments, files or output.
 - Implementation commits/pushes use normal Git under Adrian's Git identity:
   `Adrian Tkacz <adrian.tkacz@creatidy.com>`, Forgejo user `adrian.tkacz`.
   `forgejo-mcp` handles platform operations, not implementation authorship.
