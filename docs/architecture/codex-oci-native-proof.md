@@ -103,7 +103,7 @@ not in checkout `src/`. Exact locked pytest dependencies are installed offline.
 Package installation uses copy mode because mutable cache hardlinks are refused by
 the native resource boundary. Native environments and uncertain roots are retained.
 
-### Explicit Unmet Editing Gate
+### Historical Workspace-Write Editing Gate
 
 The native edit scenario does **not** conform under the unchanged outer policy.
 Codex workspace-write requires bubblewrap namespace creation. Its initially missing
@@ -112,8 +112,72 @@ closure, but native command execution still fails with namespace denial. Product
 EPERM and diagnostic EDOM receipts correlate the native command exit/output and
 attribute the refusal without allowing any previously denied syscall. Passing those
 negative cells means the incompatibility is received, not that source editing works.
-Changing to danger-full-access, permitting namespaces or adopting another product
-executor/profile is an owner-controlled boundary choice, not automatic remediation.
+This remains historical evidence, not successful editing. The explicit owner decision
+below authorizes one native permission change; it does not permit namespaces or adopt
+another executor/product profile.
+
+### Owner-Authorized OCI Permission Exception (2026-10-11)
+
+The owner explicitly resumes the existing #53 / PR85 delivery and authorizes the following
+configuration delta for the existing, externally isolated rootless worker only:
+
+| Path | Former configuration | Authorized effective configuration |
+| --- | --- | --- |
+| Verified `OwnedOCI.runtime`, pinned Codex 0.159.3 | `sandbox: workspace-write`, `approvalPolicy: never` | `sandbox: danger-full-access`, `approvalPolicy: never` |
+| Standalone / host `CodexRuntime` | `workspace-write/never` only | Unchanged; `danger-full-access` is rejected before native delivery |
+| External OCI namespace/seccomp/mount/network/cap/cgroup/UID/rootfs/lifetime policy | Existing verified policy | Unchanged; no nested namespace allowance |
+
+The architecture remains **trusted Kernel controller -> isolated OCI worker -> explicitly
+authorized external-effect relay**. This increment does not implement a new relay or public
+protocol: reception uses only the existing synthetic in-boundary model backend and no
+live provider, owner configuration, credential or paid inference. The outer OCI boundary,
+not Codex's nested approval/sandbox machinery, is responsible for isolation. Codex can use
+all operations that boundary already permits, so the exception must never be applied to a
+host connection or treated as native permission callbacks enforcing Kernel authority.
+
+The specialized Runtime class is local to `OwnedOCI.runtime`, created only after its own
+live gated connection, original launch and resource checks. It retains the base adapter's
+immutable-input validation, original host cwd, current dispatch/collection guards and
+retirement/settlement hooks. It then applies only the recorded native permission settings.
+A non-0.159.3 connection is refused and retired; no host fallback is available.
+The append-only `oci-runtime-permissions` configuration-intent artifact binds the owner
+decision, native version, full container ID and SHA-256 of the original worker launch.
+That artifact is not authority, a native-send receipt, task acceptance or production GO.
+Native protocol parameters and correlated command results are received separately.
+Reception keeps the app-server startup sandbox configuration at `workspace-write`:
+only the owned per-thread native sandbox setting changes. Successful editing therefore
+does not depend on changing an unrestricted startup default outside this factory.
+
+The positive cell runs actual native terminal execution against the materialized source:
+it changes `candidate/original.txt`, creates `candidate/result.txt`, probes immutable and
+unmounted paths, attempts to reopen PID1's private descriptors, confirms unchanged kernel
+and cgroup restrictions, launches a detached-session subprocess in the same worker
+namespaces, and receives `codex-cli 0.159.3` inside that boundary. Proc descriptor names
+may be enumerable; **reopening** an init descriptor is the refused security operation,
+not directory metadata enumeration. Original controller canaries remain untouched.
+Only exact edited Candidate bytes are proposed after retained init exit plus full-ID
+absence, with source-generation/resource/current collection-authority checks intact.
+
+The former permission conflict remains independently exercised by `edit-legacy` and
+`edit-diagnostic` comparison cells through the unchanged host-safe adapter, consuming
+the same verified owned transport/lifetime hooks but retaining workspace-write requests.
+These denied cells are not counted as positive editing; no earlier receipt is rewritten.
+
+| Accepted invariant / residual | Implementation | Evidence | Status / scope |
+| --- | --- | --- | --- |
+| OCI-only exception, fail closed without boundary | `OwnedOCI.runtime`; unchanged `CodexRuntime._inputs` | Journal binding, unsupported-version/non-gated factory, host-danger and retarget refusals | PASS scoped regression; no host exception |
+| Positive edit confined to authorized workspace | Source generation + fixed OCI bind | Factory `edit`, exact edited bytes and protected controller canaries | PASS native cell, not all filesystem effects |
+| Host/control/credentials/socket/network/rootfs inaccessible | Unchanged resource and OCI profile | Native edit security probe and worker negative cells | PASS synthetic canaries; no real credential access |
+| Namespace/seccomp/cap/cgroup/UID restrictions unchanged | `worker_profile`, pinned seccomp/resource closure | Native process observations/subprocess namespaces; worker/clone proof targets | PASS exercised LP64 x86-64; other ABI closure unproved |
+| Terminal/descendants and retirement owned | PID1 bootstrap, retained kernel handles and full ID | Cancel/revoke/EOF during actual native detached-subprocess execution; uncertain-start/settlement cells | PASS exercised retirement; no PID reconstruction or stop-ack settlement |
+| Original Attempt/source/current collection authority | SQLite journal + common collector | Edited-byte manifest, drift/expiry/revoke/reopen/currentness regressions | PASS proposal only; no lease renewal/automatic acceptance |
+| Former workspace-write source editing | Unchanged host-safe adapter over owned transport | `edit-legacy` / `edit-diagnostic` retain EPERM / EDOM | FAIL editing; PASS historical denial reception |
+| Universal AC4 / continuous per-effect mediation | Not implemented by writable bind/current checks | No universal receipt | UNVERIFIED; #53 stays open |
+| IDE/handoff/binary-source correspondence/profile adoption | Not supplied by this exception | Synthetic observer / exact public pins only | UNVERIFIED; no production GO |
+
+Full target and installed-wheel results are reported against the exact delivery HEAD in
+PR85 and the issue. A required native skip or empty suite fails reception; documentation,
+configuration intent and old denial receipts cannot replace those executed results.
 
 Current authority is rechecked for newly collected bytes even after confirmed native
 completion and retirement. This still does not provide continuous per-syscall expiry

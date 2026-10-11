@@ -8,6 +8,7 @@ are retained in the approved temporary proof root. Missing setup is UNPROVED.
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -75,6 +76,87 @@ class NativeRuntime:
     scenario: str
     codex: CodexBinary
     store_closed: bool = False
+
+
+SOURCE_EDIT_PROBE = """import ctypes, json, os, socket, subprocess, sys
+from pathlib import Path
+scope = json.loads(sys.argv[1])
+namespaces = {key: os.readlink('/proc/self/ns/' + key) for key in scope['host_namespaces']}
+assert all(value != scope['host_namespaces'][key] for key, value in namespaces.items())
+denied = []
+for name in scope['forbidden']:
+    try:
+        with open(name, 'rb') as stream:
+            stream.read(1)
+    except OSError:
+        denied.append(name)
+    else:
+        raise AssertionError('unauthorized path became readable')
+    try:
+        with open(name, 'ab') as stream:
+            stream.write(b'forbidden')
+    except OSError:
+        pass
+    else:
+        raise AssertionError('unauthorized path became writable')
+try:
+    descriptors = os.listdir('/proc/1/fd')
+except OSError:
+    descriptors = []
+init_fd_refusals = []
+for descriptor in descriptors:
+    for mode in [os.O_RDONLY, os.O_WRONLY, os.O_RDWR]:
+        try:
+            inherited = os.open('/proc/1/fd/' + descriptor, mode | os.O_NONBLOCK)
+        except OSError as error:
+            assert error.errno in [1, 13], 'descriptor refusal was not an access denial'
+            init_fd_refusals.append(error.errno)
+            continue
+        os.close(inherited)
+        raise AssertionError('private init descriptor could be reopened')
+link = Path('/workspace/candidate/escape-control')
+link.symlink_to(scope['forbidden'][0])
+try:
+    link.read_bytes()
+except OSError:
+    pass
+else:
+    raise AssertionError('symlink escaped authorized workspace')
+finally:
+    link.unlink()
+for name in ['/bin/forbidden-root-write', '/toolchain/codex/codex']:
+    try:
+        with open(name, 'ab') as stream:
+            stream.write(b'forbidden')
+    except OSError:
+        pass
+    else:
+        raise AssertionError('immutable mount became writable')
+with socket.socket() as stream:
+    stream.settimeout(0.2)
+    try:
+        stream.connect(('192.0.2.1', 443))
+    except OSError:
+        pass
+    else:
+        raise AssertionError('unauthorized external network became reachable')
+libc = ctypes.CDLL(None, use_errno=True)
+assert libc.unshare(0x10000000) == -1 and ctypes.get_errno() == 1
+child_script = ("import json,os; print(json.dumps({key: os.readlink('/proc/self/ns/'+key) "
+    "for key in ['pid','mnt','net','user']}))")
+child = subprocess.run([sys.executable, '-S', '-c', child_script],
+    env=dict(os.environ), start_new_session=True, capture_output=True, text=True, check=True)
+assert json.loads(child.stdout) == namespaces
+version = subprocess.run(['/toolchain/codex/codex', '--version'], env=dict(os.environ),
+    capture_output=True, text=True, check=True)
+assert version.stdout.strip() == 'codex-cli 0.159.3'
+Path('/workspace/candidate/original.txt').write_bytes(b'native updated source\\n')
+Path('/workspace/candidate/result.txt').write_bytes(b'native source edit\\n')
+Path('/workspace/candidate/security-receipt.json').write_text(json.dumps({'namespaces': namespaces,
+    'denied_paths': denied, 'version': version.stdout.strip(),
+    'subprocess_namespaces': json.loads(child.stdout), 'init_fd_refusals': init_fd_refusals},
+    sort_keys=True))
+"""
 
 
 @pytest.fixture
@@ -231,7 +313,38 @@ def native_runtime(
         }:
             steps[0]["delay_seconds"] = 30
         if str(request.param).startswith("edit"):
-            steps.insert(0, exec_step("printf 'native source edit\\n' > /workspace/candidate/result.txt"))
+            credentials = control / "credentials"
+            credentials.mkdir(mode=0o700)
+            for name in ("forge", "model", "host-only"):
+                (credentials / name).write_bytes(b"synthetic private canary")
+            (workspace_path / "candidate/security-probe.py").write_text(SOURCE_EDIT_PROBE)
+            scope = {
+                "forbidden": [str(credentials / name) for name in ("forge", "model", "host-only")]
+                + [str(control / "kernel.db"), str(control / "objects.git/HEAD"), "/run/podman/podman.sock"],
+                "host_namespaces": {key: os.readlink("/proc/self/ns/" + key) for key in ("pid", "mnt", "net", "user")},
+            }
+            steps.insert(
+                0,
+                exec_step(
+                    "/toolchain/bin/python3.12 -S /workspace/candidate/security-probe.py "
+                    + shlex.quote(json.dumps(scope, sort_keys=True))
+                ),
+            )
+        if request.param in {"cancel", "revoke", "close"}:
+            child = (
+                "import json,os,time; from pathlib import Path; "
+                "Path('/workspace/candidate/.subprocess.tmp').write_text(json.dumps("
+                "{'pid':os.getpid(),'session':os.getsid(0),'namespace':os.readlink('/proc/self/ns/pid')})); "
+                "os.rename('/workspace/candidate/.subprocess.tmp','/workspace/candidate/subprocess.json'); "
+                "time.sleep(45)"
+            )
+            command = (
+                "import os,subprocess,sys; from pathlib import Path; "
+                f"child=subprocess.Popen([sys.executable,'-S','-c',{child!r}],"
+                "env=dict(os.environ),start_new_session=True); "
+                "Path('/workspace/candidate/in-flight.txt').write_bytes(b'native authorized work'); child.wait()"
+            )
+            steps.insert(0, exec_step("/toolchain/bin/python3.12 -S -c " + shlex.quote(command)))
         write_scenario(workspace_path, steps, attempt_id)
         program = store.create(
             ProgramSpec(
@@ -379,6 +492,22 @@ def native_runtime(
                 active_authorizer=store.worker_active_authorizer(lambda: int(time.time())),
                 clock=lambda: int(time.time()),
             )
+            if request.param in {"edit-legacy", "edit-diagnostic"}:
+                # Historical comparison only: host-safe adapter keeps the former native settings.
+                runtime = CodexRuntime(
+                    connection,
+                    version=connection.version,
+                    resolve=runtime.resolve,
+                    authorize=runtime.authorize,
+                    authorize_resolved=runtime.authorize_resolved,
+                    authorize_recovery=runtime.authorize_recovery,
+                    collect=runtime.collect,
+                    clock=runtime.clock,
+                    native_cwd=runtime.native_cwd,
+                    authorize_active=runtime.authorize_active,
+                    retire=runtime.retire,
+                    settled=runtime.settled,
+                )
             cell = NativeRuntime(
                 root, store, execution, owner, resources, runtime, connection, str(request.param), codex_binary
             )
@@ -397,8 +526,8 @@ def native_runtime(
                 assert owner.settled(), "owned native namespace retirement remains unknown"
 
 
-@pytest.mark.parametrize("native_runtime", ["final", "edit", "edit-diagnostic"], indirect=True)
-def test_real_factory_lifecycle_and_current_workspace_write_gate(
+@pytest.mark.parametrize("native_runtime", ["final", "edit", "edit-legacy", "edit-diagnostic"], indirect=True)
+def test_real_factory_editing_and_historical_workspace_write_gate(
     native_runtime: NativeRuntime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cell = native_runtime
@@ -407,7 +536,7 @@ def test_real_factory_lifecycle_and_current_workspace_write_gate(
 
     def request(method: str, params: dict[str, object]) -> dict[str, object]:
         result = original(method, params)
-        responses.append({"method": method, "response": result})
+        responses.append({"method": method, "params": params, "response": result})
         return result
 
     monkeypatch.setattr(cell.connection, "request", request)
@@ -469,18 +598,53 @@ def test_real_factory_lifecycle_and_current_workspace_write_gate(
     assert state["last_step_kind"] == "final", (
         "hydrated terminality cannot substitute for a completed native model exchange"
     )
-    if cell.scenario.startswith("edit"):
+    native_items: list[dict[str, object]] = []
+    for notification in notifications:
+        if notification.get("method") == "item/completed":
+            params = cast(dict[str, object], notification["params"])
+            if params.get("turnId") == handle.split(":")[2]:
+                item = cast(dict[str, object], params["item"])
+                if item.get("type") == "commandExecution":
+                    native_items.append(item)
+    if cell.scenario == "edit":
+        assert native_items and native_items[-1].get("exitCode") == 0
+        assert (cell.resources.workspace / "candidate/result.txt").read_bytes() == b"native source edit\n"
+        assert (cell.resources.workspace / "candidate/original.txt").read_bytes() == b"native updated source\n"
+        proof = json.loads(read_bounded_regular(cell.resources.workspace / "candidate/security-receipt.json"))
+        assert proof["version"] == "codex-cli 0.159.3"
+        assert len(proof["denied_paths"]) == 6 and proof["namespaces"] == proof["subprocess_namespaces"]
+        assert proof["init_fd_refusals"] and set(proof["init_fd_refusals"]) <= {1, 13}
+        observed_boundary = json.loads(read_bounded_regular(cell.resources.workspace / "worker-observations.json"))[
+            "self_observations"
+        ]
+        assert observed_boundary["CapEff"] == "0000000000000000"
+        assert observed_boundary["NoNewPrivs"] == "1" and observed_boundary["Seccomp"] == "2"
+        assert observed_boundary["cgroup_pids_max"] == "256"
+        assert observed_boundary["cgroup_memory_max"] == "1073741824"
+        assert observed_boundary["uid_map"].split() == ["0", str(os.getuid()), "1"]
+        assert observed_boundary["network_interfaces"] == ["lo"] and len(observed_boundary["ipv4_routes"]) == 1
+        assert all(
+            path.read_bytes() == b"synthetic private canary" for path in (cell.root / "control/credentials").iterdir()
+        )
+        permission = json.loads(cell.store.artifact(cell.owner.operation_id, "oci-runtime-permissions"))
+        assert permission["sandbox"] == "danger-full-access" and permission["approvalPolicy"] == "never"
+        assert (
+            permission["container"] == json.loads(cell.store.artifact(cell.owner.operation_id, "oci-container"))["id"]
+        )
+        thread = next(value for value in responses if value["method"] == "thread/start")
+        assert cast(dict[str, object], thread["params"])["sandbox"] == "danger-full-access"
+        files = {artifact.path for artifact in candidate.artifacts.artifacts}
+        assert {"original.txt", "result.txt", "security-receipt.json"} <= files
+        assert not any("credentials" in path or path.startswith(".git/") for path in files)
+        assert (
+            cell.store.artifact(
+                cell.owner.operation_id, "oci-candidate-file:" + hashlib.sha256(b"original.txt").hexdigest()
+            )
+            == b"native updated source\n"
+        )
+    elif cell.scenario.startswith("edit"):
         # This is explicit negative conformance reception, not successful editing.
         assert not (cell.resources.workspace / "candidate/result.txt").exists()
-        turn = handle.split(":")[2]
-        native_items: list[dict[str, object]] = []
-        for notification in notifications:
-            if notification.get("method") == "item/completed":
-                params = cast(dict[str, object], notification["params"])
-                if params.get("turnId") == turn:
-                    item = cast(dict[str, object], params["item"])
-                    if item.get("type") == "commandExecution":
-                        native_items.append(item)
         assert native_items, "missing correlated native command denial receipt"
         output = str(native_items[-1].get("aggregatedOutput"))
         expected = (
@@ -566,6 +730,15 @@ def test_real_factory_cancel_revocation_and_transport_loss_retire_detached_names
     cell.store.observe(cell.owner.operation_id, cell.request.fence, "accepted", "accepted", reference=handle)
     descendant = json.loads(read_bounded_regular(cell.resources.workspace / "mock/process.json"))
     assert descendant["pid"] == descendant["session"], "backend did not enter an independent session"
+    deadline = time.monotonic() + 15
+    command_receipt = cell.resources.workspace / "candidate/subprocess.json"
+    while not command_receipt.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert command_receipt.exists(), "actual native detached subprocess did not start"
+    command_descendant = json.loads(read_bounded_regular(command_receipt))
+    assert command_descendant["pid"] == command_descendant["session"]
+    assert command_descendant["namespace"] != os.readlink("/proc/self/ns/pid")
+    assert (cell.resources.workspace / "candidate/in-flight.txt").read_bytes() == b"native authorized work"
     if cell.scenario == "revoke":
         cell.store.revoke(Principal("owner", "owner"), cell.request.capability_reference)
         observation = cell.runtime.observe(handle, now=int(time.time()))
@@ -589,6 +762,7 @@ def test_real_factory_cancel_revocation_and_transport_loss_retire_detached_names
                 "scenario": cell.scenario,
                 "handle": handle,
                 "detached_backend": descendant,
+                "native_detached_subprocess": command_descendant,
                 "namespace_settled": True,
                 "candidate": None,
                 "workspace_retained": True,

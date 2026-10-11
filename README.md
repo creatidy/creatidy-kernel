@@ -143,14 +143,28 @@ factory, continuous effect mediation, independent review, complete AC4 or `ISOLA
 The optional native factory suite now composes real source generations, live journal grants, kernel
 init handles, the pinned Codex binary and a synthetic in-boundary Responses backend. It receives
 final-only completion/collection, cancellation, observed revocation and controller-transport EOF,
-including retirement of a backend in a detached session. It also records an explicit **unmet native
-source-edit gate**: Codex `0.159.3` in `workspace-write/never` requires bubblewrap namespace creation,
-which the unchanged outer OCI policy denies. Providing the already pinned public helper fixes its
-initial missing-binary error, but does not resolve that policy conflict. Production and diagnostic
-denial errno reception attribute the refusal without permitting namespaces or changing sandbox mode.
-These negative tests passing means refusal was received, not that source editing or complete AC4
-works. `codex-oci-proof` requires the explicit `CREATIDY_TEST_BWRAP_BIN` as well as the OCI toolroot.
-Resolving this permission/boundary choice is not an automatic profile relaxation or adoption.
+including retirement of a backend in a detached session. The owner decision of 2026-10-11 explicitly
+authorizes Codex `0.159.3` `danger-full-access/never` **only inside the verified, owned rootless OCI
+factory**. `OwnedOCI.runtime` consumes its own live gated connection and original launch/resource
+binding; its local Runtime specialization applies the exception and journals `oci-runtime-permissions`
+against the exact container and launch. Standalone/host `CodexRuntime` still accepts only
+`workspace-write/never`, including when a caller supplies a native cwd. Missing ownership, lifetime,
+resources or an unapproved version never permits unrestricted host execution: no host fallback exists.
+
+The external OCI boundary remains responsible for enforcement. No namespace, seccomp, mount, network,
+capability, cgroup, UID, filesystem or lifetime restriction is relaxed. The positive source-backed
+native cell edits the authorized Candidate, receives terminal/subprocess execution, checks unchanged
+outer limits, denies host/controller canaries, socket, network, rootfs and init-descriptor reopening,
+and collects exact edited bytes under the original Attempt/current authority after settlement.
+Fixtures use no real credentials, host model configuration or paid/live inference.
+
+Historical `workspace-write/never` comparison cells retain production EPERM and diagnostic EDOM after
+the declared public helper closure: they prove nested-sandbox refusal, **not** positive editing.
+`codex-oci-proof` still requires explicit `CREATIDY_TEST_BWRAP_BIN` for these comparison cells.
+The new exception does not adopt `ISOLATED`, a product profile, production behavior, another executor
+or universal AC4. Continuous per-effect authority, broader ABI/channel closure and binary/source
+correspondence remain unreceived. Exact configuration and the scoped evidence matrix are recorded in
+the [native proof record](docs/architecture/codex-oci-native-proof.md).
 
 The common `OwnedOCI.collect_candidate` boundary requires a trusted collection authorizer and the
 pinned Codex resource; absent inputs refuse. Both Runtime and `GitWorkspace.collect` consume this

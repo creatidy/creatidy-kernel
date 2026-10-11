@@ -16,6 +16,7 @@ from subprocess import CompletedProcess, TimeoutExpired
 from typing import cast
 
 import pytest
+from test_codex_runtime import NativeConnection
 from test_codex_stdio import FAKE
 from test_runtime_authority import Prepared
 
@@ -723,12 +724,16 @@ class RuntimeLaunch:
 @pytest.fixture
 def runtime_launch(launch: Launch, monkeypatch: pytest.MonkeyPatch) -> Iterator[RuntimeLaunch]:
     """Real stdio and journal admission; kernel lifetime/engine observations are simulated."""
-    script = FAKE.replace("assert sys.argv[1:] == ['app-server']", "assert sys.argv[1] == 'run'")
+    script = FAKE.replace("0.99.1", "0.159.3").replace(
+        "assert sys.argv[1:] == ['app-server']", "assert sys.argv[1] == 'run'"
+    )
     script = script.replace(
         "print(json.dumps({'id': message['id'], 'result': {'ok': message['params']}}), flush=True)",
         """method = message['method']
         if method == 'thread/start':
             assert message['params']['cwd'] == '/workspace'
+            assert message['params']['sandbox'] == 'danger-full-access'
+            assert message['params']['approvalPolicy'] == 'never'
             result = {'thread': {'id': 'thread-one'}, 'model': 'model-one', 'modelProvider': 'provider-one'}
         elif method == 'turn/start':
             result = {'turn': {'id': 'turn-one'}}
@@ -740,6 +745,7 @@ def runtime_launch(launch: Launch, monkeypatch: pytest.MonkeyPatch) -> Iterator[
         print(json.dumps({'id': message['id'], 'result': result}), flush=True)""",
     )
     launch.owner.podman.write_text(script)
+    launch.codex.write_text(FAKE.replace("0.99.1", "0.159.3"))
     launch.resources = replace(
         launch.resources,
         pins=tuple((path, hashlib.sha256(path.read_bytes()).hexdigest()) for path, _ in launch.resources.pins),
@@ -747,7 +753,7 @@ def runtime_launch(launch: Launch, monkeypatch: pytest.MonkeyPatch) -> Iterator[
     connection = launch.owner.connect(
         launch.resources,
         launch.codex,
-        "0.99.1",
+        "0.159.3",
         ("/explicit/entrypoint",),
         {"HOME": str(launch.resources.private_parent / "probe-home")},
         frozenset({"thread/start", "turn/start", "thread/read", "turn/interrupt"}),
@@ -856,6 +862,64 @@ def test_owned_runtime_terminal_and_candidate_wait_for_both_retirement_witnesses
     assert cell.runtime.candidate(handle) == candidate
     assert cell.launch.prepared.root.exists()
     assert cell.runtime.reconcile(cell.launch.prepared.request.operation, handle).presence is Presence.UNKNOWN
+
+
+def test_owned_permission_exception_is_journaled_against_original_launch(runtime_launch: RuntimeLaunch) -> None:
+    cell = runtime_launch
+    cell.runtime.start(cell.launch.prepared.request)
+    permission = json.loads(
+        cell.launch.prepared.store.artifact(cell.launch.owner.operation_id, "oci-runtime-permissions")
+    )
+    launch = json.loads(
+        cell.launch.prepared.store.artifact(cell.launch.owner.operation_id, "runtime-dispatch:1:worker")
+    )
+    assert permission == {
+        "version": 1,
+        "owner": cell.launch.owner.token,
+        "container": "a" * 64,
+        "launch_reference": hashlib.sha256(launch["launch"].encode()).hexdigest(),
+        "codex_version": "0.159.3",
+        "sandbox": "danger-full-access",
+        "approvalPolicy": "never",
+        "owner_decision": "2026-10-11T13:09:41Z:Kernel53:PR85",
+    }
+
+
+@pytest.mark.parametrize("retarget", ["connection", "cwd"])
+def test_owned_permission_exception_cannot_retarget_host_execution(
+    runtime_launch: RuntimeLaunch, retarget: str
+) -> None:
+    cell = runtime_launch
+    host = NativeConnection()
+    if retarget == "connection":
+        cell.runtime.connection = host
+    else:
+        cell.runtime.native_cwd = "/unverified-host-workspace"
+    with pytest.raises(ExecutionConflict, match="cannot retarget"):
+        cell.runtime.start(cell.launch.prepared.request)
+    assert host.calls == [] and cell.calls == []
+    assert cell.launch.prepared.store.find_artifact(cell.launch.owner.operation_id, "oci-runtime-permissions") is None
+    with pytest.raises(OSError, match="transport closed"):
+        cell.connection.request("thread/start", {})
+
+
+def test_unapproved_owned_codex_version_retires_without_fallback(
+    runtime_launch: RuntimeLaunch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = runtime_launch
+    monkeypatch.setattr(CodexStdio, "version", property(lambda self: "0.99.1"))
+    with pytest.raises(UnsupportedExecution, match="sandbox exception requires Codex 0.159.3"):
+        cell.launch.owner.runtime(
+            cell.launch.resources,
+            cell.launch.codex,
+            resolve=cell.runtime.resolve,
+            authorizers=cell.launch.prepared.store.runtime_authorizers(lambda: cell.launch.time[0]),
+            active_authorizer=cell.launch.prepared.store.worker_active_authorizer(lambda: cell.launch.time[0]),
+            clock=lambda: cell.launch.time[0],
+        )
+    assert cell.calls == []
+    with pytest.raises(OSError, match="transport closed"):
+        cell.connection.request("thread/start", {})
 
 
 @pytest.mark.parametrize("initial", ["observe", "candidate"])

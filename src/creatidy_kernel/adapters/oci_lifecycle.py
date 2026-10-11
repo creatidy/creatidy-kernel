@@ -15,11 +15,11 @@ import re
 import stat
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PurePosixPath
 from subprocess import CompletedProcess, TimeoutExpired
 from types import MappingProxyType
-from typing import cast
+from typing import cast, override
 
 from creatidy_kernel.adapters.bubblewrap_verification import resource_digest
 from creatidy_kernel.adapters.codex_runtime import CodexInputs, CodexRuntime
@@ -36,6 +36,7 @@ from creatidy_kernel.core.execution import (
     ExecutionConflict,
     ExecutionRequest,
     Presence,
+    UnsupportedExecution,
     validate_relative_path,
 )
 from creatidy_kernel.ports.allocation import encode_allocation
@@ -777,6 +778,23 @@ class OwnedOCI:
         connection, lifetime = self._connection, self._lifetime
         if connection is None or lifetime is None or not lifetime.live():
             raise ExecutionConflict("owned live gated OCI connection required")
+
+        def retire(request: ExecutionRequest) -> None:
+            if request != self.request:
+                raise ExecutionConflict("OCI retirement request differs from owned Attempt")
+            lifetime.close_liveness()
+            try:
+                connection.close()
+            finally:
+                self.stop()
+
+        if connection.version != "0.159.3":
+            error = UnsupportedExecution("owned OCI sandbox exception requires Codex 0.159.3")
+            try:
+                retire(self.request)
+            except BaseException as retirement_error:
+                raise error from retirement_error
+            raise error
         stage = _object(
             json.loads(self.store.artifact(self.operation_id, f"runtime-dispatch:{self.request.fence}:worker"))
         )
@@ -796,15 +814,6 @@ class OwnedOCI:
             if value.cwd != str(resources.workspace):
                 raise ExecutionConflict("OCI Runtime host cwd differs from verified workspace")
             return value
-
-        def retire(request: ExecutionRequest) -> None:
-            if request != self.request:
-                raise ExecutionConflict("OCI retirement request differs from owned Attempt")
-            lifetime.close_liveness()
-            try:
-                connection.close()
-            finally:
-                self.stop()
 
         def active(request: ExecutionRequest) -> bool:
             if request != self.request:
@@ -840,7 +849,35 @@ class OwnedOCI:
                 raise ExecutionConflict("OCI collection request differs from owned Attempt")
             return self.collect_candidate(resources, codex=codex, authorizer=active_authorizer)
 
-        return CodexRuntime(
+        class OwnedRuntime(CodexRuntime):
+            @override
+            def _inputs(runtime_self, request: ExecutionRequest) -> CodexInputs:
+                if runtime_self.connection is not connection or runtime_self.native_cwd != "/workspace":
+                    raise ExecutionConflict("owned OCI sandbox exception cannot retarget its connection")
+                value = super()._inputs(request)
+                identifier = self._receipt()
+                if identifier is None:
+                    raise ExecutionConflict("owned OCI sandbox exception lacks container identity")
+                # Owner decision 2026-10-11: OCI, not nested Codex namespaces, enforces isolation.
+                self.store.finalize_artifact(
+                    self.operation_id,
+                    "oci-runtime-permissions",
+                    _bytes(
+                        {
+                            "version": 1,
+                            "owner": self.token,
+                            "container": identifier,
+                            "launch_reference": hashlib.sha256(binding.encode()).hexdigest(),
+                            "codex_version": connection.version,
+                            "sandbox": "danger-full-access",
+                            "approvalPolicy": "never",
+                            "owner_decision": "2026-10-11T13:09:41Z:Kernel53:PR85",
+                        }
+                    ),
+                )
+                return replace(value, sandbox="danger-full-access")
+
+        return OwnedRuntime(
             connection,
             version=connection.version,
             resolve=inputs,

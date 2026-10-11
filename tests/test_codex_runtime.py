@@ -199,6 +199,21 @@ def test_domain_rejection_mismatch_and_candidate_validation() -> None:
         runtime.candidate(handle)
 
 
+@pytest.mark.parametrize("native_cwd", [None, "/workspace"])
+def test_host_adapter_never_accepts_danger_full_access(native_cwd: str | None) -> None:
+    connection, runtime, request = setup()
+    original = runtime.resolve
+
+    def resolve(value: ExecutionRequest) -> CodexInputs:
+        return replace(original(value), sandbox="danger-full-access")
+
+    runtime.resolve = resolve
+    runtime.native_cwd = native_cwd
+    with pytest.raises(UnsupportedExecution, match="permission configuration"):
+        runtime.start(request)
+    assert connection.calls == []
+
+
 def test_capability_and_version_mismatch_fail_before_delivery() -> None:
     connection, runtime, request = setup()
     with pytest.raises(UnsupportedExecution, match="version"):
