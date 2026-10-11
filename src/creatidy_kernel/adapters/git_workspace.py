@@ -267,6 +267,7 @@ class GitWorkspace(Workspace):
         ).split("\0")
         paths: list[str] = []
         hashes: list[str] = []
+        directories: set[PurePosixPath] = set()
         total = 0
         for entry in filter(None, entries):
             metadata, separator, path = entry.partition("\t")
@@ -276,10 +277,12 @@ class GitWorkspace(Workspace):
                 raise UnsupportedExecution("Workspace source tree contains unsupported entries")
             size = int(fields[3])
             total += size
+            # The collector charges files once, directories twice, and refuses budget equality.
+            directories.update(PurePosixPath(path).parents[:-1])
             if (
                 size > MAX_FILE_BYTES
                 or total > 64 * 1024 * 1024
-                or len(paths) >= MAX_ENTRIES
+                or len(paths) + 1 + 2 * len(directories) >= MAX_ENTRIES
                 or len(PurePosixPath(path).parts) > MAX_DEPTH
             ):
                 raise UnsupportedExecution("Workspace source tree exceeds collection bounds")

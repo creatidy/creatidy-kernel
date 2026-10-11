@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from creatidy_kernel.adapters import git_workspace
+from creatidy_kernel.adapters import git_workspace, worker_collection
 from creatidy_kernel.adapters.git_workspace import GitWorkspace
 from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.source_cache import SourceAcquisitionError
@@ -251,3 +251,49 @@ def test_ambiguous_or_future_generation_version_preserves_original_evidence(
     assert cell.workspace.reconcile(handle.key).presence is Presence.UNKNOWN
     assert original(operation, "workspace-created") == received
     assert (cell.workspace.workspace / "candidate/hello.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "layout,count", [("flat", 6), ("flat", 7), ("shared", 4), ("shared", 5), ("nested", 2), ("nested", 3)]
+)
+def test_source_preflight_matches_directory_cost_and_strict_collection_boundary(
+    materialization: Materialization, monkeypatch: pytest.MonkeyPatch, layout: str, count: int
+) -> None:
+    cell = materialization
+    prefix = {"flat": "", "shared": "shared/", "nested": "shared/nested/"}[layout]
+    for index in range(count):
+        path = cell.source / f"{prefix}file-{index}"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")
+    reference_git(cell.source, "add", "-A")
+    reference_git(cell.source, "commit", "-m", "synthetic bounded tree")
+    spec = replace(cell.spec, base_revision=reference_git(cell.source, "rev-parse", "HEAD").strip())
+    monkeypatch.setattr(git_workspace, "MAX_ENTRIES", 8)
+    monkeypatch.setattr(worker_collection, "MAX_ENTRIES", 8)
+    cost = 1 + count + 2 * {"flat": 0, "shared": 1, "nested": 2}[layout]
+    if cost >= 8:
+        with pytest.raises(UnsupportedExecution, match="collection bounds"):
+            cell.workspace.materialize("workspace-one", spec)
+        assert not cell.workspace.workspace.exists() and not cell.workspace.objects.exists()
+    else:
+        cell.workspace.materialize("workspace-one", spec)
+        collected = worker_collection.collect_directory(
+            cell.workspace.workspace / "candidate", exclude=frozenset({".git"})
+        )
+        assert collected.consumed == cost and not collected.refusals
+        assert len(collected.files) == count + 1
+
+
+def test_many_distinct_directories_cannot_publish_an_uncollectable_source(materialization: Materialization) -> None:
+    cell = materialization
+    for index in range(900):
+        parent = cell.source / str(index) / "n"
+        parent.mkdir(parents=True)
+        (parent / "file").write_bytes(b"")
+    reference_git(cell.source, "add", "-A")
+    reference_git(cell.source, "commit", "-m", "synthetic directory-heavy tree")
+    spec = replace(cell.spec, base_revision=reference_git(cell.source, "rev-parse", "HEAD").strip())
+    with pytest.raises(UnsupportedExecution, match="collection bounds"):
+        cell.workspace.materialize("workspace-one", spec)
+    assert not cell.workspace.workspace.exists() and not cell.workspace.objects.exists()
+    assert (cell.source / "hello.txt").exists()

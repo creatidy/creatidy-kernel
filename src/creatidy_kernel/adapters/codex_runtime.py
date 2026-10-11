@@ -435,12 +435,21 @@ class CodexRuntime(Runtime):
         if run.retirement_started:
             self._retire(run)
             return
-        if (
-            self.authorize_active is not None
-            and not run.retired
-            and not run.cancelled
-            and not self.authorize_active(run.request)
-        ):
+        try:
+            refused = (
+                self.authorize_active is not None
+                and not run.retired
+                and not run.cancelled
+                and not self.authorize_active(run.request)
+            )
+        except BaseException as error:
+            run.cancelled = True
+            try:
+                self._retire(run)
+            except BaseException as retirement_error:
+                raise error from retirement_error
+            raise
+        if refused:
             run.cancelled = True
             self._retire(run)
 

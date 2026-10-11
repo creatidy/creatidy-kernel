@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
@@ -1048,6 +1049,50 @@ def test_different_request_input_refusal_does_not_retire_bound_worker(runtime_la
         cell.runtime.start(replace(cell.launch.prepared.request, fence=2))
     assert cell.calls == [] and lifetime.controller.fileno() >= 0
     assert cell.runtime.start(cell.launch.prepared.request) == "codex:thread-one:turn-one"
+
+
+@pytest.mark.parametrize("method", ["observe", "candidate", "reconcile"])
+@pytest.mark.parametrize("uncertain_stop", [False, True])
+def test_active_journal_failure_retires_before_preserving_validation_error(
+    runtime_launch: RuntimeLaunch, monkeypatch: pytest.MonkeyPatch, method: str, uncertain_stop: bool
+) -> None:
+    cell = runtime_launch
+    handle = cell.runtime.start(cell.launch.prepared.request)
+    lifetime = cell.launch.owner._lifetime  # pyright: ignore[reportPrivateUsage] - fixture-owned lifetime.
+    assert lifetime is not None
+    original_invoke = cell.launch.owner.invoke
+    if uncertain_stop:
+
+        def uncertain(argv: tuple[str, ...], environment: Mapping[str, str]) -> CompletedProcess[bytes]:
+            if argv[1] == "stop":
+                return CompletedProcess(argv, 125, b"", b"synthetic uncertain retirement")
+            return original_invoke(argv, environment)
+
+        object.__setattr__(cell.launch.owner, "invoke", uncertain)
+
+    def unavailable(*args: object, **kwargs: object) -> bool:
+        raise sqlite3.OperationalError("synthetic current authority unavailable")
+
+    with monkeypatch.context() as failed_journal:
+        failed_journal.setattr(cell.launch.prepared.store, "check", unavailable)
+        with pytest.raises(sqlite3.OperationalError, match="current authority unavailable") as raised:
+            if method == "observe":
+                cell.runtime.observe(handle, now=2)
+            elif method == "candidate":
+                cell.runtime.candidate(handle)
+            else:
+                cell.runtime.reconcile(cell.launch.prepared.request.operation, handle)
+        if uncertain_stop:
+            assert isinstance(raised.value.__cause__, ExecutionConflict)
+    assert lifetime.controller.fileno() == -1 and cell.calls == ["thread/start", "turn/start"]
+    with pytest.raises(OSError, match="transport closed"):
+        cell.connection.request("thread/read", {})
+    object.__setattr__(cell.launch.owner, "invoke", original_invoke)
+    cell.exited[0] = cell.absent[0] = True
+    observation = cell.runtime.observe(handle, now=3)
+    assert observation.activity is Activity.TERMINAL and observation.cancellation_requested
+    assert cell.runtime.candidate(handle) is None
+    assert cell.launch.prepared.root.exists()
 
 
 def test_non_gated_factory_connection_cannot_be_presented_as_owned_runtime(launch: Launch) -> None:
