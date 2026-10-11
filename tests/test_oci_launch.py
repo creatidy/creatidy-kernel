@@ -20,7 +20,7 @@ from test_runtime_authority import Prepared
 
 from creatidy_kernel.adapters import oci_bootstrap
 from creatidy_kernel.adapters.bubblewrap_verification import resource_digest
-from creatidy_kernel.adapters.codex_runtime import CodexRuntime
+from creatidy_kernel.adapters.codex_runtime import CodexInputs, CodexRuntime
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
 from creatidy_kernel.adapters.git_workspace import GitWorkspace
 from creatidy_kernel.adapters.oci_lifecycle import LABEL, MAX_NATIVE_PIN_BYTES, LifetimeSpec, OCIResources, OwnedOCI
@@ -29,7 +29,7 @@ from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile
 from creatidy_kernel.core.authority import Principal
-from creatidy_kernel.core.execution import Activity, ExecutionConflict, ExecutionRequest, Presence
+from creatidy_kernel.core.execution import Activity, ExecutionConflict, ExecutionRequest, Presence, UnsupportedExecution
 
 pytest_plugins = ["test_runtime_authority"]
 
@@ -997,6 +997,57 @@ def test_final_thread_admission_refusal_retires_prelaunched_owned_worker(
     assert runtime.reconcile(prepared.request.operation).presence is Presence.UNKNOWN
     assert prepared.store.find_artifact(cell.launch.owner.operation_id, "oci-candidate") is None
     assert prepared.root.exists()
+
+
+@pytest.mark.parametrize("failure", ["prompt", "cwd", "sandbox", "resolver", "retirement"])
+def test_initial_input_refusal_retires_only_its_bound_worker(runtime_launch: RuntimeLaunch, failure: str) -> None:
+    cell = runtime_launch
+    original = cell.runtime.resolve
+
+    def invalid(request: ExecutionRequest) -> CodexInputs:
+        if failure == "resolver":
+            raise OSError("synthetic input resolution failure")
+        value = original(request)
+        if failure == "cwd":
+            return replace(value, cwd="/different-host-workspace")
+        if failure == "sandbox":
+            return replace(value, sandbox="danger-full-access")
+        return replace(value, prompt="")
+
+    cell.runtime.resolve = invalid
+    if failure == "retirement":
+        original_invoke = cell.launch.owner.invoke
+
+        def uncertain(argv: tuple[str, ...], environment: Mapping[str, str]) -> CompletedProcess[bytes]:
+            if argv[1] == "stop":
+                return CompletedProcess(argv, 125, b"", b"synthetic uncertain retirement")
+            return original_invoke(argv, environment)
+
+        object.__setattr__(cell.launch.owner, "invoke", uncertain)
+    lifetime = cell.launch.owner._lifetime  # pyright: ignore[reportPrivateUsage] - fixture-owned lifetime.
+    assert lifetime is not None
+    expected = OSError if failure == "resolver" else UnsupportedExecution if failure == "sandbox" else ExecutionConflict
+    with pytest.raises(expected) as raised:
+        cell.runtime.start(cell.launch.prepared.request)
+    if failure == "retirement":
+        assert "resolved Codex inputs" in str(raised.value)
+        assert isinstance(raised.value.__cause__, ExecutionConflict)
+    assert cell.calls == [] and lifetime.controller.fileno() == -1
+    with pytest.raises(OSError, match="transport closed"):
+        cell.connection.request("thread/start", {})
+    assert cell.runtime.reconcile(cell.launch.prepared.request.operation).presence is Presence.UNKNOWN
+    assert cell.launch.prepared.store.find_artifact(cell.launch.owner.operation_id, "runtime-dispatch:1:thread") is None
+    assert cell.launch.prepared.root.exists()
+
+
+def test_different_request_input_refusal_does_not_retire_bound_worker(runtime_launch: RuntimeLaunch) -> None:
+    cell = runtime_launch
+    lifetime = cell.launch.owner._lifetime  # pyright: ignore[reportPrivateUsage] - fixture-owned lifetime.
+    assert lifetime is not None
+    with pytest.raises(ExecutionConflict, match="differs from owned Attempt"):
+        cell.runtime.start(replace(cell.launch.prepared.request, fence=2))
+    assert cell.calls == [] and lifetime.controller.fileno() >= 0
+    assert cell.runtime.start(cell.launch.prepared.request) == "codex:thread-one:turn-one"
 
 
 def test_non_gated_factory_connection_cannot_be_presented_as_owned_runtime(launch: Launch) -> None:

@@ -223,14 +223,14 @@ class CodexRuntime(Runtime):
             if previous.handle is None or previous.uncertain:
                 raise ExecutionConflict("uncertain Codex start cannot be redelivered")
             return previous.handle
-        inputs = self._inputs(request)
-        if not self.authorize(request):
-            raise ExecutionConflict("operation lacks a durable delivery claim")
-        if self.authorize_resolved is not None and not self.authorize_resolved(request, inputs.cwd, "thread/start"):
-            raise ExecutionConflict("resolved thread inputs lack current durable authority")
         run = _Run(request, uncertain=True)
-        self._by_key[key] = run
         try:
+            inputs = self._inputs(request)
+            if not self.authorize(request):
+                raise ExecutionConflict("operation lacks a durable delivery claim")
+            if self.authorize_resolved is not None and not self.authorize_resolved(request, inputs.cwd, "thread/start"):
+                raise ExecutionConflict("resolved thread inputs lack current durable authority")
+            self._by_key[key] = run
             thread_params: dict[str, object] = {
                 "model": inputs.model,
                 "modelProvider": inputs.provider,
@@ -266,10 +266,13 @@ class CodexRuntime(Runtime):
                 raise ExecutionConflict("resolved turn inputs lack current durable authority")
             turn = self.connection.request("turn/start", turn_params)
             run.turn = _field(_object(turn.get("turn")), "id")
-        except BaseException:
+        except BaseException as error:
             # A domain error might be definitive for one RPC, but thread creation or a
             # prior turn may already have happened; never issue another start here.
-            self._retire(run)
+            try:
+                self._retire(run)
+            except BaseException as retirement_error:
+                raise error from retirement_error
             raise
         run.uncertain = False
         handle = run.handle
