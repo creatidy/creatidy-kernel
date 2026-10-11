@@ -266,3 +266,33 @@ def test_inspection_diagnostic_and_conflicting_receipt_refuse_mutation(prepared:
     with pytest.raises(OperationConflict, match="immutable"):
         prepared.store.finalize_artifact(owner.operation_id, "oci-container", b"different")
     assert all(call[1] != "stop" for call in peer.calls)
+
+
+@pytest.mark.parametrize("removed_at", ["inspect", "stop"])
+@pytest.mark.parametrize("absence", [True, False])
+def test_auto_removal_during_stop_requires_fresh_full_id_absence(
+    prepared: Prepared, removed_at: str, absence: bool
+) -> None:
+    prepared.claim()
+    peer = Peer()
+    owner = owned(prepared, peer)
+    owner.bind_before_send(now=1)
+    owner.capture()
+
+    def invoke(argv: tuple[str, ...], environment: Mapping[str, str]) -> CompletedProcess[bytes]:
+        if argv[1:3] == ("container", "inspect") and removed_at == "inspect" or argv[1] == "stop":
+            peer.calls.append(argv)
+            peer.code = 1 if absence else 125
+            return CompletedProcess(argv, 125, b"", b"synthetic concurrent auto-removal")
+        return peer.invoke(argv, environment)
+
+    object.__setattr__(owner, "invoke", invoke)
+    if absence:
+        owner.stop()
+        assert owner.state() is Presence.ABSENT
+    else:
+        with pytest.raises(ExecutionConflict):
+            owner.stop()
+        assert owner.state() is Presence.UNKNOWN
+    assert all(call[-1] == peer.identifier for call in peer.calls[1:])
+    assert prepared.store.find_artifact(owner.operation_id, "oci-namespace-settled") is None

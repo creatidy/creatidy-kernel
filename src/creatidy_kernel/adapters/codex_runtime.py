@@ -72,6 +72,7 @@ class _Run:
     identity_provider: str | None = None
     identity_effort: str | None = None
     candidate: Candidate | None = None
+    retirement_started: bool = False
     retired: bool = False
 
     @property
@@ -321,9 +322,9 @@ class CodexRuntime(Runtime):
         self._check_active(run)
         state = (
             (run.terminal_status, run.identity_model)
-            if run.retired and run.terminal_status is not None
+            if run.retirement_started and run.terminal_status is not None
             else None
-            if run.retired
+            if run.retirement_started
             else self._read(run)
         )
         activity = Activity.UNKNOWN
@@ -363,9 +364,9 @@ class CodexRuntime(Runtime):
             return None
         state = (
             (run.terminal_status, run.identity_model)
-            if run.retired and run.terminal_status is not None
+            if run.retirement_started and run.terminal_status is not None
             else None
-            if run.retired
+            if run.retirement_started
             else self._read(run)
         )
         if state is not None and state[0] in {"failed", "interrupted"}:
@@ -422,10 +423,15 @@ class CodexRuntime(Runtime):
 
     def _retire(self, run: _Run) -> None:
         if self.retire is not None and not run.retired:
+            # The callback may close liveness before acknowledgement becomes known.
+            run.retirement_started = True
             self.retire(run.request)
             run.retired = True
 
     def _check_active(self, run: _Run) -> None:
+        if run.retirement_started:
+            self._retire(run)
+            return
         if (
             self.authorize_active is not None
             and not run.retired
@@ -444,6 +450,6 @@ class CodexRuntime(Runtime):
         if run.handle is None or run.uncertain or (handle is not None and handle != run.handle):
             return Lookup(Presence.UNKNOWN)
         self._check_active(run)
-        if run.retired:
+        if run.retirement_started:
             return Lookup(Presence.UNKNOWN)
         return Lookup(Presence.FOUND, run.handle) if self._read(run) is not None else Lookup(Presence.UNKNOWN)

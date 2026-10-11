@@ -857,6 +857,57 @@ def test_owned_runtime_terminal_and_candidate_wait_for_both_retirement_witnesses
     assert cell.runtime.reconcile(cell.launch.prepared.request.operation, handle).presence is Presence.UNKNOWN
 
 
+@pytest.mark.parametrize("initial", ["observe", "candidate"])
+@pytest.mark.parametrize("failure_at", ["inspect", "stop"])
+def test_completed_retirement_failure_preserves_candidate_until_exact_settlement(
+    runtime_launch: RuntimeLaunch, monkeypatch: pytest.MonkeyPatch, initial: str, failure_at: str
+) -> None:
+    cell = runtime_launch
+    root = cell.launch.prepared.root / "candidate"
+    root.mkdir()
+    (root / "result").write_bytes(b"completed result survives retirement retry")
+    handle = cell.runtime.start(cell.launch.prepared.request)
+    native_request = cell.connection.request
+
+    def pending(method: str, params: dict[str, object]) -> dict[str, object]:
+        if method == "thread/read":
+            return {"thread": {"id": "thread-one", "turns": [{"id": "turn-one", "status": "inProgress"}]}}
+        return native_request(method, params)
+
+    monkeypatch.setattr(cell.connection, "request", pending)
+    cell.launch.prepared.receipt(cell.runtime, handle)
+    monkeypatch.setattr(cell.connection, "request", native_request)
+    original = cell.launch.owner.invoke
+    failed = False
+
+    def invoke(argv: tuple[str, ...], environment: Mapping[str, str]) -> CompletedProcess[bytes]:
+        nonlocal failed
+        if not failed and (argv[1:3] == ("container", "inspect") and failure_at == "inspect" or argv[1] == "stop"):
+            failed = True
+            return CompletedProcess(argv, 125, b"", b"synthetic transient retirement observation")
+        return original(argv, environment)
+
+    object.__setattr__(cell.launch.owner, "invoke", invoke)
+    with pytest.raises(ExecutionConflict):
+        if initial == "observe":
+            cell.runtime.observe(handle, now=2)
+        else:
+            cell.runtime.candidate(handle)
+    assert failed
+    observation = cell.runtime.observe(handle, now=3)
+    assert observation.activity is Activity.UNKNOWN and not observation.cancellation_requested
+    assert cell.runtime.candidate(handle) is None
+    assert cell.calls.count("thread/read") == 1
+    cell.exited[0] = cell.absent[0] = True
+    candidate = cell.runtime.candidate(handle)
+    assert candidate is not None and candidate.spec_digest == cell.launch.prepared.request.attempt.digest
+    assert cell.runtime.candidate(handle) == candidate
+    observation = cell.runtime.observe(handle, now=4)
+    assert observation.activity is Activity.TERMINAL and not observation.cancellation_requested
+    assert cell.calls.count("thread/start") == cell.calls.count("turn/start") == cell.calls.count("thread/read") == 1
+    assert cell.launch.prepared.root.exists()
+
+
 @pytest.mark.parametrize("mutation", ["expired", "revoked", "resource"])
 def test_owned_runtime_current_authority_refusal_retires_without_read_or_candidate(
     runtime_launch: RuntimeLaunch, mutation: str

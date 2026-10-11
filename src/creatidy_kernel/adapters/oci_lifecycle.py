@@ -428,12 +428,21 @@ class OwnedOCI:
         """Stop delivery/acknowledgement is not settlement or cleanup permission."""
         if self.state() is Presence.ABSENT:
             return
-        identifier = self.capture()
+        try:
+            identifier = self.capture()
+        except ExecutionConflict:
+            if self.state() is Presence.ABSENT:
+                return
+            raise
         try:
             result = self._call("stop", "-t", "5", identifier)
         except (OSError, TimeoutError, TimeoutExpired) as error:
+            if self.state() is Presence.ABSENT:
+                return
             raise ExecutionConflict("OCI stop delivery uncertain") from error
         if result.returncode != 0 or result.stderr:
+            if self.state() is Presence.ABSENT:
+                return
             raise ExecutionConflict("OCI stop delivery uncertain")
 
     def require_absent(self) -> None:
