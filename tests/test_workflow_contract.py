@@ -59,14 +59,18 @@ def trace_dependency(issue: int, records: Mapping[int, DependencyEvidence]) -> t
         return ("SATISFIED", None) if contract == "ready" else ("UNVERIFIED", None)
     if record.get("state") != "open":
         return "UNVERIFIED", None
+    predecessor_issue = None
+    gated = False
     for dependency in record.get("dependencies", []):
         state, predecessor = trace_dependency(dependency, records)
         if state == "UNVERIFIED":
             return state, None
-        if state == "GATED":
-            return state, predecessor
-        if state == "ELIGIBLE":
-            return "GATED", predecessor
+        if state in ("GATED", "ELIGIBLE"):
+            gated = True
+        if predecessor_issue is None:
+            predecessor_issue = predecessor
+    if gated:
+        return "GATED", predecessor_issue
     return "ELIGIBLE", issue
 
 
@@ -158,6 +162,12 @@ class WorkflowContractTests(unittest.TestCase):
         }
         self.assertEqual(trace_dependency(88, unknown_contract), ("UNVERIFIED", None))
         self.assertEqual(select_confirmed_eligible((88,), records), (None, "UNVERIFIED"))
+        mixed_edges: dict[int, DependencyEvidence] = {
+            86: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": []},
+            87: {"state": "open", "evidence": "changed", "contract": "ready", "dependencies": []},
+            88: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": [86, 87]},
+        }
+        self.assertEqual(trace_dependency(88, mixed_edges), ("UNVERIFIED", None))
         loop = text(".kilo/command/loop.md")
         self.assertIn("`UNVERIFIED`, not ready and not a verified gate", loop)
         self.assertIn("Do not report `QUEUE_EMPTY` while any in-scope candidate", loop)
