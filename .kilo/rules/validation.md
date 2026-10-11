@@ -27,8 +27,11 @@
   environment before invoking a reviewer. Use a normal checkout by default; a
   specific owner-authorized task may use one isolated temporary worktree to preserve
   concurrent work. No switching/editing of the reviewed checkout during review.
-  Reviewer verifies HEAD/clean status before and after checks and inspects frozen
-  Git objects/full base delta. Ignored validation artifacts are allowed; tracked
+  Reviewer independently verifies canonical repository/PR/ref commits through
+  read-only Forgejo MCP, then matches them to the prepared local exact HEAD/base
+  objects. Anonymous Git transport is not required. Reviewer verifies HEAD/clean
+  status before and after checks and inspects the full merge-base-to-HEAD delta.
+  Ignored validation artifacts are allowed; tracked
   edits and Git/Forgejo mutations are not. Read checks before execution; permissions
   do not make arbitrary code safe. Run environment-observing tests with synthetic
   values in a sanitized closed environment, not ambient secrets. Preserve unrelated work.

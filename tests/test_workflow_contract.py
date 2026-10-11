@@ -36,6 +36,37 @@ def eligibility_transitions() -> dict[str, tuple[str, str, str]]:
     return rows
 
 
+def mcp_checkout_evidence_is_current(evidence: dict[str, object]) -> bool:
+    """Model the review admission contract for MCP refs and prepared Git objects."""
+    expected_head = evidence.get("expected_head")
+    expected_base = evidence.get("expected_base")
+    if not isinstance(expected_head, str) or not isinstance(expected_base, str):
+        return False
+    return (
+        evidence.get("canonical_repository") == "Creatidy/creatidy-kernel"
+        and evidence.get("canonical_repository_url") == "https://forgejo.creatidy.com/Creatidy/creatidy-kernel"
+        and isinstance(evidence.get("repository_is_private"), bool)
+        and evidence.get("pr_base_repository") == "Creatidy/creatidy-kernel"
+        and evidence.get("pr_base_repository_url") == evidence.get("canonical_repository_url")
+        and evidence.get("pr_state") == "open"
+        and evidence.get("pr_merged") is False
+        and evidence.get("pr_base_ref") == "develop"
+        and evidence.get("base_ref_repository") == evidence.get("pr_base_repository")
+        and evidence.get("base_ref_name") == evidence.get("pr_base_ref")
+        and evidence.get("pr_base_sha") == expected_base
+        and evidence.get("base_ref_sha") == expected_base
+        and evidence.get("pr_head_repository") == evidence.get("head_ref_repository")
+        and evidence.get("pr_head_repository_url") == evidence.get("head_ref_repository_url")
+        and evidence.get("pr_head_ref") == evidence.get("head_ref_name")
+        and evidence.get("pr_head_sha") == expected_head
+        and evidence.get("head_ref_sha") == expected_head
+        and evidence.get("local_head_sha") == expected_head
+        and evidence.get("local_head_object") == expected_head
+        and evidence.get("local_base_object") == expected_base
+        and evidence.get("checkout_clean") is True
+    )
+
+
 class WorkflowContractTests(unittest.TestCase):
     def test_pre_delivery_gates_refresh_queue_without_terminating_or_resetting_history(self) -> None:
         transitions = eligibility_transitions()
@@ -182,6 +213,87 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("never self-approve or resume a reviewer", loop)
         self.assertIn("Parent makes no edits/branch switches while it runs", loop)
         self.assertIn("Any HEAD/base change invalidates approval", loop)
+
+    def test_review_admits_matching_private_mcp_refs_and_prepared_objects(self) -> None:
+        evidence: dict[str, object] = {
+            "canonical_repository": "Creatidy/creatidy-kernel",
+            "canonical_repository_url": "https://forgejo.creatidy.com/Creatidy/creatidy-kernel",
+            "repository_is_private": True,
+            "pr_base_repository": "Creatidy/creatidy-kernel",
+            "pr_base_repository_url": "https://forgejo.creatidy.com/Creatidy/creatidy-kernel",
+            "pr_state": "open",
+            "pr_merged": False,
+            "pr_base_ref": "develop",
+            "base_ref_repository": "Creatidy/creatidy-kernel",
+            "base_ref_name": "develop",
+            "expected_base": "base-sha",
+            "pr_base_sha": "base-sha",
+            "base_ref_sha": "base-sha",
+            "pr_head_repository": "Creatidy/creatidy-kernel",
+            "pr_head_repository_url": "https://forgejo.creatidy.com/Creatidy/creatidy-kernel",
+            "head_ref_repository": "Creatidy/creatidy-kernel",
+            "head_ref_repository_url": "https://forgejo.creatidy.com/Creatidy/creatidy-kernel",
+            "pr_head_ref": "issue-86-review-mcp",
+            "head_ref_name": "issue-86-review-mcp",
+            "expected_head": "head-sha",
+            "pr_head_sha": "head-sha",
+            "head_ref_sha": "head-sha",
+            "local_head_sha": "head-sha",
+            "local_head_object": "head-sha",
+            "local_base_object": "base-sha",
+            "checkout_clean": True,
+            "anonymous_git_available": False,
+        }
+        self.assertTrue(mcp_checkout_evidence_is_current(evidence))
+
+        for field in (
+            "canonical_repository",
+            "canonical_repository_url",
+            "repository_is_private",
+            "pr_base_repository",
+            "pr_base_repository_url",
+            "pr_state",
+            "pr_merged",
+            "pr_base_ref",
+            "base_ref_repository",
+            "base_ref_name",
+            "pr_base_sha",
+            "base_ref_sha",
+            "pr_head_repository",
+            "pr_head_repository_url",
+            "head_ref_repository",
+            "head_ref_repository_url",
+            "pr_head_ref",
+            "head_ref_name",
+            "pr_head_sha",
+            "head_ref_sha",
+            "expected_head",
+            "expected_base",
+            "local_head_sha",
+            "local_head_object",
+            "local_base_object",
+            "checkout_clean",
+        ):
+            with self.subTest(mismatched_or_missing=field):
+                mismatched = {**evidence, field: None}
+                self.assertFalse(mcp_checkout_evidence_is_current(mismatched))
+
+        reviewer = text(".kilo/agents/pr-reviewer.md")
+        for requirement in (
+            '"forgejo-mcp_get_*": allow',
+            '"forgejo-mcp_list_*": allow',
+            "reported base and head repositories' branches through MCP",
+            "exact base/head ref names and commit IDs",
+            "matching both the PR metadata and supplied expected SHAs",
+            "Private repositories are valid when MCP returns matching current metadata",
+            "public visibility and anonymous Git access are not prerequisites",
+            "exact expected head/base commit objects",
+            "complete merge-base-to-HEAD diff",
+            "Recheck PR and ref metadata through MCP",
+        ):
+            self.assertIn(requirement, reviewer)
+        self.assertIn("read-only Forgejo MCP", text(".kilo/command/review-pr.md"))
+        self.assertIn("does not need anonymous Git transport", text(".kilo/command/finish-pr.md"))
 
     def test_delivery_counter_survives_reentry(self) -> None:
         finish = text(".kilo/command/finish-pr.md")
@@ -385,10 +497,9 @@ class WorkflowContractTests(unittest.TestCase):
         reviewer = (ROOT / ".kilo/agents/pr-reviewer.md").read_text().split("---", 2)[1]
         bash = reviewer.split("  bash:\n", 1)[1]
         allowed = re.findall(r'^    "([^"\n]+)": allow$', bash, flags=re.MULTILINE)
-        git_environment = (
-            "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin "
-            "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "
-        )
+        reviewer = (ROOT / ".kilo/agents/pr-reviewer.md").read_text()
+        for forbidden_tool in ("forgejo-mcp_create_", "forgejo-mcp_update_", "forgejo-mcp_delete_"):
+            self.assertNotIn(forbidden_tool, reviewer)
         check_environment = (
             "env -i HOME=/tmp PATH=/home/adrian/.local/bin:/usr/local/bin:/usr/bin:/bin "
             "TMPDIR=/tmp LANG=C.UTF-8 UV_CACHE_DIR=/home/adrian/.cache/uv UV_OFFLINE=1 "
@@ -414,18 +525,18 @@ class WorkflowContractTests(unittest.TestCase):
                     "ls-tree HEAD",
                 )
             ]
-            commands += [
-                f"{git_environment}git -C {checkout} ls-remote "
-                f"https://forgejo.creatidy.com/Creatidy/creatidy-kernel{suffix} "
-                "refs/heads/develop refs/heads/issue-67-reviewer-checkout"
-                for suffix in ("", ".git")
-            ]
             commands += [f"{check_environment}make -C {checkout} {gate}" for gate in ("check", "package-check")]
             for command in commands:
                 with self.subTest(command=command):
                     self.assertTrue(any(fnmatchcase(command, pattern) for pattern in allowed))
             self.assertIn(f'"{path_pattern}/**": allow', reviewer)
-            for operation in ("fetch origin", "checkout develop", "commit -m change", "push origin develop"):
+            for operation in (
+                "fetch origin",
+                "checkout develop",
+                "commit -m change",
+                "push origin develop",
+                "ls-remote https://forgejo.creatidy.com/Creatidy/creatidy-kernel",
+            ):
                 self.assertFalse(any(fnmatchcase(f"git -C {checkout} {operation}", pattern) for pattern in allowed))
         self.assertFalse(
             any(
