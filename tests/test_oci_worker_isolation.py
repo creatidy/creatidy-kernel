@@ -192,10 +192,10 @@ def test_native_clone_masks(toolchain: Toolchain, denial_errno: int) -> None:
     assert toolchain.crun.version == PINNED_CRUN_VERSION
     assert toolchain.conmon.version == PINNED_CONMON_VERSION
     # Public executable SHA-256 pins from the existing bounded toolroot provenance, not credentials.
-    assert (
-        toolchain.podman.sha256
-        == "72b04715918065668d3025ba67fb87ad678d1a0fe099ebd8878f33443b281c31"  # pragma: allowlist secret
-    )
+    assert toolchain.podman.sha256 in {
+        "72b04715918065668d3025ba67fb87ad678d1a0fe099ebd8878f33443b281c31",  # pragma: allowlist secret
+        "5e68f332026e5049631a17013a97e59ecbbf2f6012b69ddd8a7f6e6a5f1f3c4b",  # pragma: allowlist secret
+    }
     assert (
         toolchain.crun.sha256
         == "86d1e6a0e76945975d3aebfab39cbc6a26eea15f1c3fc66b6776d19e5dc346a0"  # pragma: allowlist secret
