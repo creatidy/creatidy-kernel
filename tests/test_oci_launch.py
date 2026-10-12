@@ -6,9 +6,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import subprocess
+import tempfile
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -1203,8 +1205,15 @@ def test_failed_native_candidate_still_retires_owned_namespace(
 
 
 @pytest.fixture
-def source_bound_launch(launch: Launch, tmp_path_factory: pytest.TempPathFactory) -> GitWorkspace:
-    source = tmp_path_factory.mktemp("bound-source")
+def source_bound_launch(launch: Launch, sqlite_tmp_path: Path, request: pytest.FixtureRequest) -> GitWorkspace:
+    source = Path(tempfile.mkdtemp(prefix="bound-source-", dir=sqlite_tmp_path.parent))
+
+    def cleanup_source() -> None:
+        shutil.rmtree(source)
+
+    request.addfinalizer(cleanup_source)
+    assert source.parent == sqlite_tmp_path.parent
+    assert source.stat().st_dev == launch.prepared.database.stat().st_dev
     reference_git(source, "init", "--template=")
     (source / "original.txt").write_bytes(b"exact materialized input")
     reference_git(source, "add", "-A")
