@@ -631,16 +631,33 @@ class OwnedOCI:
         probe = dict(probe_environment)
         if not probe or not set(probe) <= {"HOME", "CODEX_HOME", "PATH", "LC_ALL", "LANG", "TMPDIR"}:
             raise ExecutionConflict("closed OCI probe environment required")
-        if "HOME" not in probe or any(
-            not Path(probe[key]).is_relative_to(resources.private_parent)
-            or any(
-                Path(probe[key]).is_relative_to(root) or root.is_relative_to(Path(probe[key]))
-                for root in (resources.workspace, *resources.protected)
-            )
-            for key in ("HOME", "CODEX_HOME", "TMPDIR")
-            if key in probe
-        ):
+        if "HOME" not in probe:
             raise ExecutionConflict("OCI probe state must be private and separate")
+        try:
+            private_parent = resources.private_parent.resolve(strict=True)
+            private_roots = tuple(root.resolve(strict=True) for root in (resources.workspace, *resources.protected))
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ExecutionConflict("OCI probe state must be private and separate") from error
+        for key in ("HOME", "CODEX_HOME", "TMPDIR"):
+            if key not in probe:
+                continue
+            value = probe[key]
+            if type(value) is not str:
+                raise ExecutionConflict("OCI probe state must be private and separate")
+            path = Path(value)
+            if not path.is_absolute() or path == Path("/") or ".." in path.parts:
+                raise ExecutionConflict("OCI probe state must be private and separate")
+            try:
+                resolved = path.resolve(strict=False)
+            except (OSError, RuntimeError, ValueError) as error:
+                raise ExecutionConflict("OCI probe state must be private and separate") from error
+            if (
+                path != resolved
+                or not resolved.is_relative_to(private_parent)
+                or any(resolved.is_relative_to(root) or root.is_relative_to(resolved) for root in private_roots)
+            ):
+                raise ExecutionConflict("OCI probe state must be private and separate")
+            probe[key] = str(resolved)
         try:
             result = self._call("image", "inspect", "--format", "{{.Id}}", self.image)
             observed_image = result.stdout.decode("ascii").strip().removeprefix("sha256:")

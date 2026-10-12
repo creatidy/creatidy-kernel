@@ -9,10 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from creatidy_kernel.adapters import git_workspace, worker_collection
+from creatidy_kernel.adapters import git_workspace, source_cache, worker_collection
 from creatidy_kernel.adapters.git_workspace import GitWorkspace
 from creatidy_kernel.adapters.reference import reference_git
-from creatidy_kernel.adapters.source_cache import SourceAcquisitionError
+from creatidy_kernel.adapters.source_cache import SourceAcquisitionError, SourceCategory
 from creatidy_kernel.adapters.sqlite_store import OperationConflict, SQLiteProgramStore
 from creatidy_kernel.core.execution import ExecutionConflict, Presence, TrustMode, UnsupportedExecution, WorkspaceSpec
 from creatidy_kernel.ports.execution import Workspace
@@ -80,6 +80,39 @@ def test_exact_source_generation_is_durable_and_never_hardlinks_originals(materi
     with pytest.raises(UnsupportedExecution, match="preserve"):
         port.cleanup(handle, worker_settled=True)
     assert root.exists() and objects.exists()
+
+
+@pytest.mark.parametrize("budget", ["objects", "bytes"])
+def test_unrelated_git_history_is_bounded_before_workspace_publication(
+    materialization: Materialization, monkeypatch: pytest.MonkeyPatch, budget: str
+) -> None:
+    cell = materialization
+    base = cell.spec.base_revision
+    reference_git(cell.source, "checkout", "-b", "unrelated-history")
+    if budget == "objects":
+        monkeypatch.setattr(source_cache, "MAX_IMPORTED_GIT_OBJECTS", 10)
+        added_paths = [f"unrelated-{index}.bin" for index in range(10)]
+        for path in added_paths:
+            (cell.source / path).write_bytes(path.encode())
+    else:
+        monkeypatch.setattr(source_cache, "MAX_IMPORTED_GIT_OBJECT_BYTES", 1024)
+        added_paths = ["unrelated-large.bin"]
+        (cell.source / added_paths[0]).write_bytes(b"x" * 2048)
+    reference_git(cell.source, "add", "-A")
+    reference_git(cell.source, "commit", "-m", "unrelated bounded-import history")
+    base_paths = source_cache.source_git(cell.source, "ls-tree", "-r", "--name-only", base).splitlines()
+    assert set(added_paths).isdisjoint(base_paths)
+
+    key = f"workspace-object-budget-{budget}"
+    operation_id = "workspace:" + hashlib.sha256(key.encode()).hexdigest()
+    with pytest.raises(SourceAcquisitionError) as error:
+        cell.workspace.materialize(key, cell.spec)
+    assert error.value.category is SourceCategory.CHECKOUT_UNSUITABLE
+    assert not cell.workspace.workspace.exists()
+    assert not cell.workspace.objects.exists()
+    assert cell.store.find_artifact(operation_id, "workspace-created") is None
+    reservation = json.loads(cell.store.artifact(operation_id, "workspace-reserved"))
+    assert list(Path(reservation["objects"]).iterdir()) == []
 
 
 def test_reopen_reads_original_objects_without_reacquiring_changed_or_missing_source(

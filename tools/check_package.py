@@ -19,10 +19,19 @@ parser.add_argument(
 )
 options = parser.parse_args()
 if options.native_runtime and any(
-    not os.environ.get(name)
-    for name in ("CREATIDY_TEST_OCI_TOOLROOT", "CREATIDY_TEST_CODEX_BIN", "CREATIDY_TEST_BWRAP_BIN")
+    not os.environ.get(name) for name in ("CREATIDY_TEST_OCI_TOOLROOT", "CREATIDY_TEST_BWRAP_BIN")
 ):
-    raise SystemExit("Installed native factory UNPROVED: explicit OCI, Codex and bwrap pins required")
+    raise SystemExit("Installed native factory UNPROVED: explicit OCI toolroot and bwrap pins required")
+
+
+def _resolve_native_codex(probe_root: Path) -> tuple[str, Path]:
+    """Use the same version-pinned environment/PATH resolver as the source native suite."""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from tools.codex_oci_proof.codexbin import CODEX_BIN_ENV, resolve_codex_binary
+
+    return CODEX_BIN_ENV, resolve_codex_binary(probe_root).path
+
 
 with tempfile.TemporaryDirectory(
     prefix="creatidy-kernel-package-",
@@ -30,6 +39,9 @@ with tempfile.TemporaryDirectory(
     delete=not options.native_runtime,
 ) as directory:
     work = Path(directory)
+    if options.native_runtime:
+        codex_variable, codex_binary = _resolve_native_codex(work / "codex-probe")
+        os.environ[codex_variable] = str(codex_binary)
     dist = work / "dist"
     build = ["uv", "build", "--no-sources", "--no-build-isolation", "--python", sys.executable]
     subprocess.run([*build, "--out-dir", str(dist)], cwd=ROOT, check=True)

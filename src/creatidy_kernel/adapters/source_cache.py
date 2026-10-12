@@ -35,6 +35,9 @@ CACHE_NAMESPACE = ("creatidy-kernel", "source")
 GIT_TIMEOUT_SECONDS = 300
 GIT_VERIFY_TIMEOUT_SECONDS = 60
 MAX_GIT_OUTPUT_BYTES = 65536
+MAX_IMPORTED_GIT_OBJECTS = 32768
+MAX_IMPORTED_GIT_OBJECT_BYTES = 64 * 1024 * 1024
+MAX_GIT_OBJECT_INVENTORY_BYTES = 2 * 1024 * 1024
 ACQUIRED_MARKER = "kernel-source-cache-v2"
 LOCK_TIMEOUT_SECONDS = 1.0
 
@@ -466,6 +469,29 @@ def source_git(source: Path, *arguments: str, max_bytes: int = MAX_GIT_OUTPUT_BY
     ).stdout
 
 
+def _git_object_usage(repository: Path) -> tuple[int, int]:
+    """Bound the complete local object database, including unrelated history and refs."""
+    sizes = source_git(
+        repository,
+        "cat-file",
+        "--batch-all-objects",
+        "--batch-check=%(objectsize)",
+        max_bytes=MAX_GIT_OBJECT_INVENTORY_BYTES,
+    ).splitlines()
+    count = 0
+    total_bytes = 0
+    for size_text in sizes:
+        if not size_text.isascii() or not size_text.isdecimal() or len(size_text) > 20:
+            raise _refuse(SourceCategory.CHECKOUT_UNSUITABLE)
+        count += 1
+        total_bytes += int(size_text)
+        if count >= MAX_IMPORTED_GIT_OBJECTS or total_bytes >= MAX_IMPORTED_GIT_OBJECT_BYTES:
+            raise _refuse(SourceCategory.CHECKOUT_UNSUITABLE)
+    if count == 0:
+        raise _refuse(SourceCategory.CHECKOUT_UNSUITABLE)
+    return count, total_bytes
+
+
 def validate_source_repository(source: Path, repository_url: str) -> None:
     """Verify executable-config refusal and the exact qualified origin before copying."""
     validate_checkout(source)
@@ -478,9 +504,10 @@ def validate_source_repository(source: Path, repository_url: str) -> None:
 
 
 def copy_source_objects(source: Path, target: Path, *, base: str) -> None:
-    """Copy, not hardlink, source objects using the same bounded closed Git seam."""
+    """Copy a bounded complete source object database, not hardlinked source objects."""
     validate_checkout(source)
     oid(base)
+    _git_object_usage(source)
     binary = shutil.which("git", path=os.defpath)
     if binary is None:
         raise _refuse(SourceCategory.CHECKOUT_UNSUITABLE)
@@ -502,6 +529,7 @@ def copy_source_objects(source: Path, target: Path, *, base: str) -> None:
         failure=SourceCategory.CLONE_FAILED,
         timeout=GIT_TIMEOUT_SECONDS,
     )
+    _git_object_usage(target)
     if source_git(target, "rev-parse", "--verify", "refs/heads/kernel-source-base^{commit}").strip() != base:
         raise _refuse(SourceCategory.BASE_UNAVAILABLE)
 

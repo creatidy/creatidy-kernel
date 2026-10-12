@@ -53,13 +53,15 @@ class Launch:
     calls: list[tuple[str, ...]]
     spawns: list[tuple[str, ...]]
 
-    def connect(self) -> CodexStdio:
+    def connect(self, probe_environment: Mapping[str, str] | None = None) -> CodexStdio:
         return self.owner.connect(
             self.resources,
             self.codex,
             "0.99.1",
             ("/explicit/entrypoint",),
-            {"HOME": str(self.resources.private_parent / "probe-home"), "PATH": "/usr/bin:/bin"},
+            probe_environment
+            if probe_environment is not None
+            else {"HOME": str(self.resources.private_parent / "probe-home"), "PATH": "/usr/bin:/bin"},
             frozenset({"thread/read"}),
             self.prepared.store.worker_authorizers(lambda: self.time[0]),
             lambda: self.time[0],
@@ -179,6 +181,29 @@ def test_exact_resources_are_consumed_before_one_durable_worker_send(launch: Lau
         assert len(launch.spawns) == 2
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("key", ["HOME", "CODEX_HOME", "TMPDIR"])
+@pytest.mark.parametrize("escape", ["traversal", "symlink"])
+def test_probe_paths_reject_traversal_and_symlink_escapes_before_probe(
+    launch: Launch, tmp_path: Path, key: str, escape: str
+) -> None:
+    private_parent = launch.resources.private_parent
+    environment = {"HOME": str(private_parent / "probe-home"), "PATH": "/usr/bin:/bin"}
+    if escape == "traversal":
+        path = private_parent / ".." / f"outside-{key}"
+    else:
+        outside = tmp_path / f"outside-{key}"
+        outside.mkdir()
+        assert not outside.is_relative_to(private_parent)
+        link = private_parent / f"probe-link-{key}"
+        link.symlink_to(outside, target_is_directory=True)
+        path = link / "nested"
+    environment[key] = str(path)
+
+    with pytest.raises(ExecutionConflict, match="probe state"):
+        launch.connect(environment)
+    assert launch.calls == launch.spawns == []
 
 
 @pytest.mark.parametrize("which", range(5))
