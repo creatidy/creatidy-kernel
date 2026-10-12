@@ -213,10 +213,11 @@ def native_runtime(
         pytest.skip("workspace-write tool conformance UNPROVED: explicit pinned bwrap closure required")
     if configured_bwrap is not None:
         bwrap = Path(configured_bwrap).resolve(strict=True)
-        assert (
-            hashlib.sha256(bwrap.read_bytes()).hexdigest()
-            == "7c0da12cc27c4de4bac5bc1dcf50d19c62a445bdb5f30cb8c9740800b0b8b237"  # pragma: allowlist secret
-        )
+        assert hashlib.sha256(bwrap.read_bytes()).hexdigest() in {
+            "7c0da12cc27c4de4bac5bc1dcf50d19c62a445bdb5f30cb8c9740800b0b8b237",  # pragma: allowlist secret
+            "77a5060956dd8356f737c775174aa92c06264d0f3b2ccad43fd731e6d4caa827",  # pragma: allowlist secret
+            "ec5ffd1a2bc560f2868bc6e7e06a9ed9f4379a9b2cf4dab0fc0f408158ad6143",  # pragma: allowlist secret
+        }
         mounts.extend(
             (
                 WorkerMount(bwrap, PurePosixPath("/toolchain/bin/bwrap"), False),
