@@ -20,7 +20,8 @@ IMAGE_REF = "localhost/kernel78-worker:v1"
 
 # Default-allow with an explicit fail-closed deny set for namespace/mount/keyring/ptrace/
 # async-runtime surfaces, mirroring the ADR 0008 direction. Legacy clone namespace
-# flags have separate per-bit predicates; native/compat enforcement remains unreceived.
+# flags have separate per-bit predicates; LP64 native cases are exercised by the C fixture,
+# while compat-ABI enforcement remains unreceived.
 SECCOMP_DENY_NAMES = (
     "unshare",
     "setns",
@@ -63,6 +64,7 @@ CLONE_NAMESPACE_FLAGS = (
     0x08000000,  # CLONE_NEWIPC
     0x04000000,  # CLONE_NEWUTS
     0x02000000,  # CLONE_NEWCGROUP
+    0x00000080,  # CLONE_NEWTIME
 )
 
 

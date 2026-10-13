@@ -10,7 +10,16 @@ import pytest
 from tools.codex_oci_proof.boundary import write_seccomp_profile
 from tools.oci_worker_poc.ociimage import SECCOMP_DENY_NAMES, seccomp_profile_json
 
-EXPECTED_BITS = (0x10000000, 0x00020000, 0x40000000, 0x20000000, 0x08000000, 0x04000000, 0x02000000)
+EXPECTED_BITS = (
+    0x10000000,
+    0x00020000,
+    0x40000000,
+    0x20000000,
+    0x08000000,
+    0x04000000,
+    0x02000000,
+    0x00000080,
+)
 
 
 def test_exact_namespace_rules_preserve_the_existing_profile() -> None:
@@ -48,7 +57,7 @@ def test_every_namespace_subset_is_denied_without_denying_unrelated_flags(extra:
     profile = cast(dict[str, object], json.loads(seccomp_profile_json()))
     groups = cast(list[dict[str, object]], profile["syscalls"])
     rules = [group for group in groups if group["names"] == ["clone"]]
-    for subset in range(128):
+    for subset in range(1 << len(EXPECTED_BITS)):
         namespace = sum(bit for index, bit in enumerate(EXPECTED_BITS) if subset & (1 << index))
         flags = namespace | extra
         args = [cast(list[dict[str, object]], group["args"])[0] for group in rules]

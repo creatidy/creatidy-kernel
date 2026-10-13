@@ -258,7 +258,7 @@ def test_native_clone_masks(toolchain: Toolchain, denial_errno: int) -> None:
     production = json.loads(seccomp.read_text())
     selected = copy.deepcopy(production)
     clones = [group for group in selected["syscalls"] if group["names"] == ["clone"]]
-    assert len(clones) == 7
+    assert len(clones) == 8
     for group in clones:
         assert group["action"] == "SCMP_ACT_ERRNO" and group["errnoRet"] == 1 and len(group["args"]) == 1
         group["errnoRet"] = denial_errno
@@ -325,13 +325,13 @@ def test_native_clone_masks(toolchain: Toolchain, denial_errno: int) -> None:
             "RAW_CLONE_REAPED",
             "PTHREAD_JOINED",
             "CLONE3_ENOSYS",
-            *[f"DENIED {index} {denial_errno}" for index in range(9)],
+            *[f"DENIED {index} {denial_errno}" for index in range(10)],
             "NO_CHILDREN",
         ]
         evidence.probes.append(
             ProbeRecord(
                 "native-clone-matrix",
-                "reaped raw clone, joined pthread, clone3 ENOSYS, nine attributed namespace denials",
+                "reaped raw clone, joined pthread, clone3 ENOSYS, ten attributed namespace denials",
                 "passed",
                 stdout.strip(),
             )

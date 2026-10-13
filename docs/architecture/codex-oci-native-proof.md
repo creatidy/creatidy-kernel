@@ -18,8 +18,8 @@ Source-shape and complete namespace-subset arithmetic tests are not native enfor
 receipts. The historical native runs below used the earlier profile. The integration
 branch separately receives native Linux LP64 x86-64 predicates with the bounded C
 fixture in `tests/fixtures/oci_clone_probe.c`: raw non-namespace clone succeeds and is
-reaped, pthread create/join succeeds, and Codex clone3 returns ENOSYS. Nine namespace
-cases (each flag, NEWUSER|NEWNS, all seven) return EPERM under the production profile
+reaped, pthread create/join succeeds, and Codex clone3 returns ENOSYS. Ten namespace
+cases (each of eight flags, NEWUSER|NEWNS, all eight) return EPERM under the production profile
 and EDOM under an otherwise-identical diagnostic profile. The diagnostic errno
 distinguishes the filter from ordinary kernel EPERM; no unfiltered control permits
 namespace creation. Both cases confirm the owned container is absent after exit.

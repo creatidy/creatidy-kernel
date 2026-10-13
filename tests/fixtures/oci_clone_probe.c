@@ -11,6 +11,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifndef CLONE_NEWTIME
+#define CLONE_NEWTIME 0x00000080UL /* Linux UAPI flag; older libc headers may omit it. */
+#endif
+
 #if !defined(__linux__) || !defined(__x86_64__) || defined(__ILP32__)
 #error "UNPROVED: requires native Linux LP64 x86-64"
 #endif
@@ -49,10 +53,10 @@ int main(int argc, char **argv)
     static char token;
     const unsigned long cases[] = {
         CLONE_NEWUSER, CLONE_NEWNS, CLONE_NEWNET, CLONE_NEWPID,
-        CLONE_NEWIPC, CLONE_NEWUTS, CLONE_NEWCGROUP,
+        CLONE_NEWIPC, CLONE_NEWUTS, CLONE_NEWCGROUP, CLONE_NEWTIME,
         CLONE_NEWUSER | CLONE_NEWNS,
         CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWPID |
-        CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWCGROUP
+        CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWCGROUP | CLONE_NEWTIME
     };
 
     if (argc != 2 || (strcmp(argv[1], "1") && strcmp(argv[1], "33")))
