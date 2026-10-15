@@ -25,6 +25,7 @@ from creatidy_kernel.core.domain import (
     WorkUnit,
 )
 from creatidy_kernel.core.execution import (
+    Activity,
     ExecutionConflict,
     ExecutionRequest,
     OperationKey,
@@ -316,12 +317,27 @@ def test_restart_cannot_adopt_a_preexisting_claim_even_before_native_send(prepar
         assert reopened.find_artifact(prepared.intent.operation_id, "runtime-dispatch:1:thread") is None
 
 
-def test_owned_readonly_recovery_survives_expiry_revocation_cancel_and_reopen(prepared: Prepared) -> None:
+def test_non_oci_runtime_receipt_is_not_terminal_for_revocation(prepared: Prepared) -> None:
     prepared.claim()
     runtime, _ = prepared.runtime()
     handle = runtime.start(prepared.request)
+    observation = runtime.observe(handle, now=1)
+    assert observation.activity is not Activity.TERMINAL
     prepared.receipt(runtime, handle)
-    prepared.store.revoke(Principal("owner", "owner"), prepared.grant.grant_id)
+    with pytest.raises(AuthorityRevocationPending, match="active non-OCI worker retirement is unsupported"):
+        prepared.store.revoke(Principal("owner", "owner"), prepared.grant.grant_id)
+    assert (
+        prepared.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+            "SELECT 1 FROM authority_revocation_fences WHERE grant_id = ?", (prepared.grant.grant_id,)
+        ).fetchone()
+        is not None
+    )
+    assert (
+        prepared.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+            "SELECT 1 FROM authority_revocations WHERE grant_id = ?", (prepared.grant.grant_id,)
+        ).fetchone()
+        is None
+    )
     program = prepared.store.load(prepared.request.attempt.program_id)
     prepared.store.admit(
         program.program_id, "cancel", CancelAttempt(program.revision, "owner", prepared.request.attempt.attempt_id)

@@ -727,7 +727,7 @@ class SQLiteProgramStore:
                     or self.find_artifact(operation_id, stage_prefix + "turn") is not None
                     or self.find_artifact(operation_id, stage_prefix + "worker") is not None
                     or self.find_artifact(operation_id, stage_prefix + "worker-enter") is not None
-                ) and self.find_artifact(operation_id, "runtime-receipt") is None:
+                ):
                     raise AuthorityRevocationPending(
                         "durable admission fence retained; active non-OCI worker retirement is unsupported"
                     )
