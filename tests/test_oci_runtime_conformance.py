@@ -32,7 +32,13 @@ from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.worker_collection import read_bounded_regular
 from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile
-from creatidy_kernel.core.authority import AuthorityGrant, AuthorityRevocationPending, OperationIntent, Principal
+from creatidy_kernel.core.authority import (
+    AuthorityDenied,
+    AuthorityGrant,
+    AuthorityRevocationPending,
+    OperationIntent,
+    Principal,
+)
 from creatidy_kernel.core.domain import (
     ActivateProgram,
     AttemptSpec,
@@ -59,6 +65,7 @@ from tools.codex_oci_proof.boundary import write_seccomp_profile
 from tools.codex_oci_proof.codexbin import CodexBinary, ProtocolInventory
 from tools.codex_oci_proof.driver import exec_step, final_step, write_scenario
 from tools.codex_oci_proof.ocimage import CodexImageRecord
+from tools.oci_worker_poc.harness import stop_container
 from tools.oci_worker_poc.toolchain import Toolchain, host_python_closure
 
 pytest_plugins = ["test_codex_oci_isolation"]
@@ -76,6 +83,8 @@ class NativeRuntime:
     scenario: str
     codex: CodexBinary
     resolve_authority_intent: Callable[[OperationRecord], OperationIntent]
+    toolchain: Toolchain
+    grant_expires_at: int
     store_closed: bool = False
 
 
@@ -301,6 +310,27 @@ def native_runtime(
             )
         )
         steps = [final_step("bounded synthetic completion")]
+        if request.param == "expiry-effect":
+            delayed_effect = (
+                "from pathlib import Path; import time; "
+                "Path('/workspace/expiry-started.txt').write_text('started'); "
+                "time.sleep(90); Path('/workspace/expiry-late.txt').write_text('late')"
+            )
+            launcher = (
+                "import subprocess,sys; "
+                f"effect={delayed_effect!r}; "
+                "subprocess.Popen([sys.executable,'-I','-S','-c',effect],"
+                "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+                "close_fds=True,start_new_session=True)"
+            )
+            steps = [
+                exec_step("/toolchain/bin/python3.12 -I -S -c " + shlex.quote(launcher)),
+                {
+                    **exec_step("/toolchain/bin/python3.12 -I -S -c pass"),
+                    "delay_seconds": 30,
+                },
+                {**final_step("late model response"), "delay_seconds": 30},
+            ]
         if request.param in {
             "cancel",
             "revoke",
@@ -394,6 +424,7 @@ def native_runtime(
             expected,
         )
         now = int(time.time())
+        grant_expires_at = now + (45 if request.param == "expiry-effect" else 120)
         grant = AuthorityGrant(
             "grant-" + attempt_id,
             "owner",
@@ -405,7 +436,7 @@ def native_runtime(
             frozenset({workspace_path}),
             frozenset(),
             frozenset({"read", "write", "execute"}),
-            now + 120,
+            grant_expires_at,
             True,
         )
         store.issue(Principal("owner", "owner"), grant)
@@ -521,6 +552,8 @@ def native_runtime(
                 str(request.param),
                 codex_binary,
                 decode,
+                toolchain,
+                grant_expires_at,
             )
             yield cell
         finally:
@@ -723,6 +756,99 @@ def test_real_final_thread_admission_revocation_retires_without_prompt(native_ru
     assert cell.store.find_artifact(cell.owner.operation_id, "runtime-dispatch:1:thread") is None
     assert cell.store.find_artifact(cell.owner.operation_id, "oci-candidate") is None
     assert (cell.resources.workspace / "candidate/original.txt").read_bytes() == b"exact bounded source\n"
+
+
+@pytest.mark.parametrize("native_runtime", ["expiry-effect"], indirect=True)
+def test_grant_expiry_stops_inflight_native_effect_without_controller_poll(native_runtime: NativeRuntime) -> None:
+    cell = native_runtime
+    workspace = cell.resources.workspace
+    started = workspace / "expiry-started.txt"
+    late_effect = workspace / "expiry-late.txt"
+    assert not started.exists() and not late_effect.exists()
+
+    try:
+        handle = cell.runtime.start(cell.request)
+        assert handle
+        startup_deadline = time.monotonic() + 20
+        while not started.exists() and time.monotonic() < startup_deadline:
+            time.sleep(0.05)
+        assert started.is_file(), "the authorized in-flight descendant did not start"
+        assert time.time() < cell.grant_expires_at
+
+        # The synthetic model is now holding an unfinished response; do not poll the
+        # controller/runtime while the persisted grant deadline elapses.
+        mock_state = workspace / "mock/state.json"
+        scenario_deadline = time.monotonic() + 15
+        pending_model_state: dict[str, object] | None = None
+        while time.monotonic() < scenario_deadline:
+            if mock_state.exists():
+                state = cast(dict[str, object], json.loads(read_bounded_regular(mock_state)))
+                index = state.get("index")
+                if isinstance(index, int) and index >= 2:
+                    pending_model_state = state
+                    break
+            time.sleep(0.05)
+        assert pending_model_state is not None and time.time() < cell.grant_expires_at
+
+        while time.time() < cell.grant_expires_at + 2:
+            time.sleep(0.05)
+
+        assert started.is_file() and not late_effect.exists()
+        inspection = cell.owner._inspection()  # pyright: ignore[reportPrivateUsage]
+        state_value = inspection.get("State")
+        assert isinstance(state_value, dict)
+        state_value = cast(dict[str, object], state_value)
+        assert state_value.get("Status") == "exited" and state_value.get("Running") is False
+        assert cell.owner.state() is Presence.FOUND
+
+        operation = cell.store.operation(cell.owner.operation_id)
+        intent = cell.resolve_authority_intent(operation)
+        with pytest.raises(AuthorityDenied, match="expired"):
+            cell.store.check(
+                Principal(cell.request.attempt.attempt_id, "worker"),
+                cell.request.capability_reference,
+                cell.request.attempt,
+                intent,
+                int(time.time()),
+            )
+        assert cell.store.find_artifact(cell.owner.operation_id, "oci-candidate") is None
+        cgroup_settled = cell.store.find_artifact(cell.owner.operation_id, "oci-cgroup-settled")
+        assert cgroup_settled is None
+        (cell.root / "grant-expiry-receipt.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "grant_expires_at": cell.grant_expires_at,
+                    "observed_at": int(time.time()),
+                    "model_step_pending": pending_model_state.get("last_step_kind"),
+                    "started_marker": started.is_file(),
+                    "late_effect_marker": late_effect.exists(),
+                    "podman_state": state_value.get("Status"),
+                    "post_expiry_authority_check": "denied",
+                    "cgroup_settled_artifact_present": cgroup_settled is not None,
+                    "runtime_observe_polled_during_expiry_wait": False,
+                    "container_removed_as_test_cleanup_only": True,
+                },
+                sort_keys=True,
+                indent=1,
+            )
+            + "\n"
+        )
+
+        # The test proves effect termination, not durable revocation/settlement. Remove
+        # only this synthetic test container after recording that distinction.
+        stop_container(cell.toolchain, cell.owner.name)
+        assert cell.owner.state() is Presence.ABSENT
+        assert cell.store.find_artifact(cell.owner.operation_id, "oci-cgroup-settled") is None
+    finally:
+        try:
+            cell.connection.close()
+        finally:
+            try:
+                stop_container(cell.toolchain, cell.owner.name)
+            finally:
+                cell.store.close()
+                cell.store_closed = True
 
 
 @pytest.mark.parametrize("native_runtime", ["cancel", "revoke", "close"], indirect=True)
