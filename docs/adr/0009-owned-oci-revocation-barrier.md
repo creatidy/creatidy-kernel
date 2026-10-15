@@ -32,7 +32,9 @@ service, or global Podman configuration.
    the grant fenced and prevents final revocation.
 3. Verify each full OCI identity and persisted cgroup-v2 incarnation. Pause each
    worker and require `cgroup.events frozen=1` for the worker root and every populated
-   descendant. Do not freeze or kill the enclosing host/controller cgroup.
+   descendant. Require the root freeze acknowledgment even when the initial subtree
+   reports `populated=0`; an empty, unfrozen subtree can be repopulated and is not a
+   barrier. Do not freeze or kill the enclosing host/controller cgroup.
 4. Only after all freeze acknowledgments, commit the immutable authority revocation.
 5. Kill the exact worker subtree with `cgroup.kill`, observe `cgroup.events
    populated=0` while the exact cgroup still exists, and durably persist that

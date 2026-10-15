@@ -609,6 +609,20 @@ def test_real_factory_editing_and_historical_workspace_write_gate(
     assert state["last_step_kind"] == "final", (
         "hydrated terminality cannot substitute for a completed native model exchange"
     )
+    observed_boundary = json.loads(read_bounded_regular(cell.resources.workspace / "worker-observations.json"))[
+        "self_observations"
+    ]
+    assert observed_boundary["cgroup_pids_max"] == "256"
+    assert observed_boundary["cgroup_memory_max"] == "1073741824"
+    cpu_max = observed_boundary["cgroup_cpu_max"]
+    assert isinstance(cpu_max, str)
+    quota_period = cpu_max.split()
+    assert (
+        len(quota_period) == 2
+        and quota_period[0].isdecimal()
+        and quota_period[1].isdecimal()
+        and 0 < int(quota_period[0]) <= int(quota_period[1])
+    ), f"owned cgroup does not expose the requested CPU quota: {cpu_max!r}"
     native_items: list[dict[str, object]] = []
     for notification in notifications:
         if notification.get("method") == "item/completed":
@@ -625,13 +639,8 @@ def test_real_factory_editing_and_historical_workspace_write_gate(
         assert proof["version"] == "codex-cli 0.159.3"
         assert len(proof["denied_paths"]) == 6 and proof["namespaces"] == proof["subprocess_namespaces"]
         assert proof["init_fd_refusals"] and set(proof["init_fd_refusals"]) <= {1, 13}
-        observed_boundary = json.loads(read_bounded_regular(cell.resources.workspace / "worker-observations.json"))[
-            "self_observations"
-        ]
         assert observed_boundary["CapEff"] == "0000000000000000"
         assert observed_boundary["NoNewPrivs"] == "1" and observed_boundary["Seccomp"] == "2"
-        assert observed_boundary["cgroup_pids_max"] == "256"
-        assert observed_boundary["cgroup_memory_max"] == "1073741824"
         assert observed_boundary["uid_map"].split() == ["0", str(os.getuid()), "1"]
         assert observed_boundary["network_interfaces"] == ["lo"] and len(observed_boundary["ipv4_routes"]) == 1
         assert all(

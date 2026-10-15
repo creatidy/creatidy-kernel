@@ -60,6 +60,7 @@ def _self_observations() -> dict[str, Any]:
         "ipv4_routes": Path("/proc/net/route").read_text().splitlines(),
         "cgroup_pids_max": cgroup_value("pids.max"),
         "cgroup_memory_max": cgroup_value("memory.max"),
+        "cgroup_cpu_max": cgroup_value("cpu.max"),
     }
 
 

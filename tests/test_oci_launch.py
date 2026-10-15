@@ -185,8 +185,9 @@ def test_cgroup_barrier_requires_ack_from_every_populated_descendant(tmp_path: P
     assert all(events["populated"] == 0 for _, events in empty)
 
 
-def test_explicit_revoke_orders_fence_freeze_commit_kill_and_cold_receipt(
-    launch: Launch, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("empty_unfrozen", [False, True], ids=["frozen-worker", "empty-without-freeze-ack"])
+def test_explicit_revoke_requires_kernel_freeze_ack(
+    launch: Launch, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_unfrozen: bool
 ) -> None:
     owner = launch.owner
     owner.bind_before_send(now=1)
@@ -196,12 +197,13 @@ def test_explicit_revoke_orders_fence_freeze_commit_kill_and_cold_receipt(
     child = root / "worker-child"
     child.mkdir(parents=True)
     cgroup_mount.mkdir(exist_ok=True)
-    (root / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+    initial_events = "populated 0\nfrozen 0\n" if empty_unfrozen else "populated 1\nfrozen 0\n"
+    (root / "cgroup.events").write_text(initial_events)
     (root / "cgroup.procs").write_text("")
     (root / "cgroup.freeze").write_text("0\n")
     (root / "cgroup.kill").write_text("0\n")
-    (child / "cgroup.events").write_text("populated 1\nfrozen 0\n")
-    (child / "cgroup.procs").write_text("12345\n")
+    (child / "cgroup.events").write_text(initial_events)
+    (child / "cgroup.procs").write_text("" if empty_unfrozen else "12345\n")
 
     paused = [False]
     present = [True]
@@ -258,8 +260,9 @@ def test_explicit_revoke_orders_fence_freeze_commit_kill_and_cold_receipt(
             paused[0] = True
             state["Paused"] = True
             state["Status"] = "paused"
-            for path in (root, child):
-                (path / "cgroup.events").write_text("populated 1\nfrozen 1\n")
+            if not empty_unfrozen:
+                for path in (root, child):
+                    (path / "cgroup.events").write_text("populated 1\nfrozen 1\n")
             return CompletedProcess(argv, 0, b"paused", b"")
         if argv[1] == "rm":
             assert argv[2] == "--force" and argv[3] == "a" * 64
@@ -305,7 +308,7 @@ def test_explicit_revoke_orders_fence_freeze_commit_kill_and_cold_receipt(
             assert (path / "cgroup.kill").read_text().strip() == "1"
             for child_path in (path, child):
                 (child_path / "cgroup.events").write_text("populated 0\nfrozen 1\n")
-        return original_wait(path, frozen=frozen, populated=populated, timeout=timeout)
+        return original_wait(path, frozen=frozen, populated=populated, timeout=0)
 
     monkeypatch.setattr(oci_lifecycle, "_wait_cgroup_subtree", wait_for_kernel_event)
 
@@ -344,6 +347,45 @@ def test_explicit_revoke_orders_fence_freeze_commit_kill_and_cold_receipt(
         "oci-cgroup-identity",
         json.dumps(cgroup_identity, sort_keys=True, separators=(",", ":")).encode(),
     )
+
+    if empty_unfrozen:
+        with pytest.raises(AuthorityRevocationPending, match="freeze remains unresolved"):
+            launch.prepared.store.revoke(
+                Principal(launch.prepared.grant.issuer, "owner"), launch.prepared.grant.grant_id
+            )
+        assert paused[0] and present[0]
+        assert launch.prepared.store.find_artifact(owner.operation_id, "oci-cgroup-frozen") is None
+        assert launch.prepared.store.find_artifact(owner.operation_id, "oci-cgroup-empty") is None
+        assert launch.prepared.store.find_artifact(owner.operation_id, "oci-candidate") is None
+        assert (
+            launch.prepared.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                "SELECT 1 FROM authority_revocation_fences WHERE grant_id = ?",
+                (launch.prepared.grant.grant_id,),
+            ).fetchone()
+            is not None
+        )
+        assert (
+            launch.prepared.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                "SELECT 1 FROM authority_revocations WHERE grant_id = ?",
+                (launch.prepared.grant.grant_id,),
+            ).fetchone()
+            is None
+        )
+
+        # An empty snapshot is not terminal; repopulation must not turn it into a freeze receipt.
+        for path in (root, child):
+            (path / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+        (child / "cgroup.procs").write_text("12345\n")
+        assert any(events["populated"] == 1 for _, events in oci_lifecycle._cgroup_subtree(root))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(AuthorityRevocationPending, match="fenced against new admission"):
+            launch.prepared.store.check(
+                Principal(launch.prepared.request.attempt.attempt_id, "worker"),
+                launch.prepared.grant.grant_id,
+                launch.prepared.request.attempt,
+                launch.prepared.intent,
+                2,
+            )
+        return
 
     result = launch.prepared.store.revoke(
         Principal(launch.prepared.grant.issuer, "owner"), launch.prepared.grant.grant_id

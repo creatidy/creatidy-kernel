@@ -690,23 +690,19 @@ class OwnedOCI:
 
     def _pause_for_revocation(self) -> None:
         identity_bytes, _identity, path = self._load_cgroup_identity()
-        events = _cgroup_subtree(path)
-        if all(item["populated"] == 0 for _, item in events):
-            return
-        else:
-            state = self._verify_live_cgroup_identity(_object(json.loads(identity_bytes)))
-            state_is_paused = state.get("Paused") is True or state.get("Status") == "paused"
-            if not state_is_paused:
-                identifier = self._receipt()
-                if identifier is None:
-                    raise ExecutionConflict("owned OCI container identity is unavailable")
-                result = self._call("pause", identifier)
-                if result.returncode != 0 or result.stderr:
-                    raise ExecutionConflict("owned OCI pause was not acknowledged")
-            events = _wait_cgroup_subtree(path, frozen=1)
-            state = _object(self._inspection().get("State"))
-            if state.get("Paused") is not True and state.get("Status") != "paused":
-                raise ExecutionConflict("Podman did not retain the acknowledged paused state")
+        state = self._verify_live_cgroup_identity(_object(json.loads(identity_bytes)))
+        state_is_paused = state.get("Paused") is True or state.get("Status") == "paused"
+        if not state_is_paused:
+            identifier = self._receipt()
+            if identifier is None:
+                raise ExecutionConflict("owned OCI container identity is unavailable")
+            result = self._call("pause", identifier)
+            if result.returncode != 0 or result.stderr:
+                raise ExecutionConflict("owned OCI pause was not acknowledged")
+        _wait_cgroup_subtree(path, frozen=1)
+        state = _object(self._inspection().get("State"))
+        if state.get("Paused") is not True and state.get("Status") != "paused":
+            raise ExecutionConflict("Podman did not retain the acknowledged paused state")
         frozen_record = _bytes(
             {
                 "version": 1,
