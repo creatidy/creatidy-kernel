@@ -11,6 +11,10 @@ class AuthorityDenied(ValueError):
     """The requested capability is not authorized."""
 
 
+class AuthorityRevocationPending(AuthorityDenied):
+    """A durable fence denies admission while worker retirement remains unproved."""
+
+
 WORKER_OPERATIONS = frozenset({"read", "write", "execute", "publish_candidate"})
 
 

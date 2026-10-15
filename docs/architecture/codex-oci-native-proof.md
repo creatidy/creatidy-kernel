@@ -11,6 +11,8 @@ ownership, [ADR 0008](../adr/0008-linux-bubblewrap-verification.md) (verificatio
 boundary) and the [#78 whole-worker record](whole-worker-isolation.md) are unchanged; the
 owner decision in [#53 comment 15606](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53#issuecomment-15606)
 (universal executor enforcement, AC4 preserved) remains the binding scope.
+The narrower OwnedOCI explicit-revocation settlement decision is recorded separately in
+[ADR 0009](../adr/0009-owned-oci-revocation-barrier.md); it does not change universal AC4.
 
 The subsequent #53 integration branch adds generated per-bit OCI predicates for legacy
 `clone` namespace flags while retaining the Codex `clone3` ENOSYS compatibility rule.
@@ -172,6 +174,7 @@ These denied cells are not counted as positive editing; no earlier receipt is re
 | Terminal/descendants and retirement owned | PID1 bootstrap, retained kernel handles and full ID | Cancel/revoke/EOF during actual native detached-subprocess execution; uncertain-start/settlement cells | PASS exercised retirement; no PID reconstruction or stop-ack settlement |
 | Original Attempt/source/current collection authority | SQLite journal + common collector | Edited-byte manifest, drift/expiry/revoke/reopen/currentness regressions | PASS proposal only; no lease renewal/automatic acceptance |
 | Former workspace-write source editing | Unchanged host-safe adapter over owned transport | `edit-legacy` / `edit-diagnostic` retain EPERM / EDOM | FAIL editing; PASS historical denial reception |
+| OwnedOCI explicit revocation | Durable fence, cgroup freeze/ack, cgroup kill, empty receipt, exact removal | ADR 0009; diagnostic-only cgroupfs cold-recovery probe | Implemented on branch; accepted native receipt pending |
 | Universal AC4 / continuous per-effect mediation | Not implemented by writable bind/current checks | No universal receipt | UNVERIFIED; #53 stays open |
 | IDE/handoff/binary-source correspondence/profile adoption | Not supplied by this exception | Synthetic observer / exact public pins only | UNVERIFIED; no production GO |
 
@@ -180,11 +183,16 @@ PR85 and the issue. A required native skip or empty suite fails reception; docum
 configuration intent and old denial receipts cannot replace those executed results.
 
 Current authority is rechecked for newly collected bytes even after confirmed native
-completion and retirement. This still does not provide continuous per-syscall expiry
-or revocation mediation over the writable bind. Historical records remain inspectable;
-denied new collection cannot renew the original lease, issue another prompt or imply
-acceptance. Exact init exit plus confirmed owned-container absence authorizes retained
-settlement, not deletion. `GitWorkspace.cleanup` explicitly refuses caller boolean
+completion and retirement. The branch's explicit OwnedOCI revoke path first fences new
+admission, freezes and acknowledges every bound worker subtree, then commits revocation;
+cold retirement records `cgroup.events populated=0` before exact no-thaw container
+removal. This proves no live effects in that exact subtree, not PID-namespace teardown
+or universal per-syscall expiry. The branch-level diagnostic used a diagnostic-only
+Podman binary and synthetic rootless identity; it is not accepted production/native
+evidence. The accepted pinned native gate remains required. Historical records remain
+inspectable; denied new collection cannot renew the original lease, issue another prompt
+or imply acceptance. Warm settlement still uses exact retained init-PIDFD exit plus
+owned-container absence. `GitWorkspace.cleanup` explicitly refuses caller boolean
 settlement claims; source objects, workspace and journal evidence remain preserved.
 
 Frozen-task `doctor`/preflight and `task status` retain their existing command scope.

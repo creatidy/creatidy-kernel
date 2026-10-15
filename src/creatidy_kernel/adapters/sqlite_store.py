@@ -36,6 +36,7 @@ from creatidy_kernel.core.authority import (
     WORKER_OPERATIONS,
     AuthorityDenied,
     AuthorityGrant,
+    AuthorityRevocationPending,
     OperationIntent,
     Principal,
     check_scope,
@@ -56,9 +57,9 @@ from creatidy_kernel.ports.allocation import (
     is_legacy_allocation,
     load_attempt_inputs,
 )
-from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
+from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged, RevocationHandler
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _APPLICATION_ID = 0x43544B31
 DATABASE_APPLICATION_ID = _APPLICATION_ID
 _DEFAULT_BUSY_TIMEOUT_MS = 5_000
@@ -359,6 +360,7 @@ class SQLiteProgramStore:
         # Worker-supplied paths or a digest alone cannot define that interpretation.
         self._resolve_authority_intent = resolve_authority_intent
         self._runtime_claims: set[tuple[str, int]] = set()
+        self._revocation_handlers: dict[tuple[str, str], RevocationHandler] = {}
         try:
             self._connection = sqlite3.connect(
                 f"{self._path.as_uri()}?cache=private",
@@ -411,6 +413,7 @@ class SQLiteProgramStore:
                 return
             self._connection.close()
             self._closed = True
+            self._revocation_handlers.clear()
 
     def create(self, spec: ProgramSpec, command_key: str) -> Program:
         self._assert_writer_thread()
@@ -655,20 +658,103 @@ class SQLiteProgramStore:
             )
         return grant
 
+    def register_revocation_handler(self, grant_id: str, operation_id: str, handler: RevocationHandler) -> None:
+        """Register this controller's exact in-process OCI lifecycle participant."""
+        self._assert_writer_thread()
+        if type(grant_id) is not str or not grant_id or type(operation_id) is not str or not operation_id:
+            raise AuthorityDenied("revocation handler identity required")
+        if not callable(handler):
+            raise TypeError("revocation handler must be callable")
+        with self._gate:
+            binding = self._connection.execute(
+                "SELECT grant_id FROM authority_bindings WHERE operation_id = ?", (operation_id,)
+            ).fetchone()
+            if binding is None or binding["grant_id"] != grant_id:
+                raise AuthorityDenied("revocation handler differs from durable grant binding")
+            if self.find_artifact(operation_id, "oci-owner") is None:
+                raise AuthorityDenied("durable OCI owner required")
+            self._revocation_handlers[(grant_id, operation_id)] = handler
+
+    def unregister_revocation_handler(self, grant_id: str, operation_id: str) -> None:
+        self._assert_writer_thread()
+        with self._gate:
+            self._revocation_handlers.pop((grant_id, operation_id), None)
+
     def revoke(self, principal: Principal, grant_id: str) -> AuthorityGrant:
-        """Revocation is durable; previously consumed operations never restore authority."""
+        """Fence admission, quiesce every owned worker, commit, then retire it."""
         self._assert_writer_thread()
         if type(principal) is not Principal:
             raise AuthorityDenied("typed owner required")
-        with self._gate, self._transaction():
+        with self._gate:
             grant = self._authority_grant(grant_id, force_revoked=True)
             program = self.load(grant.program_id)
             if principal.role != "owner" or principal.actor_id != program.spec.authority.owner_id:
                 raise AuthorityDenied("only the current Program owner can revoke authority")
-            self._connection.execute(
-                "INSERT OR IGNORE INTO authority_revocations VALUES (?, ?)", (grant_id, principal.actor_id)
-            )
-        return grant
+            with self._transaction():
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO authority_revocation_fences VALUES (?, ?)",
+                    (grant_id, principal.actor_id),
+                )
+
+            handlers: list[tuple[str, RevocationHandler]] = []
+            rows = self._connection.execute(
+                "SELECT operation_id FROM authority_bindings WHERE grant_id = ? ORDER BY operation_id",
+                (grant_id,),
+            ).fetchall()
+            for row in rows:
+                operation_id = cast(str, row["operation_id"])
+                operation = self.operation(operation_id)
+                owner = self.find_artifact(operation_id, "oci-owner")
+                if owner is not None:
+                    if (
+                        self.find_artifact(operation_id, "oci-cgroup-settled") is not None
+                        or self.find_artifact(operation_id, "oci-namespace-settled") is not None
+                        or self.find_artifact(operation_id, "oci-revocation-no-worker") is not None
+                    ):
+                        self._revocation_handlers.pop((grant_id, operation_id), None)
+                        continue
+                    handler = self._revocation_handlers.get((grant_id, operation_id))
+                    if handler is None:
+                        raise AuthorityRevocationPending(
+                            "durable admission fence retained; exact OCI retirement handler unavailable"
+                        )
+                    handlers.append((operation_id, handler))
+                    continue
+
+                stage_prefix = f"runtime-dispatch:{operation.fence}:"
+                if (
+                    self.find_artifact(operation_id, stage_prefix + "thread") is not None
+                    or self.find_artifact(operation_id, stage_prefix + "turn") is not None
+                    or self.find_artifact(operation_id, stage_prefix + "worker") is not None
+                    or self.find_artifact(operation_id, stage_prefix + "worker-enter") is not None
+                ) and self.find_artifact(operation_id, "runtime-receipt") is None:
+                    raise AuthorityRevocationPending(
+                        "durable admission fence retained; active non-OCI worker retirement is unsupported"
+                    )
+
+            try:
+                for _operation_id, handler in handlers:
+                    handler("freeze")
+            except Exception as error:
+                raise AuthorityRevocationPending(
+                    "durable admission fence retained; worker subtree freeze remains unresolved"
+                ) from error
+
+            with self._transaction():
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO authority_revocations VALUES (?, ?)", (grant_id, principal.actor_id)
+                )
+
+            try:
+                for _operation_id, handler in handlers:
+                    handler("retire")
+            except Exception as error:
+                raise AuthorityRevocationPending(
+                    "grant revocation committed; exact worker retirement remains unresolved"
+                ) from error
+            for operation_id, _handler in handlers:
+                self._revocation_handlers.pop((grant_id, operation_id), None)
+            return self._authority_grant(grant_id)
 
     def check(
         self, principal: Principal, grant_id: str, attempt: AttemptSpec, intent: OperationIntent, now: int
@@ -691,6 +777,20 @@ class SQLiteProgramStore:
         if self._resolve_authority_intent is None:
             raise AuthorityDenied("trusted original-request interpretation required")
         with self._gate, self._transaction():
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM authority_revocation_fences WHERE grant_id = ?", (grant_id,)
+                ).fetchone()
+                is not None
+            ):
+                if (
+                    self._connection.execute(
+                        "SELECT 1 FROM authority_revocations WHERE grant_id = ?", (grant_id,)
+                    ).fetchone()
+                    is not None
+                ):
+                    raise AuthorityDenied("grant revoked")
+                raise AuthorityRevocationPending("grant is fenced against new admission")
             grant = self._authority_grant(grant_id)
             self._authority_attempt(attempt)
             check_scope(grant, attempt, intent, now)
@@ -1083,6 +1183,12 @@ class SQLiteProgramStore:
             ):
                 raise CorruptHistory("grant differs from historical approved Program or Attempt")
             grants[row["grant_id"]] = data
+        for row in self._connection.execute("SELECT grant_id, actor_id FROM authority_revocation_fences"):
+            if row["grant_id"] not in grants or type(row["actor_id"]) is not str or not row["actor_id"]:
+                raise CorruptHistory("authority revocation fence has no valid grant or actor")
+        for row in self._connection.execute("SELECT grant_id, actor_id FROM authority_revocations"):
+            if row["grant_id"] not in grants or type(row["actor_id"]) is not str or not row["actor_id"]:
+                raise CorruptHistory("authority revocation has no valid grant or actor")
         consumed: set[str] = set()
         for row in self._connection.execute("SELECT * FROM authority_bindings"):
             if _authority_record_digest(row["intent_json"]) != row["intent_digest"]:
@@ -1499,14 +1605,14 @@ class SQLiteProgramStore:
             if (
                 manifest["format"] != "creatidy-kernel-sqlite-backup"
                 or type(manifest["schema_version"]) is not int
-                or manifest["schema_version"] not in (1, 2, 3)
+                or manifest["schema_version"] not in (1, 2, 3, 4)
             ):
                 raise ValueError("unsupported backup manifest")
             with (directory / "kernel.sqlite3").open("rb") as stream:
                 if hashlib.file_digest(stream, "sha256").hexdigest() != manifest["database_sha256"]:
                     raise ValueError("backup database digest mismatch")
             entries = (
-                cast(list[dict[str, object]], manifest["artifacts"]) if manifest["schema_version"] in (2, 3) else []
+                cast(list[dict[str, object]], manifest["artifacts"]) if manifest["schema_version"] in (2, 3, 4) else []
             )
             for entry in entries:
                 digest, size = entry["digest"], entry["size"]
@@ -1844,6 +1950,9 @@ class SQLiteProgramStore:
             if version == 2:
                 self._migrate_2_to_3()
                 version = 3
+            if version == 3:
+                self._migrate_3_to_4()
+                version = 4
             if version != SCHEMA_VERSION:
                 raise UnsupportedSQLiteConfiguration(f"no migration path from schema version {version}")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -2019,6 +2128,19 @@ class SQLiteProgramStore:
                     f"BEGIN SELECT RAISE(ABORT, '{table} is immutable'); END"
                 )
 
+    def _migrate_3_to_4(self) -> None:
+        self._connection.execute(
+            """CREATE TABLE authority_revocation_fences (
+                grant_id TEXT PRIMARY KEY REFERENCES authority_grants(grant_id), actor_id TEXT NOT NULL
+            ) WITHOUT ROWID"""
+        )
+        for action in ("UPDATE", "DELETE"):
+            self._connection.execute(
+                f"CREATE TRIGGER authority_revocation_fences_no_{action.lower()} "
+                f"BEFORE {action} ON authority_revocation_fences "
+                "BEGIN SELECT RAISE(ABORT, 'authority_revocation_fences is immutable'); END"
+            )
+
     def _validate_schema(self) -> None:
         tables = {
             cast(str, row[0])
@@ -2040,6 +2162,7 @@ class SQLiteProgramStore:
             "authority_grants",
             "authority_revocations",
             "authority_bindings",
+            "authority_revocation_fences",
         }
         if not required <= tables:
             raise UnsupportedSQLiteConfiguration("database schema is missing required K2 tables")
@@ -2080,6 +2203,7 @@ class SQLiteProgramStore:
                 "intent_json",
                 "intent_digest",
             },
+            "authority_revocation_fences": {"grant_id", "actor_id"},
         }
         for table, expected in columns.items():
             actual = {cast(str, row["name"]) for row in self._connection.execute(f"PRAGMA table_info({table})")}
@@ -2102,6 +2226,7 @@ class SQLiteProgramStore:
                 "authority_grants",
                 "authority_revocations",
                 "authority_bindings",
+                "authority_revocation_fences",
             )
             for action in ("update", "delete")
         }

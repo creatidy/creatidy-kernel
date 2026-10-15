@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Application-facing contract for durable K1 Program state."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from creatidy_kernel.core.domain import DomainCommandType, Program, ProgramSpec
+
+RevocationPhase = Literal["freeze", "retire"]
+RevocationHandler = Callable[[RevocationPhase], None]
 
 
 class ProgramReadChanged(ValueError):
@@ -67,3 +71,5 @@ class ApplicationStore(ProgramStore, Protocol):
     def finalize_artifact(self, operation_id: str, name: str, data: bytes) -> str: ...
     def artifact(self, operation_id: str, name: str) -> bytes: ...
     def find_artifact(self, operation_id: str, name: str) -> bytes | None: ...
+    def register_revocation_handler(self, grant_id: str, operation_id: str, handler: RevocationHandler) -> None: ...
+    def unregister_revocation_handler(self, grant_id: str, operation_id: str) -> None: ...

@@ -22,7 +22,7 @@ from test_codex_runtime import NativeConnection
 from test_codex_stdio import FAKE
 from test_runtime_authority import Prepared
 
-from creatidy_kernel.adapters import oci_bootstrap
+from creatidy_kernel.adapters import oci_bootstrap, oci_lifecycle
 from creatidy_kernel.adapters.bubblewrap_verification import resource_digest
 from creatidy_kernel.adapters.codex_runtime import CodexInputs, CodexRuntime
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
@@ -32,7 +32,7 @@ from creatidy_kernel.adapters.oci_lifetime import SO_PASSPIDFD, LifetimeChannel
 from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile
-from creatidy_kernel.core.authority import Principal
+from creatidy_kernel.core.authority import AuthorityDenied, AuthorityRevocationPending, Principal
 from creatidy_kernel.core.execution import Activity, ExecutionConflict, ExecutionRequest, Presence, UnsupportedExecution
 
 pytest_plugins = ["test_runtime_authority"]
@@ -162,6 +162,216 @@ def launch(prepared: Prepared, monkeypatch: pytest.MonkeyPatch) -> Launch:
     return Launch(prepared, owner, resources, codex, [1], calls, spawns)
 
 
+def test_cgroup_barrier_requires_ack_from_every_populated_descendant(tmp_path: Path) -> None:
+    root = tmp_path / "worker"
+    child = root / "subprocess"
+    child.mkdir(parents=True)
+    (root / "cgroup.events").write_text("populated 1\nfrozen 1\n")
+    (child / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+    (root / "cgroup.procs").write_text("")
+    (child / "cgroup.procs").write_text("123\n")
+
+    with pytest.raises(ExecutionConflict, match="kernel cgroup state"):
+        oci_lifecycle._wait_cgroup_subtree(root, frozen=1, timeout=0)  # pyright: ignore[reportPrivateUsage]
+
+    (child / "cgroup.events").write_text("populated 1\nfrozen 1\n")
+    frozen = oci_lifecycle._wait_cgroup_subtree(root, frozen=1, timeout=0)  # pyright: ignore[reportPrivateUsage]
+    assert len(frozen) == 2
+    assert all(events["frozen"] == 1 for _, events in frozen if events["populated"] == 1)
+
+    (root / "cgroup.events").write_text("populated 0\nfrozen 1\n")
+    (child / "cgroup.events").write_text("populated 0\nfrozen 1\n")
+    empty = oci_lifecycle._wait_cgroup_subtree(root, populated=0, timeout=0)  # pyright: ignore[reportPrivateUsage]
+    assert all(events["populated"] == 0 for _, events in empty)
+
+
+def test_explicit_revoke_orders_fence_freeze_commit_kill_and_cold_receipt(
+    launch: Launch, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = launch.owner
+    owner.bind_before_send(now=1)
+
+    cgroup_mount = tmp_path / "cgroup2"
+    root = cgroup_mount / "owned"
+    child = root / "worker-child"
+    child.mkdir(parents=True)
+    cgroup_mount.mkdir(exist_ok=True)
+    (root / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+    (root / "cgroup.procs").write_text("")
+    (root / "cgroup.freeze").write_text("0\n")
+    (root / "cgroup.kill").write_text("0\n")
+    (child / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+    (child / "cgroup.procs").write_text("12345\n")
+
+    paused = [False]
+    present = [True]
+    state = {
+        "Pid": 12345,
+        "CgroupPath": "/owned",
+        "Running": True,
+        "Paused": False,
+        "Status": "running",
+    }
+
+    def invoke(argv: tuple[str, ...], environment: Mapping[str, str]) -> CompletedProcess[bytes]:
+        del environment
+        if argv[1:3] == ("image", "inspect"):
+            return CompletedProcess(argv, 0, ("sha256:" + owner.image + "\n").encode(), b"")
+        if argv[1:3] == ("container", "inspect"):
+            if not present[0]:
+                return CompletedProcess(argv, 1, b"", b"not found")
+            state["Paused"] = paused[0]
+            state["Status"] = "paused" if paused[0] else "running"
+            return CompletedProcess(
+                argv,
+                0,
+                json.dumps(
+                    [
+                        {
+                            "Id": "a" * 64,
+                            "Image": owner.image,
+                            "Name": owner.name,
+                            "Config": {"Labels": {LABEL: owner.token}},
+                            "State": state,
+                        }
+                    ]
+                ).encode(),
+                b"",
+            )
+        if argv[1:3] == ("container", "exists"):
+            return CompletedProcess(argv, 0 if present[0] else 1, b"", b"")
+        if argv[1] == "pause":
+            assert (
+                launch.prepared.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                    "SELECT 1 FROM authority_revocation_fences WHERE grant_id = ?",
+                    (launch.prepared.grant.grant_id,),
+                ).fetchone()
+                is not None
+            )
+            assert (
+                launch.prepared.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                    "SELECT 1 FROM authority_revocations WHERE grant_id = ?",
+                    (launch.prepared.grant.grant_id,),
+                ).fetchone()
+                is None
+            )
+            paused[0] = True
+            state["Paused"] = True
+            state["Status"] = "paused"
+            for path in (root, child):
+                (path / "cgroup.events").write_text("populated 1\nfrozen 1\n")
+            return CompletedProcess(argv, 0, b"paused", b"")
+        if argv[1] == "rm":
+            assert argv[2] == "--force" and argv[3] == "a" * 64
+            assert launch.prepared.store.find_artifact(owner.operation_id, "oci-cgroup-empty") is not None
+            assert (
+                launch.prepared.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                    "SELECT 1 FROM authority_revocations WHERE grant_id = ?",
+                    (launch.prepared.grant.grant_id,),
+                ).fetchone()
+                is not None
+            )
+            present[0] = False
+            return CompletedProcess(argv, 0, b"removed", b"")
+        raise AssertionError(f"unexpected synthetic Podman command: {argv[1:]}")
+
+    object.__setattr__(owner, "invoke", invoke)
+    assert owner.capture() == "a" * 64
+    monkeypatch.setattr(oci_lifecycle, "_cgroup2_mount", lambda: (7, "/", str(cgroup_mount)))
+
+    def cgroup_directory(_cgroup_path: str) -> tuple[Path, int, str, str, os.stat_result]:
+        return root, 7, "/", str(cgroup_mount), root.stat()
+
+    monkeypatch.setattr(
+        oci_lifecycle,
+        "_cgroup_directory",
+        cgroup_directory,
+    )
+
+    def verify_live(_owner: OwnedOCI, _identity: dict[str, object]) -> dict[str, object]:
+        return cast(dict[str, object], state)
+
+    monkeypatch.setattr(
+        OwnedOCI,
+        "_verify_live_cgroup_identity",
+        verify_live,
+    )
+    original_wait = oci_lifecycle._wait_cgroup_subtree  # pyright: ignore[reportPrivateUsage]
+
+    def wait_for_kernel_event(
+        path: Path, *, frozen: int | None = None, populated: int | None = None, timeout: float = 5.0
+    ) -> tuple[tuple[Path, dict[str, int]], ...]:
+        if populated == 0:
+            assert (path / "cgroup.kill").read_text().strip() == "1"
+            for child_path in (path, child):
+                (child_path / "cgroup.events").write_text("populated 0\nfrozen 1\n")
+        return original_wait(path, frozen=frozen, populated=populated, timeout=timeout)
+
+    monkeypatch.setattr(oci_lifecycle, "_wait_cgroup_subtree", wait_for_kernel_event)
+
+    binding_reference = hashlib.sha256(b"synthetic binding").hexdigest()
+    init_record = json.dumps(
+        {
+            "version": 1,
+            "owner": owner.token,
+            "container": "a" * 64,
+            "identity": {"pid": 12345, "start_ticks": 123, "namespace": [7, 8]},
+            "binding_reference": binding_reference,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    launch.prepared.store.finalize_artifact(owner.operation_id, "oci-init", init_record)
+    root_stat = root.stat()
+    cgroup_identity = {
+        "version": 1,
+        "owner": owner.token,
+        "container": "a" * 64,
+        "binding_reference": binding_reference,
+        "init_reference": hashlib.sha256(init_record).hexdigest(),
+        "pid": 12345,
+        "cgroup_path": "/owned",
+        "host_path": str(root),
+        "mount_id": 7,
+        "mount_root": "/",
+        "mount_point": str(cgroup_mount),
+        "st_dev": root_stat.st_dev,
+        "st_ino": root_stat.st_ino,
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+    }
+    launch.prepared.store.finalize_artifact(
+        owner.operation_id,
+        "oci-cgroup-identity",
+        json.dumps(cgroup_identity, sort_keys=True, separators=(",", ":")).encode(),
+    )
+
+    result = launch.prepared.store.revoke(
+        Principal(launch.prepared.grant.issuer, "owner"), launch.prepared.grant.grant_id
+    )
+    assert result.revoked and paused[0] and not present[0]
+    assert (root / "cgroup.kill").read_text().strip() == "1"
+    assert all(
+        events["populated"] == 0
+        for _, events in oci_lifecycle._cgroup_subtree(root)  # pyright: ignore[reportPrivateUsage]
+    )
+    assert launch.prepared.store.find_artifact(owner.operation_id, "oci-cgroup-frozen") is not None
+    assert launch.prepared.store.find_artifact(owner.operation_id, "oci-cgroup-empty") is not None
+    assert launch.prepared.store.find_artifact(owner.operation_id, "oci-cgroup-settled") is not None
+    assert launch.prepared.store.find_artifact(owner.operation_id, "oci-candidate") is None
+    assert launch.prepared.root.exists()
+    with pytest.raises(AuthorityDenied, match="revoked"):
+        launch.prepared.store.check(
+            Principal(launch.prepared.request.attempt.attempt_id, "worker"),
+            launch.prepared.grant.grant_id,
+            launch.prepared.request.attempt,
+            launch.prepared.intent,
+            2,
+        )
+    assert launch.prepared.store.revoke(
+        Principal(launch.prepared.grant.issuer, "owner"), launch.prepared.grant.grant_id
+    ).revoked
+
+
 def test_exact_resources_are_consumed_before_one_durable_worker_send(launch: Launch) -> None:
     connection = launch.connect()
     try:
@@ -193,7 +403,7 @@ def test_probe_paths_reject_traversal_and_symlink_escapes_before_probe(
     if escape == "traversal":
         path = private_parent / ".." / f"outside-{key}"
     else:
-        outside = tmp_path / f"outside-{key}"
+        outside = tmp_path.parent / f"{tmp_path.name}-outside-{key}"
         outside.mkdir()
         assert not outside.is_relative_to(private_parent)
         link = private_parent / f"probe-link-{key}"
@@ -319,6 +529,15 @@ def test_change_during_version_probe_prevents_worker_send(
     assert changed == [change]
     assert launch.prepared.store.find_artifact(launch.owner.operation_id, "runtime-dispatch:1:worker") is None
     assert launch.prepared.store.find_artifact(launch.owner.operation_id, "oci-owner") is not None
+    if change == "revoked":
+        assert launch.prepared.store.find_artifact(launch.owner.operation_id, "oci-revocation-no-worker") is not None
+        assert (
+            launch.prepared.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                "SELECT 1 FROM authority_revocations WHERE grant_id = ?",
+                (launch.prepared.grant.grant_id,),
+            ).fetchone()
+            is not None
+        )
 
 
 def test_reopened_controller_cannot_adopt_worker_launch_lease(launch: Launch) -> None:
@@ -702,6 +921,24 @@ def test_real_composition_consumes_entry_gate_before_release(
     launch.owner = OwnedOCI(
         owner.store, owner.request, owner.podman, profile, owner.name, owner.image, owner.environment, invoke
     )
+    if not revoked:
+
+        def capture_cgroup_identity(
+            _owner: OwnedOCI,
+            _container_id: str,
+            _state: dict[str, object],
+            _init_identity: dict[str, object],
+            _init_record: bytes,
+            _binding: bytes,
+            _channel: object,
+        ) -> bytes:
+            return b"synthetic cgroup identity"
+
+        monkeypatch.setattr(
+            oci_lifecycle.OwnedOCI,
+            "_capture_cgroup_identity",
+            capture_cgroup_identity,
+        )
     connection: CodexStdio | None = None
     try:
 
@@ -721,14 +958,29 @@ def test_real_composition_consumes_entry_gate_before_release(
             )
 
         if revoked:
-            with pytest.raises(ValueError, match="startup gate"):
+            with pytest.raises(AuthorityRevocationPending, match="freeze remains unresolved"):
                 connect()
             assert released == []
+            assert (
+                launch.prepared.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                    "SELECT 1 FROM authority_revocation_fences WHERE grant_id = ?",
+                    (launch.prepared.grant.grant_id,),
+                ).fetchone()
+                is not None
+            )
+            assert (
+                launch.prepared.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                    "SELECT 1 FROM authority_revocations WHERE grant_id = ?",
+                    (launch.prepared.grant.grant_id,),
+                ).fetchone()
+                is None
+            )
+            assert launch.prepared.store.find_artifact(launch.owner.operation_id, "oci-init") is None
         else:
             connection = connect()
             assert released == [True]
             assert any(part.startswith("--preserve-fd=") for part in launch.spawns[1])
-        assert launch.prepared.store.find_artifact(launch.owner.operation_id, "oci-init") is not None
+            assert launch.prepared.store.find_artifact(launch.owner.operation_id, "oci-init") is not None
     finally:
         if connection is not None:
             connection.close()
@@ -828,6 +1080,18 @@ def runtime_launch(launch: Launch, monkeypatch: pytest.MonkeyPatch) -> Iterator[
                 "version": 1,
             }
         ).encode(),
+    )
+
+    def fake_revocation_handler(phase: str) -> None:
+        if phase == "freeze":
+            assert launch.owner.store.find_artifact(launch.owner.operation_id, "oci-init") is not None
+            return
+        assert phase == "retire"
+        exited[0] = True
+        absent[0] = True
+
+    launch.owner.store.register_revocation_handler(
+        launch.prepared.grant.grant_id, launch.owner.operation_id, fake_revocation_handler
     )
     original_invoke = launch.owner.invoke
 
@@ -1014,8 +1278,13 @@ def test_owned_runtime_current_authority_refusal_retires_without_read_or_candida
     else:
         cell.launch.resources.pins[2][0].write_bytes(b"changed")
     count = len(cell.calls)
+    if mutation == "revoked":
+        assert cell.exited[0] and cell.absent[0]
     observation = cell.runtime.observe(handle, now=2)
-    assert observation.activity is Activity.UNKNOWN and observation.cancellation_requested
+    if mutation == "revoked":
+        assert observation.activity is Activity.TERMINAL and observation.cancellation_requested
+    else:
+        assert observation.activity is Activity.UNKNOWN and observation.cancellation_requested
     assert len(cell.calls) == count
     assert cell.runtime.candidate(handle) is None
     assert cell.launch.prepared.root.exists()

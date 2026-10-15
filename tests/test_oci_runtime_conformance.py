@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -32,7 +32,7 @@ from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.worker_collection import read_bounded_regular
 from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile
-from creatidy_kernel.core.authority import AuthorityGrant, OperationIntent, Principal
+from creatidy_kernel.core.authority import AuthorityGrant, AuthorityRevocationPending, OperationIntent, Principal
 from creatidy_kernel.core.domain import (
     ActivateProgram,
     AttemptSpec,
@@ -54,7 +54,7 @@ from creatidy_kernel.core.execution import (
 )
 from creatidy_kernel.core.resources import Allocation
 from creatidy_kernel.ports.allocation import encode_allocation
-from creatidy_kernel.ports.program_store import OperationRecord
+from creatidy_kernel.ports.program_store import OperationRecord, RevocationPhase
 from tools.codex_oci_proof.boundary import write_seccomp_profile
 from tools.codex_oci_proof.codexbin import CodexBinary, ProtocolInventory
 from tools.codex_oci_proof.driver import exec_step, final_step, write_scenario
@@ -75,6 +75,7 @@ class NativeRuntime:
     connection: CodexStdio
     scenario: str
     codex: CodexBinary
+    resolve_authority_intent: Callable[[OperationRecord], OperationIntent]
     store_closed: bool = False
 
 
@@ -510,7 +511,16 @@ def native_runtime(
                     settled=runtime.settled,
                 )
             cell = NativeRuntime(
-                root, store, execution, owner, resources, runtime, connection, str(request.param), codex_binary
+                root,
+                store,
+                execution,
+                owner,
+                resources,
+                runtime,
+                connection,
+                str(request.param),
+                codex_binary,
+                decode,
             )
             yield cell
         finally:
@@ -708,7 +718,7 @@ def test_real_final_thread_admission_revocation_retires_without_prompt(native_ru
 
 @pytest.mark.parametrize("native_runtime", ["cancel", "revoke", "close"], indirect=True)
 def test_real_factory_cancel_revocation_and_transport_loss_retire_detached_namespace(
-    native_runtime: NativeRuntime,
+    native_runtime: NativeRuntime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cell = native_runtime
     handle = cell.runtime.start(cell.request)
@@ -741,20 +751,111 @@ def test_real_factory_cancel_revocation_and_transport_loss_retire_detached_names
     assert command_descendant["namespace"] != os.readlink("/proc/self/ns/pid")
     assert (cell.resources.workspace / "candidate/in-flight.txt").read_bytes() == b"native authorized work"
     if cell.scenario == "revoke":
-        cell.store.revoke(Principal("owner", "owner"), cell.request.capability_reference)
-        observation = cell.runtime.observe(handle, now=int(time.time()))
+        marker = cell.resources.workspace / "candidate/post-revocation-exec.txt"
+        in_flight_before = (cell.resources.workspace / "candidate/in-flight.txt").read_bytes()
+        request_methods: list[str] = []
+        original_request = cell.connection.request
+
+        def record_request(method: str, params: dict[str, object]) -> dict[str, object]:
+            request_methods.append(method)
+            return original_request(method, params)
+
+        monkeypatch.setattr(cell.connection, "request", record_request)
+        owner = cell.owner
+        original_handler = owner._handle_revocation  # pyright: ignore[reportPrivateUsage] - exact native lifecycle gate.
+
+        def check_paused_exec(phase: RevocationPhase) -> None:
+            if phase == "retire":
+                assert (
+                    cell.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                        "SELECT 1 FROM authority_revocations WHERE grant_id = ?",
+                        (cell.request.capability_reference,),
+                    ).fetchone()
+                    is not None
+                )
+                identity = json.loads(cell.store.artifact(owner.operation_id, "oci-cgroup-identity"))
+                root = Path(str(identity["host_path"]))
+
+                def snapshot() -> tuple[tuple[str, tuple[str, ...], int, int], ...]:
+                    nodes: list[Path] = []
+                    pending = [root]
+                    while pending:
+                        current = pending.pop()
+                        nodes.append(current)
+                        for child in current.iterdir():
+                            if child.is_dir() and (child / "cgroup.events").exists():
+                                pending.append(child)
+                    result: list[tuple[str, tuple[str, ...], int, int]] = []
+                    for node in sorted(nodes):
+                        events = {
+                            key: int(value)
+                            for key, value in (
+                                line.split() for line in (node / "cgroup.events").read_text().splitlines()
+                            )
+                        }
+                        pids = tuple(sorted((node / "cgroup.procs").read_text().split()))
+                        relative = "." if node == root else str(node.relative_to(root))
+                        result.append((relative, pids, events["populated"], events["frozen"]))
+                    return tuple(result)
+
+                before = snapshot()
+                assert any(populated == 1 for _, _, populated, _ in before)
+                assert all(frozen == 1 for _, _, populated, frozen in before if populated == 1)
+                result = owner.invoke(
+                    (
+                        str(owner.podman),
+                        "exec",
+                        str(identity["container"]),
+                        "/toolchain/bin/python3.12",
+                        "-c",
+                        "from pathlib import Path; "
+                        "Path('/workspace/candidate/post-revocation-exec.txt').write_text('unauthorized')",
+                    ),
+                    dict(owner.environment),
+                )
+                assert result.returncode != 0
+                assert not marker.exists()
+                assert snapshot() == before
+            original_handler(phase)
+
+        cell.store.register_revocation_handler(cell.request.capability_reference, owner.operation_id, check_paused_exec)
+        methods_before_revoke = tuple(request_methods)
+        bystander = subprocess.Popen(
+            ["/bin/sleep", "45"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={"PATH": "/bin:/usr/bin"},
+            start_new_session=True,
+        )
+        try:
+            cell.store.revoke(Principal("owner", "owner"), cell.request.capability_reference)
+            assert tuple(request_methods) == methods_before_revoke
+            assert owner.settled()
+            assert cell.store.find_artifact(owner.operation_id, "oci-cgroup-empty") is not None
+            assert cell.store.find_artifact(owner.operation_id, "oci-candidate") is None
+            assert (cell.resources.workspace / "candidate/in-flight.txt").read_bytes() == in_flight_before
+            assert not marker.exists()
+            assert cell.owner.state() is not Presence.FOUND
+            assert bystander.poll() is None
+        finally:
+            if bystander.poll() is None:
+                bystander.terminate()
+                bystander.wait(timeout=5)
+        observation = None
     elif cell.scenario == "close":
         cell.connection.close()
         observation = cell.runtime.observe(handle, now=int(time.time()))
     else:
         observation = cell.runtime.cancel(handle)
-    deadline = time.monotonic() + 10
-    while observation.activity is not Activity.TERMINAL and time.monotonic() < deadline:
-        observation = cell.runtime.observe(handle, now=int(time.time()))
-        time.sleep(0.05)
-    assert observation.activity is Activity.TERMINAL and observation.cancellation_requested
-    assert cell.owner.settled()
-    assert cell.runtime.candidate(handle) is None
+    if observation is not None:
+        deadline = time.monotonic() + 10
+        while observation.activity is not Activity.TERMINAL and time.monotonic() < deadline:
+            observation = cell.runtime.observe(handle, now=int(time.time()))
+            time.sleep(0.05)
+        assert observation.activity is Activity.TERMINAL and observation.cancellation_requested
+        assert cell.owner.settled()
+        assert cell.runtime.candidate(handle) is None
     assert cell.store.find_artifact(cell.owner.operation_id, "oci-candidate") is None
     assert cell.resources.workspace.exists()
     (cell.root / "retirement-receipt.json").write_text(
@@ -768,11 +869,92 @@ def test_real_factory_cancel_revocation_and_transport_loss_retire_detached_names
                 "candidate": None,
                 "workspace_retained": True,
                 "continuous_effect_mediation": False,
+                "explicit_revoke_barrier": cell.scenario == "revoke",
             },
             sort_keys=True,
             indent=2,
         )
     )
+
+
+@pytest.mark.parametrize("native_runtime", ["revoke"], indirect=True)
+def test_cold_revoke_retires_frozen_worker_without_original_pidfd(native_runtime: NativeRuntime) -> None:
+    cell = native_runtime
+    owner = cell.owner
+    cell.runtime.start(cell.request)
+    in_flight = cell.resources.workspace / "candidate/in-flight.txt"
+    deadline = time.monotonic() + 15
+    while not in_flight.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert in_flight.read_bytes() == b"native authorized work"
+
+    original_handler = owner._handle_revocation  # pyright: ignore[reportPrivateUsage] - inject controller-loss window.
+
+    def lose_controller_after_commit(phase: RevocationPhase) -> None:
+        if phase == "retire":
+            assert (
+                cell.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                    "SELECT 1 FROM authority_revocations WHERE grant_id = ?",
+                    (cell.request.capability_reference,),
+                ).fetchone()
+                is not None
+            )
+            raise OSError("synthetic controller loss after durable revoke")
+        original_handler(phase)
+
+    cell.store.register_revocation_handler(
+        cell.request.capability_reference, owner.operation_id, lose_controller_after_commit
+    )
+    with pytest.raises(AuthorityRevocationPending, match="retirement remains unresolved"):
+        cell.store.revoke(Principal("owner", "owner"), cell.request.capability_reference)
+
+    identity = json.loads(cell.store.artifact(owner.operation_id, "oci-cgroup-identity"))
+    cgroup_root = Path(str(identity["host_path"]))
+    events = {
+        key: int(value)
+        for key, value in (line.split() for line in (cgroup_root / "cgroup.events").read_text().splitlines())
+    }
+    assert events["populated"] == 1 and events["frozen"] == 1
+    assert cell.owner.state() is Presence.FOUND
+
+    lifetime = owner._lifetime  # pyright: ignore[reportPrivateUsage] - simulate loss of controller PIDFD.
+    assert lifetime is not None
+    lifetime.close_liveness()
+    lifetime.close()
+    object.__setattr__(owner, "_lifetime", None)
+    cell.connection.close()
+    recovered_events = {
+        key: int(value)
+        for key, value in (
+            line.split() for line in (Path(str(identity["host_path"])) / "cgroup.events").read_text().splitlines()
+        )
+    }
+    assert recovered_events["populated"] == 1 and recovered_events["frozen"] == 1
+    cell.store.close()
+    cell.store_closed = True
+
+    with SQLiteProgramStore(
+        cell.root / "kernel.db", resolve_authority_intent=cell.resolve_authority_intent
+    ) as cold_store:
+        cold_owner = OwnedOCI(
+            cold_store,
+            cell.request,
+            owner.podman,
+            owner.profile,
+            owner.name,
+            owner.image,
+            owner.environment,
+            owner.invoke,
+        )
+        assert cold_owner._lifetime is None and cold_owner._connection is None  # pyright: ignore[reportPrivateUsage]
+        assert cold_owner.state() is Presence.FOUND
+        assert cold_store.revoke(Principal("owner", "owner"), cell.request.capability_reference).revoked
+        assert cold_store.find_artifact(owner.operation_id, "oci-cgroup-empty") is not None
+        assert cold_owner.state() is Presence.ABSENT
+        assert cold_owner.settled()
+        assert cold_store.find_artifact(owner.operation_id, "oci-candidate") is None
+        assert in_flight.read_bytes() == b"native authorized work"
+        assert cell.resources.workspace.exists()
 
 
 @pytest.mark.parametrize("native_runtime", ["lost-thread", "lost-turn"], indirect=True)
@@ -836,6 +1018,77 @@ def test_cold_native_ownership_never_recreates_kernel_handles_or_launches(native
     assert cold.settled(), "only an already received exact retirement receipt can survive lost live handles"
     assert cell.store.operation(warm.operation_id).attempts == 1
     assert cell.resources.workspace.exists()
+
+
+@pytest.mark.parametrize("native_runtime", ["revoke"], indirect=True)
+def test_cold_revoke_recovers_after_store_and_pidfd_loss(native_runtime: NativeRuntime) -> None:
+    cell = native_runtime
+    warm = cell.owner
+    cell.runtime.start(cell.request)
+    in_flight = cell.resources.workspace / "candidate/in-flight.txt"
+    deadline = time.monotonic() + 15
+    while not in_flight.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert in_flight.read_bytes() == b"native authorized work"
+
+    original_handler = warm._handle_revocation  # pyright: ignore[reportPrivateUsage] - exact cold-recovery gate.
+
+    def lose_controller_after_commit(phase: RevocationPhase) -> None:
+        if phase == "retire":
+            assert (
+                cell.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                    "SELECT 1 FROM authority_revocations WHERE grant_id = ?",
+                    (cell.request.capability_reference,),
+                ).fetchone()
+                is not None
+            )
+            raise OSError("synthetic controller loss after durable revocation")
+        original_handler(phase)
+
+    cell.store.register_revocation_handler(
+        cell.request.capability_reference, warm.operation_id, lose_controller_after_commit
+    )
+    with pytest.raises(AuthorityRevocationPending, match="retirement remains unresolved"):
+        cell.store.revoke(Principal("owner", "owner"), cell.request.capability_reference)
+    cgroup_identity = json.loads(cell.store.artifact(warm.operation_id, "oci-cgroup-identity"))
+    cgroup_events = {
+        key: int(value)
+        for key, value in (
+            line.split()
+            for line in (Path(str(cgroup_identity["host_path"])) / "cgroup.events").read_text().splitlines()
+        )
+    }
+    assert cgroup_events["populated"] == 1 and cgroup_events["frozen"] == 1
+
+    lifetime = warm._lifetime  # pyright: ignore[reportPrivateUsage] - simulate lost controller PIDFD.
+    assert lifetime is not None
+    lifetime.close_liveness()
+    lifetime.close()
+    object.__setattr__(warm, "_lifetime", None)
+    cell.store.close()
+    cell.store_closed = True
+
+    database = cell.root / "kernel.db"
+    with SQLiteProgramStore(database, resolve_authority_intent=cell.resolve_authority_intent) as cold_store:
+        cold = OwnedOCI(
+            cold_store,
+            cell.request,
+            warm.podman,
+            warm.profile,
+            warm.name,
+            warm.image,
+            warm.environment,
+            warm.invoke,
+        )
+        assert cold._lifetime is None and cold._connection is None  # pyright: ignore[reportPrivateUsage]
+        assert cold.state() is Presence.FOUND
+        assert cold_store.revoke(Principal("owner", "owner"), cell.request.capability_reference).revoked
+        assert cold_store.find_artifact(warm.operation_id, "oci-cgroup-empty") is not None
+        assert cold.state() is Presence.ABSENT
+        assert cold.settled()
+        assert cold_store.find_artifact(warm.operation_id, "oci-candidate") is None
+        assert in_flight.read_bytes() == b"native authorized work"
+        assert cell.resources.workspace.exists()
 
 
 @pytest.mark.parametrize("native_runtime", ["object-drift", "candidate-drift"], indirect=True)

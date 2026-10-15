@@ -6,7 +6,13 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from creatidy_kernel.adapters.worker_profile import WorkerMount, WorkerProfile, attached_run_argv, rootless_run_prefix
+from creatidy_kernel.adapters.worker_profile import (
+    WorkerMount,
+    WorkerProfile,
+    attached_run_argv,
+    owned_run_prefix,
+    rootless_run_prefix,
+)
 from tools.codex_oci_proof import boundary
 from tools.oci_worker_poc import profile as proof_profile
 from tools.oci_worker_poc.evidence import ToolRecord
@@ -72,18 +78,22 @@ def test_exact_fixed_prefix_and_shared_proof_builders(monkeypatch: pytest.Monkey
         "HOME=/home/worker",
     ]
     assert rootless_run_prefix(toolchain().root / "bin/podman", profile(), "owned-one") == expected
+    owned = expected.copy()
+    owned.remove("--rm")
+    owned[2:2] = ["--cgroup-manager=cgroupfs", "--cgroupns=private"]
+    assert owned_run_prefix(toolchain().root / "bin/podman", profile(), "owned-one") == owned
     suffix = ["localhost/proof:v1", "/bin/busybox", "sh", "-c", "exec /toolchain/bin/python3.12 -S /worker/main.py"]
     assert proof_profile.build_run_argv(toolchain(), profile(), suffix[0], "owned-one") == expected + suffix
     assert (
         boundary.build_run_argv(toolchain(), profile(), suffix[0], "owned-one")
-        == expected[:2] + ["-i"] + expected[2:] + suffix
+        == owned[:2] + ["-i"] + owned[2:] + suffix
     )
     assert proof_profile.WorkerProfile is WorkerProfile and boundary.WorkerProfile is WorkerProfile
     assert proof_profile.WorkerMount is WorkerMount and boundary.WorkerMount is WorkerMount
     assert boundary.attached_run_argv is attached_run_argv
     assert attached_run_argv(
         toolchain().root / "bin/podman", profile(), "owned-one", suffix[0], tuple(suffix[1:])
-    ) == tuple(expected[:2] + ["-i"] + expected[2:] + suffix)
+    ) == tuple(owned[:2] + ["-i"] + owned[2:] + suffix)
     assert "fixture-must-not-be-inherited" not in " ".join(expected)
 
 

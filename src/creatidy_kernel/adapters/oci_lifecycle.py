@@ -3,8 +3,7 @@
 
 Podman 6.1.3 exposes Id/Image/Name/Config.Labels in its container-inspect array.
 Container-exists returns 0/1 for present/absent; other outcomes remain unknown.
-Its CgroupPath is a hierarchy path, not an absolute filesystem resource: this
-adapter deliberately does not infer descendant settlement or cgroup enforcement.
+Its CgroupPath is cross-checked against the authenticated init's host cgroup membership.
 Trusted composition supplies verified resources and a bounded native CLI executor.
 """
 
@@ -13,6 +12,7 @@ import json
 import os
 import re
 import stat
+import time
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, replace
@@ -28,7 +28,7 @@ from creatidy_kernel.adapters.git_workspace import verify_generation
 from creatidy_kernel.adapters.oci_lifetime import LifetimeChannel
 from creatidy_kernel.adapters.source_cache import SourceAcquisitionError
 from creatidy_kernel.adapters.worker_collection import CollectedFile, collect_directory_fd
-from creatidy_kernel.adapters.worker_profile import WorkerProfile, attached_run_argv, rootless_run_prefix
+from creatidy_kernel.adapters.worker_profile import WorkerProfile, attached_run_argv, owned_run_prefix
 from creatidy_kernel.core.execution import (
     Artifact,
     ArtifactManifest,
@@ -40,7 +40,7 @@ from creatidy_kernel.core.execution import (
     validate_relative_path,
 )
 from creatidy_kernel.ports.allocation import encode_allocation
-from creatidy_kernel.ports.program_store import ApplicationStore
+from creatidy_kernel.ports.program_store import ApplicationStore, RevocationPhase
 
 Invoke = Callable[[tuple[str, ...], Mapping[str, str]], CompletedProcess[bytes]]
 LABEL = "com.creatidy.kernel.owner"
@@ -76,6 +76,117 @@ def _object(value: object) -> dict[str, object]:
 
 def _digest(value: object) -> bool:
     return type(value) is str and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def _mountinfo_unescape(value: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
+
+def _cgroup2_mount() -> tuple[int, str, str]:
+    matches: list[tuple[int, str, str]] = []
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="ascii").splitlines()
+        for line in lines:
+            before, separator, after = line.partition(" - ")
+            fields = before.split()
+            filesystem = after.split()
+            if separator and len(fields) >= 5 and filesystem and filesystem[0] == "cgroup2":
+                matches.append((int(fields[0]), _mountinfo_unescape(fields[3]), _mountinfo_unescape(fields[4])))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ExecutionConflict("host cgroup2 mount identity unavailable") from error
+    if len(matches) != 1:
+        raise ExecutionConflict("one host cgroup2 mount required")
+    mount_id, mount_root, mount_point = matches[0]
+    if not PurePosixPath(mount_root).is_absolute() or not Path(mount_point).is_absolute():
+        raise ExecutionConflict("invalid host cgroup2 mount identity")
+    return mount_id, mount_root, mount_point
+
+
+def _proc_cgroup_path(pid: int) -> str:
+    try:
+        lines = Path(f"/proc/{pid}/cgroup").read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise ExecutionConflict("authenticated init cgroup membership unavailable") from error
+    paths = [line.partition("::")[2] for line in lines if line.startswith("0::")]
+    if len(paths) != 1 or not paths[0].startswith("/") or ".." in PurePosixPath(paths[0]).parts:
+        raise ExecutionConflict("authenticated init is not in one cgroup2 subtree")
+    return paths[0]
+
+
+def _cgroup_directory(cgroup_path: str) -> tuple[Path, int, str, str, os.stat_result]:
+    mount_id, mount_root, mount_point = _cgroup2_mount()
+    try:
+        relative = PurePosixPath(cgroup_path).relative_to(PurePosixPath(mount_root))
+    except ValueError as error:
+        raise ExecutionConflict("worker cgroup is outside the mounted cgroup2 tree") from error
+    path = Path(mount_point).joinpath(*relative.parts)
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise ExecutionConflict("owned cgroup directory unavailable") from error
+    if not stat.S_ISDIR(info.st_mode) or path.is_symlink():
+        raise ExecutionConflict("owned cgroup path is not a real directory")
+    return path, mount_id, mount_root, mount_point, info
+
+
+def _cgroup_events(path: Path) -> dict[str, int]:
+    try:
+        with (path / "cgroup.events").open("rb") as stream:
+            content = stream.read(4097)
+    except OSError as error:
+        raise ExecutionConflict("owned cgroup events unavailable") from error
+    if len(content) > 4096:
+        raise ExecutionConflict("owned cgroup events exceeded bound")
+    try:
+        values = {key: int(value) for key, value in (line.split() for line in content.decode("ascii").splitlines())}
+    except (UnicodeError, ValueError) as error:
+        raise ExecutionConflict("invalid owned cgroup events") from error
+    if not {"populated", "frozen"} <= values.keys() or any(value not in {0, 1} for value in values.values()):
+        raise ExecutionConflict("invalid owned cgroup event values")
+    return values
+
+
+def _cgroup_subtree(root: Path) -> tuple[tuple[Path, dict[str, int]], ...]:
+    nodes: list[Path] = []
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        nodes.append(current)
+        if len(nodes) > 256:
+            raise ExecutionConflict("owned cgroup subtree exceeds bound")
+        try:
+            children = tuple(current.iterdir())
+        except OSError as error:
+            raise ExecutionConflict("owned cgroup subtree enumeration failed") from error
+        for child in children:
+            try:
+                info = child.lstat()
+            except OSError as error:
+                raise ExecutionConflict("owned cgroup child changed during enumeration") from error
+            if stat.S_ISLNK(info.st_mode):
+                raise ExecutionConflict("symlink in owned cgroup subtree")
+            if stat.S_ISDIR(info.st_mode) and (child / "cgroup.events").exists():
+                pending.append(child)
+    return tuple((path, _cgroup_events(path)) for path in nodes)
+
+
+def _wait_cgroup_subtree(
+    root: Path, *, frozen: int | None = None, populated: int | None = None, timeout: float = 5.0
+) -> tuple[tuple[Path, dict[str, int]], ...]:
+    deadline = time.monotonic() + timeout
+    while True:
+        snapshot = _cgroup_subtree(root)
+        if (
+            frozen is not None
+            and snapshot[0][1]["frozen"] == frozen
+            and all(events["frozen"] == frozen for _, events in snapshot if events["populated"] == 1)
+        ):
+            return snapshot
+        if populated is not None and all(events["populated"] == populated for _, events in snapshot):
+            return snapshot
+        if time.monotonic() >= deadline:
+            raise ExecutionConflict("kernel cgroup state did not reach the required barrier")
+        time.sleep(0.01)
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +371,7 @@ class OwnedOCI:
     token: str
     _lifetime: LifetimeChannel | None
     _connection: CodexStdio | None
+    _cgroup_identity: bytes | None
 
     def __init__(
         self,
@@ -286,7 +398,7 @@ class OwnedOCI:
         workspace = request.workspace.spec
         frame = _bytes(
             {
-                "version": 1,
+                "version": 2,
                 "operation": request.operation.operation_id,
                 "effect": request.operation.effect_key,
                 "request": request.operation.request_digest,
@@ -310,7 +422,7 @@ class OwnedOCI:
                 "grant": request.capability_reference,
                 "identity": asdict(request.identity),
                 "fence": request.fence,
-                "prefix": rootless_run_prefix(podman, profile, name),
+                "prefix": owned_run_prefix(podman, profile, name),
                 "image": image,
                 "environment": supplied,
                 "deadline_seconds": profile.deadline_seconds,
@@ -330,8 +442,18 @@ class OwnedOCI:
             ("token", hashlib.sha256(frame).hexdigest()),
             ("_lifetime", None),
             ("_connection", None),
+            ("_cgroup_identity", None),
         ):
             object.__setattr__(self, key, value)
+        owner = store.find_artifact(request.operation.operation_id, "oci-owner")
+        cgroup_identity = store.find_artifact(request.operation.operation_id, "oci-cgroup-identity")
+        if owner == frame:
+            if cgroup_identity is not None:
+                object.__setattr__(self, "_cgroup_identity", cgroup_identity)
+            if type(request.capability_reference) is str:
+                store.register_revocation_handler(
+                    request.capability_reference, request.operation.operation_id, self._handle_revocation
+                )
 
     def _call(self, *arguments: str) -> CompletedProcess[bytes]:
         result = self.invoke((str(self.podman), *arguments), dict(self.environment))
@@ -361,6 +483,11 @@ class OwnedOCI:
         ):
             raise ExecutionConflict("OCI generation unclaimed, expired or already uncertain")
         self.store.finalize_artifact(self.operation_id, "oci-owner", self.frame)
+        if type(self.request.capability_reference) is not str:
+            raise ExecutionConflict("OwnedOCI requires a durable authority grant")
+        self.store.register_revocation_handler(
+            self.request.capability_reference, self.operation_id, self._handle_revocation
+        )
         return "--label", f"{LABEL}={self.token}"
 
     def _receipt(self) -> str | None:
@@ -413,6 +540,366 @@ class OwnedOCI:
             raise ExecutionConflict("foreign OCI container; no mutation authorized")
         return item
 
+    def _capture_cgroup_identity(
+        self,
+        identifier: str,
+        state: dict[str, object],
+        init_identity: dict[str, object],
+        init_record: bytes,
+        binding: bytes,
+        channel: LifetimeChannel,
+    ) -> bytes:
+        pid = state.get("Pid")
+        cgroup_path = state.get("CgroupPath")
+        if (
+            type(pid) is not int
+            or pid <= 0
+            or init_identity.get("pid") != pid
+            or type(cgroup_path) is not str
+            or _proc_cgroup_path(pid) != cgroup_path
+            or channel.exited()
+        ):
+            raise ExecutionConflict("OCI init cgroup identity differs from the exact worker process")
+        path, mount_id, mount_root, mount_point, info = _cgroup_directory(cgroup_path)
+        if not path.is_relative_to(Path(mount_point)):
+            raise ExecutionConflict("owned worker cgroup escaped the cgroup2 mount")
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        return _bytes(
+            {
+                "version": 1,
+                "owner": self.token,
+                "container": identifier,
+                "binding_reference": hashlib.sha256(binding).hexdigest(),
+                "init_reference": hashlib.sha256(init_record).hexdigest(),
+                "pid": pid,
+                "cgroup_path": cgroup_path,
+                "host_path": str(path),
+                "mount_id": mount_id,
+                "mount_root": mount_root,
+                "mount_point": mount_point,
+                "st_dev": info.st_dev,
+                "st_ino": info.st_ino,
+                "boot_id": boot_id,
+            }
+        )
+
+    def _load_cgroup_identity(self, *, require_path: bool = True) -> tuple[bytes, dict[str, object], Path]:
+        identity_bytes = self.store.find_artifact(self.operation_id, "oci-cgroup-identity")
+        namespace_bytes = self.store.find_artifact(self.operation_id, "oci-init")
+        identifier = self._receipt()
+        if identity_bytes is None or namespace_bytes is None or identifier is None:
+            raise ExecutionConflict("durable OCI cgroup identity is unavailable")
+        try:
+            record = _object(json.loads(identity_bytes))
+            namespace = _object(json.loads(namespace_bytes))
+            identity = _object(namespace.get("identity"))
+        except (ValueError, TypeError) as error:
+            raise ExecutionConflict("invalid durable OCI cgroup identity") from error
+        expected = {
+            "version",
+            "owner",
+            "container",
+            "binding_reference",
+            "init_reference",
+            "pid",
+            "cgroup_path",
+            "host_path",
+            "mount_id",
+            "mount_root",
+            "mount_point",
+            "st_dev",
+            "st_ino",
+            "boot_id",
+        }
+        if (
+            set(record) != expected
+            or record.get("version") != 1
+            or record.get("owner") != self.token
+            or record.get("container") != identifier
+            or namespace.get("owner") != self.token
+            or namespace.get("container") != identifier
+            or record.get("init_reference") != hashlib.sha256(namespace_bytes).hexdigest()
+            or record.get("binding_reference") != namespace.get("binding_reference")
+            or record.get("pid") != identity.get("pid")
+            or type(record.get("mount_id")) is not int
+            or type(record.get("st_dev")) is not int
+            or type(record.get("st_ino")) is not int
+            or any(
+                type(record.get(key)) is not str
+                for key in ("cgroup_path", "host_path", "mount_root", "mount_point", "boot_id")
+            )
+        ):
+            raise ExecutionConflict("durable OCI cgroup identity differs from its launch")
+        current_boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        mount_id, mount_root, mount_point = _cgroup2_mount()
+        path = Path(cast(str, record["host_path"]))
+        if (
+            mount_id != record["mount_id"]
+            or mount_root != record["mount_root"]
+            or mount_point != record["mount_point"]
+            or current_boot_id != record["boot_id"]
+        ):
+            raise ExecutionConflict("owned worker cgroup incarnation changed")
+        if path.exists():
+            current_path, current_id, current_root, current_mount, info = _cgroup_directory(
+                cast(str, record["cgroup_path"])
+            )
+            if (
+                str(current_path) != record["host_path"]
+                or current_id != record["mount_id"]
+                or current_root != record["mount_root"]
+                or current_mount != record["mount_point"]
+                or info.st_dev != record["st_dev"]
+                or info.st_ino != record["st_ino"]
+            ):
+                raise ExecutionConflict("owned worker cgroup incarnation changed")
+            path = current_path
+        elif require_path:
+            raise ExecutionConflict("owned worker cgroup directory disappeared before settlement")
+        object.__setattr__(self, "_cgroup_identity", identity_bytes)
+        return identity_bytes, record, path
+
+    def _verify_live_cgroup_identity(self, record: dict[str, object]) -> dict[str, object]:
+        item = self._inspection()
+        state = _object(item.get("State"))
+        pid = state.get("Pid")
+        if (
+            type(pid) is not int
+            or pid != record.get("pid")
+            or state.get("CgroupPath") != record.get("cgroup_path")
+            or _proc_cgroup_path(pid) != record.get("cgroup_path")
+        ):
+            raise ExecutionConflict("live OCI process no longer matches its cgroup identity")
+        namespace_bytes = self.store.find_artifact(self.operation_id, "oci-init")
+        if namespace_bytes is None:
+            raise ExecutionConflict("original OCI init identity is unavailable")
+        namespace = _object(json.loads(namespace_bytes))
+        init_identity = _object(namespace.get("identity"))
+        try:
+            process_stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+            start_ticks = int(process_stat.rpartition(")")[2].split()[19])
+            pid_namespace = os.stat(f"/proc/{pid}/ns/pid")
+        except (OSError, ValueError, IndexError) as error:
+            raise ExecutionConflict("live OCI init kernel identity unavailable") from error
+        if start_ticks != init_identity.get("start_ticks") or [
+            pid_namespace.st_dev,
+            pid_namespace.st_ino,
+        ] != init_identity.get("namespace"):
+            raise ExecutionConflict("live OCI init differs from its recorded kernel identity")
+        return state
+
+    def _pause_for_revocation(self) -> None:
+        identity_bytes, _identity, path = self._load_cgroup_identity()
+        events = _cgroup_subtree(path)
+        if all(item["populated"] == 0 for _, item in events):
+            return
+        else:
+            state = self._verify_live_cgroup_identity(_object(json.loads(identity_bytes)))
+            state_is_paused = state.get("Paused") is True or state.get("Status") == "paused"
+            if not state_is_paused:
+                identifier = self._receipt()
+                if identifier is None:
+                    raise ExecutionConflict("owned OCI container identity is unavailable")
+                result = self._call("pause", identifier)
+                if result.returncode != 0 or result.stderr:
+                    raise ExecutionConflict("owned OCI pause was not acknowledged")
+            events = _wait_cgroup_subtree(path, frozen=1)
+            state = _object(self._inspection().get("State"))
+            if state.get("Paused") is not True and state.get("Status") != "paused":
+                raise ExecutionConflict("Podman did not retain the acknowledged paused state")
+        frozen_record = _bytes(
+            {
+                "version": 1,
+                "owner": self.token,
+                "container": self._receipt(),
+                "identity_reference": hashlib.sha256(identity_bytes).hexdigest(),
+                "frozen": 1,
+            }
+        )
+        self.store.finalize_artifact(self.operation_id, "oci-cgroup-frozen", frozen_record)
+
+    def _validate_cgroup_empty(self, identity_bytes: bytes, empty_bytes: bytes, container_id: str) -> dict[str, object]:
+        empty = _object(json.loads(empty_bytes))
+        if (
+            set(empty) != {"version", "owner", "container", "identity_reference", "populated", "frozen"}
+            or empty.get("version") != 1
+            or empty.get("owner") != self.token
+            or empty.get("container") != container_id
+            or empty.get("identity_reference") != hashlib.sha256(identity_bytes).hexdigest()
+            or empty.get("populated") != 0
+            or type(empty.get("frozen")) is not int
+            or empty.get("frozen") not in {0, 1}
+        ):
+            raise ExecutionConflict("durable cgroup-empty receipt differs")
+        return empty
+
+    def _finalize_cgroup_settled(self, identity_bytes: bytes, empty_bytes: bytes, container_id: str) -> None:
+        if self.state() is not Presence.ABSENT:
+            raise ExecutionConflict("container absence required after cgroup-empty receipt")
+        settled = _bytes(
+            {
+                "version": 1,
+                "owner": self.token,
+                "container": container_id,
+                "identity_reference": hashlib.sha256(identity_bytes).hexdigest(),
+                "empty_reference": hashlib.sha256(empty_bytes).hexdigest(),
+            }
+        )
+        self.store.finalize_artifact(self.operation_id, "oci-cgroup-settled", settled)
+        if type(self.request.capability_reference) is str:
+            self.store.unregister_revocation_handler(self.request.capability_reference, self.operation_id)
+
+    def _retire_revoked_worker(self) -> None:
+        identity_bytes, _identity, path = self._load_cgroup_identity(require_path=False)
+        container_id = self._receipt()
+        if container_id is None:
+            raise ExecutionConflict("owned OCI container identity is unavailable")
+        settled = self.store.find_artifact(self.operation_id, "oci-cgroup-settled")
+        if settled is not None:
+            if self.state() is not Presence.ABSENT:
+                raise ExecutionConflict("settled OCI container reappeared")
+            self._close_owned_runtime()
+            return
+
+        empty_bytes = self.store.find_artifact(self.operation_id, "oci-cgroup-empty")
+        if empty_bytes is not None:
+            self._validate_cgroup_empty(identity_bytes, empty_bytes, container_id)
+            presence = self.state()
+            if presence is Presence.ABSENT:
+                self._close_owned_runtime()
+                self._finalize_cgroup_settled(identity_bytes, empty_bytes, container_id)
+                return
+            if presence is not Presence.FOUND:
+                raise ExecutionConflict("owned container state is unknown after cgroup-empty receipt")
+            if not path.exists():
+                raise ExecutionConflict("owned cgroup disappeared before exact container removal")
+            self._inspection()
+            events = _cgroup_subtree(path)
+            if any(item["populated"] != 0 for _, item in events):
+                raise ExecutionConflict("worker cgroup repopulated after durable empty receipt")
+        else:
+            if not path.exists():
+                raise ExecutionConflict("owned cgroup disappeared before empty receipt")
+            self._inspection()
+            events = _cgroup_subtree(path)
+            if any(item["populated"] == 1 for _, item in events):
+                if any(item["frozen"] != 1 for _, item in events if item["populated"] == 1):
+                    raise ExecutionConflict("worker subtree thawed after revocation commit")
+                state = _object(self._inspection().get("State"))
+                if state.get("Paused") is not True and state.get("Status") != "paused":
+                    raise ExecutionConflict("Podman no longer reports the frozen worker as paused")
+                (path / "cgroup.kill").write_text("1", encoding="ascii")
+                events = _wait_cgroup_subtree(path, populated=0)
+            if any(item["populated"] != 0 for _, item in events):
+                raise ExecutionConflict("worker cgroup did not reach populated=0")
+            identity_bytes, _identity, path = self._load_cgroup_identity()
+            events = _cgroup_subtree(path)
+            if any(item["populated"] != 0 for _, item in events):
+                raise ExecutionConflict("worker cgroup repopulated before receipt")
+            empty_bytes = _bytes(
+                {
+                    "version": 1,
+                    "owner": self.token,
+                    "container": container_id,
+                    "identity_reference": hashlib.sha256(identity_bytes).hexdigest(),
+                    "populated": 0,
+                    "frozen": events[0][1]["frozen"],
+                }
+            )
+            self.store.finalize_artifact(self.operation_id, "oci-cgroup-empty", empty_bytes)
+
+        # The receipt is durable before Podman removes the cgroupfs tree.
+        self._close_owned_runtime()
+        self._remove_exact_container(container_id)
+        self._finalize_cgroup_settled(identity_bytes, empty_bytes, container_id)
+
+    def _remove_exact_container(self, identifier: str) -> None:
+        self._inspection()
+        try:
+            result = self._call("rm", "--force", identifier)
+        except (OSError, TimeoutError, TimeoutExpired) as error:
+            if self.state() is Presence.ABSENT:
+                return
+            raise ExecutionConflict("exact owned OCI removal uncertain") from error
+        if result.returncode != 0 or result.stderr:
+            if self.state() is Presence.ABSENT:
+                return
+            raise ExecutionConflict("exact owned OCI removal unacknowledged")
+        if self.state() is not Presence.ABSENT:
+            raise ExecutionConflict("exact owned OCI absence unproved after removal")
+
+    def _close_owned_runtime(self) -> None:
+        connection = self._connection
+        lifetime = self._lifetime
+        if lifetime is not None:
+            lifetime.close_liveness()
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            if lifetime is not None:
+                lifetime.close()
+            object.__setattr__(self, "_lifetime", None)
+            object.__setattr__(self, "_connection", None)
+
+    def _record_no_worker_revocation(self) -> bool:
+        if (
+            self.store.find_artifact(self.operation_id, "oci-container") is not None
+            or self.store.find_artifact(self.operation_id, "oci-cgroup-identity") is not None
+        ):
+            return False
+        prefix = f"runtime-dispatch:{self.request.fence}:"
+        if any(
+            self.store.find_artifact(self.operation_id, prefix + stage) is not None
+            for stage in ("worker", "worker-enter", "thread", "turn")
+        ):
+            return False
+        receipt = _bytes(
+            {
+                "version": 1,
+                "owner": self.token,
+                "operation": self.operation_id,
+                "grant": self.request.capability_reference,
+                "fence": self.request.fence,
+                "worker_created": False,
+            }
+        )
+        self.store.finalize_artifact(self.operation_id, "oci-revocation-no-worker", receipt)
+        return True
+
+    def _handle_revocation(self, phase: RevocationPhase) -> None:
+        if phase == "freeze":
+            if self.store.find_artifact(self.operation_id, "oci-cgroup-settled") is not None:
+                if self.state() is not Presence.ABSENT:
+                    raise ExecutionConflict("settled OCI container reappeared")
+                return
+            empty_bytes = self.store.find_artifact(self.operation_id, "oci-cgroup-empty")
+            if empty_bytes is not None:
+                identity_bytes, _record, _path = self._load_cgroup_identity(require_path=False)
+                container_id = self._receipt()
+                if container_id is None:
+                    raise ExecutionConflict("owned OCI container identity is unavailable")
+                self._validate_cgroup_empty(identity_bytes, empty_bytes, container_id)
+                if self.state() is Presence.ABSENT:
+                    self._finalize_cgroup_settled(identity_bytes, empty_bytes, container_id)
+                    return
+            if self.store.find_artifact(self.operation_id, "oci-revocation-no-worker") is not None:
+                return
+            if self.store.find_artifact(self.operation_id, "oci-cgroup-identity") is None:
+                if self._record_no_worker_revocation():
+                    return
+                raise ExecutionConflict("worker launch is uncertain without exact cgroup identity")
+            self._pause_for_revocation()
+            return
+        if phase == "retire":
+            if self.store.find_artifact(self.operation_id, "oci-cgroup-settled") is not None:
+                return
+            if self.store.find_artifact(self.operation_id, "oci-revocation-no-worker") is not None:
+                return
+            self._retire_revoked_worker()
+            return
+        raise ExecutionConflict("unknown OCI revocation phase")
+
     def state(self) -> Presence:
         identifier = self._receipt()
         if identifier is None:
@@ -430,11 +917,18 @@ class OwnedOCI:
         if self.state() is Presence.ABSENT:
             return
         try:
-            identifier = self.capture()
+            item = self._inspection()
         except ExecutionConflict:
             if self.state() is Presence.ABSENT:
                 return
             raise
+        state_value = item.get("State")
+        state = _object(state_value) if state_value is not None else {}
+        if state.get("Paused") is True or state.get("Status") == "paused":
+            return
+        if state and state.get("Running") is not True:
+            return
+        identifier = cast(str, item["Id"])
         try:
             result = self._call("stop", "-t", "5", identifier)
         except (OSError, TimeoutError, TimeoutExpired) as error:
@@ -444,6 +938,10 @@ class OwnedOCI:
         if result.returncode != 0 or result.stderr:
             if self.state() is Presence.ABSENT:
                 return
+            current = self._inspection()
+            current_state = _object(current.get("State"))
+            if current_state.get("Running") is not True or current_state.get("Paused") is True:
+                return
             raise ExecutionConflict("OCI stop delivery uncertain")
 
     def require_absent(self) -> None:
@@ -452,11 +950,36 @@ class OwnedOCI:
             raise ExecutionConflict("owned OCI container absence unproved")
 
     def settled(self) -> bool:
-        """Require exact retained kernel init exit AND owned container absence, never cold PID guesses."""
+        """Require a warm PIDFD witness or a cold cgroup-empty receipt plus exact absence."""
         identifier = self._receipt()
         namespace = self.store.find_artifact(self.operation_id, "oci-init")
         if identifier is None or namespace is None:
             return False
+        identity_bytes = self.store.find_artifact(self.operation_id, "oci-cgroup-identity")
+        empty_bytes = self.store.find_artifact(self.operation_id, "oci-cgroup-empty")
+        cgroup_settled = self.store.find_artifact(self.operation_id, "oci-cgroup-settled")
+        if cgroup_settled is not None and (identity_bytes is None or empty_bytes is None):
+            raise ExecutionConflict("cgroup settlement is missing its durable empty witness")
+        if identity_bytes is not None and empty_bytes is not None:
+            self._load_cgroup_identity(require_path=False)
+            self._validate_cgroup_empty(identity_bytes, empty_bytes, identifier)
+            expected = _bytes(
+                {
+                    "version": 1,
+                    "owner": self.token,
+                    "container": identifier,
+                    "identity_reference": hashlib.sha256(identity_bytes).hexdigest(),
+                    "empty_reference": hashlib.sha256(empty_bytes).hexdigest(),
+                }
+            )
+            if cgroup_settled is not None and cgroup_settled != expected:
+                raise ExecutionConflict("cgroup settlement receipt differs")
+            if self.state() is not Presence.ABSENT:
+                return False
+            if cgroup_settled is None:
+                self.store.finalize_artifact(self.operation_id, "oci-cgroup-settled", expected)
+            return True
+
         record = _object(json.loads(namespace))
         if (
             set(record) != {"version", "owner", "container", "identity", "binding_reference"}
@@ -482,23 +1005,27 @@ class OwnedOCI:
         if previous is not None:
             if previous != witness:
                 raise ExecutionConflict("OCI settlement receipt differs")
-            return self.state() is Presence.ABSENT
+            absent = self.state() is Presence.ABSENT
+            if absent and type(self.request.capability_reference) is str:
+                self.store.unregister_revocation_handler(self.request.capability_reference, self.operation_id)
+            return absent
         lifetime = self._lifetime
-        if (
-            lifetime is None
-            or lifetime.identity != record.get("identity")
-            or not lifetime.exited()
-            or self.state() is not Presence.ABSENT
-        ):
+        if lifetime is None or lifetime.identity != record.get("identity") or not lifetime.exited():
+            return False
+        if self.state() is Presence.FOUND:
+            self._remove_exact_container(identifier)
+        if self.state() is not Presence.ABSENT:
             return False
         self.store.finalize_artifact(self.operation_id, "oci-namespace-settled", witness)
         lifetime.close()
         object.__setattr__(self, "_lifetime", None)
+        if type(self.request.capability_reference) is str:
+            self.store.unregister_revocation_handler(self.request.capability_reference, self.operation_id)
         return True
 
     def require_settled(self) -> None:
         if not self.settled():
-            raise ExecutionConflict("owned OCI namespace settlement unproved")
+            raise ExecutionConflict("owned OCI worker settlement unproved")
 
     def collect_candidate(
         self, resources: OCIResources, *, codex: Path | None = None, authorizer: WorkerAuthorizer | None = None
@@ -723,20 +1250,22 @@ class OwnedOCI:
                 state = _object(self._inspection().get("State"))
                 if state.get("Running") is not True or state.get("Pid") != identity["pid"]:
                     raise ExecutionConflict("OCI init differs from authenticated bootstrap")
-                self.store.finalize_artifact(
-                    self.operation_id,
-                    "oci-init",
-                    _bytes(
-                        {
-                            "version": 1,
-                            "owner": self.token,
-                            "container": identifier,
-                            "identity": identity,
-                            "binding_reference": hashlib.sha256(binding).hexdigest(),
-                        }
-                    ),
+                init_record = _bytes(
+                    {
+                        "version": 1,
+                        "owner": self.token,
+                        "container": identifier,
+                        "identity": identity,
+                        "binding_reference": hashlib.sha256(binding).hexdigest(),
+                    }
                 )
+                self.store.finalize_artifact(self.operation_id, "oci-init", init_record)
+                cgroup_identity = self._capture_cgroup_identity(
+                    identifier, state, identity, init_record, binding, channel
+                )
+                self.store.finalize_artifact(self.operation_id, "oci-cgroup-identity", cgroup_identity)
                 object.__setattr__(self, "_lifetime", channel)
+                object.__setattr__(self, "_cgroup_identity", cgroup_identity)
                 if (
                     resources.verify(self, codex) != evidence
                     or enter_authorizer(self.request, cwd, binding) is not True

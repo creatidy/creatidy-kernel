@@ -118,6 +118,14 @@ def rootless_run_prefix(podman: Path, profile: WorkerProfile, container_name: st
     return argv
 
 
+def owned_run_prefix(podman: Path, profile: WorkerProfile, container_name: str) -> list[str]:
+    """Use a persistent cgroupfs-owned container for revocation recovery."""
+    argv = rootless_run_prefix(podman, profile, container_name)
+    argv.remove("--rm")
+    argv[2:2] = ["--cgroup-manager=cgroupfs", "--cgroupns=private"]
+    return argv
+
+
 def attached_run_argv(
     podman: Path, profile: WorkerProfile, container_name: str, image: str, entrypoint: tuple[str, ...]
 ) -> tuple[str, ...]:
@@ -137,6 +145,6 @@ def attached_run_argv(
     ):
         raise ValueError("explicit OCI image and immutable entrypoint required")
     _validate_path(PurePosixPath(entrypoint[0]))
-    argv = rootless_run_prefix(podman, profile, container_name)
+    argv = owned_run_prefix(podman, profile, container_name)
     argv.insert(2, "-i")
     return (*argv, image, *entrypoint)

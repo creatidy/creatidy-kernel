@@ -13,7 +13,7 @@ from test_codex_runtime import NativeConnection
 
 from creatidy_kernel.adapters.codex_runtime import CodexInputs, CodexRuntime
 from creatidy_kernel.adapters.sqlite_store import OperationConflict, SQLiteProgramStore
-from creatidy_kernel.core.authority import AuthorityGrant, OperationIntent, Principal
+from creatidy_kernel.core.authority import AuthorityGrant, AuthorityRevocationPending, OperationIntent, Principal
 from creatidy_kernel.core.domain import (
     ActivateProgram,
     AttemptSpec,
@@ -267,9 +267,21 @@ def test_revocation_between_thread_and_turn_stops_next_native_send(prepared: Pre
             return response
 
     runtime, connection = prepared.runtime(connection=RevokeOnThread())
-    with pytest.raises(ExecutionConflict, match="turn inputs"):
+    with pytest.raises(AuthorityRevocationPending, match="non-OCI worker retirement is unsupported"):
         runtime.start(prepared.request)
     assert [method for method, _ in connection.calls] == ["thread/start"]
+    assert (
+        prepared.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+            "SELECT 1 FROM authority_revocation_fences WHERE grant_id = ?", (prepared.grant.grant_id,)
+        ).fetchone()
+        is not None
+    )
+    assert (
+        prepared.store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+            "SELECT 1 FROM authority_revocations WHERE grant_id = ?", (prepared.grant.grant_id,)
+        ).fetchone()
+        is None
+    )
     assert runtime.reconcile(prepared.request.operation).presence is Presence.UNKNOWN
     with pytest.raises(ExecutionConflict, match="uncertain"):
         runtime.start(prepared.request)

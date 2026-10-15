@@ -20,7 +20,13 @@ from creatidy_kernel.adapters.sqlite_store import (
     UnsupportedSQLiteConfiguration,
     WrongWriterThread,
 )
-from creatidy_kernel.core.authority import AuthorityDenied, AuthorityGrant, OperationIntent, Principal
+from creatidy_kernel.core.authority import (
+    AuthorityDenied,
+    AuthorityGrant,
+    AuthorityRevocationPending,
+    OperationIntent,
+    Principal,
+)
 from creatidy_kernel.core.domain import (
     ActivateProgram,
     AttemptSpec,
@@ -207,6 +213,96 @@ def test_expiry_revocation_cancel_and_current_principal_are_rechecked(
             reopened.check(worker, other.grant_id, attempt, intent, 2)
 
 
+def test_revocation_fences_dispatch_freezes_all_generations_before_commit_then_retires(
+    authority: tuple[SQLiteProgramStore, AttemptSpec, AuthorityGrant, Path],
+) -> None:
+    store, attempt, grant, _ = authority
+    owner = Principal("owner-1", "owner")
+    worker = Principal(attempt.attempt_id, "worker")
+    multi = replace(grant, single_use=False)
+    store.issue(owner, multi)
+    operations = (original(store, "op-1"), original(store, "op-2"))
+    order: list[tuple[str, str]] = []
+
+    for intent in operations:
+        store.check(worker, multi.grant_id, attempt, intent, 1)
+        store.finalize_artifact(intent.operation_id, "oci-owner", b"owner")
+        store.finalize_artifact(intent.operation_id, "oci-cgroup-identity", b"identity")
+
+        def handler(phase: str, *, operation_id: str = intent.operation_id) -> None:
+            order.append((phase, operation_id))
+            fence = store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                "SELECT 1 FROM authority_revocation_fences WHERE grant_id = ?", (multi.grant_id,)
+            ).fetchone()
+            revoked = store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                "SELECT 1 FROM authority_revocations WHERE grant_id = ?", (multi.grant_id,)
+            ).fetchone()
+            assert fence is not None
+            if phase == "freeze":
+                assert revoked is None
+            else:
+                assert phase == "retire"
+                assert revoked is not None
+                store.finalize_artifact(operation_id, "oci-cgroup-settled", b"settled")
+
+        store.register_revocation_handler(multi.grant_id, intent.operation_id, handler)
+
+    assert store.revoke(owner, multi.grant_id).revoked
+    assert order == [
+        ("freeze", "op-1"),
+        ("freeze", "op-2"),
+        ("retire", "op-1"),
+        ("retire", "op-2"),
+    ]
+    with pytest.raises(AuthorityDenied, match="revoked"):
+        store.check(worker, multi.grant_id, attempt, operations[0], 2)
+    assert store.revoke(owner, multi.grant_id).revoked
+
+
+def test_failed_freeze_keeps_durable_fence_without_claiming_revocation(
+    authority: tuple[SQLiteProgramStore, AttemptSpec, AuthorityGrant, Path],
+) -> None:
+    store, attempt, grant, _ = authority
+    owner = Principal("owner-1", "owner")
+    worker = Principal(attempt.attempt_id, "worker")
+    multi = replace(grant, single_use=False)
+    store.issue(owner, multi)
+    operations = (original(store, "op-1"), original(store, "op-2"))
+    order: list[tuple[str, str]] = []
+    for intent in operations:
+        store.check(worker, multi.grant_id, attempt, intent, 1)
+        store.finalize_artifact(intent.operation_id, "oci-owner", b"owner")
+        store.finalize_artifact(intent.operation_id, "oci-cgroup-identity", b"identity")
+
+        def handler(phase: str, *, operation_id: str = intent.operation_id) -> None:
+            order.append((phase, operation_id))
+            if phase == "freeze" and operation_id == "op-1":
+                return
+            if phase == "freeze":
+                raise OSError("synthetic second-generation cgroup freeze failure")
+            raise AssertionError("retirement must not run before every freeze barrier")
+
+        store.register_revocation_handler(multi.grant_id, intent.operation_id, handler)
+
+    with pytest.raises(AuthorityRevocationPending, match="freeze remains unresolved"):
+        store.revoke(owner, multi.grant_id)
+    assert (
+        store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+            "SELECT 1 FROM authority_revocation_fences WHERE grant_id = ?", (multi.grant_id,)
+        ).fetchone()
+        is not None
+    )
+    assert (
+        store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+            "SELECT 1 FROM authority_revocations WHERE grant_id = ?", (multi.grant_id,)
+        ).fetchone()
+        is None
+    )
+    assert order == [("freeze", "op-1"), ("freeze", "op-2")]
+    with pytest.raises(AuthorityRevocationPending, match="fenced against new admission"):
+        store.check(worker, multi.grant_id, attempt, operations[0], 2)
+
+
 def test_resolver_failure_rolls_back_consumption_and_dispatch_requires_prior_admission(
     authority: tuple[SQLiteProgramStore, AttemptSpec, AuthorityGrant, Path],
 ) -> None:
@@ -272,11 +368,16 @@ def test_additive_schema_migration_preserves_history_and_original_requests(
     operation = store.operation(intent.operation_id)
     store.close()
     with closing(sqlite3.connect(database)) as connection, connection:
-        for table in ("authority_bindings", "authority_revocations", "authority_grants"):
+        for table in (
+            "authority_bindings",
+            "authority_revocations",
+            "authority_revocation_fences",
+            "authority_grants",
+        ):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("PRAGMA user_version = 2")
     with SQLiteProgramStore(database) as reopened:
-        assert reopened.startup_evidence.schema_version == 3
+        assert reopened.startup_evidence.schema_version == 4
         assert reopened.history("program-1") == history
         assert reopened.operation(intent.operation_id) == operation
     with closing(sqlite3.connect(database)) as connection, connection:
