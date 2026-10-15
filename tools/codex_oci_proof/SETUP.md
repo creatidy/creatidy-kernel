@@ -32,11 +32,15 @@ make codex-oci-proof
 `CREATIDY_TEST_CODEX_BIN` may be omitted when `codex` is on `PATH`. Missing components are
 explicitly UNPROVED (skips with precise reasons), never synthetic passes.
 
-The factory cells require the existing bubblewrap 0.13.0 public receipt pin
-`7c0da12cc27c4de4bac5bc1dcf50d19c62a445bdb5f30cb8c9740800b0b8b237` and a declared
-libcap closure. Supplying it does not resolve the workspace-write/outer namespace
-policy conflict: the source-edit negative cells deliberately retain an **UNMET**
-conformance gate. No syscall/profile relaxation or privileged installation is implied.
+The factory cells require an explicitly recorded bubblewrap 0.13.0 digest and its declared
+libcap closure. The native test pins are `7c0da12cc27c4de4bac5bc1dcf50d19c62a445bdb5f30cb8c9740800b0b8b237`,
+`77a5060956dd8356f737c775174aa92c06264d0f3b2ccad43fd731e6d4caa827`, and the owner-approved
+native-test-only `956cb41aec4589d5e0ee04d06f56e93305f161fe8f4e3eed39bb4e50ccc29394`. The
+unproven `ec5ffd1a2bc560f2868bc6e7e06a9ed9f4379a9b2cf4dab0fc0f408158ad6143` test allowance
+was removed. None is a production runtime pin. Bubblewrap verification does not resolve the
+workspace-write/outer namespace policy conflict: the source-edit negative cells deliberately
+retain an **UNMET** conformance gate. No syscall/profile relaxation or privileged installation
+is implied.
 The target also runs `tools/check_package.py --native-runtime`: it rebuilds from the
 sdist, copy-installs the wheel, installs only the lock-constrained pytest dependency
 closure offline, and asserts Kernel imports do not come from the checkout. This

@@ -219,6 +219,23 @@ Both 0.13.0 binaries were built by the repository setup tool from the pinned arc
 passed the complete native suite with zero skips; the two differing binary digests again
 demonstrate build-path variance, not a reproducible-binary claim.
 
+### Additional 0.13.0 Native Test Pin (2026-10-15)
+
+The owner approved bubblewrap SHA-256
+`956cb41aec4589d5e0ee04d06f56e93305f161fe8f4e3eed39bb4e50ccc29394` as an additional
+**native test pin only**. It was built by the repository setup tool from the same pinned
+v0.13.0 source/archive with the recorded libcap closure; complete inputs and native receipts
+are in [`bubblewrap-0.13.0-956-provenance.md`](../architecture/bubblewrap-0.13.0-956-provenance.md).
+Standalone native-proof passed 67/0, Codex OCI passed 42/0, and installed-wheel native
+reception passed 17/0. This does not make bubblewrap a production runtime pin, change outer
+security policy, or close AC4.
+
+The previous PR test allowlist also contained `ec5ffd1a2bc560f2868bc6e7e06a9ed9f4379a9b2cf4dab0fc0f408158ad6143`.
+Its retained evidence is a separate standalone native-proof run (67/0), but the complete
+historical provenance artifact is unavailable and no #80/#79 full factory acceptance receipt
+or ADR entry exists. It is therefore removed from the active factory test allowlist here;
+its digest remains historical evidence, not an accepted pin.
+
 `test_bubblewrap_verification.py` runs Python and checks no-new-privileges/seccomp/zero capabilities,
 PID-1 layout and userns refusal; it attempts synthetic controller/artifact/credential/host-parent
 reads/writes, symlink/proc/FD and mount/privilege/syscall escapes, IPv4/IPv6/UNIX networking and
