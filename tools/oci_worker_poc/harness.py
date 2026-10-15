@@ -92,7 +92,7 @@ def wait_container_exit(process: subprocess.Popen[bytes], timeout: float) -> tup
 
 
 def stop_container(toolchain: Toolchain, container_name: str, grace_seconds: int = 5) -> str:
-    """Stop only the owned container; returns observed final podman stop output."""
+    """Stop and remove only the exact owned container after confirmed existence."""
     argv = [
         str(toolchain.root / "bin/podman"),
         "stop",
@@ -108,7 +108,21 @@ def stop_container(toolchain: Toolchain, container_name: str, grace_seconds: int
         check=False,
         timeout=120,
     )  # noqa: S603 - fixed tool argv.
-    return (result.stdout + result.stderr).strip()
+    output = (result.stdout + result.stderr).strip()
+    if container_state(toolchain, container_name) != CONTAINER_EXISTS:
+        return output
+    removed = subprocess.run(
+        [str(toolchain.root / "bin/podman"), "rm", container_name],
+        env=toolchain.env(),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )  # noqa: S603 - removes only the exact observed owned container.
+    removal_output = (removed.stdout + removed.stderr).strip()
+    if removed.returncode != 0 and not removal_output:
+        removal_output = f"podman rm exited {removed.returncode}"
+    return "\n".join(part for part in (output, removal_output) if part)
 
 
 CONTAINER_EXISTS = "exists"

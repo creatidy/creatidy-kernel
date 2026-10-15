@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared inert OCI command composition, not native enforcement reception."""
 
+import subprocess
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
@@ -14,6 +15,7 @@ from creatidy_kernel.adapters.worker_profile import (
     rootless_run_prefix,
 )
 from tools.codex_oci_proof import boundary
+from tools.oci_worker_poc import harness
 from tools.oci_worker_poc import profile as proof_profile
 from tools.oci_worker_poc.evidence import ToolRecord
 from tools.oci_worker_poc.toolchain import Toolchain
@@ -95,6 +97,31 @@ def test_exact_fixed_prefix_and_shared_proof_builders(monkeypatch: pytest.Monkey
         toolchain().root / "bin/podman", profile(), "owned-one", suffix[0], tuple(suffix[1:])
     ) == tuple(owned[:2] + ["-i"] + owned[2:] + suffix)
     assert "fixture-must-not-be-inherited" not in " ".join(expected)
+
+
+@pytest.mark.parametrize("state", [harness.CONTAINER_EXISTS, harness.CONTAINER_ABSENT, harness.CONTAINER_UNKNOWN])
+def test_stop_container_removes_only_confirmed_exact_container(monkeypatch: pytest.MonkeyPatch, state: str) -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        output = "stopped" if argv[1] == "stop" else "removed"
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    def state_for(_toolchain: Toolchain, _name: str) -> str:
+        return state
+
+    monkeypatch.setattr(harness, "container_state", state_for)
+    monkeypatch.setattr(harness.subprocess, "run", run)
+
+    output = harness.stop_container(toolchain(), "owned-one", grace_seconds=3)
+    expected = [["/explicit/toolroot/bin/podman", "stop", "-t", "3", "owned-one"]]
+    if state == harness.CONTAINER_EXISTS:
+        expected.append(["/explicit/toolroot/bin/podman", "rm", "owned-one"])
+        assert output == "stopped\nremoved"
+    else:
+        assert output == "stopped"
+    assert calls == expected
 
 
 @pytest.mark.parametrize("field", ("pids_limit", "memory_bytes", "deadline_seconds"))

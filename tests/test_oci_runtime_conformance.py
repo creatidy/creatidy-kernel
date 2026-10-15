@@ -943,7 +943,7 @@ def test_cold_revoke_retires_frozen_worker_without_original_pidfd(native_runtime
     cell.store_closed = True
 
     with SQLiteProgramStore(
-        cell.root / "kernel.db", resolve_authority_intent=cell.resolve_authority_intent
+        cell.resources.private_parent / "kernel.db", resolve_authority_intent=cell.resolve_authority_intent
     ) as cold_store:
         cold_owner = OwnedOCI(
             cold_store,
@@ -1017,14 +1017,15 @@ def test_cold_native_ownership_never_recreates_kernel_handles_or_launches(native
             cell.store.worker_authorizers(lambda: int(time.time())),
             lambda: int(time.time()),
         )
+    # Cold ownership has no live handles but can still use the durable cgroup identity to
+    # freeze, revoke, and remove the exact worker generation.
+    assert cell.store.revoke(Principal("owner", "owner"), cell.request.capability_reference).revoked
     cell.connection.close()
-    deadline = time.monotonic() + 10
-    while cold.state() is not Presence.ABSENT and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert cold.state() is Presence.ABSENT and not cold.settled()
+    assert cold.state() is Presence.ABSENT
+    assert cold.settled()
     assert cell.store.find_artifact(warm.operation_id, "oci-namespace-settled") is None
-    assert warm.settled()
-    assert cold.settled(), "only an already received exact retirement receipt can survive lost live handles"
+    assert cell.store.find_artifact(warm.operation_id, "oci-cgroup-settled") is not None
+    assert cell.store.find_artifact(warm.operation_id, "oci-candidate") is None
     assert cell.store.operation(warm.operation_id).attempts == 1
     assert cell.resources.workspace.exists()
 
@@ -1077,7 +1078,7 @@ def test_cold_revoke_recovers_after_store_and_pidfd_loss(native_runtime: NativeR
     cell.store.close()
     cell.store_closed = True
 
-    database = cell.root / "kernel.db"
+    database = cell.resources.private_parent / "kernel.db"
     with SQLiteProgramStore(database, resolve_authority_intent=cell.resolve_authority_intent) as cold_store:
         cold = OwnedOCI(
             cold_store,
