@@ -5,11 +5,13 @@ No profile adoption, owner state or live inference. Evidence and uncertain roots
 are retained in the approved temporary proof root. Missing setup is UNPROVED.
 """
 
+import ctypes
 import hashlib
 import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -310,12 +312,46 @@ def native_runtime(
             )
         )
         steps = [final_step("bounded synthetic completion")]
-        if request.param == "expiry-effect":
-            delayed_effect = (
-                "from pathlib import Path; import time; "
-                "Path('/workspace/expiry-started.txt').write_text('started'); "
-                "time.sleep(90); Path('/workspace/expiry-late.txt').write_text('late')"
-            )
+        if request.param in {"expiry-effect", "expiry-race"}:
+            if request.param == "expiry-race":
+                delayed_effect = """\
+from pathlib import Path
+import json, os, subprocess, sys, time
+
+deadline_ns = int(Path('/workspace/expiry-race-deadline.txt').read_text())
+Path('/workspace/expiry-race-pre.json').write_text(json.dumps({
+    'write_requested_ns': time.time_ns(), 'pid': os.getpid()
+}))
+release = Path('/workspace/expiry-race-release')
+while not release.exists():
+    time.sleep(0.005)
+while time.time_ns() <= deadline_ns + 1_000_000_000:
+    time.sleep(0.001)
+requested_ns = time.time_ns()
+child_code = (
+    "from pathlib import Path; import json,os,time; "
+    "path=Path('/workspace/expiry-race-post.json'); "
+    "fd=os.open(str(path), os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600); "
+    "stream=os.fdopen(fd, 'w'); "
+    "stream.write(json.dumps({'started_ns':time.time_ns(),'pid':os.getpid()})); "
+    "stream.flush(); os.fsync(stream.fileno()); stream.close()"
+)
+child = subprocess.Popen(
+    [sys.executable, '-I', '-S', '-c', child_code],
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    close_fds=True, start_new_session=True,
+)
+Path('/workspace/expiry-race-launch.json').write_text(json.dumps({
+    'requested_ns': requested_ns, 'child_pid': child.pid, 'parent_pid': os.getpid()
+}))
+child.wait()
+"""
+            else:
+                delayed_effect = (
+                    "from pathlib import Path; import time; "
+                    "Path('/workspace/expiry-started.txt').write_text('started'); "
+                    "time.sleep(90); Path('/workspace/expiry-late.txt').write_text('late')"
+                )
             launcher = (
                 "import subprocess,sys; "
                 f"effect={delayed_effect!r}; "
@@ -424,7 +460,7 @@ def native_runtime(
             expected,
         )
         now = int(time.time())
-        grant_expires_at = now + (45 if request.param == "expiry-effect" else 120)
+        grant_expires_at = now + (45 if request.param in {"expiry-effect", "expiry-race"} else 120)
         grant = AuthorityGrant(
             "grant-" + attempt_id,
             "owner",
@@ -841,6 +877,184 @@ def test_grant_expiry_stops_inflight_native_effect_without_controller_poll(nativ
         assert cell.owner.state() is Presence.ABSENT
         assert cell.store.find_artifact(cell.owner.operation_id, "oci-cgroup-settled") is None
     finally:
+        try:
+            cell.connection.close()
+        finally:
+            try:
+                stop_container(cell.toolchain, cell.owner.name)
+            finally:
+                cell.store.close()
+                cell.store_closed = True
+
+
+@pytest.mark.parametrize("native_runtime", ["expiry-race"], indirect=True)
+def test_native_descendant_can_start_subprocess_after_grant_expiry_before_pid1_notice(
+    native_runtime: NativeRuntime,
+) -> None:
+    """Diagnostic only: passing proves a post-expiry effect, not AC4 acceptance."""
+    cell = native_runtime
+    workspace = cell.resources.workspace
+    deadline_ns = cell.grant_expires_at * 1_000_000_000
+    deadline_file = workspace / "expiry-race-deadline.txt"
+    pre_effect = workspace / "expiry-race-pre.json"
+    release = workspace / "expiry-race-release"
+    launch_receipt = workspace / "expiry-race-launch.json"
+    post_effect = workspace / "expiry-race-post.json"
+    assert cell.store.worker_deadline(cell.request, str(workspace)) == cell.grant_expires_at
+    assert not any(path.exists() for path in (pre_effect, release, launch_receipt, post_effect))
+    deadline_file.write_text(str(deadline_ns))
+
+    lifetime = None
+    pid1_stopped = False
+
+    def send_pidfd_signal(pidfd: int, signal_number: int) -> None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        send_signal = libc.pidfd_send_signal
+        send_signal.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+        send_signal.restype = ctypes.c_int
+        if send_signal(pidfd, signal_number, None, 0) != 0:
+            raise OSError(ctypes.get_errno(), f"pidfd_send_signal({signal_number}) failed")
+
+    try:
+        handle = cell.runtime.start(cell.request)
+        assert handle
+        deadline = time.monotonic() + 15
+        while not pre_effect.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert pre_effect.is_file(), "the pre-expiry native descendant did not start"
+        assert pre_effect.stat().st_mtime_ns < deadline_ns
+        pre_record = cast(dict[str, object], json.loads(read_bounded_regular(pre_effect)))
+        pre_pid = pre_record.get("pid")
+        assert type(pre_pid) is int
+
+        mock_state = workspace / "mock/state.json"
+        pending_deadline = time.monotonic() + 15
+        while time.monotonic() < pending_deadline:
+            if mock_state.exists():
+                state = cast(dict[str, object], json.loads(read_bounded_regular(mock_state)))
+                index = state.get("index")
+                if isinstance(index, int) and index >= 2:
+                    break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("synthetic native response did not reach its in-flight step")
+
+        lifetime = cell.owner._lifetime  # pyright: ignore[reportPrivateUsage]
+        assert lifetime is not None and lifetime.pidfd is not None and lifetime.identity is not None
+        pid = lifetime.identity.get("pid")
+        assert type(pid) is int and time.time_ns() < deadline_ns
+
+        def pid1_state() -> str | None:
+            try:
+                line = next(
+                    line for line in Path(f"/proc/{pid}/status").read_text().splitlines() if line.startswith("State:")
+                )
+            except (OSError, StopIteration):
+                return None
+            fields = line.split()
+            return fields[1] if len(fields) > 1 else None
+
+        # Stop only the authenticated gate process so descendants remain runnable.
+        send_pidfd_signal(lifetime.pidfd, signal.SIGSTOP)
+        pid1_stopped = True
+        stop_deadline = time.monotonic() + 3
+        while pid1_state() != "T" and time.monotonic() < stop_deadline:
+            time.sleep(0.01)
+        assert pid1_state() == "T", "the exact owned PID-1 did not enter stopped state"
+        assert not lifetime.exited()
+
+        _, _cgroup_identity, cgroup_path = cell.owner._load_cgroup_identity()  # pyright: ignore[reportPrivateUsage]
+
+        def cgroup_events() -> dict[str, str]:
+            return dict(line.split() for line in (cgroup_path / "cgroup.events").read_text().splitlines())
+
+        events_before_expiry = cgroup_events()
+        assert events_before_expiry.get("frozen") == "0" and events_before_expiry.get("populated") == "1"
+        expiry_observation_deadline = time.monotonic() + 60
+        while time.time_ns() <= deadline_ns + 1_000_000_000 and time.monotonic() < expiry_observation_deadline:
+            time.sleep(0.005)
+        release_ns = time.time_ns()
+        assert release_ns > deadline_ns + 1_000_000_000, "bounded wait did not pass the expiry boundary"
+        assert pid1_state() == "T" and not lifetime.exited()
+        release.write_text(str(release_ns))
+
+        effect_deadline = time.monotonic() + 10
+        while not post_effect.exists() and time.monotonic() < effect_deadline:
+            time.sleep(0.02)
+        assert post_effect.is_file(), "no positive post-expiry native filesystem effect was observed"
+
+        launch_record = cast(dict[str, object], json.loads(read_bounded_regular(launch_receipt)))
+        post_record = cast(dict[str, object], json.loads(read_bounded_regular(post_effect)))
+        launch_ns = launch_record.get("requested_ns")
+        child_pid = launch_record.get("child_pid")
+        post_ns = post_record.get("started_ns")
+        post_pid = post_record.get("pid")
+        assert type(launch_ns) is int
+        assert type(child_pid) is int
+        assert type(post_ns) is int
+        assert type(post_pid) is int
+        post_stat = post_effect.stat()
+        assert launch_ns > deadline_ns
+        assert post_ns > deadline_ns
+        assert post_stat.st_mtime_ns > deadline_ns and post_stat.st_ctime_ns > deadline_ns
+        assert child_pid == post_pid and child_pid != pre_pid
+        assert pid1_state() == "T" and not lifetime.exited()
+        events_after_effect = cgroup_events()
+        assert events_after_effect.get("frozen") == "0" and events_after_effect.get("populated") == "1"
+
+        operation = cell.store.operation(cell.owner.operation_id)
+        intent = cell.resolve_authority_intent(operation)
+        with pytest.raises(AuthorityDenied, match="expired"):
+            cell.store.check(
+                Principal(cell.request.attempt.attempt_id, "worker"),
+                cell.request.capability_reference,
+                cell.request.attempt,
+                intent,
+                int(time.time()),
+            )
+        grant = cell.store._authority_grant(cell.request.capability_reference)  # pyright: ignore[reportPrivateUsage]
+        assert grant.revoked is False
+        assert cell.store.find_artifact(cell.owner.operation_id, "oci-cgroup-frozen") is None
+        assert cell.store.find_artifact(cell.owner.operation_id, "oci-cgroup-settled") is None
+
+        send_pidfd_signal(lifetime.pidfd, signal.SIGCONT)
+        pid1_stopped = False
+        exit_deadline = time.monotonic() + 10
+        while not lifetime.exited() and time.monotonic() < exit_deadline:
+            time.sleep(0.02)
+        assert lifetime.exited(), "PID-1 did not autonomously exit after resuming past its deadline"
+        inspection = cell.owner._inspection()  # pyright: ignore[reportPrivateUsage]
+        state_value = cast(dict[str, object], inspection.get("State"))
+        assert state_value.get("Status") in {"exited", "stopped"} and state_value.get("Running") is False
+
+        events_after_exit = cgroup_events()
+        receipt = {
+            "schema_version": 1,
+            "grant_expires_at_ns": deadline_ns,
+            "pre_effect_mtime_ns": pre_effect.stat().st_mtime_ns,
+            "pid1_stopped_before_expiry": True,
+            "pid1_still_stopped_after_expiry": True,
+            "controller_release_ns": release_ns,
+            "subprocess_launch_requested_ns": launch_ns,
+            "post_effect_started_ns": post_ns,
+            "post_effect_mtime_ns": post_stat.st_mtime_ns,
+            "post_effect_ctime_ns": post_stat.st_ctime_ns,
+            "post_effect_pid": post_pid,
+            "pid1_exited_only_after_resume": True,
+            "durable_authority_check": "denied_expired",
+            "durable_explicit_revocation": grant.revoked,
+            "cgroup_frozen_during_effect": events_after_effect.get("frozen"),
+            "cgroup_populated_after_pid1_exit": events_after_exit.get("populated"),
+            "cgroup_settled_artifact_present": False,
+        }
+        stop_container(cell.toolchain, cell.owner.name)
+        assert cell.owner.state() is Presence.ABSENT
+        assert cell.store.find_artifact(cell.owner.operation_id, "oci-cgroup-settled") is None
+        receipt["container_absent_after_cleanup"] = True
+        (cell.root / "grant-expiry-race-receipt.json").write_text(json.dumps(receipt, sort_keys=True, indent=1) + "\n")
+    finally:
+        if pid1_stopped and lifetime is not None and lifetime.pidfd is not None and not lifetime.exited():
+            send_pidfd_signal(lifetime.pidfd, signal.SIGCONT)
         try:
             cell.connection.close()
         finally:
