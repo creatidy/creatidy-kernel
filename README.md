@@ -311,11 +311,28 @@ Expired work remains observable but cannot be newly dispatched or accepted; chec
 use actual decision times. This is a synthetic-proved owned-session repair, not detached supervision
 or a live conformance receipt. Verification commands retain finite timeouts; full monetary/quota,
 hidden-call and auxiliary-effect accounting remains unimplemented. Remaining work belongs to
-[#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56) and the separately proved
-native integration under [#53](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53), not
-promised detached recovery features. [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48)
-supplies the bounded owned-session repair.
+[#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56), not promised detached
+recovery features. [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48) supplies the
+bounded owned-session repair. [#53](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53)
+and PR #85 are closed not implemented; their post-expiry diagnostic is evidence of an AC4 gap, not
+a supported native adapter or accepted effect-fencing proof.
 Native-shaped offline fixtures are not live model or remote-Forge acceptance.
+
+### Trusted-Development Expiry Boundary
+
+In the current trusted-development Codex path, the persisted deadline prevents new Kernel-controlled
+dispatch/acceptance and triggers cancellation; it does not atomically revoke a native process's
+filesystem or subprocess syscalls. Local effects may occur while the active process group is being
+terminated. A stop/interrupt acknowledgement is not settlement, cancellation is not rollback, and
+no candidate is accepted while outcome or settlement is unknown. This is not a hostile-worker
+sandbox or a strict no-native-effect-after-expiry guarantee. [Proposed ADR 0011](docs/adr/0011-task-level-authority-and-trusted-development.md)
+and its [issue-description patches](docs/architecture/ac4-issue-description-proposals.md) are not
+accepted; the existing AC4 remains binding until an explicit owner decision. Do not use
+this mode in a credential-rich or otherwise protected environment unless the selected profile keeps
+those resources outside the worker's actual reach.
+The current deadline is persisted as a wall-clock Unix timestamp; recovery retains it, but the code
+does not establish a boot-scoped monotonic projection or rollback-resistant clock. ADR 0011 proposes
+that additional durable clock requirement; it is not implemented or claimed here.
 
 The separately opt-in [ADR 0008 verification-only profile](docs/adr/0008-linux-bubblewrap-verification.md)
 uses native Linux bubblewrap and libseccomp for untrusted test children, including such execution
@@ -406,7 +423,8 @@ require an independently configured `profile_policy_version`, the complete appro
 and exact returned profile/version/requirement equality. There is no local profile catalogue or
 floor lookup. Selection is not reservation, gateway admission, privacy enforcement, a worker grant
 or ordinary dispatch. The reference application refuses to allocate new ordinary work via its L0
-path. #52/#53 still own executable-route/native reception.
+path. #52 owns the route consumer; #53/PR #85 is closed not implemented and supplies no accepted
+native reception or strict-expiry proof.
 
 `make package-check` exercises preparation, approval, intact refusal, typed recommendation over
 synthetic loopback HTTP and exact evidence reopen in an isolated installed wheel with synthetic

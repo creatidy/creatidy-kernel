@@ -9,6 +9,29 @@ or model context. Native reception is required on the selected platform; unsuppo
 refuses, never falls back. No live execution is authorized by these docs.
 The [threat model](docs/architecture/threat-model.md) separates target controls from implemented code.
 
+## Trusted-Development Expiry Status
+
+The current trusted-development Codex path does not enforce grant expiry at each native filesystem
+or subprocess syscall. Deadline expiry and user STOP prevent new Kernel-controlled dispatch and
+initiate cancellation/termination; an already-running worker or descendant may still make local
+effects during teardown. A stop/interrupt acknowledgement is not settlement, and local changes are
+not rolled back. Unknown termination/effect outcomes must remain unknown and cannot be accepted or
+published.
+
+`TRUSTED_DEVELOPMENT` is an explicit owner-trusted coding profile, not hostile-worker isolation. It
+must not expose Kernel/controller/production credentials or an unapproved external mutation path.
+The closed child environment does not prove that files reachable through the configured `HOME` are
+credential-free. Use only a credential-clean local profile; if the sandbox or external-effect boundary
+cannot be established for a task, refuse that mode rather than rely on prompts. Strict native effect
+expiry remains unmet: #53 is closed not implemented and PR #85 is closed unmerged.
+
+Proposed [ADR 0011](docs/adr/0011-task-level-authority-and-trusted-development.md) and its
+[issue-description proposals](docs/architecture/ac4-issue-description-proposals.md) are not
+authoritative until explicit owner acceptance.
+The current task deadline is persisted as wall-clock Unix time and recovery retains its original
+value. A boot-scoped monotonic projection/clock-rollback proof is not implemented; a recovery that
+cannot validate the original clock authority must not be described as rollback-proof.
+
 Report vulnerabilities through the mirror's
 [private security advisory intake](https://github.com/creatidy/creatidy-kernel/security/advisories/new).
 This is confidential intake only; fixes and development remain canonical on Forgejo. Do not post

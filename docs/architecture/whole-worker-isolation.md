@@ -8,6 +8,16 @@ conformance. [ADR 0007](../adr/0007-shared-harness-routing-observability.md) own
 [ADR 0008](../adr/0008-linux-bubblewrap-verification.md) (verification-only boundary) are
 unchanged; no production behavior changed in this delivery.
 
+## Current Kernel Disposition (2026-10-16)
+
+Kernel issue #53 is CLOSED / NOT IMPLEMENTED and PR #85 is CLOSED / UNMERGED. The
+owner's strict native-expiry requirement remains binding and unmet: the #53 controlled
+post-expiry effect test is diagnostic evidence, not AC4 acceptance. The separate
+cgroup cold-recovery proof below supports bounded revocation/settlement within its
+tested boundary only; it does not prove that native effects stop at exact grant expiry.
+Proposed [ADR 0011](../adr/0011-task-level-authority-and-trusted-development.md) considers a different task-level baseline but is not accepted and
+does not change this record or the current AC4 contract.
+
 Owner decision in force ([#53 comment 15606](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53#issuecomment-15606)):
 **universal executor enforcement** — Kernel authority over file/terminal effects must be
 enforced by a trusted worker/executor boundary independently of harness approval callbacks,
