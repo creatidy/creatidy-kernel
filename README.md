@@ -327,9 +327,13 @@ terminated. A stop/interrupt acknowledgement is not settlement, cancellation is 
 no candidate is accepted while outcome or settlement is unknown. This is not a hostile-worker
 sandbox or a strict no-native-effect-after-expiry guarantee. [Proposed ADR 0011](docs/adr/0011-task-level-authority-and-trusted-development.md)
 and its [issue-description patches](docs/architecture/ac4-issue-description-proposals.md) are not
-accepted; the existing AC4 remains binding until an explicit owner decision. Do not use
-this mode in a credential-rich or otherwise protected environment unless the selected profile keeps
-those resources outside the worker's actual reach.
+accepted; the existing AC4 remains binding until an explicit owner decision. The native app-server
+requires provider auth in `HOME`, and the repository does not prove the terminal child cannot read it.
+Ordinary local Codex is an explicit same-principal trust choice: use a limited provider account and
+keep production/remote-write credentials out of the task user's account. This is not credential
+isolation. Tasks requiring provider-key secrecy or enforced shell egress control are not supported by
+the current path unless the selected profile proves those boundaries; ordinary local coding is not
+blanket-refused.
 The current deadline is persisted as a wall-clock Unix timestamp; recovery retains it, but the code
 does not establish a boot-scoped monotonic projection or rollback-resistant clock. ADR 0011 proposes
 that additional durable clock requirement; it is not implemented or claimed here.

@@ -71,12 +71,18 @@ truthful STOP and owned process-group settlement.
 >
 > Kernel-owned external changes (including remote Git/Forgejo mutation, publication,
 > merge, release, deployment, and protected APIs) require separate exact operation
-> authorization and durable identity/reconciliation. Native workers must not receive
-> Kernel/controller/production credentials or an unapproved direct external-mutation
-> path. The selected Codex/OS profile must be verified to enforce the declared
-> workspace and network/credential boundary; if that cannot be established for a
-> task, refuse that execution mode/task rather than relying on prompt text or a status
-> label.
+> authorization and durable identity/reconciliation. The Kernel does not pass its
+> controller API tokens directly to Codex. The Codex app-server requires provider
+> authentication from its configured `HOME` and network connectivity. The current task
+> environment forwards `HOME`; the repository does not prove that a native terminal
+> child cannot read that HOME or use provider auth. Treat the app-server and native tool
+> tree as one same-principal trusted task, not isolated secret domains. Ordinary local
+> Codex use may continue when the owner/user accepts that trust and uses a limited
+> provider account with no production or remote-write credentials available to the
+> task. If a task requires provider-key secrecy, protected remote mutation, or verified
+> shell egress denial, the current path cannot guarantee it; refuse that sensitive task
+> rather than silently refusing all ordinary local coding or claiming Kernel control of
+> those effects.
 
 This explicitly changes the old per-file/terminal-effect interpretation. Until the
 owner accepts this wording, the existing strict AC4 remains authoritative. A passing
@@ -114,20 +120,64 @@ Attempt may still begin after the wall deadline and before that Attempt is settl
   not create grants, change the original deadline, retarget a Kernel operation,
   authorize publication, or accept a candidate.
 - `TRUSTED_DEVELOPMENT` is a user-trusted local coding mode. It is not suitable for
-  hostile code, adversarial PR tests, protected production workspaces, or a
-  credential-rich same-user account. The user explicitly trusts the native task to
-  modify its declared local workspace during the active task and possible termination
-  interval.
-- The current child environment is constructed from a small allowlist, but a
-  configured `HOME` can expose files readable by the same OS identity. The proposed
-  contract therefore requires a credential-clean profile and actual test of
-  workspace/network restrictions. If remote-write credentials, host control data, or
-  other protected resources are reachable by the worker, refuse the task/profile; do
-  not claim those resources are protected by a prompt.
+  hostile code, adversarial PR tests, or protected production workspaces. The user
+  explicitly trusts the native task tree with the local files and provider credentials
+  reachable to that OS identity during the active task/termination interval. Ordinary
+  local Codex remains usable with that explicit same-principal trust; the mode must not
+  be described as credential isolation.
+- `task_execution.codex_environment` forwards only `HOME`, `PATH`, `LANG`, `LC_ALL` and
+  `TMPDIR`, but `HOME` is not a secret-free path: source comments identify it as the
+  native Codex authentication/configuration home. The installed standalone
+  `codex-cli 0.159.3` is configured with `workspace-write`/`approvalPolicy=never`; the
+  Kernel adapter rejects explicit workspace mount/network-destination grants, but it
+  does not implement or attest Codex's sandbox. The repository has no test proving that
+  native terminal commands cannot read outside the workspace or access `HOME` auth.
+- `workspace-write` must not be assumed to deny reads outside the workspace. Provider
+  inference requires the app-server's auth HOME and provider connectivity; the model
+  app-server and terminal tool run under the same native trust profile. Internal
+  provider subcalls within a running turn are not individually admitted by Kernel and
+  may remain in flight through STOP/expiry; usage/result is UNKNOWN if the provider
+  does not report it.
+- Ordinary Codex local coding can remain available under explicit
+  `TRUSTED_DEVELOPMENT` same-principal consent: the user accepts that the app-server
+  and native tool may read files/credentials reachable to that account. Use a limited
+  inference account, and do not place production or remote-write credentials in that
+  identity. This is a trust decision, not confidentiality. If a task requires the
+  provider key hidden from the tool, all outside-workspace reads denied, or verified
+  shell egress denial, current supported mechanisms cannot prove that property; refuse
+  that sensitive task. A stronger guarantee would require a new owner-authorized
+  mechanism and is explicitly not part of this proposal.
 - The task's native local capability ends only when the selected owned process group
   or cgroup has profile-appropriate settlement evidence. If a descendant escapes the
   observable group, the result remains `unknown`; no universal process-tree containment
   is claimed.
+
+## Current Codex Credential And Network Assessment
+
+The current source passes `workspace-write` and `approvalPolicy=never` to the native
+Codex app-server and rejects explicit Kernel workspace-mount/network-destination
+grants. It does not implement the native sandbox or attest its read/egress behavior.
+`task_execution.codex_environment` forwards `HOME`; its source comment identifies
+`~/.codex` as the app-server's authentication/configuration home. The app-server needs
+that provider auth and network connectivity to perform inference. A terminal command is
+spawned natively under the same Codex trust profile. The repository contains no
+evidence that the terminal child cannot read files outside the workspace or `HOME`,
+including provider auth, and no evidence that all terminal egress is blocked. The
+existing #53 app-server tests use a fresh synthetic `CODEX_HOME` in a disposable
+container, not the host trusted-development auth home; that test is not a credential
+isolation proof. No live inference or owner credential was used in this proposal.
+
+Therefore this baseline does **not** guarantee provider-key secrecy from model-driven
+terminal commands. It permits ordinary local Codex only as an explicit same-principal
+trust decision: the user trusts the native app-server/tool tree with data reachable to
+that OS account and uses a limited inference account with no production or remote-write
+credentials in it. This avoids refusing all ordinary local Codex work while stating the
+real boundary. If a task requires the provider credential hidden from the native tool,
+all reads outside the workspace denied, or guaranteed terminal egress control, the
+current supported path cannot establish it; that sensitive task/effect is unsupported
+unless an owner later authorizes a different enforcement mechanism. Do not mislabel
+`workspace-write` or an empty declared `network_destinations` set as proof of those
+properties.
 
 ## Guarantees Preserved
 
@@ -172,7 +222,7 @@ observable, it remains `cancel_uncertain`/`unknown` and is not accepted.
 | User presses STOP during a framed RPC | Latch the request; handle it on the existing owner thread after the finite RPC boundary; persist cancellation before teardown. | The stop is not instantaneous. Report requested/cancelled/uncertain honestly. |
 | Interrupt acknowledgement arrives but the process group remains | Do not report `cancelled` or accept work until the profile's termination evidence is observed. | Retain workspace and mark `unknown`/`cancel_uncertain`; no automatic restart or duplicate external effect. |
 | Descendant calls `setsid`/escapes the observable group | Keep the task uncertain; do not claim all descendants have terminated. | This mode is not a hostile-worker sandbox. If the task requires guaranteed containment, refuse it rather than silently widening support. |
-| Native command attempts remote write or protected API access | No controller/production credentials are supplied to the worker; the selected sandbox must deny unapproved egress. | If direct credentials/network access cannot be ruled out in the actual profile, refuse tasks needing controlled external effects. |
+| Native command attempts remote write or protected API access | Kernel adapter tokens are not forwarded, but provider auth in HOME may be readable and native terminal egress is unverified. | Ordinary local Codex is an explicit same-principal trust choice with a limited provider account. Tasks needing protected remote state or secret isolation are unsupported unless the existing profile proves that boundary. |
 | Controller loses a remote effect reply | Preserve the exact Operation as unknown and reconcile it; no fallback/retry. | No claim that timeout means the external system did nothing. |
 | Native provider turn is still active at deadline | Do not start a new Kernel turn; interrupt the current turn and retain cost/result uncertainty. | A hard per-subcall cutoff or exact cost cap requires producer/Router evidence (#52/#56); it is not claimed here. |
 
@@ -181,16 +231,20 @@ observable, it remains `cancel_uncertain`/`unknown` and is not accepted.
 The proposal keeps the existing Codex `workspace-write`/`approvalPolicy=never`
 integration and the existing `TRUSTED_DEVELOPMENT` acknowledgement. It does not switch
 to `danger-full-access`, add a syscall broker, or replace the Codex executor. Ordinary
-local coding remains possible where the selected native sandbox, workspace and
-credential-clean environment are actually verified.
+local coding can continue as an explicit trusted use of the current same-principal
+Codex app-server/tool path; the user must understand that provider credentials and
+other OS-readable files may be accessible to the native tool. This is not isolation.
 
-The current native shell path must be tested against outside-workspace writes, network
-egress, child access to credential sentinels, and subprocess escape. If a supported
-Codex version falls back to broader permissions or a credential/egress boundary cannot
-be proved, refuse that execution mode/task. Strict no-native-effect-after-expiry,
-hostile PR execution, broad owner secrets, production resources, and guaranteed
-termination of escaped processes remain unsupported without a separately authorized
-enforcement architecture.
+The Kernel excludes its own controller tokens from the child environment, but it
+cannot hide a provider credential stored in a HOME shared with the native Codex
+process. Users should use a limited provider account and keep production/remote-write
+credentials out of that OS identity. The exact version's `workspace-write` read and
+egress behavior must be tested; it must not be assumed to deny outside-workspace reads
+or terminal network. If a task requires provider-key secrecy, protected remote state,
+or enforced shell egress denial, the current path cannot guarantee it; refuse that
+sensitive task rather than refusing all ordinary local Codex. Strict
+no-native-effect-after-expiry, hostile PR execution, and guaranteed termination of
+escaped processes remain unsupported absent a separately authorized architecture.
 
 ## Bounded Acceptance/Falsification Plan
 
@@ -211,9 +265,14 @@ Codex/profile versions. Do not use live inference or production credentials:
    cancellation intent, bounded TERM/KILL, exact-target settlement, `cancel_uncertain`
    when unresolved, retained workspace, no duplicate start and honest CLI/export
    output.
-4. **Credential/egress refusal:** use synthetic secrets and a fake remote to test the
-   actual native profile. If protected credentials or direct external mutation remain
-   reachable, refuse that profile/task. Never infer safety from prompt language.
+4. **Credential/egress disclosure:** use a synthetic provider credential and fake
+   remote to test the exact native profile. Record whether a terminal child can read
+   the provider-auth HOME or reach the fake remote. A readable provider sentinel is a
+   same-principal trust exposure, not a sandbox pass. Ordinary local Codex can remain
+   available under that explicit trust with no production/remote-write credentials;
+   tasks requiring secret isolation or enforced egress denial are refused if the
+   current sandbox cannot prove those properties. Never infer safety from prompt
+   language.
 5. **External effect recovery:** lose a reply after an authorized Kernel-controlled
    operation. Prove operation identity, durable unknown/reconciliation, and no blind
    retry or route change.
@@ -229,16 +288,22 @@ acceptance pass.
 
 **RECOMMENDATION: REVISE.** A task-level admission/STOP contract can support the
 existing trusted-development Codex workflow without a new broker, privileged kernel
-subsystem or replacement executor, while preserving Kernel control over external
-effects, durable identity, bounded cancellation attempts and honest `unknown` outcomes.
-It deliberately relinquishes strict per-syscall expiry and hostile-worker containment
-for this profile, and it is supportable only when the credential/workspace/egress
-preconditions are true.
+subsystem or replacement executor, while preserving Kernel control over
+Kernel-mediated external operations, durable identity, bounded cancellation attempts
+and honest `unknown` outcomes. It deliberately relinquishes strict per-syscall expiry
+and hostile-worker containment for this profile. Ordinary local Codex remains
+available only as an explicit same-principal trust decision; that does not amount to
+Kernel control over native terminal egress or provider-auth confidentiality.
 
 The proposal is **not authoritative**. Until explicit owner acceptance, the previous
 AC4 remains binding and #53 stays closed not implemented. Acceptance must explicitly
 approve the task-level capability horizon, the local native termination residual, the
-credential/egress refusal condition, and the no-candidate/no-retry behavior while
-termination or external outcomes are unknown. If any of those conditions is rejected,
-the trusted-development mode must remain unavailable for the affected task rather than
-silently reverting to the strict but unimplemented contract.
+same-principal provider-auth tradeoff for ordinary Codex, the boundary for protected
+remote effects, the boot-scoped monotonic deadline projection/recovery behavior, and the
+no-candidate/no-retry behavior while termination or external outcomes are unknown. If
+the owner requires provider-key secrecy or guaranteed shell egress isolation, the
+current native path cannot meet that property under the rejected architecture options;
+those sensitive task types remain unsupported, while ordinary local Codex is not
+globally refused. If the owner rejects the local native termination window, retain the
+old strict AC4 and keep that execution path gated until a separately authorized
+enforcement design exists.

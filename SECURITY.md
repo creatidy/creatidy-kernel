@@ -18,12 +18,17 @@ effects during teardown. A stop/interrupt acknowledgement is not settlement, and
 not rolled back. Unknown termination/effect outcomes must remain unknown and cannot be accepted or
 published.
 
-`TRUSTED_DEVELOPMENT` is an explicit owner-trusted coding profile, not hostile-worker isolation. It
-must not expose Kernel/controller/production credentials or an unapproved external mutation path.
-The closed child environment does not prove that files reachable through the configured `HOME` are
-credential-free. Use only a credential-clean local profile; if the sandbox or external-effect boundary
-cannot be established for a task, refuse that mode rather than rely on prompts. Strict native effect
-expiry remains unmet: #53 is closed not implemented and PR #85 is closed unmerged.
+`TRUSTED_DEVELOPMENT` is an explicit owner-trusted coding profile, not hostile-worker isolation. The
+Codex app-server needs provider authentication in `HOME`; the native terminal may share the same
+principal, and `workspace-write` is not a proven read boundary. Ordinary local Codex remains available
+as an explicit same-principal trust choice with a limited provider account and no production or
+remote-write credentials in that account. This does not hide provider auth from a tool that can read
+`HOME`. Kernel adapter tokens are not placed directly in the child environment; this does not protect
+secrets stored in files reachable through `HOME`. The current profile also does not prove all terminal
+egress is blocked. Tasks needing provider-key confidentiality or enforced
+remote-effect containment are unsupported unless the exact profile proves them; do not silently refuse
+ordinary local coding or falsely claim those protections. Strict native effect expiry remains unmet:
+#53 is closed not implemented and PR #85 is closed unmerged.
 
 Proposed [ADR 0011](docs/adr/0011-task-level-authority-and-trusted-development.md) and its
 [issue-description proposals](docs/architecture/ac4-issue-description-proposals.md) are not

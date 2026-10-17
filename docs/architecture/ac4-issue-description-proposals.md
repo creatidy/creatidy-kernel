@@ -19,9 +19,9 @@ and comments do carry local prerequisites; closure of #53 does not satisfy them.
 | #56 | Open; whole-task deadline, in-flight overrun and unknown-cost accounting. | State that deadline stops new Kernel admissions and initiates STOP; native effects/usage during teardown may be unknown; clock/boot identity must not renew the original deadline. | Router #184 and approved task budget/usage evidence remain. |
 | #57 | Open; owner-served task state and user-facing status. | Distinguish deadline/STOP request from owned-process settlement and uncertainty; don't imply exact syscall cutoff. | SQLite owner-thread, snapshot/event and current-authority gates remain. |
 | #58 | Open; full-path private outcome/cost export. | Export trust profile, deadline decision and cancellation/settlement evidence; never report unknown local effects/usage as zero or rollback. | MI/Router producer contracts, privacy and versioned export gates remain. |
-| #59 | Open; body says “#53 chosen harness” and requires owned workspace/process cleanup. | Replace #53 as a strict-expiry/harness prerequisite with the proposed task-level profile and #90 STOP only after owner acceptance. | #48 lifetime, #50 verification/test-child, #57 view, #61 cache ownership, manual-edit and Router parallel-call gates remain. |
-| #60 | Open; integrated reception includes #53 harness adapter/lifetime. | Replace #53 as a strict native-expiry acceptance prerequisite with ADR 0011 + #90 and other actual component receipts. Report the termination-window residual explicitly. | #47/#48/#49/#50/#52/#54/#55/#56/#57/#58/#59/#61/#62, Router #141 and MI #19 gates remain. |
-| #62 | Open; installed/profile/platform compatibility. | Add an explicit trusted-development profile row: no strict native effect cutoff or hostile-worker claim; refuse unverified profiles without fallback. | Actual producer versions, migration safety and platform evidence remain. |
+| #59 | Open; body says “#53 chosen harness” and requires owned workspace/process cleanup. | Replace #53 as a strict-expiry/harness prerequisite with the proposed task-level profile and #90 STOP only after owner acceptance. State same-principal provider-HOME trust; no production/remote-write credentials in the task identity. | #48 lifetime, #50 verification/test-child, #57 view, #61 cache ownership, manual-edit and Router parallel-call gates remain. |
+| #60 | Open; integrated reception includes #53 harness adapter/lifetime. | Replace #53 as a strict native-expiry acceptance prerequisite with ADR 0011 + #90 and other actual component receipts. Report the termination-window residual and same-principal provider-HOME trust explicitly. | #47/#48/#49/#50/#52/#54/#55/#56/#57/#58/#59/#61/#62, Router #141 and MI #19 gates remain. |
+| #62 | Open; installed/profile/platform compatibility. | Add an explicit trusted-development profile row: no strict native effect cutoff or hostile-worker claim; provider-auth HOME is same-principal trust unless a test proves otherwise; no production/remote-write credentials; no fallback to a broader profile. | Actual producer versions, migration safety and platform evidence remain. |
 | #79 | Open verification/test-child follow-up; PR #83 is already merged. Its body says #53's whole-worker gate remains separate. | Clarify that #50/#79 are test-child only and neither proves whole-worker isolation nor strict expiry. | Exact upstream/license/provenance and test-child acceptance remain; do not promote the profile. |
 | #90 | Open user-requested STOP issue; no formal dependency on #53. | It supplies only the STOP/cancellation portion of proposed AC4, not strict expiry or universal effect mediation. | Exact owned-process-group settlement, unknown reporting and single-writer behavior remain. |
 | Console #4/#8/#12/#13 | Open Console consumers; #8/#13 link #53 and #12 tests revoked/expired permissions. No formal edge to #53 is registered. | Proposed consumer copy below; requires Console-owner acceptance, not a Kernel issue mutation. | Console parent/producer/browser/security/service gates remain. |
@@ -164,7 +164,9 @@ Do not add telemetry, prompt contents, a new service, or inferred provider usage
 > STOP while native local effects may continue during termination. Unsettled/escaped
 > work remains `unknown`; retain the workspace and block acceptance/publication/successor
 > Attempt while uncertain. Producer Router parallel-call admission remains external,
-> not a Kernel scheduler to clone.
+> not a Kernel scheduler to clone. The task user accepts the native Codex same-principal
+> provider-HOME trust and must not expose production/remote-write credentials through
+> the worker identity.
 
 Keep the manual-edit, immutable Attempt, cache-ownership and foreign-resource cleanup
 criteria. This proposal does not mark #59 complete or authorize live multi-task work.
@@ -196,7 +198,9 @@ criteria. This proposal does not mark #59 complete or authorize live multi-task 
 > operations stop at the original deadline/revocation/STOP, that cancellation uses the
 > existing bounded path, and that uncertainty blocks acceptance/publication/retry. It
 > must separately disclose any local native effect during termination. Such a receipt
-> does not prove strict native-effect expiry or hostile-worker isolation.
+> does not prove strict native-effect expiry or hostile-worker isolation. It must also
+> record the selected Codex trust profile and same-principal provider-auth exposure;
+> production/remote-write credentials are not made available to the native worker.
 
 Keep actual Router #141, MI #19, producer, privacy, live-scope and independent-review
 gates. Do not close #60 based on documentation or synthetic fixtures alone.
@@ -207,8 +211,12 @@ gates. Do not close #60 based on documentation or synthetic fixtures alone.
 
 > The installed compatibility matrix labels `TRUSTED_DEVELOPMENT` as trusted native
 > execution with task-level deadline/STOP semantics, not strict per-syscall expiry or
-> hostile-worker isolation. The documented profile must state credential/workspace/
-> egress preconditions and refuse an unsupported profile without a broader fallback.
+> hostile-worker isolation. It must state that Codex provider auth in `HOME` may be
+> readable to terminal tools, that no production/remote-write secrets are permitted in
+> the task identity, and that native egress is unverified unless the exact sandbox test
+> proves it. Ordinary same-principal local coding is an explicit trust choice; a task
+> requiring secret secrecy or enforced egress control is unsupported without evidence.
+> Never fall back to a broader profile.
 
 Keep existing ciphertext, migration, package and producer-version gates.
 
