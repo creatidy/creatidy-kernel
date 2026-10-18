@@ -9,6 +9,41 @@ or model context. Native reception is required on the selected platform; unsuppo
 refuses, never falls back. No live execution is authorized by these docs.
 The [threat model](docs/architecture/threat-model.md) separates target controls from implemented code.
 
+## Trusted-Development Expiry Status
+
+The current trusted-development Codex path does not enforce grant expiry at each native filesystem
+or subprocess syscall. Deadline expiry and user STOP prevent new Kernel-controlled dispatch and
+initiate cancellation/termination; an already-running worker or descendant may still make local
+effects during teardown. A stop/interrupt acknowledgement is not settlement, and local changes are
+not rolled back. The accepted AC4 requires unknown termination/effect outcomes to remain unknown
+and block acceptance/publication, but current owned-process settlement does not yet enforce that
+gate: a terminal turn can reach candidate acceptance or finalize cancellation before the CLI closes
+`CodexStdio` and obtains its owned-group settlement result. This is the unresolved implementation
+gap tracked by [#90](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/90), not a current
+runtime guarantee. The approved #56/#60 body changes require deadline-triggered cancellation
+to use the same gate once synchronized.
+
+`TRUSTED_DEVELOPMENT` is an explicit owner-trusted coding profile, not hostile-worker isolation. The
+Codex app-server needs provider authentication in `HOME`; the native terminal may share the same
+principal, and `workspace-write` is not a proven read boundary. Ordinary local Codex remains available
+as an explicit same-principal trust choice with a limited provider account and no production or
+remote-write credentials in that account. This does not hide provider auth from a tool that can read
+`HOME`. Kernel adapter tokens are not placed directly in the child environment; this does not protect
+secrets stored in files reachable through `HOME`. The current profile also does not prove all terminal
+egress is blocked. Tasks needing provider-key confidentiality or enforced
+remote-effect containment are unsupported unless the exact profile proves them; do not silently refuse
+ordinary local coding or falsely claim those protections. The historical strict native-effect expiry
+requirement in #53 remains unmet and explicitly unsupported under the accepted baseline; #53 is closed
+not implemented and PR #85 is closed unmerged.
+
+Accepted [ADR 0011](docs/adr/0011-task-level-authority-and-trusted-development.md) defines the
+authoritative task-level baseline for this profile. Its [approved Kernel issue-body patches](docs/architecture/ac4-issue-description-proposals.md)
+record the associated issue alignment; this authority does not imply runtime implementation is
+complete.
+The current task deadline is persisted as wall-clock Unix time and recovery retains its original
+value. The suspend-inclusive boot-scoped projection required by ADR 0011 is not implemented; a
+recovery that cannot validate the original clock authority must not be described as rollback-proof.
+
 Report vulnerabilities through the mirror's
 [private security advisory intake](https://github.com/creatidy/creatidy-kernel/security/advisories/new).
 This is confidential intake only; fixes and development remain canonical on Forgejo. Do not post

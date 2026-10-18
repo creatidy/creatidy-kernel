@@ -8,9 +8,13 @@ rootless OCI worker boundary, with a controller-owned synthetic model backend. I
 close #53, adopt a product security profile, authorize live inference or paid model access,
 change production behavior, or alter AC4. [ADR 0007](../adr/0007-shared-harness-routing-observability.md)
 ownership, [ADR 0008](../adr/0008-linux-bubblewrap-verification.md) (verification-only bubblewrap
-boundary) and the [#78 whole-worker record](whole-worker-isolation.md) are unchanged; the
-owner decision in [#53 comment 15606](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53#issuecomment-15606)
-(universal executor enforcement, AC4 preserved) remains the binding scope.
+boundary) and the [#78 whole-worker record](whole-worker-isolation.md) are unchanged. The
+[#53 comment 15606](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53#issuecomment-15606)
+records the historical universal-executor-enforcement directive for #53, with its original
+AC4 scope preserved as history. The owner later accepted [ADR 0011](../adr/0011-task-level-authority-and-trusted-development.md)
+on 2026-10-18 as the authoritative task-level baseline for defined `TRUSTED_DEVELOPMENT`;
+strict native-effect expiry remains unsupported. This later decision does not change this
+bounded proof verdict, reclassify #53, or close its historical unmet strict-expiry criterion.
 
 ## Verdict
 

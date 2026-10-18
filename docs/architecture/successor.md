@@ -7,6 +7,26 @@ a time, explicitly by the owner or under an explicit owner-invoked repository `/
 not invocation authority. The known full product scope is retained; a vertical proof or documentation
 approval does not close missing requirements, authorize inference or mean `READY_FOR_LIVE_TASK`.
 
+## Accepted AC4 Baseline And Status (2026-10-18)
+
+Issue #53 is CLOSED / NOT IMPLEMENTED and PR #85 is CLOSED / UNMERGED. Their
+post-expiry regression is diagnostic evidence that strict native-effect expiry was not
+achieved; it is not an accepted adapter or successful native receipt. The owner accepted
+[ADR 0011](../adr/0011-task-level-authority-and-trusted-development.md) on 2026-10-18 as
+the authoritative task-level baseline for the defined trusted-development profile. The
+historical strict-expiry criterion remains unmet and explicitly unsupported; this
+acceptance does not reclassify #53 or its diagnostic.
+
+Accepted [ADR 0011](../adr/0011-task-level-authority-and-trusted-development.md) defines a task-level baseline for the existing trusted-development
+Codex path: deny new Kernel-controlled admissions after the original deadline/revoke,
+request bounded STOP, preserve exact operation/cancellation evidence, and report
+unknowns honestly while acknowledging that native local effects can continue during
+termination. Strict per-syscall native-effect expiry is unsupported. This accepted
+contract is requirements authority, not evidence that implementation or downstream
+issues are complete. The current code retains a wall-clock Unix deadline across recovery
+but has no proven suspend-inclusive boot-scoped projection; that requirement remains an
+implementation gate, not current runtime evidence.
+
 ## Observation Basis
 
 Kernel canonical Git/Forgejo `develop`, fetched 2026-10-04:
@@ -37,7 +57,7 @@ implementation. **Verified** here means the named bounded source/tests, not the 
 
 | Gap / agreed requirement | Owner of Kernel slice | Verified current evidence / existing coverage | Documentation correction | Registered missing result |
 | --- | --- | --- | --- | --- |
-| G01 Existing harness control, permissions/progress/lifetime/recovery/process ownership | Kernel | `ports/execution.Runtime`, `adapters/codex_runtime`, `codex_stdio`; tests `test_codex_runtime.py`, `test_codex_stdio.py`; #8/PR #26 native subset, not shared supervisor | Runtime contract, README, reuse | [#47](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/47) bounded feasibility; [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48) current lifetime repair; [#53](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53) proved adapter integration |
+| G01 Existing harness control, permissions/progress/lifetime/recovery/process ownership | Kernel | `ports/execution.Runtime`, `adapters/codex_runtime`, `codex_stdio`; tests `test_codex_runtime.py`, `test_codex_stdio.py`; #8/PR #26 native subset, not shared supervisor | Runtime contract, README, reuse | [#47](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/47) bounded feasibility; [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48) current lifetime repair; #53 closed not implemented; its post-expiry test is diagnostic only; [#90](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/90) user STOP |
 | G02 Ordinary issue preparation and approved versioned intake/freshness | Kernel | `adapters/task_execution.TaskSpec`, CLI `TASKS`, tests `test_task_preflight.py`, `test_task_166.py`; #31/#42 freeze examples; #32/#37 exclude ordinary ingestion | Task/authority contract and README | [#49](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/49) scope/requirements/recipes/approval and current issue/PR/source/test-baseline evidence |
 | G03 Durable product review/remediation and exact candidate reception | Kernel | `core/verification.verify_candidate`, `remediation_action`, `test_verification.py`; #7 domain seam; task POLICY reviewer false; #15/#19 development only | Acceptance contract, README | [#54](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/54) review receipt/independence/findings/new Attempt/fresh exact-SHA acceptance |
 | G04 Executable Router decision, sticky main route through harness/gateway/tools/recovery | Kernel consumer; Router producer | `adapters/scarcity_router.select`, `ports/allocation`, `test_allocation_recovery.py`; #11/PR #28 exclude gateway and prove only durable recommendation/no reselection | Allocator/runtime contract and migration | [#47](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/47) separate backend proof; [#52](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/52) consumer; Router [#174](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/issues/174) producer |
@@ -46,7 +66,7 @@ implementation. **Verified** here means the named bounded source/tests, not the 
 | G07 Versioned private full-outcome/cost export, causal limits | Kernel producer; Router optional consumer, MI optional privacy decision | `core/outcomes.export_outcomes`, `test_context_outcomes.py`, richer `reference_export`, thin `export_task_store`; #7/#10 foundations exclude analytics/telemetry | Export contract, README | [#58](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/58) complete export; Router [#177](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/issues/177) consumer; MI [#17](https://forgejo.creatidy.com/Creatidy/model-intelligence/issues/17) optional sharing, not local-path prerequisite |
 | G08 Owner-served state/events/CLI/Console/IDE/notifications | Kernel producer; Console client | `sqlite_store` EXCLUSIVE owner connection, offline CLI status/export, doctor; `test_sqlite_store.py`, `test_selfcontained_operator.py`; #5/#10/#44 do not establish served events | State/operator/security contract | [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) snapshot/position/dedupe/gap/buffer/correlation/current-authority commands/alerts. Console [#1 bootstrap](https://forgejo.creatidy.com/Creatidy/creatidy-console/issues/1) found at final check; specific consumer contract/receipt not yet found, no direct SQL |
 | G09 Actual workspace/test/reviewer isolation and permission refusals | Kernel | `TrustMode`, native workspace-write/never, synthetic `test_fake_execution.py`; #6 excludes OS sandbox; verifier runs all checks before rejection | Threat model/SECURITY/verification contract | [#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50) trusted preconditions and existing-sandbox denial proof; Router [#180](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/issues/180) owns native-workspace authority conflict |
-| G10 Preserve identity/protocol/access-mode/effort and evidence strength | Kernel consumer; Router/harness producers | `RuntimeIdentity`, `identity_matches`, `test_reference_identity.py`, explicit D-057 effort; #8/#11/#35 subset; observed physical identity unknown, resource/access mode absent | Runtime/allocator/identity contract | [#52](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/52) consumer with #47/#53 harness version proof; Router [#179](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/issues/179) identity/effort, [#181](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/issues/181) ingress compatibility |
+| G10 Preserve identity/protocol/access-mode/effort and evidence strength | Kernel consumer; Router/harness producers | `RuntimeIdentity`, `identity_matches`, `test_reference_identity.py`, explicit D-057 effort; #8/#11/#35 subset; observed physical identity unknown, resource/access mode absent | Runtime/allocator/identity contract | [#52](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/52) consumer with #47 evidence; #53 is not an integrated adapter; Router [#179](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/issues/179) identity/effort, [#181](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/issues/181) ingress compatibility |
 | G11 Many tasks, host-qualified cache/locks/ownership/manual edits/cleanup | Kernel | `source_cache.source_cache_key` path-only, SQLite one-writer, candidate/Attempt identities; `test_source_cache.py`; #13 local fences/#44 layout independent, not complete multi-task ownership | Workspace/state/migration contract | [#61](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/61) cache/dispatch identity; [#59](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/59) controllers/workspaces/manual changes/concurrent view |
 | G12 Whole-task attempts/review/tools/retries/auxiliary budget and costs | Kernel aggregate authority; Router call enforcement | `BudgetPolicy` count limits, journal retry safety, per-command timeout, pure outcomes; #4/#7/#32 subsets, no complete consumption/enforcement | Execution/effect/cost contract | [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48) immediate deadline/freshness repair; [#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56) full budget/retry/capture/unknown ledger; Router [#184](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/issues/184) enforcement facts |
 | G13 Public contract/adapter distribution, durable/profile migration and platform lifecycle | Kernel consumer/distributor; each producer owns its versions | Versioned store/allocation codecs, package smoke, generic dotenv/SOPS and Linux-only storage; #5/#8/#11/#44 subsets, no real ciphertext migration or exercised platform matrix | Migration/delivery/operator contract | [#62](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/62) compatibility/install/ciphertext/state/platform; #61 hostless-cache migration; Router [#185](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/issues/185)/[#186](https://forgejo.creatidy.com/BioMedical-IT/scarcity-router/issues/186), MI [#18](https://forgejo.creatidy.com/Creatidy/model-intelligence/issues/18) producer obligations |
@@ -59,13 +79,13 @@ has been registered as a Kernel implementation issue.
 
 ## First-Priority Deviations
 
-These remain product defects/proof blockers even if the documentation PR is approved. Static code
-facts are distinguished from unrun exploit/live scenarios. Closure requires behavior evidence, not
-only changed prose or a green unrelated test suite.
+These remain product defects/proof blockers after ADR 0011 acceptance. Static code facts are
+distinguished from unrun exploit/live scenarios. Closure requires behavior evidence, not only changed
+prose or a green unrelated test suite.
 
 | Current fact | User/integration consequence and urgency | Task / observable closure |
 | --- | --- | --- |
-| CLI `_task` retains its owned connection while active; failed/interrupted no-candidate finishes the Attempt; expiry/Ctrl-C have separate cancel journal/receipt/observations | #48 synthetic delayed-turn/restart/crash proof does not establish detached lifetime, shared-session handoff, interrupt delivery or remote descendant settlement. | [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48) bounded owned-session repair; #53 receives separately proved native integration |
+| CLI `_task` retains its owned connection while active; failed/interrupted no-candidate finishes the Attempt; expiry/Ctrl-C have separate cancel journal/receipt/observations | #48 synthetic delayed-turn/restart/crash proof does not establish detached lifetime, shared-session handoff, interrupt delivery or remote descendant settlement. | [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48) bounded owned-session repair; #53/PR #85 remain closed and provide no integrated adapter; [#90](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/90) tracks STOP reconciliation |
 | `run_task` enforces original deadline/version/mode/source on recovery; Runtime/check/admission timestamps are decision-time observations | Original envelope cannot be renewed by CLI defaults; expired work may be observed but not newly dispatched or accepted. Full call/tool/quota/cost enforcement remains absent. | #48 deterministic envelope/freshness refusal; [#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56) whole-path budget and streaming byte/process bounds |
 | #61 source repair uses a separate host-qualified namespace, stable acquisition/use lock, matched ownership metadata and shared local dispatch validation; unknown trees are preserved | Lease covers the validated exact-object copy, not a healthy model session. This trusted native-local protocol is not hostile same-UID isolation or complete multi-task control. | #61 synthetic two-host/port, forced process/thread interleavings, preservation/refusal and zero-start negatives; independent exact-HEAD reception remains the delivery gate. #59 still owns controllers/manual edits. |
 | `verify_candidate` runs every check before rejection; TaskChecks executes candidate commands after changed-path failure; same-user environment is not sandbox | Out-of-scope candidate tooling can run before rejection; final no-PR assertion is not no-effect proof. | [#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50): no-execution marker for rejected tooling and real sandbox/test/reviewer denials |
@@ -87,8 +107,11 @@ installed acceptance. It is registered, not omitted as demo-only or minimum scop
    preserve it in Kernel #51. No new hard-quality minima are guessed from issue prose.
 3. Router #174 executable handoff follows exact-core correction #178, identity/effort #179 and
    affected native authority #180. Receive protocol/tool/partial-recovery evidence #181 and known
-   cancellation #165. Kernel #52 persists the result; #53 integrates the proved harness. Research
-   may run jointly, but implemented consumer receipt cannot precede producer conformance.
+   cancellation #165. Kernel #52 persists the result. #53/PR #85 is closed not implemented; the
+   diagnostic does not prove a supported adapter or strict native expiry. Accepted ADR 0011 is
+   authoritative for the defined trusted-development baseline, but the diagnostic does not satisfy
+   that baseline's implementation gates. Research may run jointly, but implemented consumer receipt
+   cannot precede producer conformance.
 4. MI #13 publication semantics/integrity and #14 mapping precede Router #176 admitted consumption
    and Kernel #55 retained references. MI's data/value/rights and complete-publication work remains
    MI-owned; optional sharing #17 is not a prerequisite for local operation.
@@ -119,14 +142,14 @@ to execute, select a library, set a budget or change authority.
 | [#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50) | Trusted verifier preconditions and proved existing sandbox | Immediate untrusted-execution safety |
 | [#51](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/51) | Meaningful monotone Router requirements | #49; Router #175/MI #14 semantics |
 | [#52](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/52) | Sticky executable-route/identity consumer | #47/#51; producer #174/#179/#180/#181 |
-| [#53](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53) | Proved harness adapter/session integration | #47; #48/#50 accepted lifecycle/security |
+| [#53](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53) | Closed not implemented; historical strict native-expiry criterion remains unmet and unsupported under accepted ADR 0011; diagnostic evidence preserved | #47; #48/#50 are separate lifecycle/verification evidence, not strict effect fencing |
 | [#54](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/54) | Durable product review/remediation/acceptance | Approved spec, harness, isolation, budget policy |
 | [#55](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/55) | Utilized MI reference/harness-evidence provenance | MI #13/Router #176 producer conformance |
 | [#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56) | Whole-task accounting/enforcement/hidden retries | #48/#49/#52/#54 facts; Router #184 |
 | [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) | Served state/progress/commands/notifications, useful CLI | Lifecycle/correlation/ownership; preserves SQLite |
 | [#58](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/58) | Complete versioned private outcomes/cost export | #54/#56 identity/cost ledger; optional Router #177 |
-| [#59](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/59) | Multiple-task workspace/controller/manual-edit reconciliation | #48/#50/#53/#61; #57 concurrent view |
-| [#60](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/60) | Installed composed user-path reception, negative/live evidence | Actual component receipts and separately scoped live authority |
+| [#59](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/59) | Multiple-task workspace/controller/manual-edit reconciliation | #48/#50/#61; #57 view; accepted ADR 0011 baseline; #90 STOP status remains a scoped implementation input, not a global queue gate |
+| [#60](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/60) | Installed composed user-path reception, negative/live evidence | Accepted ADR 0011 plus actual component receipts and separately scoped live authority |
 | [#61](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/61) | Host cache/locks/cleanup/source dispatch checks | Immediate data/identity safety; compatible migration |
 | [#62](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/62) | Public install/platform/contract/state/profile compatibility | Accompany migrations, precede installed reception |
 
