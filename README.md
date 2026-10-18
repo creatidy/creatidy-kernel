@@ -74,8 +74,8 @@ Public dependencies may be reused; no private `creatidy-onprem` is required for 
 
 [ADR 0007](docs/adr/0007-shared-harness-routing-observability.md) records the owner's 2026-10-04
 shared-architecture direction and source availability. [The coverage roadmap](docs/architecture/successor.md)
-distinguishes **Agreed**, revision-**Verified**, **Proposed clarification** and **To prove**. The current
-foundations and bounded intake are not evidence that ordinary execution, rich routing, gateway,
+maps the accepted AC4 baseline separately from observed evidence and registered work still to prove.
+The current foundations and bounded intake are not evidence that ordinary execution, rich routing, gateway,
 product review, isolation, full costs or
 Console integration are complete. No Creatidy cloud account is required by the target architecture.
 
@@ -314,8 +314,9 @@ hidden-call and auxiliary-effect accounting remains unimplemented. Remaining wor
 [#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56), not promised detached
 recovery features. [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48) supplies the
 bounded owned-session repair. [#53](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53)
-and PR #85 are closed not implemented; their post-expiry diagnostic is evidence of an AC4 gap, not
-a supported native adapter or accepted effect-fencing proof.
+and PR #85 are closed not implemented; their post-expiry diagnostic proves the historical strict
+native-effect expiry was not achieved, not that the accepted task-level baseline is implemented.
+Strict native-effect expiry remains explicitly unsupported.
 Native-shaped offline fixtures are not live model or remote-Forge acceptance.
 
 ### Trusted-Development Expiry Boundary
@@ -324,16 +325,16 @@ In the current trusted-development Codex path, the persisted deadline prevents n
 dispatch/acceptance and triggers cancellation; it does not atomically revoke a native process's
 filesystem or subprocess syscalls. Local effects may occur while the active process group is being
 terminated. A stop/interrupt acknowledgement is not settlement, and cancellation is not rollback.
-The proposed contract requires acceptance/publication to remain blocked while outcome or
+The accepted contract requires acceptance/publication to remain blocked while outcome or
 owned-process settlement is unknown, but the current code does not yet enforce that gate at the
 process-group boundary: a terminal Codex turn can finalize cancellation or reach candidate
 acceptance before the controller's `CodexStdio.close()` records `owned_group_settled`. This is the
 unresolved implementation gap tracked by [#90](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/90),
-not a guarantee established by this proposal. The proposed #56/#60 criteria require the same gate
-for deadline-triggered cancellation. This is not a hostile-worker sandbox or a strict
-no-native-effect-after-expiry guarantee. [Proposed ADR 0011](docs/adr/0011-task-level-authority-and-trusted-development.md)
-and its [issue-description patches](docs/architecture/ac4-issue-description-proposals.md) are not
-accepted; the existing AC4 remains binding until an explicit owner decision. The native app-server
+not a guarantee established by this documentation. The approved #56/#60 body changes
+require the same gate for deadline-triggered cancellation when synchronized. This is not
+a hostile-worker sandbox or a strict no-native-effect-after-expiry guarantee. [Accepted ADR 0011](docs/adr/0011-task-level-authority-and-trusted-development.md)
+defines the authoritative baseline for this profile; its [approved Kernel issue-body patches](docs/architecture/ac4-issue-description-proposals.md)
+record the corresponding acceptance alignment. The native app-server
 requires provider auth in `HOME`, and the repository does not prove the terminal child cannot read it.
 Ordinary local Codex is an explicit same-principal trust choice: use a limited provider account and
 keep production/remote-write credentials out of the task user's account. This is not credential
@@ -341,8 +342,9 @@ isolation. Tasks requiring provider-key secrecy or enforced shell egress control
 the current path unless the selected profile proves those boundaries; ordinary local coding is not
 blanket-refused.
 The current deadline is persisted as a wall-clock Unix timestamp; recovery retains it, but the code
-does not establish a boot-scoped monotonic projection or rollback-resistant clock. ADR 0011 proposes
-that additional durable clock requirement; it is not implemented or claimed here.
+does not establish the required suspend-inclusive boot-scoped projection. Accepted ADR 0011 requires
+verified `CLOCK_BOOTTIME` where supported and fail-closed recovery, but this clock behavior is not
+implemented or claimed here.
 
 The separately opt-in [ADR 0008 verification-only profile](docs/adr/0008-linux-bubblewrap-verification.md)
 uses native Linux bubblewrap and libseccomp for untrusted test children, including such execution

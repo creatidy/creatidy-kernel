@@ -8,17 +8,20 @@ conformance. [ADR 0007](../adr/0007-shared-harness-routing-observability.md) own
 [ADR 0008](../adr/0008-linux-bubblewrap-verification.md) (verification-only boundary) are
 unchanged; no production behavior changed in this delivery.
 
-## Current Kernel Disposition (2026-10-16)
+## Current Kernel Disposition (2026-10-18)
 
 Kernel issue #53 is CLOSED / NOT IMPLEMENTED and PR #85 is CLOSED / UNMERGED. The
-owner's strict native-expiry requirement remains binding and unmet: the #53 controlled
-post-expiry effect test is diagnostic evidence, not AC4 acceptance. The separate
+historical strict native-expiry requirement remains unmet: the #53 controlled
+post-expiry effect test is diagnostic evidence, not proof of native expiry. The separate
 cgroup cold-recovery proof below supports bounded revocation/settlement within its
 tested boundary only; it does not prove that native effects stop at exact grant expiry.
-Proposed [ADR 0011](../adr/0011-task-level-authority-and-trusted-development.md) considers a different task-level baseline but is not accepted and
-does not change this record or the current AC4 contract.
+The owner accepted [ADR 0011](../adr/0011-task-level-authority-and-trusted-development.md)
+on 2026-10-18 as the authoritative task-level baseline for defined trusted-development.
+Strict native-effect expiry remains explicitly unsupported. This decision does not
+reopen #53, reclassify its evidence, or adopt this whole-worker proposal as a product
+security profile.
 
-Owner decision in force ([#53 comment 15606](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53#issuecomment-15606)):
+Historical #53 owner directive ([comment 15606](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53#issuecomment-15606), preserved; superseded for the defined trusted-development baseline by ADR 0011):
 **universal executor enforcement** — Kernel authority over file/terminal effects must be
 enforced by a trusted worker/executor boundary independently of harness approval callbacks,
 with expiry/revocation preventing new unauthorized effects and triggering bounded
@@ -127,14 +130,19 @@ The requested distinction is preserved explicitly:
    (observed `lost` event); workspace bytes written before/while dying persist and are not
    rolled back (observed partial stream).
 
-**AC4 compatibility:** the existing AC4 contract requires new unauthorized effects to be
-refused under current authority and forbids instantaneous-cancellation claims. This boundary
-satisfies the refusal requirement for the relayed channel and confines all native effects
-statically; it does **not** provide instantaneous revocation of native in-flight writes, and
-this record does not reinterpret AC4 to claim it. The enforcement combination that satisfies
-AC4 for a real harness is: static whole-worker containment + relay-only external effects +
-bounded termination + durable receipts — with the workspace treated as a disposable,
-owner-visible-until-settled scratch resource, not as a revocable authority surface.
+**Historical AC4 compatibility analysis (2026-10-08):** the strict effect-boundary
+interpretation then in force required new unauthorized effects to be refused and forbade
+instantaneous-cancellation claims. This synthetic boundary confines its relayed channel
+and statically limits effects, but does **not** provide instantaneous revocation of
+native in-flight writes. The listed static containment/relay/termination/receipt
+combination was a candidate for that historical requirement, not an adopted or proved
+real-harness implementation.
+
+**Current accepted baseline:** ADR 0011 governs the defined trusted-development profile.
+It requires task-level Kernel admission, STOP, settlement and honest-unknown semantics;
+it does not require this whole-worker proposal and explicitly does not guarantee strict
+native-effect expiry. This record remains synthetic feasibility evidence only, not
+acceptance evidence for the current runtime.
 
 ## Limitations, residual threats and unproved guarantees
 

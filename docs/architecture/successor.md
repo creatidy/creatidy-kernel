@@ -7,22 +7,25 @@ a time, explicitly by the owner or under an explicit owner-invoked repository `/
 not invocation authority. The known full product scope is retained; a vertical proof or documentation
 approval does not close missing requirements, authorize inference or mean `READY_FOR_LIVE_TASK`.
 
-## Current AC4 Status And Proposal (2026-10-16)
+## Accepted AC4 Baseline And Status (2026-10-18)
 
 Issue #53 is CLOSED / NOT IMPLEMENTED and PR #85 is CLOSED / UNMERGED. Their
-post-expiry regression is diagnostic evidence that the strict native effect-cutoff
-requirement is unmet; it is not an accepted adapter, a successful native receipt, or
-AC4 acceptance. The prior strict AC4 remains binding.
+post-expiry regression is diagnostic evidence that strict native-effect expiry was not
+achieved; it is not an accepted adapter or successful native receipt. The owner accepted
+[ADR 0011](../adr/0011-task-level-authority-and-trusted-development.md) on 2026-10-18 as
+the authoritative task-level baseline for the defined trusted-development profile. The
+historical strict-expiry criterion remains unmet and explicitly unsupported; this
+acceptance does not reclassify #53 or its diagnostic.
 
-The proposed [ADR 0011](../adr/0011-task-level-authority-and-trusted-development.md) considers a task-level baseline for the existing trusted-development
+Accepted [ADR 0011](../adr/0011-task-level-authority-and-trusted-development.md) defines a task-level baseline for the existing trusted-development
 Codex path: deny new Kernel-controlled admissions after the original deadline/revoke,
 request bounded STOP, preserve exact operation/cancellation evidence, and report
 unknowns honestly while acknowledging that native local effects can continue during
-termination. It is not accepted or authoritative. Until explicit owner acceptance,
-do not retire the strict AC4 gate, reclassify #53, or mark downstream issues complete.
-The current code retains a wall-clock Unix deadline across recovery but has no proven
-boot-scoped monotonic projection; rollback-resistant expiry is an implementation gate in ADR 0011,
-not current evidence.
+termination. Strict per-syscall native-effect expiry is unsupported. This accepted
+contract is requirements authority, not evidence that implementation or downstream
+issues are complete. The current code retains a wall-clock Unix deadline across recovery
+but has no proven suspend-inclusive boot-scoped projection; that requirement remains an
+implementation gate, not current runtime evidence.
 
 ## Observation Basis
 
@@ -76,9 +79,9 @@ has been registered as a Kernel implementation issue.
 
 ## First-Priority Deviations
 
-These remain product defects/proof blockers even if the documentation PR is approved. Static code
-facts are distinguished from unrun exploit/live scenarios. Closure requires behavior evidence, not
-only changed prose or a green unrelated test suite.
+These remain product defects/proof blockers after ADR 0011 acceptance. Static code facts are
+distinguished from unrun exploit/live scenarios. Closure requires behavior evidence, not only changed
+prose or a green unrelated test suite.
 
 | Current fact | User/integration consequence and urgency | Task / observable closure |
 | --- | --- | --- |
@@ -105,8 +108,9 @@ installed acceptance. It is registered, not omitted as demo-only or minimum scop
 3. Router #174 executable handoff follows exact-core correction #178, identity/effort #179 and
    affected native authority #180. Receive protocol/tool/partial-recovery evidence #181 and known
    cancellation #165. Kernel #52 persists the result. #53/PR #85 is closed not implemented; the
-   diagnostic does not prove a supported adapter or strict native expiry. Proposed ADR 0011 is not
-   authoritative until owner acceptance. Research may run jointly, but implemented consumer receipt
+   diagnostic does not prove a supported adapter or strict native expiry. Accepted ADR 0011 is
+   authoritative for the defined trusted-development baseline, but the diagnostic does not satisfy
+   that baseline's implementation gates. Research may run jointly, but implemented consumer receipt
    cannot precede producer conformance.
 4. MI #13 publication semantics/integrity and #14 mapping precede Router #176 admitted consumption
    and Kernel #55 retained references. MI's data/value/rights and complete-publication work remains
@@ -138,14 +142,14 @@ to execute, select a library, set a budget or change authority.
 | [#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50) | Trusted verifier preconditions and proved existing sandbox | Immediate untrusted-execution safety |
 | [#51](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/51) | Meaningful monotone Router requirements | #49; Router #175/MI #14 semantics |
 | [#52](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/52) | Sticky executable-route/identity consumer | #47/#51; producer #174/#179/#180/#181 |
-| [#53](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53) | Closed not implemented; strict native-expiry AC4 remains unmet; diagnostic evidence preserved | #47; #48/#50 are separate lifecycle/verification evidence, not strict effect fencing |
+| [#53](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53) | Closed not implemented; historical strict native-expiry criterion remains unmet and unsupported under accepted ADR 0011; diagnostic evidence preserved | #47; #48/#50 are separate lifecycle/verification evidence, not strict effect fencing |
 | [#54](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/54) | Durable product review/remediation/acceptance | Approved spec, harness, isolation, budget policy |
 | [#55](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/55) | Utilized MI reference/harness-evidence provenance | MI #13/Router #176 producer conformance |
 | [#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56) | Whole-task accounting/enforcement/hidden retries | #48/#49/#52/#54 facts; Router #184 |
 | [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) | Served state/progress/commands/notifications, useful CLI | Lifecycle/correlation/ownership; preserves SQLite |
 | [#58](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/58) | Complete versioned private outcomes/cost export | #54/#56 identity/cost ledger; optional Router #177 |
-| [#59](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/59) | Multiple-task workspace/controller/manual-edit reconciliation | #48/#50/#61; #57 view; current strict AC4 remains binding until ADR 0011 is explicitly accepted; #90 STOP status is separate |
-| [#60](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/60) | Installed composed user-path reception, negative/live evidence | Actual component receipts and separately scoped live authority; current strict AC4 remains binding until owner accepts a revision |
+| [#59](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/59) | Multiple-task workspace/controller/manual-edit reconciliation | #48/#50/#61; #57 view; accepted ADR 0011 baseline; #90 STOP status remains a scoped implementation input, not a global queue gate |
+| [#60](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/60) | Installed composed user-path reception, negative/live evidence | Accepted ADR 0011 plus actual component receipts and separately scoped live authority |
 | [#61](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/61) | Host cache/locks/cleanup/source dispatch checks | Immediate data/identity safety; compatible migration |
 | [#62](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/62) | Public install/platform/contract/state/profile compatibility | Accompany migrations, precede installed reception |
 

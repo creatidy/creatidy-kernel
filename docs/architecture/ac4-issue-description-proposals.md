@@ -1,9 +1,11 @@
-# Proposed AC4 Issue-Description And Dependency Changes
+# Approved AC4 Issue-Description And Dependency Changes
 
-- Status: Proposal only; no live issue body, label, state, or dependency edge changed
-- Date: 2026-10-16
-- Authority: Apply only after explicit owner acceptance of ADR 0011. Cross-repository
-  Console text additionally requires Console-owner approval.
+- Status: Owner accepted 2026-10-18; this document records the approved Kernel body text
+- Live state: This PR does not change issue bodies, labels, states, or dependency edges
+- Original draft date: 2026-10-16
+- Owner acceptance: 2026-10-18
+- Authority: Owner approval authorizes the listed Kernel issue-body updates after PR #91
+  merges. Cross-repository Console text still requires Console-owner approval.
 
 ## Dependency Reconciliation
 
@@ -11,32 +13,33 @@ The canonical Forgejo dependency APIs return no formal dependencies or dependent
 #53. #59, #60 and #90 also have no formal incoming dependency edges. The issue bodies
 and comments do carry local prerequisites; closure of #53 does not satisfy them.
 
-| Issue | Current gate/reference | Proposed disposition if ADR 0011 is accepted | Still required |
+| Issue | Current gate/reference | Owner-approved direction after PR #91 merges | Still required |
 | --- | --- | --- | --- |
-| #53 | CLOSED / NOT IMPLEMENTED; PR #85 CLOSED / UNMERGED. Positive native post-expiry effect is diagnostic evidence. | Leave closed. Do not retrofit its AC4 history or mark it accepted. | Current strict AC4 remains binding until owner acceptance; the new wording is only a proposal. |
-| #52 | Open; historical issue comment [#14078](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/52#issuecomment-14078) orders producer contracts before a “#52/#53 consumer receipt”; this wording is in the comment, not the current issue body. | After owner acceptance, add an explicit clarification to the #52 issue body. Preserve comment #14078 unchanged as historical context; do not silently edit or claim to replace it. | Router #174/#178/#179/#180/#181, existing Router #165 cancellation evidence, and Kernel #47/#49/#51/#52 gates remain. |
-| #54 | Open; body depends on #47/#48/#49/#50 and a separately authorized Router review route; no direct #53 edge. | Clarify that a review verdict is not an effect-fencing or hostile-worker proof; consume STOP/uncertainty facts if using the proposed baseline. | Review-route, live inference/effect scopes, #50 test-child scope and existing policy/budget gates remain. |
-| #56 | Open; whole-task deadline, in-flight overrun and unknown-cost accounting. The current source records terminal cancellation before owned-process settlement is established. | Specify a verified suspend-inclusive deadline projection and tests; expiry uses the same owned-process settlement gate as user STOP. Record the current ordering defect as an implementation gap, not as fixed by this documentation. | Router #184 and approved task budget/usage evidence remain; uncertainty is scoped to the affected Attempt/resources. |
+| #53 | CLOSED / NOT IMPLEMENTED; PR #85 CLOSED / UNMERGED. Positive native post-expiry effect is diagnostic evidence. | Leave closed. Do not retrofit its history or claim its strict-expiry acceptance. | Historical strict native expiry remains unmet and unsupported under ADR 0011; the diagnostic is not a task-level implementation receipt. |
+| #52 | Open; historical issue comment [#14078](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/52#issuecomment-14078) orders producer contracts before a “#52/#53 consumer receipt”; this wording is in the comment, not the current issue body. | After PR #91 merges, add the approved clarification to the #52 issue body. Preserve comment #14078 unchanged; do not silently edit or claim to replace it. | Router #174/#178/#179/#180/#181, existing Router #165 cancellation evidence, and Kernel #47/#49/#51/#52 gates remain. |
+| #54 | Open; body depends on #47/#48/#49/#50 and a separately authorized Router review route; no direct #53/#90 edge. | Preserve synthetic-first eligibility independently of #90 and #60. Require #90 STOP/settlement evidence only for live trusted-development review/remediation that can incur native effects. | Review-route, live inference/effect scopes, #50 test-child scope and existing policy/budget gates remain. |
+| #56 | Open; whole-task deadline, in-flight overrun and unknown-cost accounting. The current source records terminal cancellation before owned-process settlement is established. | Specify the accepted suspend-inclusive deadline projection and tests; expiry uses the same owned-process settlement gate as user STOP. Record the current ordering defect as an implementation gap, not as fixed by this documentation. | Router #184 and approved task budget/usage evidence remain; uncertainty is scoped to the affected Attempt/resources. |
 | #57 | Open; owner-served task state and user-facing status. | Distinguish deadline/STOP request from owned-process settlement and uncertainty; don't imply exact syscall cutoff. | SQLite owner-thread, snapshot/event and current-authority gates remain. |
 | #58 | Open; full-path private outcome/cost export. | Export trust profile, deadline decision and cancellation/settlement evidence; never report unknown local effects/usage as zero or rollback. | MI/Router producer contracts, privacy and versioned export gates remain. |
-| #59 | Open; body says “#53 chosen harness” and requires owned workspace/process cleanup. | Replace #53 as a strict-expiry/harness prerequisite with the proposed task-level profile and #90 STOP only after owner acceptance. State same-principal provider-HOME trust; no production/remote-write credentials in the task identity. | #48 lifetime, #50 verification/test-child, #57 view, #61 cache ownership, manual-edit and Router parallel-call gates remain. |
-| #60 | Open; integrated reception includes #53 harness adapter/lifetime. | Replace #53 as a strict native-expiry acceptance prerequisite with ADR 0011 + #90 and other actual component receipts. Require expiry-triggered cancellation to meet the same owned-process settlement gate as user STOP, and report the termination-window residual and same-principal provider-HOME trust explicitly. | #47/#48/#49/#50/#52/#54/#55/#56/#57/#58/#59/#61/#62, Router #141 and MI #19 gates remain. |
+| #59 | Open; body says “#53 chosen harness” and requires owned workspace/process cleanup. | Replace #53 as a strict-expiry/harness prerequisite with the accepted task-level profile and scoped #90 STOP evidence. State same-principal provider-HOME trust; no production/remote-write credentials in the task identity. | #48 lifetime, #50 verification/test-child, #57 view, #61 cache ownership, manual-edit and Router parallel-call gates remain. |
+| #60 | Open; integrated reception includes #53 harness adapter/lifetime. | Replace #53 as a strict native-expiry acceptance prerequisite with accepted ADR 0011 + #90 and other actual component receipts. Require expiry-triggered cancellation to meet the same owned-process settlement gate as user STOP, and report the termination-window residual and same-principal provider-HOME trust explicitly. | #47/#48/#49/#50/#52/#54/#55/#56/#57/#58/#59/#61/#62, Router #141 and MI #19 gates remain. |
 | #62 | Open; installed/profile/platform compatibility. | Add an explicit trusted-development profile row: no strict native effect cutoff or hostile-worker claim; provider-auth HOME is same-principal trust unless a test proves otherwise; no production/remote-write credentials; no fallback to a broader profile. | Actual producer versions, migration safety and platform evidence remain. |
 | #79 | Open verification/test-child follow-up; PR #83 is already merged. Its body says #53's whole-worker gate remains separate. | Clarify that #50/#79 are test-child only and neither proves whole-worker isolation nor strict expiry. | Exact upstream/license/provenance and test-child acceptance remain; do not promote the profile. |
-| #90 | Open user-requested STOP issue; no formal dependency on #53. Its body already records the terminal-turn-before-process-group-settlement ordering gap. | Keep #90 scoped to user-requested STOP and its existing implementation gap; do not claim documentation acceptance fixes it. Proposed #56/#60 criteria separately require the same settlement gate for deadline cancellation. | Exact owned-process-group settlement, unknown reporting and single-writer behavior remain. |
+| #90 | Open user-requested STOP issue; no formal dependency on #53. Its body already records the terminal-turn-before-process-group-settlement ordering gap. | Keep #90 scoped to user-requested STOP and its existing implementation gap; do not claim documentation acceptance fixes it. Approved #56/#60 criteria separately require the same settlement gate for deadline cancellation. | Exact owned-process-group settlement, unknown reporting and single-writer behavior remain. |
 | Console #4/#8/#12/#13 | Open Console consumers; #8/#13 link #53 and #12 tests revoked/expired permissions. No formal edge to #53 is registered. | Proposed consumer copy below; requires Console-owner acceptance, not a Kernel issue mutation. | Console parent/producer/browser/security/service gates remain. |
 
-No formal Forgejo dependency edge is changed by this proposal. If accepted, owners may
-consider formal #59 -> #90 and #60 -> #59/#90 edges because those acceptance paths
-consume STOP/ownership outcomes; do not add them automatically. #52's Router producer
-gates remain independent. External Router/MI/Console issue bodies and statuses are not
-changed here.
+No formal Forgejo dependency edge is authorized or changed by this acceptance. In
+particular, #54 synthetic-first work has no #90 or #60 prerequisite. Potential #59 -> #90
+and #60 -> #59/#90 edges remain unregistered and are not part of this task. #52's Router
+producer gates remain independent. External Router/MI/Console issue bodies and statuses
+are not changed here.
 
 ## Kernel Issue-Description Patches
 
-The following excerpts are the exact proposed replacements/additions. All unquoted
-criteria, authorities, acceptance evidence and external producer gates remain in force.
-These are not applied to live Forgejo descriptions.
+The following excerpts are the exact owner-approved replacements/additions for the
+Kernel issue bodies after PR #91 merges. All unquoted criteria, authorities, acceptance
+evidence and external producer gates remain in force. The PR itself does not mutate live
+Forgejo issue descriptions.
 
 ### #52 — Route Consumer
 
@@ -47,7 +50,7 @@ These are not applied to live Forgejo descriptions.
 > evidence; Kernel #52/#53 consumer receipt. No source/effort/access-mode parsing or
 > physical attestation inference from gateway audit.
 
-**Proposed issue-body addition (after owner acceptance):**
+**Approved issue-body addition (apply after PR #91 merges):**
 
 Add this paragraph to the #52 issue body's **Dependencies And Priority** section, after its existing ordering paragraph:
 
@@ -63,11 +66,11 @@ Add this paragraph to the #52 issue body's **Dependencies And Priority** section
 > #53/PR #85 remains CLOSED / NOT IMPLEMENTED; its diagnostic is neither a shipped
 > route adapter nor an acceptance pass.
 
-This is a proposed addition to the issue body, not a replacement or edit of comment
-#14078. If accepted, the new body text is the actionable current-scope clarification;
-the historical comment remains intact and is not a formal dependency edge. This addition
-does not retire any listed producer or Kernel consumer gate, resolve the explicit D-063
-workspace-owner decision, or grant live inference/effect authority.
+This is the approved addition to the issue body, not a replacement or edit of comment
+#14078. After PR #91 merges, the new body text is the actionable current-scope
+clarification; the historical comment remains intact and is not a formal dependency edge.
+This addition does not retire any listed producer or Kernel consumer gate, resolve the
+explicit D-063 workspace-owner decision, or grant live inference/effect authority.
 
 ### #54 — Review And Remediation
 
@@ -78,15 +81,19 @@ workspace-owner decision, or grant live inference/effect authority.
 > whole-task budget/cost and exports must consume review/remediation facts. No manual
 > owner handoff as integration plan.
 
-**Proposed replacement:**
+**Approved replacement:**
 
 > Product acceptance prerequisite after approved spec #49, proved harness/control
-> evidence #47, verification/test-child profile #50 and lifecycle #48. For the proposed
-> baseline, native review/remediation must use an explicit trusted-development profile
-> and consume #90 STOP/uncertainty facts; an independent verdict is not proof that
-> native effects stopped at expiry or that the reviewer was hostile-worker isolated.
-> Router owns a separately authorized review route; whole-task budget/cost and exports
-> must consume review/remediation facts. No manual owner handoff as integration plan.
+> evidence #47, verification/test-child profile #50 and lifecycle #48. Synthetic
+> fixture-first review/remediation remains independently eligible after these existing
+> synthetic prerequisites; it does not wait for #90, #53 or #60. Only a live
+> trusted-development review/remediation path that may create native effects must use
+> an explicit trusted-development profile and consume #90 STOP/uncertainty/settlement
+> facts, with separately authorized Router route and effect scope. An independent verdict
+> is not proof that native effects stopped at expiry or that the reviewer was
+> hostile-worker isolated. Router owns the separately authorized review route;
+> whole-task budget/cost and exports must consume review/remediation facts. No manual
+> owner handoff as integration plan.
 
 This does not grant live review/inference/effect scope or promote #50 into a worker
 profile.
@@ -99,7 +106,7 @@ profile.
 > cannot reset task budget/deadline. In-flight overrun/unknown accounting is explicit
 > with tested pause/reconciliation behavior.
 
-**Proposed replacement:**
+**Approved replacement:**
 
 > Each new Kernel-controlled admission respects the approved envelope and original
 > deadline; restart cannot reset it. Use a verified suspend-inclusive Linux
@@ -119,7 +126,7 @@ profile.
 
 Router #184's call/quota evidence and approved numeric task budget remain required.
 
-**Proposed addition to Acceptance Criteria (new criterion 7):**
+**Approved addition to Acceptance Criteria (new criterion 7):**
 
 > Deadline-triggered cancellation uses the same exact owned-process settlement gate as
 > user-requested STOP. A terminal Codex turn or successful interrupt acknowledgement
@@ -140,7 +147,7 @@ Router #184's call/quota evidence and approved numeric task budget remain requir
 > workspace/candidate and safe next action; JSON/pipes remain machine-usable with
 > version/freshness/unknowns. No leaked secrets/transcripts/private telemetry.
 
-**Proposed replacement:**
+**Approved replacement:**
 
 > CLI human status shows work/blocked/unknown/decision needed/actual
 > workspace/candidate and safe next action; JSON/pipes remain machine-usable with
@@ -159,7 +166,7 @@ Keep the existing single-writer/store and owner-served projection contracts.
 > provenance and multidimensional consumption/unknowns for the whole journey; imported/
 > consumer fixture reproduces facts without granting authority.
 
-**Proposed replacement:**
+**Approved replacement:**
 
 > Offline scenario exports task/Attempt/session/route/call/candidate/spec/policy/verdict/
 > provenance, the selected trust profile, original deadline decision, STOP/cancellation
@@ -179,14 +186,14 @@ Do not add telemetry, prompt contents, a new service, or inferred provider usage
 > invariants independently. Producer Router parallel-call admission remains external,
 > not a Kernel scheduler to clone.
 
-**Proposed replacement:**
+**Approved replacement:**
 
 > Depends on safe source-cache ownership (#61), #48 lifetime, the #50
 > verification/test-child profile, #57 owner-served concurrency state, and #90 user
 > STOP/owned-process outcome for baseline cancellation acceptance. #50 is not promoted
 > to whole-worker isolation. #53/PR #85 is closed NOT IMPLEMENTED; its cold-recovery
 > evidence is diagnostic, not a shipped harness integration or strict-expiry proof.
-> Under the proposed baseline, task expiry stops new Kernel admissions and initiates
+> Under the accepted baseline, task expiry stops new Kernel admissions and initiates
 > STOP while native local effects may continue during termination. Unsettled/escaped
 > work remains `unknown`; retain the workspace and block acceptance/publication/successor
 > Attempt while uncertain. Producer Router parallel-call admission remains external,
@@ -195,7 +202,7 @@ Do not add telemetry, prompt contents, a new service, or inferred provider usage
 > the worker identity.
 
 Keep the manual-edit, immutable Attempt, cache-ownership and foreign-resource cleanup
-criteria. This proposal does not mark #59 complete or authorize live multi-task work.
+criteria. Applying this body text does not mark #59 complete or authorize live multi-task work.
 
 ### #60 — Installed End-To-End Acceptance
 
@@ -208,7 +215,7 @@ criteria. This proposal does not mark #59 complete or authorize live multi-task 
 > Fixture/protocol planning can start earlier, but unavailable functionality cannot be
 > counted as received.
 
-**Proposed replacement:**
+**Approved replacement:**
 
 > Final reception after #47/#48, approved intake/requirements (#49/#51), Router route
 > (#52), verification/test-child profile (#50), review (#54), MI refs (#55), budgets
@@ -218,7 +225,7 @@ criteria. This proposal does not mark #59 complete or authorize live multi-task 
 > contracts must be accepted first. Fixture/protocol planning can start earlier, but
 > unavailable functionality cannot be counted as received.
 
-**Proposed baseline acceptance addition:**
+**Approved baseline acceptance addition:**
 
 > A trusted-development receipt must show that new Kernel-controlled dispatch/external
 > operations stop at the original deadline/revocation/STOP, and that deadline-triggered
@@ -240,7 +247,7 @@ gates. Do not close #60 based on documentation or synthetic fixtures alone.
 
 ### #62 — Public Install And Compatibility
 
-**Proposed addition to Acceptance Criteria:**
+**Approved addition to Acceptance Criteria:**
 
 > The installed compatibility matrix labels `TRUSTED_DEVELOPMENT` as trusted native
 > execution with task-level deadline/STOP semantics, not strict per-syscall expiry or
@@ -260,15 +267,15 @@ Keep existing ciphertext, migration, package and producer-version gates.
 > #50 history remains unchanged, profile stays verification/test-child only, #53
 > whole-worker gate remains separate.
 
-**Proposed replacement:**
+**Approved replacement:**
 
 > #50 history remains unchanged and this profile stays verification/test-child only.
 > Neither #50 nor this issue proves whole-worker isolation or strict native effect
 > expiry. #53/PR #85 is closed NOT IMPLEMENTED; its post-expiry diagnostic remains
 > evidence of the gap, not a promotion of this profile. This issue does not close or
-> weaken the proposed/current AC4 gate.
+> weaken the accepted AC4 baseline.
 
-No bubblewrap qualification, source/pin change, or implementation is proposed by this
+No bubblewrap qualification, source/pin change, or implementation is authorized by this
 AC4 document.
 
 ### #90 — Trusted-Development STOP
@@ -280,7 +287,7 @@ AC4 document.
 (`runtime.observe`, currently around lines 1792-1805), before the normal controller
 close path obtains `CodexStdio.owned_group_settled`. Runtime terminality can therefore
 precede process-group settlement. This remains an implementation gap for #90's existing
-user-requested STOP scope; this documentation PR does not fix it. The proposed #56/#60
+user-requested STOP scope; this documentation PR does not fix it. The approved #56/#60
 criteria below separately require deadline-triggered cancellation to consume the same
 settlement gate.
 
@@ -289,15 +296,15 @@ settlement gate.
 > Do not claim strict native grant expiry, universal effect mediation, hostile-worker
 > containment, or issue #53 AC4 acceptance.
 
-**Proposed replacement:**
+**Approved replacement:**
 
 > This issue supplies only the STOP/cancellation component of a task-level baseline,
-> if ADR 0011 is accepted. It does not prove strict native effect expiry, universal
+> under accepted ADR 0011. It does not prove strict native effect expiry, universal
 > mediation, hostile-worker containment, rollback, or full AC4 acceptance. During
 > bounded termination local native effects may still occur; report unknown/unsettled
 > descendants honestly and block acceptance/publication while uncertainty remains.
 
-#90 remains a live issue and no issue body is changed by this proposal.
+#90 remains a live issue; this documentation PR does not change its live issue body.
 
 ## Cross-Repository Consumer Issue Proposals
 
@@ -366,18 +373,18 @@ No cross-repository issue patch or dependency edge is applied here.
 
 ## Dependency Impact Table
 
-| Current relation | Formal edge? | Proposal impact |
+| Current relation | Formal edge? | Approved issue-body impact |
 | --- | --- | --- |
-| #53 → #59 “chosen harness” | None; issue-body gate only | Retire as a baseline prerequisite only after ADR 0011 acceptance; keep #53 closed and its strict diagnostic unmet. #90 STOP becomes a proposed acceptance input. |
-| #53 → #60 installed reception | None; issue-body gate only | Replace with accepted baseline plus actual #90/#59/component receipts. Do not count #53 diagnostic as native acceptance. |
+| #53 → #59 “chosen harness” | None; issue-body gate only | Retire from the accepted-baseline body after PR #91 merges; keep #53 closed and its historical strict diagnostic unmet. #90 STOP is a scoped body receipt, not a formal edge. |
+| #53 → #60 installed reception | None; issue-body gate only | Replace after PR #91 merges with accepted baseline plus actual #90/#59/component receipts. Do not count #53 diagnostic as native acceptance. |
 | #53 ↔ #90 | None; #90 links #53 as history | #90 handles STOP only; it neither depends on nor satisfies strict expiry. |
 | #53 ↔ #79 | None; #79 says the worker gate is separate | Keep #79 verification/test-child only; no promotion to task runtime or AC4 proof. |
-| #52 route/consumer | No formal #53 edge; historical issue comment #14078 names #52/#53 consumer order | Add the specified #52 issue-body clarification after owner acceptance; preserve comment #14078 unchanged. Keep Router #165/#174/#178/#179/#180/#181 and Kernel #47/#49/#51/#52 gates. A route receipt does not prove native effect cutoff. |
-| #59 → #90 (proposed) | No current formal edge | Recommend only after ADR acceptance because reliable STOP/uncertainty is required for concurrent cleanup. |
-| #60 → #59/#90 (proposed) | No current formal edge | Recommend only after ADR acceptance; installed reception must observe multi-task ownership and STOP outcomes. |
+| #52 route/consumer | No formal #53 edge; historical issue comment #14078 names #52/#53 consumer order | Add the specified #52 issue-body clarification after PR #91 merges; preserve comment #14078 unchanged. Keep Router #165/#174/#178/#179/#180/#181 and Kernel #47/#49/#51/#52 gates. A route receipt does not prove native effect cutoff. |
+| #59 → #90 (not authorized) | No current formal edge | No formal edge is authorized by this task. #59 may consume scoped STOP/settlement evidence in its body without adding a graph dependency. |
+| #60 → #59/#90 (not authorized) | No current formal edge | No formal edge is authorized by this task. #60's body retains installed acceptance gates without mutating dependency state. |
 | Console #8/#12/#13 references | No formal edge to #53 in the inspected Console graph | Propose display/acceptance wording to Console owner; no cross-repository mutation here. |
 
-Other upstream producer/compatibility edges (Router #174/#181/etc., MI publication,
-Console parents) are not retired by this AC4 proposal. Existing issue registrations,
-formal dependency states and live gates remain unchanged until the owner accepts the
-contract and the relevant repository owners apply their proposed text.
+Other upstream producer/compatibility gates (Router #174/#181/etc., MI publication,
+Console parents) are not retired by accepted ADR 0011. The owner-approved Kernel body
+text does not modify formal dependency state; Console consumers still require their
+separate owner approval.

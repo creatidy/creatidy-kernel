@@ -1,28 +1,34 @@
-# ADR 0011: Proposed Task-Level Authority And Trusted-Development Contract
+# ADR 0011: Task-Level Authority And Trusted-Development Contract
 
-- Status: Proposed; not authoritative until explicit owner acceptance
-- Date: 2026-10-16
+- Status: Accepted
+- Date: 2026-10-18
 
 ## Purpose And Decision Boundary
 
-This proposal aligns Kernel acceptance with the product's purpose: reliable
+This decision aligns Kernel acceptance with the product's purpose: reliable
 orchestration of AI coding agents with bounded controller work, user-requested STOP,
 durable recovery, controlled external effects, and honest failure reporting. It
-proposes a narrower interpretation of AC4 for the existing trusted-development Codex
-path. It does not change the contract by itself.
+defines the accepted task-level AC4 baseline for the existing trusted-development Codex
+path. This ADR is authoritative for that defined profile; it does not itself implement
+the required runtime behavior or claim strict native-effect expiry.
 
 Issue #53 remains **CLOSED / NOT IMPLEMENTED**, PR #85 remains **CLOSED / UNMERGED**,
 and their branch evidence is preserved. This ADR does not merge, reopen, or reclassify
-that work. The #53 post-expiry regression remains positive evidence of a strict native
-expiry failure, not an acceptance pass.
+that work. The #53 post-expiry regression remains positive evidence that strict native
+expiry failed for the investigated mechanism, not an acceptance pass or proof of the
+accepted task-level baseline's implementation.
 
 ## Existing Requirement And Evidence
 
-Issue #53 AC4 currently states: “File/terminal operations execute only through
-identified constrained executor; denied/expired/revoked permission cannot expand
-authority. Cold/native review remains independent and candidate-specific.” The
-current architecture therefore requires the native effect boundary to enforce
-expiry/revocation on file and terminal effects, not merely on Kernel dispatch.
+The closed issue #53 retains its historical AC4 wording:
+“File/terminal operations execute only through identified constrained executor;
+denied/expired/revoked permission cannot expand authority. Cold/native review remains
+independent and candidate-specific.” The
+original strict interpretation required the native effect boundary to enforce
+expiry/revocation on file and terminal effects, not merely on Kernel dispatch. The owner
+accepted the task-level baseline in this ADR on 2026-10-18 for the defined
+trusted-development profile. The historical #53 requirement remains unmet and strict
+native-effect expiry is explicitly unsupported under the accepted baseline.
 
 The controlled #53 regression observed a native descendant start a subprocess and
 create a workspace file more than one second after the persisted grant expiry while
@@ -30,8 +36,8 @@ PID-1 had not yet observed its deadline. Receipt:
 `/tmp/kilo/runtime-conformance-dyg_9gb4/grant-expiry-race-receipt.json`, SHA-256
 `efe32596a60bb98546da62a90ecdd48d4d41e624739b71d8a5d6d5685106d6bd`. It used a
 diagnostic-only Podman candidate, not an accepted production/native toolchain. The
-positive result refutes strict native expiration for the current mechanism; it does
-not prove that a revised baseline is accepted.
+positive result refutes strict native expiration for the current mechanism. It remains
+diagnostic evidence, not task-level acceptance or proof of a native effect fence.
 
 Current `CodexRuntime` checks authority before Runtime thread/turn dispatch. After
 dispatch, the native Codex process and terminal descendants can perform filesystem
@@ -41,13 +47,13 @@ those process capabilities. The current CLI uses `workspace-write` and explicit
 `TRUSTED_DEVELOPMENT`; that profile is not a hostile-worker sandbox. Issue #90 tracks
 truthful STOP and owned process-group settlement.
 
-## Proposed AC4 Wording
+## Accepted AC4 Baseline
 
 > **AC4 — Task authority, bounded STOP, external effects, and honest recovery
-> (proposed).** For every new Kernel-controlled dispatch or external state-changing
-> operation, Kernel MUST bind the operation to the exact task, Attempt, Operation,
-> resource scope, current revocation state, and original task deadline. Kernel MUST
-> check authority before dispatch, durably record operation intent before invoking an
+> (accepted 2026-10-18).** For every new Kernel-controlled dispatch or external
+> state-changing operation, Kernel MUST bind the operation to the exact task, Attempt,
+> Operation, resource scope, current revocation state, and original task deadline.
+> Kernel MUST check authority before dispatch, durably record operation intent before invoking an
 > external effect, and never silently renew, reroute, or replay an uncertain
 > operation. After the original deadline, revocation, or user STOP, Kernel MUST stop
 > admitting new Kernel-controlled work, persist cancellation intent through the
@@ -84,17 +90,18 @@ truthful STOP and owned process-group settlement.
 > rather than silently refusing all ordinary local coding or claiming Kernel control of
 > those effects.
 
-This explicitly changes the old per-file/terminal-effect interpretation. Until the
-owner accepts this wording, the existing strict AC4 remains authoritative. A passing
-task-level STOP test or the bounded cgroup cold-recovery proof cannot be reported as
-proof that native syscalls stop at the expiry timestamp.
+This accepted wording supersedes the old per-file/terminal-effect interpretation only
+for the defined trusted-development profile. Strict native-effect expiry remains
+unsupported. A passing task-level STOP test or the bounded cgroup cold-recovery proof
+cannot be reported as proof that native syscalls stop at the expiry timestamp or as
+completion of #53.
 
 ## Deadline Clock And Recovery
 
 The current store persists an absolute wall-clock deadline and Runtime call sites
 compare it using `int(time.time())`. That preserves the original timestamp across
 ordinary process restart, but does not prove that a backward wall-clock step or host
-reboot cannot lengthen the effective lease. The proposed baseline must not silently
+reboot cannot lengthen the effective lease. The accepted baseline must not silently
 renew it.
 
 The required projection must continue to elapse across system suspend. On supported
@@ -112,9 +119,10 @@ or the host boot identity is unavailable, unsupported, or cannot be verified, or
 recovery observes a different boot identity, fail closed: deny new dispatch and a
 successor Attempt, retain `unknown`, and require reconciliation rather than extending
 the original deadline. The wall deadline remains the user-visible audit value. This is
-durable metadata in the existing task store, not a service or replacement executor;
-its schema/clock cost remains part of the owner decision. Until implementation and
-clock tests exist, do not claim rollback-resistant deadlines.
+durable metadata in the existing task store, not a service or replacement executor.
+Schema/clock support and deterministic tests are implementation requirements under this
+accepted decision. Until implementation and clock tests exist, do not claim that the
+runtime provides rollback-resistant deadlines.
 
 The suspend-inclusive projection protects Kernel admission only. Expiry initiates the
 bounded cancellation path, but does not prove process termination or settlement and
@@ -156,7 +164,7 @@ Attempt is settled. No strict per-syscall cutoff is claimed.
   provider key hidden from the tool, all outside-workspace reads denied, or verified
   shell egress denial, current supported mechanisms cannot prove that property; refuse
   that sensitive task. A stronger guarantee would require a new owner-authorized
-  mechanism and is explicitly not part of this proposal.
+  mechanism and is explicitly not part of this accepted baseline.
 - The task's native local capability ends only when the selected owned process group
   or cgroup has profile-appropriate settlement evidence. If a descendant escapes the
   observable group, the result remains `unknown`; no universal process-tree containment
@@ -175,7 +183,7 @@ evidence that the terminal child cannot read files outside the workspace or `HOM
 including provider auth, and no evidence that all terminal egress is blocked. The
 existing #53 app-server tests use a fresh synthetic `CODEX_HOME` in a disposable
 container, not the host trusted-development auth home; that test is not a credential
-isolation proof. No live inference or owner credential was used in this proposal.
+isolation proof. No live inference or owner credential was used in forming this ADR.
 
 Therefore this baseline does **not** guarantee provider-key secrecy from model-driven
 terminal commands. It permits ordinary local Codex only as an explicit same-principal
@@ -207,11 +215,11 @@ properties.
   reconciled. A task-level native grant does not confer controller API credentials or
   external write authority.
 - The verification/test-child profile (#50) remains a separate, narrower use. It is
-  not promoted into whole-worker isolation by this proposal.
+  not promoted into whole-worker isolation by this ADR.
 
 ## Guarantees Deliberately Relinquished
 
-If accepted, the baseline will **not** guarantee that no new native filesystem or
+The accepted baseline does **not** guarantee that no new native filesystem or
 subprocess syscall starts after exact expiry/STOP. A task already admitted may
 initiate local effects during the bounded termination interval. This explicitly
 changes the authority horizon from the old strict effect-level reading to a
@@ -226,7 +234,7 @@ observable, it remains `cancel_uncertain`/`unknown` and is not accepted.
 
 ## Adversarial Evaluation
 
-| Scenario | Proposed baseline response | Remaining risk/containment |
+| Scenario | Accepted baseline response | Remaining risk/containment |
 | --- | --- | --- |
 | Deadline expires during an active Codex turn or across host suspend | Use the verified suspend-inclusive `CLOCK_BOOTTIME` projection to deny new Kernel admissions and initiate bounded cancellation. | Native local writes or a new subprocess may still occur during termination; preserve the workspace and keep it unaccepted until owned-process settlement and fresh verification. No syscall cutoff is claimed. |
 | Controller/host restarts, wall clock moves backward, or boot identity changes | Same-boot recovery reuses the original projection. A missing/unverifiable clock or changed boot identity denies new dispatch and reports `unknown`. | The current wall-clock-only schema does not yet prove suspend-inclusive, rollback-resistant expiry; implementation and clock tests are required. |
@@ -240,7 +248,7 @@ observable, it remains `cancel_uncertain`/`unknown` and is not accepted.
 
 ## Codex Compatibility And Unsupported Work
 
-The proposal keeps the existing Codex `workspace-write`/`approvalPolicy=never`
+The accepted baseline keeps the existing Codex `workspace-write`/`approvalPolicy=never`
 integration and the existing `TRUSTED_DEVELOPMENT` acknowledgement. It does not switch
 to `danger-full-access`, add a syscall broker, or replace the Codex executor. Ordinary
 local coding can continue as an explicit trusted use of the current same-principal
@@ -260,8 +268,9 @@ escaped processes remain unsupported absent a separately authorized architecture
 
 ## Bounded Acceptance/Falsification Plan
 
-After owner acceptance only, use synthetic local resources and the exact supported
-Codex/profile versions. Do not use live inference or production credentials:
+For future implementation acceptance only, use synthetic local resources and the exact
+supported Codex/profile versions. Owner acceptance of this ADR does not authorize live
+inference or production credentials:
 
 1. **Kernel admission and deadline clock:** show that expiry/revocation denies a new
    Kernel turn, controller command and external Operation at their existing admission
@@ -301,31 +310,29 @@ Codex/profile versions. Do not use live inference or production credentials:
    system may report a residual/unknown, but may not report zero usage, no effect, or
    strict syscall expiration without evidence.
 
-These checks evaluate the proposed task-level contract. They do not reopen #53, repeat
-its source/pin investigation, or convert its positive strict-expiry diagnostic into an
-acceptance pass.
+These checks evaluate implementation of the accepted task-level contract. They do not
+reopen #53, repeat its source/pin investigation, or convert its positive strict-expiry
+diagnostic into an acceptance pass.
 
-## Recommendation And Owner Gate
+## Decision And Acceptance
 
-**RECOMMENDATION: REVISE.** A task-level admission/STOP contract can support the
-existing trusted-development Codex workflow without a new broker, privileged kernel
-subsystem or replacement executor, while preserving Kernel control over
-Kernel-mediated external operations, durable identity, bounded cancellation attempts
-and honest `unknown` outcomes. It deliberately relinquishes strict per-syscall expiry
-and hostile-worker containment for this profile. Ordinary local Codex remains
-available only as an explicit same-principal trust decision; that does not amount to
-Kernel control over native terminal egress or provider-auth confidentiality.
+**DECISION: ACCEPTED — 2026-10-18.** The owner accepts the task-level capability
+horizon, local native termination residual, same-principal provider-auth tradeoff for
+ordinary Codex, boundary for protected remote effects, suspend-inclusive
+`CLOCK_BOOTTIME` deadline projection and fail-closed recovery behavior, and no-candidate/
+no-retry behavior while termination or external outcomes are unknown.
 
-The proposal is **not authoritative**. Until explicit owner acceptance, the previous
-AC4 remains binding and #53 stays closed not implemented. Acceptance must explicitly
-approve the task-level capability horizon, the local native termination residual, the
-same-principal provider-auth tradeoff for ordinary Codex, the boundary for protected
-remote effects, the suspend-inclusive `CLOCK_BOOTTIME` deadline projection and
-fail-closed recovery behavior, and the no-candidate/no-retry behavior while termination
-or external outcomes are unknown. If
-the owner requires provider-key secrecy or guaranteed shell egress isolation, the
-current native path cannot meet that property under the rejected architecture options;
-those sensitive task types remain unsupported, while ordinary local Codex is not
-globally refused. If the owner rejects the local native termination window, retain the
-old strict AC4 and keep that execution path gated until a separately authorized
-enforcement design exists.
+This baseline is authoritative for the defined `TRUSTED_DEVELOPMENT` profile. It
+deliberately relinquishes strict per-syscall expiry and hostile-worker containment;
+strict native-effect expiry remains unsupported. Issue #53 remains closed/not
+implemented, and its diagnostic is not retroactively accepted. The accepted decision is
+requirements authority, not proof that the current runtime implements those requirements:
+deadline clock projection and owned-process settlement remain explicit implementation
+gaps tracked by the existing Kernel issues.
+
+Ordinary local Codex remains available only as an explicit same-principal trust decision;
+that does not amount to Kernel control over native terminal egress or provider-auth
+confidentiality. Tasks requiring provider-key secrecy, protected remote state or
+guaranteed shell egress isolation are unsupported on the current path. No owner decision
+is pending to exclude those unsupported guarantees or to authorize the accepted
+documentation and Kernel issue-body synchronization.
