@@ -77,6 +77,30 @@ the cited historical subsets; the acceptance-criteria differences above explain 
 duplicate delivery. No producer-only calibration, publication, routing or Console implementation
 has been registered as a Kernel implementation issue.
 
+## G12 Existing Cost-Shape Specification (Planned)
+
+This source-grounded specification is an independently useful preparation slice for #56; it does not
+claim whole-task accounting, budget enforcement or provider billing evidence as implemented.
+
+| Existing shape | What it establishes | What it does not establish |
+| --- | --- | --- |
+| `BudgetPolicy.max_attempts` and `max_active_attempts` | Kernel admission counts in a versioned program policy | Money, quota consumption, token, compute, wall-time or owner-attention limits |
+| `UsageObservation` | An immutable receipt-scoped `metric`/`unit`, optional nonnegative quantity, provenance, source, observation time and correction reference | Route/call/tool/reviewer correlation unless the producer supplies that identity; a missing quantity is not zero |
+| `export_outcomes` | Per-receipt correction lineage, latest effective observation, Attempt association and remediation lineage for an accepted result | A total across unlike units, conversion between quota/tokens/money, hidden retry multiplicity or a hard budget guarantee |
+| `QuotaSnapshot` | A source-qualified quota reference with an observation and freshness interval | Consumption, reservation, a token equivalent or actual provider billing |
+| Router #184 strict no-PAYG evidence | An opt-in admission restriction for positively evidenced supported paths; source/control facts remain separate from billing | Zero charges, settlement, whole-task cost or known production-adapter billing when those facts are unavailable |
+
+Planned composition must preserve each measure's unit, source, provenance and unknown state. Only a
+verified correction for the same receipt supersedes its earlier effective value; corrections are not
+additional usage. Attempt lineage may group a result's attributable Attempts, but must not invent
+missing route/call/tool identity or collapse concurrent/unrelated receipts. Quota is never converted to
+tokens, money is never estimated from an unapproved rate, and observation timestamps alone are not
+durations. Unobserved helper/retry calls, provider settlement and owner attention remain unknown rather
+than zero. Any numerical whole-task envelope requires explicit owner-approved policy; current count
+limits are not a substitute. Full receipt correlation and route-bound accounting remain subject to #52
+and producer evidence. This planned boundary adds neither a second quota collector nor live spending
+authority.
+
 ## First-Priority Deviations
 
 These remain product defects/proof blockers after ADR 0011 acceptance. Static code facts are
