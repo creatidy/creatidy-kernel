@@ -77,6 +77,31 @@ the cited historical subsets; the acceptance-criteria differences above explain 
 duplicate delivery. No producer-only calibration, publication, routing or Console implementation
 has been registered as a Kernel implementation issue.
 
+## G07 Local Outcome Export Boundaries (Planned)
+
+This source-grounded preparation for #58 distinguishes the current export paths. None is a complete,
+automatically shareable whole-task ledger.
+
+| Existing path | What it currently establishes | Boundary not established |
+| --- | --- | --- |
+| `task export` / `export_task_store` (`adapters/cli.py`, `adapters/task_execution.py`) | One-shot local schema-1 JSON for Program/Task/deadline/base, Attempt status, terminal candidate, operation reference/dispatch claims, allocation identity, candidate/acceptance/cancellation and a stored PR artifact | Full resolved/observed identity provenance, checks/review/remediation/usage/call lineage, redaction or current remote PR status; the `task` value and references may be private |
+| `reference export` / `reference_export` (`adapters/reference.py`) | A richer schema-1 synthetic/reference view with Attempt/allocation/identity, verification/rejections, interruptions, cancellations and a PR observation explicitly marked historical | The production task exporter or metered usage; resources are `null` when synthetic or unavailable, and runtime usage remains unknown |
+| `core.outcomes.export_outcomes` (`core/outcomes.py`) | Pure `creatidy-local-outcomes-v1` facts for Attempt identities, quota references, validation/findings, remediation, product-review delivery/verdict, acceptance, interventions and receipt-corrected `UsageObservation`s | A task-export call site, unified export schema, route/call/candidate identity, per-task total or private-content policy |
+
+Planned export compatibility must identify the producer/schema and reject unsupported or malformed
+input without modifying task authority. Preserve corrections, Attempt/result lineage, units, provenance
+and unavailable values; a missing charge, review, retry or PR read is not zero, a final-result cost or a
+current remote-state claim. PASS/APPROVE is conditional evidence for its exact subject, not a model
+quality score or causal ranking. The task export's local JSON output is not a redaction guarantee:
+stored Task text, identifiers, references and evidence may reveal private workload or workspace data.
+
+Default operation remains origin-local with no automatic upload. Local export does not authorize
+republication, MI intake or Router learning. MI #17's owner decision rejects current operational intake;
+Router #177 is a separate local-consumer contract, not an upload destination. Any future sharing would
+need separately accepted producer/consumer semantics, data/source rights, destination/purpose/scope
+consent and negative privacy handling. This specification chooses no new schema version, redaction
+policy, destination or sharing permission; whole-task correlation and costs still depend on #52/#56.
+
 ## G08 Owner-Served State Boundary (Planned)
 
 This source-grounded specification is an early preparation slice for #57. It records durable facts and
