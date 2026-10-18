@@ -202,19 +202,35 @@ def decode_identity(data: bytes) -> RuntimeIdentity:
 
 def decode_runtime_receipt(data: bytes) -> tuple[str, int, RuntimeIdentity]:
     """The native handle and configuration snapshot are one durable publication."""
+    handle, fence, identity, _ = decode_runtime_receipt_with_group(data)
+    return handle, fence, identity
+
+
+def decode_runtime_receipt_with_group(data: bytes) -> tuple[str, int, RuntimeIdentity, str | None]:
+    """Decode legacy receipts, preserving only a versioned opaque owner-group reference."""
     payload = _object(data)
+    version = payload.get("version")
+    expected = {"version", "handle", "fence", "identity"}
+    if version == 2:
+        expected.add("owned_group_reference")
     if (
-        set(payload) != {"version", "handle", "fence", "identity"}
-        or type(payload["version"]) is not int
-        or payload["version"] != 1
+        type(version) is not int
+        or version not in {1, 2}
+        or set(payload) != expected
         or type(payload["handle"]) is not str
         or not payload["handle"].strip()
         or type(payload["fence"]) is not int
         or payload["fence"] <= 0
+        or (
+            version == 2
+            and payload["owned_group_reference"] is not None
+            and (type(payload["owned_group_reference"]) is not str or not payload["owned_group_reference"].strip())
+        )
     ):
         raise ValueError("invalid durable runtime receipt")
     identity = decode_identity(json.dumps(payload["identity"], allow_nan=False).encode())
-    return payload["handle"], payload["fence"], identity
+    group_reference = payload.get("owned_group_reference")
+    return payload["handle"], payload["fence"], identity, cast(str | None, group_reference)
 
 
 def identity_matches(

@@ -36,7 +36,7 @@ from creatidy_kernel.adapters.codex_discovery import (
     CodexDiscoveryFailure,
     resolve_codex,
 )
-from creatidy_kernel.adapters.codex_runtime import CodexConnection, CodexInputs, CodexRuntime
+from creatidy_kernel.adapters.codex_runtime import CodexConnection, CodexInputs, CodexRuntime, owned_group_callbacks
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
 from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
 from creatidy_kernel.adapters.forge_refs import AGitPush, ForgeBinding, https_origin, oid, repository_path, valid_branch
@@ -64,6 +64,7 @@ from creatidy_kernel.adapters.sqlite_store import (
 )
 from creatidy_kernel.core.domain import (
     ActivateProgram,
+    Attempt,
     AttemptStatus,
     AuthorityEnvelope,
     BudgetPolicy,
@@ -90,11 +91,14 @@ from creatidy_kernel.core.execution import (
     WorkspaceHandle,
     WorkspaceSpec,
 )
+from creatidy_kernel.core.execution import (
+    Presence as RuntimePresence,
+)
 from creatidy_kernel.core.forge import EffectStatus, Presence, Reference, UnsupportedForge
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
 from creatidy_kernel.ports.allocation import (
-    decode_runtime_receipt,
+    decode_runtime_receipt_with_group,
     encode_allocation,
     identity_matches,
     load_allocation,
@@ -1179,6 +1183,65 @@ class TaskCollector:
         )
 
 
+def _cancellation_settlement_evidence(store: SQLiteProgramStore, operation_id: str) -> tuple[bool | None, bool | None]:
+    for name in ("terminal", "owned-group-settlement", "receipt"):
+        data = store.find_artifact(operation_id, name)
+        if data is None:
+            continue
+        try:
+            value: object = json.loads(data)
+        except (TypeError, ValueError):
+            return None, None
+        if type(value) is not dict:
+            return None, None
+        record = cast(dict[str, object], value)
+        settled = record.get("owned_group_settled")
+        reconciled = record.get("result_reconciled")
+        return (
+            settled if type(settled) is bool else None,
+            reconciled if type(reconciled) is bool else None,
+        )
+    return None, None
+
+
+def _owned_group_lease_seconds(connection: object) -> int:
+    """Cover the existing interrupt RPC and two bounded process-group waits."""
+    timeout = getattr(connection, "timeout", None)
+    if type(timeout) is int and timeout > 0:
+        return max(1, timeout * 3 + 1)
+    if type(timeout) is float and timeout > 0:
+        return max(1, math.ceil(timeout) * 3 + 1)
+    return 1
+
+
+def _cancel_receipt_evidence(
+    data: bytes,
+    *,
+    handle: str,
+    identity: RuntimeIdentity,
+    expected_group_reference: str,
+) -> tuple[bool | None, bool, bool]:
+    try:
+        value: object = json.loads(data)
+    except (TypeError, ValueError):
+        return None, False, False
+    if type(value) is not dict:
+        return None, False, False
+    record = cast(dict[str, object], value)
+    if (
+        record.get("handle") != handle
+        or record.get("identity") != asdict(identity)
+        or record.get("cancellation_requested") is not True
+        or record.get("owned_group_reference") != expected_group_reference
+        or record.get("activity") not in {item.value for item in Activity}
+    ):
+        return None, False, False
+    settled = record.get("owned_group_settled")
+    if settled is not None and type(settled) is not bool:
+        return None, False, False
+    return settled, True, record["activity"] == Activity.TERMINAL.value
+
+
 def export_task_store(store: SQLiteProgramStore) -> dict[str, object]:
     program = store.load(PROGRAM_ID)
     mode = _request(store, "task_execution:mode")
@@ -1239,9 +1302,55 @@ def export_task_store(store: SQLiteProgramStore) -> dict[str, object]:
         ("cancellation", f"cancel:{ATTEMPT_ID}"),
     ):
         try:
-            result[key] = _request(store, operation)
+            request = _request(store, operation)
         except OperationConflict:
             pass
+        else:
+            if key != "cancellation":
+                result[key] = request
+                continue
+            cancellation = store.operation(operation)
+            settled, reconciled = _cancellation_settlement_evidence(store, operation)
+            operations = [cast(dict[str, object], item["operation"]) for item in attempts]
+            no_dispatch = bool(operations) and all(
+                item["status"] == "intent" and item["dispatch_claims"] == 0 for item in operations
+            )
+            no_runtime_operation = result["runtime_operation_absent"] is True and not operations
+            terminal = bool(operations) and all(item["status"] == "terminal" for item in operations)
+            attempts_finished = bool(attempts) and all(
+                cast(dict[str, object], item["attempt"])["status"] == AttemptStatus.FINISHED.value for item in attempts
+            )
+            terminal_fact = store.find_artifact(operation, "terminal")
+            if (
+                cancellation.status == "accepted"
+                and settled is True
+                and reconciled is True
+                and (
+                    no_dispatch
+                    or no_runtime_operation
+                    or (terminal and attempts_finished and terminal_fact is not None)
+                )
+            ):
+                settlement_state = "settled"
+            elif cancellation.status == "intent" and cancellation.attempts == 0:
+                settlement_state = "requested"
+            elif (
+                cancellation.status == "dispatched"
+                and cancellation.lease_until is not None
+                and (cancellation.lease_until > int(time.time()))
+            ):
+                settlement_state = "in_progress"
+            elif settled is True and reconciled is True:
+                settlement_state = "in_progress"
+            else:
+                settlement_state = "uncertain"
+            result[key] = {
+                **request,
+                "operation_status": cancellation.status,
+                "settlement_state": settlement_state,
+                "owned_group_settled": settled,
+                "result_reconciled": reconciled,
+            }
     try:
         result["pr"] = json.loads(store.artifact(PR_OPERATION, "export"))
     except OperationConflict:
@@ -1264,21 +1373,28 @@ def task_status(directory: Path) -> dict[str, object]:
     pr = cast("dict[str, object] | None", result.get("pr"))
     attempts = cast("list[dict[str, object]]", result["attempts"])
     operations = [cast("dict[str, object]", item["operation"]) for item in attempts]
+    cancellation = cast("dict[str, object] | None", result.get("cancellation"))
+    cancellation_state = cancellation.get("settlement_state") if cancellation is not None else None
     expired = type(result["deadline"]) is int and int(time.time()) >= result["deadline"]
     terminal = bool(operations) and all(item["status"] == "terminal" for item in operations)
     condition = (
         "accepted"
         if acceptance is not None
         else "cancelled_no_dispatch"
-        if result.get("cancellation") is not None
+        if cancellation is not None
+        and cancellation_state == "settled"
         and (
             (not operations and result["runtime_operation_absent"] is True)
             or all(item["status"] == "intent" and item["dispatch_claims"] == 0 for item in operations)
         )
         else "cancelled"
-        if result.get("cancellation") is not None and terminal
+        if cancellation is not None and cancellation_state == "settled" and terminal
+        else "cancel_requested"
+        if cancellation is not None and cancellation_state == "requested"
+        else "cancel_in_progress"
+        if cancellation is not None and cancellation_state == "in_progress"
         else "cancel_uncertain"
-        if result.get("cancellation") is not None
+        if cancellation is not None
         else "expired"
         if expired
         else "terminal_no_candidate"
@@ -1304,8 +1420,15 @@ def task_status(directory: Path) -> dict[str, object]:
         "next_action": (
             "Cancelled before dispatch; new execution requires separate approval."
             if condition == "cancelled_no_dispatch"
+            else "Cancellation is recorded and waiting at the existing bounded owner-thread cleanup boundary."
+            if condition == "cancel_requested"
+            else "Wait for owned process-group settlement; do not start a successor Attempt."
+            if condition == "cancel_in_progress"
+            else "Cancellation is confirmed for the exact owned group; it is not rollback or "
+            "universal descendant containment."
+            if condition == "cancelled"
             else "Inspect cancellation evidence; retain workspace until owned descendants are proved settled."
-            if result.get("cancellation") is not None
+            if cancellation is not None
             else "Inspect terminal evidence; new execution requires separate approval."
             if terminal or expired
             else "Observe/reconcile the original receipt and deadline; never blindly resubmit."
@@ -1384,7 +1507,11 @@ def run_task(
             raise TaskInterrupted(f"interrupted after {boundary}; rerun to reconcile")
 
     with SQLiteProgramStore(directory / "kernel.sqlite3") as store, ExitStack() as cleanup:
+        cancellation_lease = _owned_group_lease_seconds(connection)
         cancellation_latched = False
+        close_owned_group, observe_owned_group, observe_owned_group_reference = owned_group_callbacks(connection)
+        retirement_context: tuple[str, str, str | None, int | None, int, str | None, bool, bool] | None = None
+        retire_owned_group = close_owned_group
 
         def record_cancellation(attempt_id: str, operation_id: str) -> OperationRecord:
             nonlocal cancellation_latched
@@ -1411,16 +1538,383 @@ def run_task(
                 record_cancellation(ATTEMPT_ID, OPERATION_ID)
             return cancellation_latched
 
+        def settlement_record(
+            attempt_id: str,
+            operation_id: str,
+            handle: str | None,
+            runtime_fence: int | None,
+            cancellation_fence: int,
+            owned_group: str | None,
+            expected_group: str | None,
+            settled: bool | None,
+            result_reconciled: bool,
+            transport_succeeded: bool,
+        ) -> bytes:
+            return manifest_bytes(
+                {
+                    "version": 1,
+                    "attempt_id": attempt_id,
+                    "operation_id": operation_id,
+                    "handle": handle,
+                    "runtime_fence": runtime_fence,
+                    "cancellation_fence": cancellation_fence,
+                    "owned_group_reference": owned_group,
+                    "expected_group_reference": expected_group,
+                    "owned_group_settled": settled,
+                    "result_reconciled": result_reconciled,
+                    "transport_succeeded": transport_succeeded,
+                    "descendants": "unproven",
+                }
+            )
+
+        def persist_settlement(
+            attempt_id: str,
+            operation_id: str,
+            handle: str | None,
+            runtime_fence: int | None,
+            cancellation_fence: int,
+            owned_group: str | None,
+            expected_group: str | None,
+            settled: bool | None,
+            result_reconciled: bool,
+            transport_succeeded: bool,
+        ) -> str:
+            cancellation_id = f"cancel:{attempt_id}"
+            data = settlement_record(
+                attempt_id,
+                operation_id,
+                handle,
+                runtime_fence,
+                cancellation_fence,
+                owned_group,
+                expected_group,
+                settled,
+                result_reconciled,
+                transport_succeeded,
+            )
+            store.record_transport(cancellation_id, cancellation_fence, transport_succeeded)
+            reference = store.finalize_artifact(cancellation_id, "owned-group-settlement", data)
+            observation_id = f"owned-group-settlement:{hashlib.sha256(data).hexdigest()}"
+            if transport_succeeded and result_reconciled and settled is True:
+                store.observe(
+                    cancellation_id,
+                    cancellation_fence,
+                    observation_id,
+                    "accepted",
+                    reference=reference,
+                )
+            else:
+                store.observe(cancellation_id, cancellation_fence, observation_id, "unknown")
+            return reference
+
+        retire_owned_group = close_owned_group
+
+        def settle_without_dispatch(attempt_id: str, operation_id: str) -> bool | None:
+            nonlocal retirement_context
+            cancellation_id = f"cancel:{attempt_id}"
+            cancellation = record_cancellation(attempt_id, operation_id)
+            existing = store.find_artifact(cancellation_id, "owned-group-settlement")
+            if existing is not None:
+                stored_value: object = json.loads(existing)
+                if type(stored_value) is not dict:
+                    raise ValueError("owned-group settlement differs from the exact no-dispatch cancellation")
+                stored = cast(dict[str, object], stored_value)
+                if (
+                    stored.get("version") != 1
+                    or stored.get("attempt_id") != attempt_id
+                    or stored.get("operation_id") != operation_id
+                    or stored.get("handle") is not None
+                    or stored.get("runtime_fence") is not None
+                    or type(stored.get("cancellation_fence")) is not int
+                    or stored.get("expected_group_reference") != stored.get("owned_group_reference")
+                    or type(stored.get("transport_succeeded")) is not bool
+                ):
+                    raise ValueError("owned-group settlement differs from the exact no-dispatch cancellation")
+                settled = stored.get("owned_group_settled")
+                reconciled = stored.get("result_reconciled") is True
+                if (
+                    cancellation.status in {"dispatched", "unknown"}
+                    and reconciled
+                    and settled is True
+                    and stored["cancellation_fence"] == cancellation.fence
+                    and stored["transport_succeeded"] is True
+                ):
+                    store.record_transport(cancellation_id, cancellation.fence, True)
+                    reference = store.finalize_artifact(cancellation_id, "owned-group-settlement", existing)
+                    store.observe(
+                        cancellation_id,
+                        cast(int, stored["cancellation_fence"]),
+                        f"owned-group-recovered:{hashlib.sha256(existing).hexdigest()}",
+                        "accepted",
+                        reference=reference,
+                    )
+                    return True
+                if (
+                    cancellation.status == "accepted"
+                    and settled is True
+                    and reconciled
+                    and stored["cancellation_fence"] == cancellation.fence
+                    and stored["transport_succeeded"] is True
+                ):
+                    return True
+                if cancellation.status == "dispatched":
+                    store.observe(
+                        cancellation_id,
+                        cancellation.fence,
+                        f"owned-group-unconfirmed:{hashlib.sha256(existing).hexdigest()}",
+                        "unknown",
+                    )
+                return None
+            if cancellation.attempts > 0:
+                return None
+            expected_group = observe_owned_group_reference() if observe_owned_group_reference is not None else None
+            fence = store.claim(cancellation_id, now=int(time.time()), lease_seconds=cancellation_lease)
+            crash("cancel-claim")
+            close_attempted = False
+            if close_owned_group is not None:
+                previous_context = retirement_context
+                retirement_context = (
+                    attempt_id,
+                    operation_id,
+                    None,
+                    None,
+                    fence,
+                    expected_group,
+                    expected_group is not None,
+                    True,
+                )
+                try:
+                    close_owned_group()
+                    close_attempted = True
+                except Exception:
+                    close_attempted = False
+                finally:
+                    retirement_context = previous_context
+            try:
+                settled = observe_owned_group() if observe_owned_group is not None else None
+            except Exception:
+                settled = None
+            try:
+                owned_group = observe_owned_group_reference() if observe_owned_group_reference is not None else None
+            except Exception:
+                owned_group = None
+            crash("cancel-send")
+            persist_settlement(
+                attempt_id,
+                operation_id,
+                None,
+                None,
+                fence,
+                owned_group,
+                expected_group,
+                settled,
+                close_attempted and expected_group is not None and owned_group == expected_group,
+                close_attempted,
+            )
+            return settled if close_attempted and type(settled) is bool else None
+
+        def settle_unreconciled_target(
+            attempt: Attempt,
+            operation: OperationRecord,
+            handle: str | None,
+            expected_group_reference: str | None,
+        ) -> None:
+            nonlocal retirement_context
+            cancellation_id = record_cancellation(attempt.attempt_id, operation.operation_id).operation_id
+            cancellation = store.operation(cancellation_id)
+            if cancellation.attempts > 0:
+                return
+            fence = store.claim(cancellation_id, now=int(time.time()), lease_seconds=cancellation_lease)
+            crash("cancel-claim")
+            close_attempted = False
+            if close_owned_group is not None:
+                previous_context = retirement_context
+                retirement_context = (
+                    attempt.attempt_id,
+                    operation.operation_id,
+                    handle,
+                    operation.fence,
+                    fence,
+                    expected_group_reference,
+                    False,
+                    True,
+                )
+                try:
+                    close_owned_group()
+                    close_attempted = True
+                except Exception:
+                    close_attempted = False
+                finally:
+                    retirement_context = previous_context
+            try:
+                settled = observe_owned_group() if observe_owned_group is not None else None
+            except Exception:
+                settled = None
+            try:
+                owned_group = observe_owned_group_reference() if observe_owned_group_reference is not None else None
+            except Exception:
+                owned_group = None
+            crash("cancel-send")
+            persist_settlement(
+                attempt.attempt_id,
+                operation.operation_id,
+                handle,
+                operation.fence,
+                fence,
+                owned_group,
+                expected_group_reference,
+                settled,
+                False,
+                close_attempted,
+            )
+
+        def read_settlement_record(
+            attempt: Attempt,
+            operation: OperationRecord,
+            handle: str,
+            cancellation: OperationRecord,
+            expected_group_reference: str | None,
+        ) -> tuple[dict[str, object] | None, str | None]:
+            cancellation_id = f"cancel:{attempt.attempt_id}"
+            data = store.find_artifact(cancellation_id, "owned-group-settlement")
+            if data is None:
+                return None, None
+            value: object = json.loads(data)
+            expected = {
+                "version",
+                "attempt_id",
+                "operation_id",
+                "handle",
+                "runtime_fence",
+                "cancellation_fence",
+                "owned_group_reference",
+                "expected_group_reference",
+                "owned_group_settled",
+                "result_reconciled",
+                "transport_succeeded",
+                "descendants",
+            }
+            if type(value) is not dict or set(cast(dict[str, object], value)) != expected:
+                raise ValueError("owned-group settlement is malformed")
+            record = cast(dict[str, object], value)
+            mismatches = [
+                name
+                for name, expected_value in (
+                    ("version", 1),
+                    ("attempt_id", attempt.attempt_id),
+                    ("operation_id", operation.operation_id),
+                    ("handle", handle),
+                    ("runtime_fence", operation.fence),
+                    ("cancellation_fence", cancellation.fence),
+                    ("expected_group_reference", expected_group_reference),
+                    ("descendants", "unproven"),
+                )
+                if record[name] != expected_value
+            ]
+            if record["owned_group_settled"] is not None and type(record["owned_group_settled"]) is not bool:
+                mismatches.append("owned_group_settled")
+            owned_reference = record["owned_group_reference"]
+            if owned_reference is not None:
+                if not isinstance(owned_reference, str) or not owned_reference.strip():
+                    mismatches.append("owned_group_reference")
+            expected_reference = record["expected_group_reference"]
+            if expected_reference is not None:
+                if not isinstance(expected_reference, str) or not expected_reference.strip():
+                    mismatches.append("expected_group_reference")
+            if type(record["result_reconciled"]) is not bool:
+                mismatches.append("result_reconciled")
+            if record["result_reconciled"] is True and (
+                expected_group_reference is None or record["owned_group_reference"] != expected_group_reference
+            ):
+                mismatches.append("group_reference")
+            if type(record["transport_succeeded"]) is not bool:
+                mismatches.append("transport_succeeded")
+            if mismatches:
+                raise ValueError(f"owned-group settlement differs from exact target fields: {', '.join(mismatches)}")
+            return record, store.finalize_artifact(cancellation_id, "owned-group-settlement", data)
+
         def finish_cancelled_attempt(attempt_id: str) -> None:
             current = store.load(PROGRAM_ID)
             if current.attempt(attempt_id).status is AttemptStatus.EXECUTING:
                 store.admit(PROGRAM_ID, f"finish:{attempt_id}", FinishAttempt(current.revision, "worker", attempt_id))
 
+        def terminal_cancellation_fact(
+            attempt: Attempt,
+            operation: OperationRecord,
+            handle: str,
+            settlement_reference: str,
+            owned_group_reference: str,
+        ) -> dict[str, object]:
+            return {
+                "version": 2,
+                "attempt": attempt.spec.digest,
+                "operation": operation.operation_id,
+                "request_digest": operation.request_digest,
+                "handle": handle,
+                "fence": operation.fence,
+                "candidate": "not_requested",
+                "owned_group_reference": owned_group_reference,
+                "owned_group_settled": True,
+                "result_reconciled": True,
+                "settlement_reference": settlement_reference,
+                "descendants": "unproven",
+            }
+
+        def finish_settled_cancellation(
+            attempt: Attempt,
+            operation: OperationRecord,
+            handle: str,
+            cancellation_fence: int,
+            settlement_reference: str,
+            owned_group_reference: str,
+        ) -> None:
+            cancellation_id = f"cancel:{attempt.attempt_id}"
+            terminal_fact = terminal_cancellation_fact(
+                attempt, operation, handle, settlement_reference, owned_group_reference
+            )
+            terminal_bytes = manifest_bytes(terminal_fact)
+            store.finalize_artifact(cancellation_id, "terminal", terminal_bytes)
+            cancel_record = store.operation(cancellation_id)
+            if cancel_record.status != "accepted":
+                if cancel_record.fence != cancellation_fence:
+                    raise ValueError("cancellation settlement fence changed")
+                store.observe(
+                    cancellation_id,
+                    cancellation_fence,
+                    f"confirmed:{hashlib.sha256(terminal_bytes).hexdigest()}",
+                    "accepted",
+                    reference=settlement_reference,
+                )
+            current_operation = store.operation(operation.operation_id)
+            if current_operation.status != "terminal":
+                store.observe(
+                    operation.operation_id,
+                    operation.fence,
+                    f"terminal:{operation.operation_id}",
+                    "terminal",
+                    reference=handle,
+                )
+            finish_cancelled_attempt(attempt.attempt_id)
+
+        def mark_cancellation_uncertain(cancellation_id: str, cancellation: OperationRecord) -> None:
+            if cancellation.status == "dispatched":
+                store.observe(
+                    cancellation_id,
+                    cancellation.fence,
+                    f"cancel-uncertain:{cancellation_id}:{cancellation.fence}",
+                    "unknown",
+                )
+
         def cancelled_without_attempt() -> dict[str, object]:
             result = export_task_store(store)
             if result["runtime_operation_absent"] is not True:
                 raise ValueError("orphaned runtime Operation requires explicit reconciliation")
-            result.update(condition="cancelled_no_dispatch", lifecycle=lifecycle)
+            settled = settle_without_dispatch(ATTEMPT_ID, OPERATION_ID)
+            result = export_task_store(store)
+            result.update(
+                condition="cancelled_no_dispatch" if settled is True else "cancel_uncertain",
+                lifecycle=lifecycle,
+            )
             return result
 
         try:
@@ -1498,15 +1992,118 @@ def run_task(
         assert deadline is not None  # noqa: S101 - established by durable envelope validation.
         if isinstance(connection, CodexStdio):
             previous_before_close = connection.before_close
+            previous_after_close = connection.after_close
 
             def before_owned_close() -> None:
+                nonlocal retirement_context
                 if cancellation_requested_now() or int(time.time()) >= deadline:
-                    record_cancellation(ATTEMPT_ID, OPERATION_ID)
+                    cancel_record = record_cancellation(ATTEMPT_ID, OPERATION_ID)
+                    if (
+                        retirement_context is None
+                        and store.find_artifact(f"cancel:{ATTEMPT_ID}", "owned-group-settlement") is None
+                    ):
+                        current_group = (
+                            observe_owned_group_reference() if observe_owned_group_reference is not None else None
+                        )
+                        try:
+                            runtime_operation = store.operation(OPERATION_ID)
+                        except OperationConflict as error:
+                            if str(error) != "unknown operation":
+                                raise
+                            runtime_operation = None
+                        runtime_receipt = store.find_artifact(OPERATION_ID, "runtime-receipt")
+                        if runtime_operation is None:
+                            handle = None
+                            runtime_fence = None
+                            expected_group = current_group
+                            result_reconciled = expected_group is not None
+                        elif runtime_receipt is not None:
+                            (
+                                receipt_handle,
+                                receipt_fence,
+                                _,
+                                expected_group,
+                            ) = decode_runtime_receipt_with_group(runtime_receipt)
+                            handle = runtime_operation.accepted_reference
+                            runtime_fence = runtime_operation.fence
+                            result_reconciled = (
+                                handle == receipt_handle
+                                and runtime_fence == receipt_fence
+                                and expected_group is not None
+                                and current_group == expected_group
+                            )
+                        elif runtime_operation.status == "intent" and runtime_operation.attempts == 0:
+                            handle = None
+                            runtime_fence = runtime_operation.fence
+                            expected_group = current_group
+                            result_reconciled = expected_group is not None
+                        else:
+                            handle = runtime_operation.accepted_reference
+                            runtime_fence = runtime_operation.fence
+                            expected_group = None
+                            result_reconciled = False
+                        cancellation_fence = (
+                            store.claim(
+                                f"cancel:{ATTEMPT_ID}",
+                                now=int(time.time()),
+                                lease_seconds=cancellation_lease,
+                            )
+                            if cancel_record.attempts == 0
+                            else cancel_record.fence
+                        )
+                        retirement_context = (
+                            ATTEMPT_ID,
+                            OPERATION_ID,
+                            handle,
+                            runtime_fence,
+                            cancellation_fence,
+                            expected_group,
+                            result_reconciled,
+                            False,
+                        )
                 if previous_before_close is not None:
                     previous_before_close()
 
+            def after_owned_close(settled: bool | None) -> None:
+                nonlocal retirement_context
+                context = retirement_context
+                try:
+                    if context is not None:
+                        (
+                            attempt_id,
+                            operation_id,
+                            handle,
+                            runtime_fence,
+                            cancellation_fence,
+                            expected_group,
+                            target_reconciled,
+                            defer_settlement,
+                        ) = context
+                        owned_group = (
+                            observe_owned_group_reference() if observe_owned_group_reference is not None else None
+                        )
+                        if not defer_settlement:
+                            persist_settlement(
+                                attempt_id,
+                                operation_id,
+                                handle,
+                                runtime_fence,
+                                cancellation_fence,
+                                owned_group,
+                                expected_group,
+                                settled,
+                                target_reconciled and expected_group is not None and owned_group == expected_group,
+                                settled is not None,
+                            )
+                finally:
+                    retirement_context = None
+                    if previous_after_close is not None:
+                        previous_after_close(settled)
+
             connection.before_close = before_owned_close
             cleanup.callback(setattr, connection, "before_close", previous_before_close)
+            connection.after_close = after_owned_close
+            cleanup.callback(setattr, connection, "after_close", previous_after_close)
         cancellation_id = f"cancel:{ATTEMPT_ID}"
         cancellation_pending = cancellation_requested_now()
         try:
@@ -1648,6 +2245,9 @@ def run_task(
                 collect=collector.runtime_candidate,
                 supported_efforts=supported_efforts,
                 clock=lambda: int(time.time()),
+                retire=retire_owned_group if close_owned_group is not None else None,
+                settled=observe_owned_group,
+                group_reference=observe_owned_group_reference,
             )
 
             def restore(request: ExecutionRequest, handle: str) -> None:
@@ -1686,7 +2286,7 @@ def run_task(
                 for attempt in program.attempts:
                     operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
                     cancellation_id = f"cancel:{attempt.spec.attempt_id}"
-                    cancellation = record_cancellation(attempt.spec.attempt_id, operation.operation_id)
+                    record_cancellation(attempt.spec.attempt_id, operation.operation_id)
                     if operation.status == "intent" and operation.attempts == 0:
                         current = store.load(PROGRAM_ID)
                         if current.attempt(attempt.spec.attempt_id).status in {
@@ -1698,18 +2298,21 @@ def run_task(
                                 f"cancel-before-dispatch:{attempt.spec.attempt_id}",
                                 CancelAttempt(current.revision, "owner", attempt.spec.attempt_id),
                             )
-                        status = "cancelled_no_dispatch"
-                        continue
-                    if operation.status == "terminal":
-                        finish_cancelled_attempt(attempt.spec.attempt_id)
-                        if int(time.time()) < deadline:
-                            status = "cancelled"
+                        settled = settle_without_dispatch(attempt.spec.attempt_id, operation.operation_id)
+                        status = "cancelled_no_dispatch" if settled is True else "cancel_uncertain"
                         continue
                     selected = load_allocation(store, attempt.spec)
                     handle = operation.accepted_reference
                     receipt_data = store.find_artifact(operation.operation_id, "runtime-receipt")
+                    receipt_identity: RuntimeIdentity | None = None
+                    receipt_group_reference: str | None = None
                     if receipt_data is not None:
-                        receipt_handle, receipt_fence, receipt_identity = decode_runtime_receipt(receipt_data)
+                        (
+                            receipt_handle,
+                            receipt_fence,
+                            receipt_identity,
+                            receipt_group_reference,
+                        ) = decode_runtime_receipt_with_group(receipt_data)
                         if (
                             receipt_fence != operation.fence
                             or handle not in {None, receipt_handle}
@@ -1735,31 +2338,147 @@ def run_task(
                         handle = receipt_handle
                         store.finalize_artifact(cancellation_id, "target", receipt_data)
                     if handle is None:
-                        lifecycle.append("cancellation target unknown; no interrupt issued")
-                        continue
-                    terminal_cancel = store.find_artifact(cancellation_id, "terminal")
-                    terminal_fact = {
-                        "version": 1,
-                        "attempt": attempt.spec.digest,
-                        "operation": operation.operation_id,
-                        "request_digest": operation.request_digest,
-                        "handle": handle,
-                        "fence": operation.fence,
-                        "candidate": "not_requested",
-                        "descendants": "unproven",
-                    }
-                    if terminal_cancel is not None:
-                        if json.loads(terminal_cancel) != terminal_fact:
-                            raise ValueError("terminal cancellation differs from original execution")
-                        store.observe(
-                            operation.operation_id,
-                            operation.fence,
-                            f"terminal:{operation.operation_id}",
-                            "terminal",
-                            reference=handle,
+                        settle_unreconciled_target(attempt, operation, None, receipt_group_reference)
+                        lifecycle.append(
+                            "cancellation target unknown; owned group retired without replay; result uncertain"
                         )
-                        finish_cancelled_attempt(attempt.spec.attempt_id)
+                        status = "cancel_uncertain"
+                        continue
+                    cancellation_record = store.operation(cancellation_id)
+                    if receipt_group_reference is None:
+                        mark_cancellation_uncertain(cancellation_id, cancellation_record)
+                        lifecycle.append("runtime receipt lacks owned-group identity; cancellation remains uncertain")
+                        status = "cancel_uncertain"
+                        continue
+                    settlement_payload, settlement_reference = read_settlement_record(
+                        attempt,
+                        operation,
+                        handle,
+                        cancellation_record,
+                        receipt_group_reference,
+                    )
+                    terminal_cancel = store.find_artifact(cancellation_id, "terminal")
+                    if terminal_cancel is not None:
+                        terminal_value = json.loads(terminal_cancel)
+                        legacy_terminal = {
+                            "version": 1,
+                            "attempt": attempt.spec.digest,
+                            "operation": operation.operation_id,
+                            "request_digest": operation.request_digest,
+                            "handle": handle,
+                            "fence": operation.fence,
+                            "candidate": "not_requested",
+                            "descendants": "unproven",
+                        }
+                        if terminal_value == legacy_terminal:
+                            mark_cancellation_uncertain(cancellation_id, cancellation_record)
+                            lifecycle.append("legacy cancellation lacks owned-group settlement proof; no retry")
+                            status = "cancel_uncertain"
+                            continue
+                        if (
+                            settlement_payload is None
+                            or settlement_reference is None
+                            or settlement_payload["owned_group_settled"] is not True
+                            or settlement_payload["result_reconciled"] is not True
+                            or settlement_payload["transport_succeeded"] is not True
+                            or terminal_value
+                            != terminal_cancellation_fact(
+                                attempt, operation, handle, settlement_reference, receipt_group_reference
+                            )
+                        ):
+                            raise ValueError("terminal cancellation differs from owned-group settlement evidence")
+                        finish_settled_cancellation(
+                            attempt,
+                            operation,
+                            handle,
+                            cancellation_record.fence,
+                            settlement_reference,
+                            receipt_group_reference,
+                        )
                         status = "expired" if int(time.time()) >= deadline else "cancelled"
+                        continue
+
+                    if cancellation_record.attempts > 0:
+                        cancel_receipt_data = store.find_artifact(cancellation_id, "receipt")
+                        if (
+                            settlement_payload is None
+                            and cancel_receipt_data is not None
+                            and receipt_identity is not None
+                        ):
+                            group_settled, reconciled, terminal = _cancel_receipt_evidence(
+                                cancel_receipt_data,
+                                handle=handle,
+                                identity=receipt_identity,
+                                expected_group_reference=receipt_group_reference,
+                            )
+                            if reconciled:
+                                settlement_reference = persist_settlement(
+                                    attempt.attempt_id,
+                                    operation.operation_id,
+                                    handle,
+                                    operation.fence,
+                                    cancellation_record.fence,
+                                    receipt_group_reference,
+                                    receipt_group_reference,
+                                    group_settled,
+                                    True,
+                                    True,
+                                )
+                                settlement_payload, _ = read_settlement_record(
+                                    attempt,
+                                    operation,
+                                    handle,
+                                    store.operation(cancellation_id),
+                                    receipt_group_reference,
+                                )
+                                crash("cancel-settlement")
+                                if group_settled is True and terminal and settlement_payload is not None:
+                                    finish_settled_cancellation(
+                                        attempt,
+                                        operation,
+                                        handle,
+                                        cancellation_record.fence,
+                                        settlement_reference,
+                                        receipt_group_reference,
+                                    )
+                                    status = "expired" if int(time.time()) >= deadline else "cancelled"
+                                    continue
+                        if (
+                            settlement_payload is not None
+                            and settlement_payload["owned_group_settled"] is True
+                            and settlement_payload["result_reconciled"] is True
+                            and settlement_payload["transport_succeeded"] is True
+                            and settlement_reference is not None
+                        ):
+                            finish_settled_cancellation(
+                                attempt,
+                                operation,
+                                handle,
+                                cancellation_record.fence,
+                                settlement_reference,
+                                receipt_group_reference,
+                            )
+                            status = "expired" if int(time.time()) >= deadline else "cancelled"
+                        else:
+                            mark_cancellation_uncertain(cancellation_id, cancellation_record)
+                            lifecycle.append("prior cancellation has no confirmed owned-group settlement; no replay")
+                            status = "cancel_uncertain"
+                        continue
+
+                    if receipt_data is None or receipt_identity is None:
+                        settle_unreconciled_target(attempt, operation, handle, receipt_group_reference)
+                        lifecycle.append("original runtime receipt is unavailable; cancellation remains uncertain")
+                        status = "cancel_uncertain"
+                        continue
+                    current_group_reference = (
+                        observe_owned_group_reference() if observe_owned_group_reference is not None else None
+                    )
+                    if current_group_reference != receipt_group_reference:
+                        settle_unreconciled_target(attempt, operation, handle, receipt_group_reference)
+                        lifecycle.append(
+                            "current Codex group differs from the runtime receipt; cancellation remains uncertain"
+                        )
+                        status = "cancel_uncertain"
                         continue
                     request = ExecutionRequest(
                         OperationKey(operation.operation_id, operation.effect_key, operation.request_digest),
@@ -1779,35 +2498,131 @@ def run_task(
                         operation.fence,
                         allocation=selected,
                     )
-                    runtime.restore(request, handle)
-                    if cancellation.attempts == 0:
-                        fence = store.claim(cancellation_id, now=int(time.time()), lease_seconds=1)
-                        crash("cancel-claim")
-                        store.observe(cancellation_id, fence, f"uncertain:{cancellation_id}", "unknown")
+                    restored = runtime.restore(
+                        request,
+                        handle,
+                        receipt_identity=receipt_identity,
+                        owned_group_reference=receipt_group_reference,
+                    )
+                    if restored.presence is not RuntimePresence.FOUND:
+                        settle_unreconciled_target(attempt, operation, handle, receipt_group_reference)
+                        lifecycle.append("original runtime receipt cannot be restored; cancellation remains uncertain")
+                        status = "cancel_uncertain"
+                        continue
+                    fence = store.claim(cancellation_id, now=int(time.time()), lease_seconds=cancellation_lease)
+                    crash("cancel-claim")
+                    retirement_context = (
+                        attempt.attempt_id,
+                        operation.operation_id,
+                        handle,
+                        operation.fence,
+                        fence,
+                        receipt_group_reference,
+                        True,
+                        True,
+                    )
+                    try:
                         receipt = runtime.cancel(handle)
-                        crash("cancel-send")
-                        store.finalize_artifact(cancellation_id, "receipt", manifest_bytes(asdict(receipt)))
-                    observation = runtime.observe(handle, now=int(time.time()))
-                    data = manifest_bytes(asdict(observation))
-                    if observation.activity is Activity.TERMINAL:
-                        store.finalize_artifact(cancellation_id, "terminal", manifest_bytes(terminal_fact))
-                    store.finalize_artifact(cancellation_id, f"observation:{hashlib.sha256(data).hexdigest()}", data)
+                    except Exception as error:
+                        if (
+                            close_owned_group is not None
+                            and store.find_artifact(cancellation_id, "owned-group-settlement") is None
+                        ):
+                            try:
+                                close_owned_group()
+                            except Exception as retire_error:
+                                lifecycle.append(
+                                    "owned-group retirement failed; result remains uncertain "
+                                    f"(exception={type(retire_error).__name__})"
+                                )
+                        settlement_payload, settlement_reference = read_settlement_record(
+                            attempt,
+                            operation,
+                            handle,
+                            store.operation(cancellation_id),
+                            receipt_group_reference,
+                        )
+                        if (
+                            settlement_payload is not None
+                            and settlement_reference is not None
+                            and settlement_payload["owned_group_settled"] is True
+                            and settlement_payload["result_reconciled"] is True
+                            and settlement_payload["transport_succeeded"] is True
+                        ):
+                            finish_settled_cancellation(
+                                attempt,
+                                operation,
+                                handle,
+                                fence,
+                                settlement_reference,
+                                receipt_group_reference,
+                            )
+                            status = "expired" if int(time.time()) >= deadline else "cancelled"
+                        else:
+                            mark_cancellation_uncertain(cancellation_id, store.operation(cancellation_id))
+                            status = "cancel_uncertain"
+                            lifecycle.append(
+                                "cancellation reply could not be reconciled; owned-group outcome is uncertain "
+                                f"(exception={type(error).__name__})"
+                            )
+                        continue
+                    finally:
+                        retirement_context = None
+                    crash("cancel-send")
+                    receipt_bytes = manifest_bytes(asdict(receipt))
+                    store.record_transport(cancellation_id, fence, True)
+                    store.finalize_artifact(cancellation_id, "receipt", receipt_bytes)
+                    crash("cancel-receipt")
+                    group_settled, reconciled, terminal = _cancel_receipt_evidence(
+                        receipt_bytes,
+                        handle=handle,
+                        identity=receipt_identity,
+                        expected_group_reference=receipt_group_reference,
+                    )
+                    settlement_reference = persist_settlement(
+                        attempt.attempt_id,
+                        operation.operation_id,
+                        handle,
+                        operation.fence,
+                        fence,
+                        receipt.owned_group_reference,
+                        receipt_group_reference,
+                        group_settled,
+                        reconciled,
+                        True,
+                    )
+                    settlement_payload, _ = read_settlement_record(
+                        attempt,
+                        operation,
+                        handle,
+                        store.operation(cancellation_id),
+                        receipt_group_reference,
+                    )
                     crash("cancel-observation")
-                    if observation.activity is Activity.TERMINAL:
-                        store.observe(
-                            operation.operation_id,
-                            operation.fence,
-                            f"terminal:{operation.operation_id}",
-                            "terminal",
-                            reference=handle,
+                    if (
+                        receipt.cancellation_requested
+                        and receipt.activity is Activity.TERMINAL
+                        and group_settled is True
+                        and reconciled
+                        and settlement_payload is not None
+                        and settlement_payload["transport_succeeded"] is True
+                    ):
+                        finish_settled_cancellation(
+                            attempt,
+                            operation,
+                            handle,
+                            fence,
+                            settlement_reference,
+                            receipt_group_reference,
                         )
                         crash("cancel-terminal")
-                        finish_cancelled_attempt(attempt.spec.attempt_id)
-                        if int(time.time()) < deadline:
-                            status = "cancelled"
-                    lifecycle.append(
-                        "cancel delivery uncertain; descendant settlement unproven; cancellation is not rollback"
-                    )
+                        status = "expired" if int(time.time()) >= deadline else "cancelled"
+                    else:
+                        status = "cancel_uncertain"
+                        lifecycle.append(
+                            "cancel cleanup is unconfirmed; preserve workspace and original envelope; "
+                            "cancellation is not rollback"
+                        )
             if status == "identity_unavailable":
                 lifecycle.append("runtime identity evidence missing or mismatched; no acceptance")
             elif status in {"unknown", "waiting", "running"}:

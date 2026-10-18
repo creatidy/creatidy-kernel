@@ -38,6 +38,33 @@ class CodexConnection(Protocol):
     def request(self, method: str, params: dict[str, object]) -> dict[str, object]: ...
 
 
+def owned_group_callbacks(
+    connection: CodexConnection,
+) -> tuple[
+    Callable[[], None] | None,
+    Callable[[], bool | None] | None,
+    Callable[[], str | None] | None,
+]:
+    """Bind retirement only when the connection exposes settlement and identity witnesses."""
+    retire = getattr(connection, "close", None)
+    if (
+        not callable(retire)
+        or not hasattr(connection, "owned_group_settled")
+        or not hasattr(connection, "owned_group_reference")
+    ):
+        return None, None, None
+
+    def settled() -> bool | None:
+        value = getattr(connection, "owned_group_settled", None)
+        return value if type(value) is bool else None
+
+    def group_reference() -> str | None:
+        value = getattr(connection, "owned_group_reference", None)
+        return value if type(value) is str and value.strip() else None
+
+    return cast(Callable[[], None], retire), settled, group_reference
+
+
 class CodexRejected(Exception):
     """Native app-server domain rejection, distinct from uncertain transport delivery."""
 
@@ -66,11 +93,14 @@ class _Run:
     turn: str | None = None
     uncertain: bool = False
     cancelled: bool = False
+    owned_group_settled: bool | None = None
+    owned_group_reference: str | None = None
     terminal: bool = False
     terminal_status: str | None = None
     identity_model: str | None = None
     identity_provider: str | None = None
     identity_effort: str | None = None
+    receipt_identity: RuntimeIdentity | None = None
     candidate: Candidate | None = None
 
     @property
@@ -81,6 +111,8 @@ class _Run:
 
     @property
     def identity(self) -> RuntimeIdentity:
+        if self.receipt_identity is not None:
+            return self.receipt_identity
         return replace(
             self.request.identity,
             resolved=self.identity_model,
@@ -122,6 +154,9 @@ class CodexRuntime(Runtime):
         freshness: int = 30,
         supported_efforts: frozenset[tuple[str, str, str]] = frozenset(),
         clock: Callable[[], int] | None = None,
+        retire: Callable[[], None] | None = None,
+        settled: Callable[[], bool | None] | None = None,
+        group_reference: Callable[[], str | None] | None = None,
     ) -> None:
         if not version or connection.version != version or freshness <= 0:
             raise UnsupportedExecution("Codex version mismatch or invalid freshness contract")
@@ -135,12 +170,17 @@ class CodexRuntime(Runtime):
             for binding in supported_efforts
         ):
             raise ValueError("supported efforts must be immutable provider/model/effort bindings")
+        if len({retire is None, settled is None, group_reference is None}) != 1:
+            raise ValueError("Codex process retirement requires settlement and identity witnesses")
         self.connection = connection
         self.resolve = resolve
         self.authorize = authorize
         self.collect = collect
         self.freshness = freshness
         self.clock = clock
+        self.retire = retire
+        self.settled = settled
+        self.group_reference = group_reference
         # Trusted support evidence for this pinned connection version, never a
         # vocabulary inferred from an allocator's requested configuration.
         self.supported_efforts = supported_efforts
@@ -204,7 +244,11 @@ class CodexRuntime(Runtime):
         inputs = self._inputs(request)
         if not self.authorize(request):
             raise ExecutionConflict("operation lacks a durable delivery claim")
-        run = _Run(request, uncertain=True)
+        run = _Run(
+            request,
+            uncertain=True,
+            owned_group_reference=self.group_reference() if self.group_reference is not None else None,
+        )
         self._by_key[key] = run
         try:
             thread_params: dict[str, object] = {
@@ -251,9 +295,33 @@ class CodexRuntime(Runtime):
         self._by_handle[handle] = run
         return handle
 
-    def restore(self, request: ExecutionRequest, handle: str) -> Lookup:
+    def restore(
+        self,
+        request: ExecutionRequest,
+        handle: str,
+        *,
+        receipt_identity: RuntimeIdentity | None = None,
+        owned_group_reference: str | None = None,
+    ) -> Lookup:
         """Bind an externally durable, accepted receipt before inspecting its native turn."""
         self._inputs(request)
+        if (
+            receipt_identity is not None
+            and replace(
+                receipt_identity,
+                resolved=None,
+                observed=None,
+                resolved_provider=None,
+                observed_provider=None,
+                resolved_effort=None,
+                observed_effort=None,
+            )
+            != request.identity
+        ):
+            raise ExecutionConflict("Codex receipt identity differs from immutable Attempt request")
+        current_group_reference = self.group_reference() if self.group_reference is not None else None
+        if owned_group_reference is not None and current_group_reference != owned_group_reference:
+            return Lookup(Presence.UNKNOWN)
         prefix = "codex:"
         parts = handle.removeprefix(prefix).split(":") if handle.startswith(prefix) else []
         if len(parts) != 2 or not all(parts):
@@ -262,9 +330,24 @@ class CodexRuntime(Runtime):
         if existing is not None and (existing.request != request or existing.handle != handle):
             raise ExecutionConflict("Codex receipt conflicts with immutable Operation")
         if existing is None:
-            run = _Run(request, thread=parts[0], turn=parts[1])
+            run = _Run(
+                request,
+                thread=parts[0],
+                turn=parts[1],
+                identity_model=receipt_identity.resolved if receipt_identity is not None else None,
+                identity_provider=(receipt_identity.resolved_provider if receipt_identity is not None else None),
+                identity_effort=(receipt_identity.resolved_effort if receipt_identity is not None else None),
+                owned_group_reference=(
+                    owned_group_reference if owned_group_reference is not None else current_group_reference
+                ),
+            )
             self._by_key[request.operation.effect_key] = run
             self._by_handle[handle] = run
+        restored = self._by_handle[handle]
+        if owned_group_reference is not None and restored.owned_group_reference != owned_group_reference:
+            return Lookup(Presence.UNKNOWN)
+        if receipt_identity is not None:
+            restored.receipt_identity = receipt_identity
         return self.reconcile(request.operation, handle)
 
     def _read(self, run: _Run) -> tuple[str, str | None] | None:
@@ -290,8 +373,32 @@ class CodexRuntime(Runtime):
         run = self._by_handle.get(handle)
         if run is None:
             raise ExecutionConflict("unknown Codex receipt handle")
+        if run.cancelled:
+            activity = Activity.TERMINAL if run.owned_group_settled is True else Activity.UNKNOWN
+            observed_at = self.clock() if self.clock is not None else now
+            return RuntimeObservation(
+                handle,
+                activity,
+                observed_at,
+                observed_at + self.freshness if activity is Activity.TERMINAL else observed_at,
+                run.identity,
+                True,
+                run.owned_group_settled,
+                run.owned_group_reference,
+            )
         state = self._read(run)
         observed_at = self.clock() if self.clock is not None else now
+        if state is None and run.terminal:
+            return RuntimeObservation(
+                handle,
+                Activity.TERMINAL,
+                observed_at,
+                observed_at,
+                run.identity,
+                False,
+                None,
+                run.owned_group_reference,
+            )
         activity = Activity.UNKNOWN
         if state is not None:
             status, _ = state
@@ -310,12 +417,16 @@ class CodexRuntime(Runtime):
             observed_at + self.freshness if state else observed_at,
             run.identity,
             run.cancelled,
+            None,
+            run.owned_group_reference,
         )
 
     def candidate(self, handle: str) -> Candidate | None:
         run = self._by_handle.get(handle)
         if run is None:
             raise ExecutionConflict("unknown Codex receipt handle")
+        if run.cancelled:
+            return None
         if run.terminal_status in {"failed", "interrupted"}:
             return None
         state = self._read(run)
@@ -344,19 +455,38 @@ class CodexRuntime(Runtime):
         run = self._by_handle.get(handle)
         if run is None or run.thread is None or run.turn is None:
             raise ExecutionConflict("unknown Codex receipt handle")
+        if run.cancelled:
+            observed_at = self.clock() if self.clock is not None else 0
+            return RuntimeObservation(
+                handle,
+                Activity.TERMINAL if run.owned_group_settled is True else Activity.UNKNOWN,
+                observed_at,
+                observed_at + self.freshness if run.owned_group_settled is True else observed_at,
+                run.identity,
+                True,
+                run.owned_group_settled,
+                run.owned_group_reference,
+            )
         run.cancelled = True
         if not run.terminal:
             try:
                 self.connection.request("turn/interrupt", {"threadId": run.thread, "turnId": run.turn})
             except (OSError, TimeoutError, CodexRejected, CodexRPCError):
                 pass  # Acknowledgment is not proof that cancellation completed.
+        if self.retire is not None and self.settled is not None:
+            self.retire()
+            settlement = self.settled()
+            run.owned_group_settled = settlement if type(settlement) is bool else None
+        observed_at = self.clock() if self.clock is not None else 0
         return RuntimeObservation(
             handle,
-            Activity.TERMINAL if run.terminal else Activity.UNKNOWN,
-            0,
-            0,
+            Activity.TERMINAL if run.owned_group_settled is True else Activity.UNKNOWN,
+            observed_at,
+            observed_at + self.freshness if run.owned_group_settled is True else observed_at,
             run.identity,
             True,
+            run.owned_group_settled,
+            run.owned_group_reference,
         )
 
     def reconcile(self, operation: OperationKey, handle: str | None = None) -> Lookup:

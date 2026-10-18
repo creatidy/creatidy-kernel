@@ -13,6 +13,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
@@ -26,6 +27,7 @@ class CodexStdio:
     # The active controller can journal pending cancellation before pipe failure
     # causes owned process cleanup, without reopening its exclusively held store.
     before_close: Callable[[], None] | None = None
+    after_close: Callable[[bool | None], None] | None = None
 
     def __init__(
         self,
@@ -75,6 +77,7 @@ class CodexStdio:
         self._notification_bytes = 0
         self._next_id = 1
         self._process: subprocess.Popen[bytes] | None = None
+        self._owned_group_reference = uuid.uuid4().hex
         self.owned_group_settled: bool | None = None
         self._version = expected_version
         # initialize supplies no native method inventory. A trusted caller must
@@ -116,6 +119,10 @@ class CodexStdio:
     @property
     def version(self) -> str:
         return self._version
+
+    @property
+    def owned_group_reference(self) -> str:
+        return self._owned_group_reference
 
     @property
     def methods(self) -> frozenset[str]:
@@ -338,9 +345,15 @@ class CodexStdio:
             if self.before_close is not None:
                 self.before_close()
         finally:
-            process, self._process = self._process, None
-            if process is not None:
-                self.owned_group_settled = self._stop(process)
+            try:
+                process, self._process = self._process, None
+                if process is not None:
+                    self.owned_group_settled = self._stop(process)
+                elif self.owned_group_settled is None:
+                    self.owned_group_settled = True
+            finally:
+                if self.after_close is not None:
+                    self.after_close(self.owned_group_settled)
 
     def close(self) -> None:
         with self._lock:

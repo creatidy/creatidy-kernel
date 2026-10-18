@@ -488,7 +488,7 @@ def test_existing_attempt_refuses_missing_original_objects_without_copy_or_start
 
 
 @pytest.mark.parametrize("task_id", ["143", "166"])
-def test_historical_hostless_source_and_frozen_identity_survive_expired_recovery(
+def test_historical_hostless_source_and_frozen_identity_survive_uncertain_expired_recovery(
     sqlite_tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     task_id: str,
@@ -556,7 +556,7 @@ def test_historical_hostless_source_and_frozen_identity_survive_expired_recovery
     assert resolved == legacy and not resolved.exists()
     monkeypatch.setattr(task_execution.time, "time", lambda: deadline + 1)
     recovered = InterruptedConnection(lambda _: pytest.fail("expired work cannot execute"))
-    assert advance(recovered)["condition"] == "expired" and recovered.starts == 0
+    assert advance(recovered)["condition"] == "cancel_uncertain" and recovered.starts == 0
     with SQLiteProgramStore(control / "kernel.sqlite3") as store:
         assert requests == {key: store.operation(key).request_json for key in operations}
         assert store.load(task_execution.PROGRAM_ID).attempt(task_execution.ATTEMPT_ID).spec == attempt

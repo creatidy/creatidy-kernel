@@ -392,11 +392,7 @@ def _task(args: argparse.Namespace, environment: dict[str, str]) -> int:
     try:
         while True:
             result = advance()
-            if cancellation_signal and result.get("condition") not in {
-                "cancelled",
-                "cancel_uncertain",
-                "cancelled_no_dispatch",
-            }:
+            if cancellation_signal:
                 result = advance(cancel_requested=True)
             if result.get("condition") not in {"running", "waiting"}:
                 break

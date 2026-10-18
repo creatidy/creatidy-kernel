@@ -15,6 +15,7 @@ from unittest.mock import patch
 import pytest
 
 from creatidy_kernel.adapters.cli import main
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 
 pytest_plugins = ["test_sqlite_store", "test_codex_stdio"]
 
@@ -147,7 +148,6 @@ def test_cli_task_run_prints_lifecycle(
 ) -> None:
     from test_task_execution import (
         EFFORT_ALLOCATION,
-        FixtureConnection,
         deflake_edit,
         export_task,
         fixture_task,
@@ -159,22 +159,34 @@ def test_cli_task_run_prints_lifecycle(
     from creatidy_kernel.adapters.codex_stdio import CodexStdio
     from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
     from creatidy_kernel.adapters.reference import reference_git
-    from creatidy_kernel.adapters.task_execution import LiveTaskComponents, TaskSpec
+    from creatidy_kernel.adapters.task_execution import CODEX_METHODS, LiveTaskComponents, TaskSpec
 
     source = make_source(sqlite_tmp_path)
     base = reference_git(source, "rev-parse", "refs/heads/develop")
     forge, _transport = make_forge(base)
 
-    class OwnedConnection(FixtureConnection, CodexStdio):
+    class OwnedConnection(CodexStdio):
         reads = 0
-        closed = False
         events: list[str]
 
         def __init__(self) -> None:
-            FixtureConnection.__init__(self, deflake_edit, effort="low")
+            self.edit = deflake_edit
+            self.provider = "zai"
+            self.effort = "low"
+            self.starts = 0
+            self.interrupts = 0
+            self.status = "completed"
+            self.cwd = None
+            self.owned_group_settled = None
+            self._owned_group_reference = "cli-test-owned-group"
+            self.closed = False
             self.events = []
+            self.before_close = lambda: self.events.append("before-close")
+            self._version = "0.99.1"
+            self._methods = CODEX_METHODS
+            self._lock = threading.Lock()
+            self._process = None
             if interrupt in {"rpc", "startup"}:
-                self._lock = threading.Lock()
                 self._process = cast("subprocess.Popen[bytes]", object())
 
         def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
@@ -186,6 +198,7 @@ def test_cli_task_run_prints_lifecycle(
             assert not self.closed
             self.events.append(method)
             if method == "turn/interrupt":
+                self.interrupts += 1
                 self.status = "interrupted"
                 return {}
             if method == "thread/read":
@@ -194,22 +207,46 @@ def test_cli_task_run_prints_lifecycle(
                     signal.raise_signal(signal.SIGINT)
                 if self.status != "interrupted":
                     self.status = "inProgress" if self.reads <= initial_reads else "completed"
-            result = FixtureConnection.request(self, method, params)
+                return {
+                    "thread": {
+                        "id": "thread-1",
+                        "turns": [{"id": "turn-1", "status": self.status}],
+                    }
+                }
+            if method == "thread/start":
+                self.starts += 1
+                self.cwd = str(params["cwd"])
+                result: dict[str, object] = {
+                    "thread": {"id": f"thread-{self.starts}"},
+                    "model": "glm-5.3",
+                    "modelProvider": self.provider,
+                }
+                result["reasoningEffort"] = self.effort
+            elif method == "turn/start":
+                self.edit(Path(str(self.cwd)))
+                result = {"turn": {"id": f"turn-{self.starts}"}}
+            else:
+                raise AssertionError(f"unexpected Codex method: {method}")
             if interrupt == "startup" and method == "thread/start":
                 signal.raise_signal(signal.SIGINT)
             return result
 
         def _close_unlocked(self) -> None:
-            assert "cancellation" in export_task(control)
+            if self.before_close is not None:
+                self.before_close()
+            assert "before-close" in self.events
             self.events.append("owned-teardown")
             self._process = None
+            self.owned_group_settled = True
             self.closed = True
+            if self.after_close is not None:
+                self.after_close(self.owned_group_settled)
 
         def close(self) -> None:
-            assert self.status in {"completed", "interrupted"}
             if interrupt in {"rpc", "startup"}:
                 CodexStdio.close(self)
             else:
+                self.owned_group_settled = True
                 self.closed = True
 
     connection = OwnedConnection()
@@ -280,7 +317,8 @@ def test_cli_task_run_prints_lifecycle(
         assert polls == 1
     assert "task admitted: owner-approved frozen task" in output
     if interrupt:
-        assert ("condition=cancel_uncertain" if interrupt == "startup" else "condition=cancelled") in output
+        assert ("condition=cancel_uncertain" if interrupt == "startup" else "condition=cancelled") in output, output
+        assert "cancellation" in export_task(control)
         assert "acceptance" not in export_task(control)
         assert "pr" not in export_task(control)
     else:
@@ -290,7 +328,7 @@ def test_cli_task_run_prints_lifecycle(
     assert connection.closed
     assert signal.getsignal(signal.SIGINT) == original_sigint
     if interrupt == "rpc":
-        assert connection.events.index("turn/interrupt") < connection.events.index("owned-teardown")
+        assert connection.events.index("before-close") < connection.events.index("owned-teardown")
     if interrupt == "startup":
         assert "turn/start" not in connection.events
         assert "turn/interrupt" not in connection.events
@@ -347,6 +385,7 @@ def test_real_pipe_timeout_persists_stop_before_owned_teardown(sqlite_tmp_path: 
         )
 
     assert advance_original()["condition"] == "running"
+    assert original.interrupts == 0
     events: list[str] = []
 
     class ProcessLoss(BaseException):
@@ -413,14 +452,19 @@ def test_real_pipe_timeout_persists_stop_before_owned_teardown(sqlite_tmp_path: 
             ]
         )
     assert events == ["pipe-read", "owned-teardown"]
+    assert original.interrupts == 0
     assert "cancellation" in export_task(control)
     assert pipe.before_close is None
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        cancellation = store.operation("cancel:task_execution:change")
+        assert cancellation.attempts == 1
+        assert store.artifact(cancellation.operation_id, "owned-group-settlement")
     original.status = "completed"
     recovered = advance_original()
-    assert recovered["condition"] == "cancelled"
+    assert recovered["condition"] == "cancel_uncertain"
     assert "acceptance" not in recovered
     assert "pr" not in recovered
     assert original.starts == 1
-    assert original.interrupts == 1
-    assert advance_original()["condition"] == "cancelled"
-    assert original.interrupts == 1
+    assert original.interrupts == 0
+    assert advance_original()["condition"] == "cancel_uncertain"
+    assert original.interrupts == 0
