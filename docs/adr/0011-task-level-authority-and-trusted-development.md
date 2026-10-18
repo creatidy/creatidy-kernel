@@ -97,20 +97,30 @@ ordinary process restart, but does not prove that a backward wall-clock step or 
 reboot cannot lengthen the effective lease. The proposed baseline must not silently
 renew it.
 
-Recommended contract: when the original Attempt/deadline is committed, also persist a
-boot-scoped monotonic deadline projection and its host boot identity, derived from the
-original wall deadline. Admission checks use that same monotonic projection after the
-existing single-writer serialization point; recovery on the same boot reuses it. If
-the boot identity/clock mapping changes or cannot be validated, do not dispatch or
-start a new Attempt; report `unknown` and require reconciliation. The wall deadline
-remains the user-visible audit value. This is durable metadata in the existing task
-store, not a service or replacement executor; its schema/clock cost is part of the
-owner decision. Until implementation and clock tests exist, do not claim
-rollback-resistant deadlines.
+The required projection must continue to elapse across system suspend. On supported
+Linux hosts, prefer a verified `CLOCK_BOOTTIME` reading, which includes suspended time;
+ordinary `CLOCK_MONOTONIC` is insufficient where it pauses during suspend. When the
+original Attempt/deadline is committed, persist the original wall deadline, a
+boot-scoped deadline projection derived from the remaining duration, the verified
+clock identity, and the host boot identity. Use the existing single-writer
+serialization point for that binding.
 
-The monotonic mapping protects Kernel admission; it does not eliminate the documented
-native termination window. A native effect under an already-running trusted-development
-Attempt may still begin after the wall deadline and before that Attempt is settled.
+Same-boot recovery reuses the original projection; it must never recompute a later
+expiry from the current wall clock. A wall-clock rollback therefore cannot extend the
+persisted deadline, and suspend time counts toward it. If `CLOCK_BOOTTIME`, its reading,
+or the host boot identity is unavailable, unsupported, or cannot be verified, or if
+recovery observes a different boot identity, fail closed: deny new dispatch and a
+successor Attempt, retain `unknown`, and require reconciliation rather than extending
+the original deadline. The wall deadline remains the user-visible audit value. This is
+durable metadata in the existing task store, not a service or replacement executor;
+its schema/clock cost remains part of the owner decision. Until implementation and
+clock tests exist, do not claim rollback-resistant deadlines.
+
+The suspend-inclusive projection protects Kernel admission only. Expiry initiates the
+bounded cancellation path, but does not prove process termination or settlement and
+does not eliminate the native termination window: an effect under an already-running
+trusted-development Attempt may still begin after admission expiry and before that
+Attempt is settled. No strict per-syscall cutoff is claimed.
 
 ## Trust Model And Supported Scope
 
@@ -186,9 +196,10 @@ properties.
 - No new Kernel-controlled dispatch or external mutation after the original
   deadline/revocation. Recovery never renews a deadline, creates a successor Attempt,
   changes the route, or blindly replays an uncertain effect.
-- User STOP records a cancellation against the exact active Attempt and invokes the
-  existing Runtime interrupt plus bounded process-group/OCI cleanup. An interrupt
-  acknowledgement, turn status or leader exit alone is not settlement.
+- Deadline expiry and user STOP record cancellation against the exact active Attempt
+  and use the existing Runtime interrupt plus bounded process-group/OCI cleanup. An
+  interrupt acknowledgement, terminal turn status or leader exit alone is not
+  settlement; the applicable owned-process witness is required before settlement.
 - Candidate acceptance/publication is blocked while the task or its external effects
   are unknown. Partial workspace changes are retained, not relabelled as verified or
   rolled back.
@@ -217,11 +228,12 @@ observable, it remains `cancel_uncertain`/`unknown` and is not accepted.
 
 | Scenario | Proposed baseline response | Remaining risk/containment |
 | --- | --- | --- |
-| Deadline expires during an active Codex turn | Deny new Kernel-controlled operations, persist expiry/cancel intent, interrupt and terminate the exact owned runtime. | Native local writes or a new subprocess may still occur while termination is in progress; the workspace remains partial/unaccepted until settlement and fresh verification. |
-| Controller/host restarts or wall clock moves backward | Reuse the original boot-scoped monotonic deadline; on invalid/mismatched clock identity, deny new dispatch and report `unknown`. | The current wall-clock-only schema does not yet prove rollback-resistant expiry; implementation and clock tests are required. |
+| Deadline expires during an active Codex turn or across host suspend | Use the verified suspend-inclusive `CLOCK_BOOTTIME` projection to deny new Kernel admissions and initiate bounded cancellation. | Native local writes or a new subprocess may still occur during termination; preserve the workspace and keep it unaccepted until owned-process settlement and fresh verification. No syscall cutoff is claimed. |
+| Controller/host restarts, wall clock moves backward, or boot identity changes | Same-boot recovery reuses the original projection. A missing/unverifiable clock or changed boot identity denies new dispatch and reports `unknown`. | The current wall-clock-only schema does not yet prove suspend-inclusive, rollback-resistant expiry; implementation and clock tests are required. |
 | User presses STOP during a framed RPC | Latch the request; handle it on the existing owner thread after the finite RPC boundary; persist cancellation before teardown. | The stop is not instantaneous. Report requested/cancelled/uncertain honestly. |
-| Interrupt acknowledgement arrives but the process group remains | Do not report `cancelled` or accept work until the profile's termination evidence is observed. | Retain workspace and mark `unknown`/`cancel_uncertain`; no automatic restart or duplicate external effect. |
+| Deadline or STOP cancellation receives a terminal turn or interrupt acknowledgement while the process group remains | Neither runtime terminality nor acknowledgement is settlement; wait for the applicable owned-process evidence. | Retain workspace and mark `unknown`/`cancel_uncertain`; block acceptance/publication and a conflicting successor Attempt without blocking independent eligible tasks. |
 | Descendant calls `setsid`/escapes the observable group | Keep the task uncertain; do not claim all descendants have terminated. | This mode is not a hostile-worker sandbox. If the task requires guaranteed containment, refuse it rather than silently widening support. |
+| Controller is lost during termination or before settlement evidence is durable | Recovery uses only the exact durable operation and an authoritative settlement witness; absence of that witness remains uncertain. | Retain the workspace; do not infer settlement from a terminal turn, reacquire a numeric PID, accept/publish, or start a conflicting successor Attempt. Independent eligible tasks remain separate. |
 | Native command attempts remote write or protected API access | Kernel adapter tokens are not forwarded, but provider auth in HOME may be readable and native terminal egress is unverified. | Ordinary local Codex is an explicit same-principal trust choice with a limited provider account. Tasks needing protected remote state or secret isolation are unsupported unless the existing profile proves that boundary. |
 | Controller loses a remote effect reply | Preserve the exact Operation as unknown and reconcile it; no fallback/retry. | No claim that timeout means the external system did nothing. |
 | Native provider turn is still active at deadline | Do not start a new Kernel turn; interrupt the current turn and retain cost/result uncertainty. | A hard per-subcall cutoff or exact cost cap requires producer/Router evidence (#52/#56); it is not claimed here. |
@@ -251,20 +263,29 @@ escaped processes remain unsupported absent a separately authorized architecture
 After owner acceptance only, use synthetic local resources and the exact supported
 Codex/profile versions. Do not use live inference or production credentials:
 
-1. **Kernel admission:** show that expiry/revocation denies a new Kernel turn,
-   controller command and external Operation at their existing admission points.
-   Recovery must retain the original deadline and may not generate a new Attempt or
-   authority; simulated wall-clock rollback and boot-identity mismatch fail closed.
+1. **Kernel admission and deadline clock:** show that expiry/revocation denies a new
+   Kernel turn, controller command and external Operation at their existing admission
+   points. With controlled wall and boot clocks, test suspend/resume by advancing
+   `CLOCK_BOOTTIME` across the deadline, wall-clock rollback after projection creation,
+   reboot/boot-ID mismatch, unavailable or unverifiable clock identity, and same-boot
+   recovery. Recovery must reuse the original projection, fail closed when it cannot
+   verify it, and never generate a new Attempt or authority to extend the deadline.
 2. **Native residual:** reproduce a positive local workspace write/subprocess during
    the termination interval under the selected `TRUSTED_DEVELOPMENT` profile. Record
    it as a residual partial effect and prove that it cannot be accepted, published,
    or converted into a new Attempt while termination/verification is outstanding.
    Do not treat the absence of a marker as proof of a strict fence.
-3. **STOP:** exercise Ctrl-C before dispatch, during a finite RPC, after an interrupt
-   reply, with a live same-group child, and with an unobservable/escaped child. Verify
-   cancellation intent, bounded TERM/KILL, exact-target settlement, `cancel_uncertain`
-   when unresolved, retained workspace, no duplicate start and honest CLI/export
-   output.
+3. **STOP and deadline settlement:** exercise user Ctrl-C and deadline-triggered
+   cancellation before dispatch, during a finite RPC, after a terminal Codex turn or
+   successful interrupt reply, with a live same-group descendant, an escaped/unobservable
+   child, controller loss during cleanup, and incomplete or missing termination
+   evidence. Terminal turn status and interrupt acknowledgement alone are never
+   settlement. Verify the same exact owned-process settlement gate for both causes;
+   unresolved evidence remains `unknown`/`cancel_uncertain`, retains the workspace,
+   blocks acceptance/publication/retry and a conflicting successor Attempt, and does
+   not block independent eligible tasks with non-conflicting resources. Verify bounded
+   TERM/KILL, recovery without blind retry or numeric-PID reacquisition, and honest
+   CLI/export output.
 4. **Credential/egress disclosure:** use a synthetic provider credential and fake
    remote to test the exact native profile. Record whether a terminal child can read
    the provider-auth HOME or reach the fake remote. A readable provider sentinel is a
@@ -299,8 +320,9 @@ The proposal is **not authoritative**. Until explicit owner acceptance, the prev
 AC4 remains binding and #53 stays closed not implemented. Acceptance must explicitly
 approve the task-level capability horizon, the local native termination residual, the
 same-principal provider-auth tradeoff for ordinary Codex, the boundary for protected
-remote effects, the boot-scoped monotonic deadline projection/recovery behavior, and the
-no-candidate/no-retry behavior while termination or external outcomes are unknown. If
+remote effects, the suspend-inclusive `CLOCK_BOOTTIME` deadline projection and
+fail-closed recovery behavior, and the no-candidate/no-retry behavior while termination
+or external outcomes are unknown. If
 the owner requires provider-key secrecy or guaranteed shell egress isolation, the
 current native path cannot meet that property under the rejected architecture options;
 those sensitive task types remain unsupported, while ordinary local Codex is not

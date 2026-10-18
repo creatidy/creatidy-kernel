@@ -14,16 +14,16 @@ and comments do carry local prerequisites; closure of #53 does not satisfy them.
 | Issue | Current gate/reference | Proposed disposition if ADR 0011 is accepted | Still required |
 | --- | --- | --- | --- |
 | #53 | CLOSED / NOT IMPLEMENTED; PR #85 CLOSED / UNMERGED. Positive native post-expiry effect is diagnostic evidence. | Leave closed. Do not retrofit its AC4 history or mark it accepted. | Current strict AC4 remains binding until owner acceptance; the new wording is only a proposal. |
-| #52 | Open; its issue comment orders producer contracts before the #52/#53 consumer receipt. | Clarify that route admission/identity is Kernel-controlled; do not use #53's closed diagnostic as a strict native effect proof. | Router #174/#178/#179/#180/#181 and Kernel #47/#49 gates remain. |
+| #52 | Open; historical issue comment [#14078](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/52#issuecomment-14078) orders producer contracts before a “#52/#53 consumer receipt”; this wording is in the comment, not the current issue body. | After owner acceptance, add an explicit clarification to the #52 issue body. Preserve comment #14078 unchanged as historical context; do not silently edit or claim to replace it. | Router #174/#178/#179/#180/#181, existing Router #165 cancellation evidence, and Kernel #47/#49/#51/#52 gates remain. |
 | #54 | Open; body depends on #47/#48/#49/#50 and a separately authorized Router review route; no direct #53 edge. | Clarify that a review verdict is not an effect-fencing or hostile-worker proof; consume STOP/uncertainty facts if using the proposed baseline. | Review-route, live inference/effect scopes, #50 test-child scope and existing policy/budget gates remain. |
-| #56 | Open; whole-task deadline, in-flight overrun and unknown-cost accounting. | State that deadline stops new Kernel admissions and initiates STOP; native effects/usage during teardown may be unknown; clock/boot identity must not renew the original deadline. | Router #184 and approved task budget/usage evidence remain. |
+| #56 | Open; whole-task deadline, in-flight overrun and unknown-cost accounting. The current source records terminal cancellation before owned-process settlement is established. | Specify a verified suspend-inclusive deadline projection and tests; expiry uses the same owned-process settlement gate as user STOP. Record the current ordering defect as an implementation gap, not as fixed by this documentation. | Router #184 and approved task budget/usage evidence remain; uncertainty is scoped to the affected Attempt/resources. |
 | #57 | Open; owner-served task state and user-facing status. | Distinguish deadline/STOP request from owned-process settlement and uncertainty; don't imply exact syscall cutoff. | SQLite owner-thread, snapshot/event and current-authority gates remain. |
 | #58 | Open; full-path private outcome/cost export. | Export trust profile, deadline decision and cancellation/settlement evidence; never report unknown local effects/usage as zero or rollback. | MI/Router producer contracts, privacy and versioned export gates remain. |
 | #59 | Open; body says “#53 chosen harness” and requires owned workspace/process cleanup. | Replace #53 as a strict-expiry/harness prerequisite with the proposed task-level profile and #90 STOP only after owner acceptance. State same-principal provider-HOME trust; no production/remote-write credentials in the task identity. | #48 lifetime, #50 verification/test-child, #57 view, #61 cache ownership, manual-edit and Router parallel-call gates remain. |
-| #60 | Open; integrated reception includes #53 harness adapter/lifetime. | Replace #53 as a strict native-expiry acceptance prerequisite with ADR 0011 + #90 and other actual component receipts. Report the termination-window residual and same-principal provider-HOME trust explicitly. | #47/#48/#49/#50/#52/#54/#55/#56/#57/#58/#59/#61/#62, Router #141 and MI #19 gates remain. |
+| #60 | Open; integrated reception includes #53 harness adapter/lifetime. | Replace #53 as a strict native-expiry acceptance prerequisite with ADR 0011 + #90 and other actual component receipts. Require expiry-triggered cancellation to meet the same owned-process settlement gate as user STOP, and report the termination-window residual and same-principal provider-HOME trust explicitly. | #47/#48/#49/#50/#52/#54/#55/#56/#57/#58/#59/#61/#62, Router #141 and MI #19 gates remain. |
 | #62 | Open; installed/profile/platform compatibility. | Add an explicit trusted-development profile row: no strict native effect cutoff or hostile-worker claim; provider-auth HOME is same-principal trust unless a test proves otherwise; no production/remote-write credentials; no fallback to a broader profile. | Actual producer versions, migration safety and platform evidence remain. |
 | #79 | Open verification/test-child follow-up; PR #83 is already merged. Its body says #53's whole-worker gate remains separate. | Clarify that #50/#79 are test-child only and neither proves whole-worker isolation nor strict expiry. | Exact upstream/license/provenance and test-child acceptance remain; do not promote the profile. |
-| #90 | Open user-requested STOP issue; no formal dependency on #53. | It supplies only the STOP/cancellation portion of proposed AC4, not strict expiry or universal effect mediation. | Exact owned-process-group settlement, unknown reporting and single-writer behavior remain. |
+| #90 | Open user-requested STOP issue; no formal dependency on #53. Its body already records the terminal-turn-before-process-group-settlement ordering gap. | Keep #90 scoped to user-requested STOP and its existing implementation gap; do not claim documentation acceptance fixes it. Proposed #56/#60 criteria separately require the same settlement gate for deadline cancellation. | Exact owned-process-group settlement, unknown reporting and single-writer behavior remain. |
 | Console #4/#8/#12/#13 | Open Console consumers; #8/#13 link #53 and #12 tests revoked/expired permissions. No formal edge to #53 is registered. | Proposed consumer copy below; requires Console-owner acceptance, not a Kernel issue mutation. | Console parent/producer/browser/security/service gates remain. |
 
 No formal Forgejo dependency edge is changed by this proposal. If accepted, owners may
@@ -40,27 +40,34 @@ These are not applied to live Forgejo descriptions.
 
 ### #52 — Route Consumer
 
-**Current excerpt (Dependencies And Priority):**
+**Historical source (issue comment #14078; preserve unchanged, not issue-body text):**
 
 > First integration prerequisite after #47 control/backend proof + approved #49/#51
 > requirements; producer #178/#179/#180 and #174 conformance; #181 specific protocol
 > evidence; Kernel #52/#53 consumer receipt. No source/effort/access-mode parsing or
 > physical attestation inference from gateway audit.
 
-**Proposed replacement:**
+**Proposed issue-body addition (after owner acceptance):**
 
-> First integration prerequisite after #47 control/backend proof + approved #49/#51
-> requirements; producer #178/#179/#180 and #174 conformance; #181 specific protocol
-> evidence; and an exact Kernel consumer receipt. A route/admission receipt proves
-> only Kernel-controlled routing; it does not prove that native workspace or subprocess
-> effects are cut off at expiry. Under the proposed baseline, expiry denies new
-> Kernel-controlled dispatch and initiates STOP while local native effects may continue
-> until the owned task settles. Do not treat closed #53/PR #85 diagnostic evidence as a
-> shipped route adapter or strict-expiry proof. No source/effort/access-mode parsing or
-> physical attestation inference from gateway audit.
+Add this paragraph to the #52 issue body's **Dependencies And Priority** section, after its existing ordering paragraph:
 
-This patch does not retire Router #174/#178/#179/#180/#181 obligations, resolve the
-explicit D-063 workspace-owner decision, or grant live inference/effect authority.
+> Retain the existing prerequisites: #47 control/backend proof; approved #49/#51
+> requirements; Router #174 executable decision/admission, #178 route identity, #179
+> identity/effort, #180 workspace authority, #181 protocol evidence, and #165
+> cancellation evidence; and an exact Kernel #52 consumer receipt. This receipt proves
+> only Kernel-controlled route/admission and Attempt-bound identity; it does not prove
+> strict native effect expiry. Under the accepted task-level baseline, expiry denies
+> new Kernel-controlled dispatch and initiates bounded STOP while native local effects
+> may continue until the exact owned task settles. Preserve the existing prohibition on
+> source/effort/access-mode parsing or physical-attestation inference from gateway audit.
+> #53/PR #85 remains CLOSED / NOT IMPLEMENTED; its diagnostic is neither a shipped
+> route adapter nor an acceptance pass.
+
+This is a proposed addition to the issue body, not a replacement or edit of comment
+#14078. If accepted, the new body text is the actionable current-scope clarification;
+the historical comment remains intact and is not a formal dependency edge. This addition
+does not retire any listed producer or Kernel consumer gate, resolve the explicit D-063
+workspace-owner decision, or grant live inference/effect authority.
 
 ### #54 — Review And Remediation
 
@@ -95,16 +102,35 @@ profile.
 **Proposed replacement:**
 
 > Each new Kernel-controlled admission respects the approved envelope and original
-> deadline; restart cannot reset it. Deadline expiry stops new Kernel dispatch and
-> initiates existing STOP/termination. Local native effects and provider usage during
-> an active turn/termination interval are recorded as observed or `unknown`, never
-> assumed zero or rolled back. No claim of strict per-syscall expiry is made. In-flight
-> overrun/unknown accounting is explicit with tested pause/reconciliation behavior.
-> Reuse the original boot-scoped deadline mapping on same-boot recovery; if clock/boot
-> identity cannot be validated, fail closed and keep the Attempt `unknown` rather than
-> deriving a later expiry from a reset wall clock.
+> deadline; restart cannot reset it. Use a verified suspend-inclusive Linux
+> `CLOCK_BOOTTIME` projection anchored to the original wall deadline and host boot
+> identity. Same-boot recovery reuses the persisted projection; it must not derive a
+> later expiry from the current wall clock. Deadline expiry stops new Kernel dispatch
+> and initiates bounded cancellation. If the clock, its reading, or boot identity is
+> unavailable or unverifiable, or the boot identity changes, fail closed: deny dispatch
+> and a successor Attempt and keep the Attempt `unknown` pending reconciliation.
+> Tests use controlled clocks to cover suspend/resume across expiry, wall-clock rollback
+> after projection creation, reboot/boot-ID mismatch, unavailable/unverifiable clock
+> identity, and same-boot recovery without projection renewal. Local native effects and
+> provider usage during an active turn/termination interval are recorded as observed or
+> `unknown`, never assumed zero or rolled back. No strict per-syscall expiry is claimed.
+> In-flight overrun/unknown accounting is explicit with tested pause/reconciliation
+> behavior.
 
 Router #184's call/quota evidence and approved numeric task budget remain required.
+
+**Proposed addition to Acceptance Criteria (new criterion 7):**
+
+> Deadline-triggered cancellation uses the same exact owned-process settlement gate as
+> user-requested STOP. A terminal Codex turn or successful interrupt acknowledgement
+> is not settlement. Test a live owned-group descendant, an escaped/unobservable child,
+> controller loss during termination or before the settlement witness is durable, and
+> incomplete or missing termination evidence. Unless the exact profile-appropriate
+> settlement witness is durably verified, retain the workspace, report `unknown` or
+> `cancel_uncertain`, and block acceptance, publication, retry and any conflicting
+> successor Attempt. Recovery must not infer settlement from a terminal turn or
+> reacquire a numeric PID. Scope uncertainty to the affected Attempt/resources; do not
+> block independent eligible tasks with non-conflicting authority and workspaces.
 
 ### #57 — Served State And Progress
 
@@ -195,9 +221,16 @@ criteria. This proposal does not mark #59 complete or authorize live multi-task 
 **Proposed baseline acceptance addition:**
 
 > A trusted-development receipt must show that new Kernel-controlled dispatch/external
-> operations stop at the original deadline/revocation/STOP, that cancellation uses the
-> existing bounded path, and that uncertainty blocks acceptance/publication/retry. It
-> must separately disclose any local native effect during termination. Such a receipt
+> operations stop at the original deadline/revocation/STOP, and that deadline-triggered
+> cancellation uses the same owned-process settlement gate and bounded termination
+> evidence as user-requested STOP. A terminal Codex turn or successful interrupt
+> acknowledgement alone is not settlement. Installed acceptance must cover a live
+> descendant, an escaped/unobservable child, controller loss during termination or
+> before durable settlement evidence, and incomplete termination evidence. Until the
+> exact settlement witness is verified, retain the workspace, report `unknown` or
+> `cancel_uncertain`, and block acceptance/publication and a conflicting successor
+> Attempt; independent eligible tasks with non-conflicting resources remain eligible.
+> It must separately disclose local native effects during termination. Such a receipt
 > does not prove strict native-effect expiry or hostile-worker isolation. It must also
 > record the selected Codex trust profile and same-principal provider-auth exposure;
 > production/remote-write credentials are not made available to the native worker.
@@ -239,6 +272,17 @@ No bubblewrap qualification, source/pin change, or implementation is proposed by
 AC4 document.
 
 ### #90 — Trusted-Development STOP
+
+**Existing implementation gap (source-confirmed; already recorded in the live #90 body):**
+
+`src/creatidy_kernel/adapters/task_execution.py` records the runtime Operation as
+`terminal` and calls `finish_cancelled_attempt` after observing a terminal Codex turn
+(`runtime.observe`, currently around lines 1792-1805), before the normal controller
+close path obtains `CodexStdio.owned_group_settled`. Runtime terminality can therefore
+precede process-group settlement. This remains an implementation gap for #90's existing
+user-requested STOP scope; this documentation PR does not fix it. The proposed #56/#60
+criteria below separately require deadline-triggered cancellation to consume the same
+settlement gate.
 
 **Current excerpt (Constraints):**
 
@@ -328,7 +372,7 @@ No cross-repository issue patch or dependency edge is applied here.
 | #53 → #60 installed reception | None; issue-body gate only | Replace with accepted baseline plus actual #90/#59/component receipts. Do not count #53 diagnostic as native acceptance. |
 | #53 ↔ #90 | None; #90 links #53 as history | #90 handles STOP only; it neither depends on nor satisfies strict expiry. |
 | #53 ↔ #79 | None; #79 says the worker gate is separate | Keep #79 verification/test-child only; no promotion to task runtime or AC4 proof. |
-| #52 route/consumer | No formal #53 edge; issue comment #14078 names #52/#53 consumer order | Keep Router producer gates #174/#178/#179/#180/#181. A route receipt does not prove native effect cutoff. |
+| #52 route/consumer | No formal #53 edge; historical issue comment #14078 names #52/#53 consumer order | Add the specified #52 issue-body clarification after owner acceptance; preserve comment #14078 unchanged. Keep Router #165/#174/#178/#179/#180/#181 and Kernel #47/#49/#51/#52 gates. A route receipt does not prove native effect cutoff. |
 | #59 → #90 (proposed) | No current formal edge | Recommend only after ADR acceptance because reliable STOP/uncertainty is required for concurrent cleanup. |
 | #60 → #59/#90 (proposed) | No current formal edge | Recommend only after ADR acceptance; installed reception must observe multi-task ownership and STOP outcomes. |
 | Console #8/#12/#13 references | No formal edge to #53 in the inspected Console graph | Propose display/acceptance wording to Console owner; no cross-repository mutation here. |
