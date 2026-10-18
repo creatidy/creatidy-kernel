@@ -18,6 +18,7 @@ from creatidy_kernel.core.outcomes import (
     export_outcomes,
 )
 from creatidy_kernel.core.resources import Allocation
+from creatidy_kernel.core.verification import ProductReviewVerdict
 
 
 def context() -> ContextPackage:
@@ -33,7 +34,7 @@ def context() -> ContextPackage:
     )
 
 
-def attempt(attempt_id: str, context_reference: str | None = None) -> AttemptSpec:
+def attempt(attempt_id: str, context_reference: str | None = None, remediation_of: str | None = None) -> AttemptSpec:
     return AttemptSpec(
         attempt_id,
         "program",
@@ -42,13 +43,14 @@ def attempt(attempt_id: str, context_reference: str | None = None) -> AttemptSpe
         "spec-sha",
         allocation_reference="allocation-1",
         context_reference=context_reference,
+        remediation_of=remediation_of,
     )
 
 
 def outcome(attempt_id: str, *, remediation_of: str | None = None, acceptance_id: str | None = None) -> AttemptOutcome:
     allocation = Allocation("harness", "provider", "model", frozenset(), 100, "fixed", "high")
     return AttemptOutcome(
-        attempt(attempt_id),
+        attempt(attempt_id, remediation_of=remediation_of),
         "code",
         Identity.from_allocation(allocation),
         resolved=AttributedIdentity(Identity("harness-v2", "provider", "model", "high"), "allocator", 10, 20),
@@ -105,7 +107,14 @@ def test_context_rejects_unbounded_or_ambiguous_manifest() -> None:
 
 def test_export_preserves_unknown_provenance_freshness_and_remediation_cost() -> None:
     first = outcome("try-1")
-    second = outcome("try-2", remediation_of="try-1", acceptance_id="accepted-1")
+    second = replace(
+        outcome("try-2", acceptance_id="accepted-1"),
+        attempt=attempt("try-2", remediation_of="try-1"),
+        review_operation_id="product-review:sha256",
+        review_operation_status="accepted",
+        review_id="review-2",
+        review_verdict=ProductReviewVerdict.APPROVE,
+    )
     facts = (
         usage("obs-1", "try-1", "receipt-1", None),
         usage("obs-2", "try-1", "receipt-1", Decimal("12.50"), "obs-1"),
@@ -119,9 +128,31 @@ def test_export_preserves_unknown_provenance_freshness_and_remediation_cost() ->
     assert attempts[0]["effective_usage"] == [facts[1].payload()]
     assert attempts[1]["effective_usage"] == [facts[2].payload()]
     assert attempts[1]["cost_attempt_ids"] == ["try-1", "try-2"]
+    assert attempts[0]["product_review"] is None
+    assert attempts[1]["product_review"] == {
+        "operation_id": "product-review:sha256",
+        "delivery_status": "accepted",
+        "review_id": "review-2",
+        "verdict": "approve",
+    }
     assert attempts[0]["requested"]["reasoning_effort"] == "high"
     assert attempts[0]["observed"]["identity"]["provider_id"] is None
     assert attempts[0]["quota"]["fresh_until"] == 12
+
+
+def test_cost_export_follows_nested_attempt_spec_lineage() -> None:
+    outcomes = (
+        outcome("try-1"),
+        replace(outcome("try-2"), attempt=attempt("try-2", remediation_of="try-1")),
+        replace(
+            outcome("try-3", acceptance_id="accepted-2"),
+            attempt=attempt("try-3", remediation_of="try-2"),
+        ),
+    )
+    attempts = export_outcomes(outcomes, ())["attempts"]
+    assert isinstance(attempts, list)
+    assert attempts[2]["remediation_of"] == "try-2"
+    assert attempts[2]["cost_attempt_ids"] == ["try-1", "try-2", "try-3"]
     assert attempts[0]["finding_ids"] == ["finding-1"]
 
 

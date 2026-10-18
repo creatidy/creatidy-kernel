@@ -10,6 +10,7 @@ from typing import Protocol, cast
 from creatidy_kernel.core.domain import (
     AttemptSpec,
     AttemptStatus,
+    DomainAction,
     FinishAttempt,
     PrepareAttempt,
     Program,
@@ -33,6 +34,9 @@ from creatidy_kernel.core.verification import (
     AcceptedResult,
     CandidateResult,
     CheckProducer,
+    EvidenceSubject,
+    ProductReviewRequest,
+    ProductReviewVerdict,
     VerificationPolicy,
     admit_accepted,
     verify_candidate,
@@ -49,11 +53,82 @@ from creatidy_kernel.ports.allocation import (
 from creatidy_kernel.ports.execution import Runtime
 from creatidy_kernel.ports.program_store import ApplicationStore, OperationRecord
 from creatidy_kernel.ports.resources import ResourceAllocator
+from creatidy_kernel.ports.verification import (
+    DurableProductReviewChecks,
+    ProductReviewDispatcher,
+    ProductReviewStatus,
+    product_review_operation_id,
+)
 
 
 def manifest_bytes(value: object) -> bytes:
     """Canonical JSON for public, non-secret application evidence."""
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _remediation_context(store: ApplicationStore, source_attempt_id: str) -> tuple[str | None, list[dict[str, str]]]:
+    operation_id = f"rejection:{source_attempt_id}"
+    operation = store.operation(operation_id)
+    envelope_value: object = json.loads(operation.request_json)
+    if type(envelope_value) is not dict:
+        raise ValueError("invalid persisted candidate rejection intent")
+    envelope = cast(dict[str, object], envelope_value)
+    if set(envelope) != {"version", "request"} or envelope["version"] != 1:
+        raise ValueError("invalid persisted candidate rejection intent")
+    request_value = envelope["request"]
+    if type(request_value) is not dict:
+        raise ValueError("invalid persisted candidate rejection request")
+    request = cast(dict[str, object], request_value)
+    if set(request) != {"manifest", "product_review_status", "reason", "review_operation_id"}:
+        raise ValueError("invalid persisted candidate rejection request")
+    result_value: object = json.loads(store.artifact(operation_id, "rejected-result"))
+    if type(result_value) is not dict:
+        raise ValueError("invalid persisted rejected candidate result")
+    result = cast(dict[str, object], result_value)
+    if type(result.get("findings")) is not list or type(result.get("subject")) is not dict:
+        raise ValueError("invalid persisted rejected candidate result")
+    findings: object = result["findings"]
+    review_operation_id = request["review_operation_id"]
+    review_status = request["product_review_status"]
+    if review_operation_id is not None and type(review_operation_id) is not str:
+        raise ValueError("invalid persisted product review reference")
+    if review_status is not None and type(review_status) is not str:
+        raise ValueError("invalid persisted product review status")
+    if review_status is not None and review_status not in {item.value for item in ProductReviewStatus}:
+        raise ValueError("unknown persisted product review status")
+    if review_status in {
+        ProductReviewStatus.COMMENT.value,
+        ProductReviewStatus.INVALID.value,
+        ProductReviewStatus.OWNER_DECISION_NEEDED.value,
+    }:
+        return review_operation_id, []
+    if review_operation_id is not None:
+        receipt_value: object = json.loads(store.artifact(review_operation_id, "review-receipt"))
+        if type(receipt_value) is not dict:
+            raise ValueError("product review receipt differs from rejected candidate subject")
+        receipt = cast(dict[str, object], receipt_value)
+        if receipt.get("subject") != result["subject"]:
+            raise ValueError("product review receipt differs from rejected candidate subject")
+        verdict = receipt.get("verdict")
+        if verdict == ProductReviewVerdict.REQUEST_CHANGES.value:
+            findings = receipt.get("findings")
+    if type(findings) is not list:
+        raise ValueError("persisted rejection findings are invalid")
+    normalized: list[dict[str, str]] = []
+    for item in cast(list[object], findings):
+        if type(item) is not dict:
+            raise ValueError("persisted finding is malformed")
+        finding = cast(dict[str, object], item)
+        if any(type(finding.get(name)) is not str for name in ("finding_id", "fingerprint", "reason")):
+            raise ValueError("persisted finding is malformed")
+        normalized.append(
+            {
+                "finding_id": cast(str, finding["finding_id"]),
+                "fingerprint": cast(str, finding["fingerprint"]),
+                "reason": cast(str, finding["reason"]),
+            }
+        )
+    return review_operation_id, normalized
 
 
 def terminal_outcome(store: ApplicationStore, attempt: AttemptSpec, operation: OperationRecord) -> str | None:
@@ -111,6 +186,8 @@ def advance_work_unit(
     clock: Callable[[], int] | None = None,
     deadline: int | None = None,
     cancel_requested: Callable[[], bool] | None = None,
+    product_reviewer: ProductReviewDispatcher | None = None,
+    remediation_of: str | None = None,
 ) -> str:
     """Perform at most one dispatch/observation, never retry an uncertain effect blindly.
 
@@ -123,8 +200,61 @@ def advance_work_unit(
     decision_clock = clock if clock is not None else lambda: now
     if program.state(unit_id).status is WorkUnitStatus.SATISFIED:
         return "accepted"
-    attempt_id = f"{program.program_id}:{unit_id}"
+    if policy.reviewer_required and product_reviewer is None:
+        return "product_review_dispatcher_required"
+    remediation_data: dict[str, object] | None = None
+    if remediation_of is None:
+        attempt_id = f"{program.program_id}:{unit_id}"
+    else:
+        if type(remediation_of) is not str or not remediation_of.strip():
+            raise ValueError("remediation requires an exact source Attempt")
+        attempt_id = (
+            f"{program.program_id}:{unit_id}:remediation:{hashlib.sha256(remediation_of.encode()).hexdigest()[:16]}"
+        )
+        if not any(item.spec.attempt_id == attempt_id for item in program.attempts):
+            unit_attempts = [item for item in program.attempts if item.spec.work_unit_id == unit_id]
+            if not unit_attempts or unit_attempts[-1].attempt_id != remediation_of:
+                return "remediation_source_not_latest"
+            source = program.attempt(remediation_of)
+            if source.status is not AttemptStatus.FINISHED or program.state(unit_id).status is not WorkUnitStatus.READY:
+                return "remediation_source_not_rejected"
+            authority = program.spec.authority
+            if DomainAction.PREPARE_ATTEMPT not in authority.allowed_actions or "worker" not in {
+                authority.owner_id,
+                *authority.delegated_actor_ids,
+            }:
+                return "remediation_paused"
+            attempt_limit = min(program.spec.budget.max_attempts, authority.max_attempts)
+            if len(program.attempts) >= attempt_limit:
+                return "remediation_paused"
+            if store.find_artifact(f"rejection:{remediation_of}", "rejected-result") is None:
+                return "remediation_paused"
+            review_operation_id, findings = _remediation_context(store, remediation_of)
+            if not findings:
+                return "remediation_paused"
+            history: list[frozenset[str]] = []
+            for previous in unit_attempts:
+                previous_data = store.find_artifact(f"rejection:{previous.attempt_id}", "rejected-result")
+                if previous_data is None:
+                    continue
+                _, previous_findings = _remediation_context(store, previous.attempt_id)
+                if previous_findings:
+                    history.append(frozenset(item["fingerprint"] for item in previous_findings))
+            current_fingerprints = frozenset(item["fingerprint"] for item in findings)
+            if len(history) > 1 and (
+                current_fingerprints == history[-2] or (len(history) > 2 and current_fingerprints in history[:-1])
+            ):
+                return "remediation_paused"
+            remediation_data = {
+                "findings": findings,
+                "review_operation_id": review_operation_id,
+                "source_attempt_id": remediation_of,
+            }
+        elif program.attempt(attempt_id).spec.remediation_of != remediation_of:
+            raise ValueError("persisted remediation Attempt differs from its source reference")
     operation_id = f"runtime:{attempt_id}"
+    if store.find_artifact(f"rejection:{attempt_id}", "rejected-result") is not None:
+        return "rejected"
     if not any(item.spec.attempt_id == attempt_id for item in program.attempts):
         if any(item.name == "ordinary-declaration" for item in program.spec.initial_inputs):
             raise ValueError("ordinary dispatch is not supported by the reference composition")
@@ -137,7 +267,10 @@ def advance_work_unit(
             return "cancel_requested"
         allocation_bytes = encode_allocation(allocation)
         allocation_ref = "sha256:" + hashlib.sha256(allocation_bytes).hexdigest()
-        context = manifest_bytes([asdict(item) for item in program.resolved_inputs(unit_id)])
+        resolved_inputs = [asdict(item) for item in program.resolved_inputs(unit_id)]
+        context = manifest_bytes(resolved_inputs)
+        if remediation_data is not None:
+            context = manifest_bytes({"inputs": resolved_inputs, "remediation": remediation_data, "version": 1})
         context_ref = "sha256:" + hashlib.sha256(context).hexdigest()
         attempt = AttemptSpec(
             attempt_id,
@@ -150,6 +283,7 @@ def advance_work_unit(
             "reference:v1",
             workspace.key,
             context_ref,
+            remediation_of,
         )
         fault("selected")
         program = store.admit_with_intent(
@@ -429,12 +563,40 @@ def advance_work_unit(
     proposal = CandidateResult(
         f"candidate:{attempt_id}", candidate, tuple((name, artifact_path) for name in sorted(unit.outputs))
     )
+    checks = collection.checks
+    review_request: ProductReviewRequest | None = None
+    review_checks: DurableProductReviewChecks | None = None
+    if product_reviewer is not None and policy.reviewer_required:
+        subject = EvidenceSubject(
+            proposal.digest,
+            program.attempt(attempt_id).spec.digest,
+            program.spec.digest,
+            policy.reference.digest,
+            collection.repository,
+            collection.base,
+            collection.head,
+        )
+        review_request = ProductReviewRequest(
+            proposal,
+            subject,
+            attempt_id,
+            program.attempt(attempt_id).actor_id,
+            policy.reference,
+        )
+        review_checks = DurableProductReviewChecks(
+            store,
+            collection.checks,
+            lambda _: review_request,
+            product_reviewer,
+            clock=decision_clock,
+        )
+        checks = review_checks
     result = verify_candidate(
         program,
         proposal,
         collection.manifest,
         policy,
-        collection.checks,
+        checks,
         repository=collection.repository,
         base_revision=collection.base,
         head_revision=collection.head,
@@ -447,11 +609,31 @@ def advance_work_unit(
     digest = hashlib.sha256(data).hexdigest()
     reference = store.finalize_artifact(operation_id, f"verification:{digest}", data)
     if not isinstance(result, AcceptedResult):
+        review_result = review_checks.last_result if review_checks is not None else None
+        if review_result is not None and review_result.status is ProductReviewStatus.UNKNOWN:
+            return "review_unknown"
+        rejection_id = f"rejection:{attempt_id}"
         store.intent(
-            f"rejection:{attempt_id}:{digest}",
-            f"rejection:{attempt_id}:{digest}",
-            {"manifest": reference, "reason": "verification failed; bounded run paused"},
+            rejection_id,
+            rejection_id,
+            {
+                "manifest": reference,
+                "product_review_status": review_result.status.value if review_result is not None else None,
+                "reason": "verification failed; bounded run paused",
+                "review_operation_id": (
+                    product_review_operation_id(review_request)
+                    if review_request is not None and review_result is not None
+                    else None
+                ),
+            },
         )
+        store.finalize_artifact(rejection_id, "rejected-result", data)
+        if review_result is not None and review_result.status in {
+            ProductReviewStatus.OWNER_DECISION_NEEDED,
+            ProductReviewStatus.COMMENT,
+            ProductReviewStatus.INVALID,
+        }:
+            return review_result.status.value
         return "rejected"
     if cancel_requested is not None and cancel_requested():
         return "cancel_requested"

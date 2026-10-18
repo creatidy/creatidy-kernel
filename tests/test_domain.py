@@ -1362,3 +1362,55 @@ def test_command_subclass_cannot_relabel_authorization() -> None:
     with pytest.raises(InvalidDomainValue):
         program.apply(ForgedActivate(program.revision, OWNER))
     assert program.status is ProgramStatus.DRAFT
+
+
+def test_remediation_attempt_pins_latest_finished_source() -> None:
+    source = finished(active())
+    retry_spec = AttemptSpec(
+        "a2",
+        source.program_id,
+        "first",
+        source.spec.revision,
+        source.spec.digest,
+        source.resolved_inputs("first"),
+        remediation_of="a1",
+    )
+    retry = source.apply(PrepareAttempt(source.revision, OWNER, retry_spec))
+    assert retry.attempt("a2").spec.remediation_of == "a1"
+    latest = retry.apply(StartAttempt(retry.revision, OWNER, "a2"))
+    latest = latest.apply(FinishAttempt(latest.revision, OWNER, "a2"))
+
+    with pytest.raises(IllegalTransition, match="latest finished Attempt"):
+        latest.apply(
+            PrepareAttempt(
+                latest.revision,
+                OWNER,
+                AttemptSpec(
+                    "a3",
+                    latest.program_id,
+                    "first",
+                    latest.spec.revision,
+                    latest.spec.digest,
+                    latest.resolved_inputs("first"),
+                    remediation_of="a1",
+                ),
+            )
+        )
+
+    unfinished = prepared(active(), "first", "unfinished")
+    with pytest.raises(IllegalTransition, match="active, ready WorkUnit"):
+        unfinished.apply(
+            PrepareAttempt(
+                unfinished.revision,
+                OWNER,
+                AttemptSpec(
+                    "retry-unfinished",
+                    unfinished.program_id,
+                    "first",
+                    unfinished.spec.revision,
+                    unfinished.spec.digest,
+                    unfinished.resolved_inputs("first"),
+                    remediation_of="unfinished",
+                ),
+            )
+        )
