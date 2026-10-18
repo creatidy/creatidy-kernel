@@ -11,7 +11,12 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from creatidy_kernel.adapters.codex_runtime import CodexConnection, CodexInputs, CodexRuntime
+from creatidy_kernel.adapters.codex_runtime import (
+    CodexConnection,
+    CodexInputs,
+    CodexRuntime,
+    owned_group_callbacks,
+)
 from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
 from creatidy_kernel.adapters.reference import (
     EXPECTED,
@@ -182,6 +187,7 @@ def run_live_reference(
                 ArtifactManifest(request.workspace.key, (Artifact("result.txt", digest),)),
             )
 
+        retire_owned_group, observe_owned_group, observe_owned_group_reference = owned_group_callbacks(connection)
         runtime = CodexRuntime(
             connection,
             version=version,
@@ -189,6 +195,9 @@ def run_live_reference(
             authorize=authorize,
             collect=collect,
             supported_efforts=supported_efforts,
+            retire=retire_owned_group,
+            settled=observe_owned_group,
+            group_reference=observe_owned_group_reference,
         )
 
         def restore(request: ExecutionRequest, handle: str) -> None:

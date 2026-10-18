@@ -424,7 +424,15 @@ def advance_work_unit(
         store.finalize_artifact(
             operation_id,
             "runtime-receipt",
-            manifest_bytes({"version": 1, "handle": handle, "fence": fence, "identity": asdict(receipt_identity)}),
+            manifest_bytes(
+                {
+                    "version": 2,
+                    "handle": handle,
+                    "fence": fence,
+                    "identity": asdict(receipt_identity),
+                    "owned_group_reference": started.owned_group_reference,
+                }
+            ),
         )
         fault("receipt-evidence")
         store.record_transport(operation_id, fence, True)
@@ -512,7 +520,16 @@ def advance_work_unit(
         store.finalize_artifact(
             operation_id,
             "runtime-receipt",
-            manifest_bytes({"version": 1, "handle": handle, "fence": operation.fence, "identity": asdict(recorded)}),
+            manifest_bytes(
+                {
+                    "version": 2,
+                    "handle": handle,
+                    "fence": operation.fence,
+                    "identity": asdict(recorded),
+                    # The restored adapter cannot vouch for the previous process group.
+                    "owned_group_reference": None,
+                }
+            ),
         )
     if observation.activity is not Activity.TERMINAL:
         return "terminal_candidate_unknown" if operation.status == "terminal" else observation.activity.value

@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
@@ -186,8 +187,16 @@ class FixtureConnection:
         self.provider = provider
         self.effort = effort
         self.starts = 0
+        self.interrupts = 0
         self.status = "completed"
         self.cwd: str | None = None
+        self.owned_group_settled: bool | None = None
+        self.owned_group_reference = uuid.uuid4().hex
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+        self.owned_group_settled = True
 
     def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
         if method == "thread/start":
@@ -204,6 +213,10 @@ class FixtureConnection:
         if method == "turn/start":
             self.edit(Path(str(self.cwd)))
             return {"turn": {"id": f"turn-{self.starts}"}}
+        if method == "turn/interrupt":
+            self.interrupts += 1
+            self.status = "interrupted"
+            return {}
         if method == "thread/read":
             thread = str(params["threadId"])
             return {
@@ -614,12 +627,16 @@ def test_partial_owned_cleanup_retains_workspace_and_unproven_stop(
         )
 
     def owned_signal(group: int, sig: int) -> None:
-        assert group == connection.group != bystander.pid
+        if group != connection.group:
+            original_killpg(group, sig)
+            return
+        assert group != bystander.pid
         signals.append(sig)
         if sig == signal.SIGKILL:
             # The leader has exited after TERM but its stubborn child remains live.
             assert Path(f"/proc/{connection.child}/stat").read_text().split(")", 1)[1].split()[0] != "Z"
             assert connection.owned_group_settled is not True
+            return
         original_killpg(group, sig)
 
     try:
@@ -627,19 +644,19 @@ def test_partial_owned_cleanup_retains_workspace_and_unproven_stop(
             assert advance()["condition"] == "running"
         assert connection.starts == 1
         assert connection.notifications() == ()
-        stopped = advance(cancel=True)
-        assert stopped["condition"] == "cancelled"
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "killpg", owned_signal)
+            stopped = advance(cancel=True)
+        assert stopped["condition"] == "cancel_uncertain"
         assert cast("dict[str, object]", stopped["cancellation"])["descendants"] == "unproven"
+        assert cast("dict[str, object]", stopped["cancellation"])["owned_group_settled"] is False
         assert "acceptance" not in stopped and "pr" not in stopped
         workspace = control / "workspace"
         assert workspace.exists()
         assert Path(f"/proc/{connection.child}").exists()
-        with monkeypatch.context() as patch:
-            patch.setattr(os, "killpg", owned_signal)
-            connection.close()
         assert signal.SIGTERM in signals and signal.SIGKILL in signals
         assert bystander.poll() is None
-        assert advance()["condition"] == "cancelled"
+        assert advance()["condition"] == "cancel_uncertain"
         assert workspace.exists()
         assert connection.interrupts == connection.starts == 1
         assert cast("dict[str, object]", export_task(control)["cancellation"])["descendants"] == "unproven"
@@ -652,6 +669,33 @@ def test_partial_owned_cleanup_retains_workspace_and_unproven_stop(
                 original_killpg(connection.group, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def test_unobservable_owned_group_is_uncertain_without_retry(sqlite_tmp_path: Path) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+
+    class UnobservableConnection(FixtureConnection):
+        def close(self) -> None:
+            self.closed = True
+            self.owned_group_settled = None
+
+    connection = UnobservableConnection(deflake_edit)
+    connection.status = "inProgress"
+    assert run(control, source, connection)["condition"] == "running"
+
+    stopped = run(control, source, connection, cancel_requested=True)
+    assert stopped["condition"] == "cancel_uncertain"
+    cancellation = cast("dict[str, object]", stopped["cancellation"])
+    assert cancellation["owned_group_settled"] is None
+    assert cancellation["settlement_state"] == "uncertain"
+    assert "acceptance" not in stopped and "pr" not in stopped
+    assert task_status(control)["condition"] == "cancel_uncertain"
+
+    recovered = run(control, source, connection)
+    assert recovered["condition"] == "cancel_uncertain"
+    assert connection.starts == connection.interrupts == 1
+    assert recovered["attempts"] == stopped["attempts"]
 
 
 def test_terminal_cancel_observation_recovers_without_native_context(sqlite_tmp_path: Path) -> None:
@@ -926,15 +970,20 @@ def test_expiry_journals_interrupt_once_even_after_lost_reply(
         assert run(control, source, connection)["condition"] == "expired"
     before = connection.interrupts
     result = run(control, source, connection)
-    assert result["condition"] == "expired"
+    assert result["condition"] == ("cancel_uncertain" if fault in {"cancel-claim", "cancel-send"} else "expired")
     assert connection.interrupts == before == (0 if fault == "cancel-claim" else 1)
     assert connection.starts == 1
     assert "acceptance" not in result
     with SQLiteProgramStore(control / "kernel.sqlite3") as store:
         cancellation = store.operation("cancel:task_execution:change")
         assert cancellation.attempts == 1
-        assert cancellation.status in {"dispatched", "unknown"}
-        if fault not in {"cancel-claim", "cancel-send"}:
+        assert cancellation.status == ("unknown" if fault in {"cancel-claim", "cancel-send"} else "accepted")
+        if fault == "cancel-claim":
+            assert store.find_artifact(cancellation.operation_id, "owned-group-settlement") is None
+        elif fault == "cancel-send":
+            assert store.find_artifact(cancellation.operation_id, "owned-group-settlement") is None
+            assert store.find_artifact(cancellation.operation_id, "receipt") is None
+        else:
             assert store.find_artifact(cancellation.operation_id, "receipt") is not None
 
 
@@ -1051,7 +1100,7 @@ def test_deadline_expiring_during_thread_start_never_dispatches_turn(
     connection = SlowThread(edits.append)
     control = sqlite_tmp_path / "control"
     result = run(control, source, connection)
-    assert result["condition"] == "expired"
+    assert result["condition"] == "cancel_uncertain"
     assert edits == []
     assert connection.starts == 1
     assert "acceptance" not in result

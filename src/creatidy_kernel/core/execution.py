@@ -182,6 +182,16 @@ class RuntimeObservation:
     fresh_until: int
     identity: RuntimeIdentity
     cancellation_requested: bool
+    owned_group_settled: bool | None = None
+    owned_group_reference: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.owned_group_settled is not None and type(self.owned_group_settled) is not bool:
+            raise ExecutionConflict("owned process-group settlement must be explicit boolean evidence or unknown")
+        if self.owned_group_settled is not None and not self.cancellation_requested:
+            raise ExecutionConflict("owned-group settlement cannot certify a normal runtime observation")
+        if self.owned_group_reference is not None and not self.owned_group_reference.strip():
+            raise ExecutionConflict("owned-group reference must be non-empty when supplied")
 
 
 @dataclass(frozen=True, slots=True)

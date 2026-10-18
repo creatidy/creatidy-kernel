@@ -29,7 +29,7 @@ class NativeConnection:
     version = "codex-cli 1.2.3"
     methods = frozenset({"thread/start", "turn/start", "thread/read", "turn/interrupt"})
 
-    def __init__(self) -> None:
+    def __init__(self, *, cleanup_result: bool | None = True) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
         self.status = "inProgress"
         self.fail: str | None = None
@@ -37,6 +37,14 @@ class NativeConnection:
         self.model = "model-one"
         self.provider = "provider-one"
         self.effort: object = None
+        self.cleanup_result = cleanup_result
+        self.owned_group_settled: bool | None = None
+        self.owned_group_reference = "codex-test-owned-group"
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+        self.owned_group_settled = self.cleanup_result
 
     def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
         self.calls.append((method, params))
@@ -65,7 +73,7 @@ class NativeConnection:
         raise AssertionError(method)
 
 
-def setup() -> tuple[NativeConnection, CodexRuntime, ExecutionRequest]:
+def setup(*, cleanup_result: bool | None = True) -> tuple[NativeConnection, CodexRuntime, ExecutionRequest]:
     workspace = FakeWorkspace().materialize(
         "workspace-one", WorkspaceSpec("repo", "revision", (), "image", "trusted", TrustMode.TRUSTED_DEVELOPMENT)
     )
@@ -90,7 +98,7 @@ def setup() -> tuple[NativeConnection, CodexRuntime, ExecutionRequest]:
         RuntimeIdentity("model-one", None, None, "agent-one"),
         1,
     )
-    connection = NativeConnection()
+    connection = NativeConnection(cleanup_result=cleanup_result)
 
     def resolve(value: ExecutionRequest) -> CodexInputs:
         return CodexInputs(
@@ -108,7 +116,14 @@ def setup() -> tuple[NativeConnection, CodexRuntime, ExecutionRequest]:
         return Candidate(value.attempt.attempt_id, value.attempt.digest, ArtifactManifest(value.workspace.key, ()))
 
     runtime = CodexRuntime(
-        connection, version=connection.version, resolve=resolve, authorize=lambda _: True, collect=collect
+        connection,
+        version=connection.version,
+        resolve=resolve,
+        authorize=lambda _: True,
+        collect=collect,
+        retire=connection.close,
+        settled=lambda: connection.owned_group_settled,
+        group_reference=lambda: connection.owned_group_reference,
     )
     return connection, runtime, request
 
@@ -142,6 +157,32 @@ def test_native_start_duplicate_and_terminal_replay() -> None:
         port.start(replace(request, operation=replace(request.operation, request_digest="changed")))
 
 
+def test_restore_refuses_a_different_owned_group() -> None:
+    connection, runtime, request = setup()
+    handle = runtime.start(request)
+    receipt_identity = runtime.observe(handle, now=10).identity
+    foreign = NativeConnection()
+    foreign.owned_group_reference = "different-owned-group"
+    foreign_runtime = CodexRuntime(
+        foreign,
+        version=foreign.version,
+        resolve=runtime.resolve,
+        authorize=runtime.authorize,
+        collect=runtime.collect,
+        retire=foreign.close,
+        settled=lambda: foreign.owned_group_settled,
+        group_reference=lambda: foreign.owned_group_reference,
+    )
+    restored = foreign_runtime.restore(
+        request,
+        handle,
+        receipt_identity=receipt_identity,
+        owned_group_reference=connection.owned_group_reference,
+    )
+    assert restored.presence is Presence.UNKNOWN
+    assert foreign.calls == []
+
+
 @pytest.mark.parametrize("lost_at", ["thread/start", "turn/start"])
 def test_lost_replies_are_uncertain_and_never_duplicate_turns(lost_at: str) -> None:
     connection, runtime, request = setup()
@@ -169,16 +210,35 @@ def test_quiet_healthy_work_and_cancel_race() -> None:
     connection, runtime, request = setup()
     handle = runtime.start(request)
     assert runtime.observe(handle, now=900).activity is Activity.RUNNING
-    assert runtime.cancel(handle).cancellation_requested
-    assert runtime.cancel(handle).activity is Activity.UNKNOWN
+    cancelled = runtime.cancel(handle)
+    assert cancelled.cancellation_requested
+    assert cancelled.activity is Activity.TERMINAL and cancelled.owned_group_settled is True
+    assert connection.closed
+    interrupts = [method for method, _ in connection.calls].count("turn/interrupt")
+    assert runtime.cancel(handle) == cancelled
+    assert [method for method, _ in connection.calls].count("turn/interrupt") == interrupts
     connection.status = "interrupted"
     assert runtime.observe(handle, now=1000).activity is Activity.TERMINAL
     assert runtime.candidate(handle) is None
+    calls = len(connection.calls)
     connection.status = "inProgress"
     assert runtime.observe(handle, now=1001).activity is Activity.TERMINAL
-    connection.status = "completed"
-    with pytest.raises(ExecutionConflict, match="terminal replay"):
-        runtime.observe(handle, now=1002)
+    assert len(connection.calls) == calls
+
+
+@pytest.mark.parametrize("cleanup_result", [False, None])
+def test_terminal_turn_and_interrupt_are_not_owned_group_settlement(cleanup_result: bool | None) -> None:
+    connection, runtime, request = setup(cleanup_result=cleanup_result)
+    handle = runtime.start(request)
+    connection.status = "interrupted"
+    observation = runtime.cancel(handle)
+    assert observation.cancellation_requested
+    assert observation.activity is Activity.UNKNOWN
+    assert observation.owned_group_settled is cleanup_result
+    assert runtime.observe(handle, now=1001).activity is Activity.UNKNOWN
+    assert runtime.cancel(handle) == observation
+    assert [method for method, _ in connection.calls].count("turn/interrupt") == 1
+    assert runtime.candidate(handle) is None
 
 
 def test_domain_rejection_mismatch_and_candidate_validation() -> None:
