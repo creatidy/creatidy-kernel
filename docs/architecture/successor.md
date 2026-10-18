@@ -156,6 +156,31 @@ limits are not a substitute. Full receipt correlation and route-bound accounting
 and producer evidence. This planned boundary adds neither a second quota collector nor live spending
 authority.
 
+## G13 Compatibility Evidence Matrix (Planned)
+
+This source-grounded preparation for #62 distinguishes repo-local evidence from a support promise.
+Each eventual cell must name the exact product/adapter/contract versions, source and test revisions,
+dated fixture/installed evidence, supported semantic subset and separate synthetic/live level. PASS,
+PARTIAL, UNKNOWN and UNSUPPORTED are per-combination results; they are not one global Kernel or
+cross-product version.
+
+| Surface | Current source/evidence | Bounded status |
+| --- | --- | --- |
+| Kernel package | `pyproject.toml` declares `0.0.1.dev0`, Python `>=3.12`, no runtime dependencies; `make package-check` builds wheel/sdist and runs installed-package smoke checks | PARTIAL: reproducible developer build/install only; it is not evidence of a published artifact, release channel, update or rollback promise |
+| SQLite state | `sqlite_store.py` schema 2, `sqlite_codec.CODEC_VERSION` 1, in-place migration 0->1->2 and backup manifests 1/2; startup verifies mount and SQLite capabilities | PARTIAL: a finite native local Linux filesystem/topology gate; tests use a verified Linux mount, not every listed filesystem or OS |
+| Operator profile | Generic literal dotenv, optional user-supplied SOPS-to-JSON, XDG-compatible Linux default; values are not a managed secret store | PARTIAL: parser/decryption path only; no recipient/key migration, real-profile transition or preserved-ciphertext rollback is evidenced |
+| Codex app-server | `CodexStdio` requires an absolute executable, exact probed version, finite limits and caller-supplied schema-method inventory | UNKNOWN as a general support matrix: a version probe does not discover feature compatibility or prove hostile isolation |
+| Router | Kernel implements public `/v1/select` recommendation, not route pinning, reservation or gateway/harness execution | PARTIAL for the bounded recommendation interface; executable-route compatibility remains UNKNOWN until accepted producer/consumer evidence |
+| Model Intelligence | Kernel has no accepted MI snapshot consumer in its current implementation; packaging/source publication is not the same as consumption | UNKNOWN for Kernel-to-MI publication compatibility until a producer/consumer contract and exact fixtures are accepted |
+| Trust/profile | ADR 0011 and #90 establish the accepted task-level STOP/owned-group baseline for the defined trusted-development path | PARTIAL; strict native-effect expiry is explicitly UNSUPPORTED, and this path is not hostile-worker isolation or provider-secret/egress isolation |
+| WSL, Windows and real profile migration | Current package/storage checks are Linux/local; README documents the SQLite native Linux requirement | UNKNOWN for WSL-vs-DrvFS, Windows install/signing and actual encrypted profile migration; no compatibility or incompatibility claim |
+
+The current storage and task-level trust facts are useful boundaries, not global installation approval.
+Future cross-product cells require the exact accepted producer revision and producer/consumer fixtures;
+proposal text or a local Kernel implementation alone remains UNKNOWN. Destructive profile migration,
+downgrade policy, signing, publication and new platform commitments are not selected here. No real
+profile/key/ciphertext was read, changed or used.
+
 ## First-Priority Deviations
 
 These remain product defects/proof blockers after ADR 0011 acceptance. Static code facts are
