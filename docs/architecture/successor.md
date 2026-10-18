@@ -77,6 +77,36 @@ the cited historical subsets; the acceptance-criteria differences above explain 
 duplicate delivery. No producer-only calibration, publication, routing or Console implementation
 has been registered as a Kernel implementation issue.
 
+## G08 Owner-Served State Boundary (Planned)
+
+This source-grounded specification is an early preparation slice for #57. It records durable facts and
+required semantics, not an accepted endpoint, event schema, authentication mechanism or live feature.
+
+| Existing evidence | What it establishes | Boundary not established |
+| --- | --- | --- |
+| `SQLiteProgramStore` (`adapters/sqlite_store.py`) | One creating process/thread owns one file-backed store with SQLite `EXCLUSIVE` locking | A second reader/controller, concurrent Console view or distributed ownership |
+| `AttemptSpec`, operations and artifacts (`core/domain.py`, `adapters/task_execution.py`) | Immutable Attempt identifiers/revisions, operation receipts and durable acceptance/candidate/cancellation evidence | One public snapshot revision, event position or UI command contract |
+| `task_status` / `export_task` (`adapters/task_execution.py`) | A one-shot schema-1 projection reconstructed by opening the same exclusive store; current fields include Program/Attempt/operation status and available candidate, acceptance, cancellation and PR evidence | A concurrent served API, subscription, replayable progress log or cross-task ownership view |
+| `Page.next_cursor` (`core/forge.py`) | Pagination position for a provider-owned Forge read | A Kernel task-state cursor, event identity or replay guarantee |
+| Codex notifications (`adapters/codex_stdio.py`) | Bounded, transport-scoped in-memory messages when retained | Durable Kernel progress, reconnect/replay or authority-bearing state |
+
+The planned producer boundary must project state from Kernel-owned durable records without a second
+SQLite reader, frontend scheduler or consumer-owned permission truth. State/decision history remains
+distinct from lossy progress and telemetry. A reconnectable contract must scope positions to their
+producer, define deduplication, and surface expired positions, retention loss or buffer exhaustion as
+an explicit gap requiring a supported snapshot resync; it must not claim global event order or silently
+complete a partial history. Reconnect/read itself must not dispatch work, change an Attempt or authorize
+a stale command. Freshness and correlation use only producer-sourced revisions/observations; absent
+timestamps, route/call/candidate identity or concurrent ownership remain unknown rather than inferred.
+
+The command boundary is separate from the read projection: a future action must be checked against the
+current subject, revision and Kernel authority, and an accepted receipt is not proof that its effect
+settled. Console #2 supplies a bounded read/auth design inventory; Console #3/#7/#12 remain consumer
+and conformance work, not an accepted producer-consumer API. Route/call semantics depend on #52, and
+multi-task ownership/current workspace semantics depend on #59. This specification selects no socket,
+HTTP endpoint, wire version, cursor representation, grant/token, origin policy, event retention or
+process-lifetime choice; those require consumer agreement and any owner decision identified by #57.
+
 ## G12 Existing Cost-Shape Specification (Planned)
 
 This source-grounded specification is an independently useful preparation slice for #56; it does not
