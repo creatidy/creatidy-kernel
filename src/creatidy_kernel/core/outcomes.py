@@ -4,9 +4,11 @@
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
+from typing import cast
 
 from creatidy_kernel.core.domain import AttemptSpec
 from creatidy_kernel.core.resources import Allocation
+from creatidy_kernel.core.verification import ProductReviewVerdict
 
 
 def _text(value: str, name: str) -> None:
@@ -106,6 +108,10 @@ class AttemptOutcome:
     validation: str | None = None
     finding_ids: tuple[str, ...] = ()
     remediation_of: str | None = None
+    review_operation_id: str | None = None
+    review_operation_status: str | None = None
+    review_id: str | None = None
+    review_verdict: ProductReviewVerdict | None = None
     acceptance_id: str | None = None
     intervention_ids: tuple[str, ...] = ()
 
@@ -119,8 +125,30 @@ class AttemptOutcome:
                 raise ValueError(f"{name} must have attributed identity")
         if self.quota is not None and type(self.quota) is not QuotaSnapshot:
             raise ValueError("quota must be a QuotaSnapshot")
-        for name in ("validation", "remediation_of", "acceptance_id"):
+        for name in (
+            "validation",
+            "remediation_of",
+            "review_operation_id",
+            "review_operation_status",
+            "review_id",
+            "acceptance_id",
+        ):
             _optional_text(getattr(self, name), name)
+        review_fields = (self.review_operation_id, self.review_operation_status, self.review_id, self.review_verdict)
+        if any(value is not None for value in review_fields) and (
+            any(value is None for value in review_fields) or type(self.review_verdict) is not ProductReviewVerdict
+        ):
+            raise ValueError("product review delivery and substantive verdict must be exported together")
+        if self.review_operation_status is not None and self.review_operation_status not in {
+            "accepted",
+            "dispatched",
+            "intent",
+            "rejected",
+            "unknown",
+        }:
+            raise ValueError("invalid product review delivery status")
+        if self.remediation_of is not None and self.attempt.remediation_of not in (None, self.remediation_of):
+            raise ValueError("outcome remediation lineage conflicts with immutable Attempt")
         for name, values in (("finding_ids", self.finding_ids), ("intervention_ids", self.intervention_ids)):
             if type(values) is not tuple or len(values) != len(set(values)):
                 raise ValueError(f"{name} must be a tuple of unique IDs")
@@ -176,13 +204,17 @@ def export_outcomes(
     if type(observations) is not tuple or any(type(item) is not UsageObservation for item in observations):
         raise ValueError("observations must be an immutable tuple")
     by_attempt = {item.attempt.attempt_id: item for item in outcomes}
+
+    def parent_of(item: AttemptOutcome) -> str | None:
+        return item.remediation_of if item.remediation_of is not None else item.attempt.remediation_of
+
     if len(by_attempt) != len(outcomes) or len({item.acceptance_id for item in outcomes if item.acceptance_id}) != sum(
         item.acceptance_id is not None for item in outcomes
     ):
         raise ValueError("attempt and acceptance identities must be unique")
     for item in outcomes:
-        if item.remediation_of is not None:
-            parent = by_attempt.get(item.remediation_of)
+        if parent_of(item) is not None:
+            parent = by_attempt.get(cast(str, parent_of(item)))
             if (
                 parent is None
                 or parent.attempt.program_id != item.attempt.program_id
@@ -194,7 +226,8 @@ def export_outcomes(
                 if parent.attempt.attempt_id in seen:
                     raise ValueError("remediation cycle")
                 seen.add(parent.attempt.attempt_id)
-                parent = by_attempt.get(parent.remediation_of) if parent.remediation_of is not None else None
+                parent_id = parent_of(parent)
+                parent = by_attempt.get(parent_id) if parent_id is not None else None
     latest: dict[str, UsageObservation] = {}
     ids: dict[str, UsageObservation] = {}
     for observation in observations:
@@ -216,10 +249,10 @@ def export_outcomes(
 
     def chain(item: AttemptOutcome) -> tuple[str, ...]:
         result = [item.attempt.attempt_id]
-        parent = item.remediation_of
+        parent = parent_of(item)
         while parent is not None:
             result.append(parent)
-            parent = by_attempt[parent].remediation_of
+            parent = parent_of(by_attempt[parent])
         return tuple(reversed(result))
 
     exported: list[dict[str, object]] = []
@@ -250,7 +283,17 @@ def export_outcomes(
                 },
                 "validation": item.validation,
                 "finding_ids": list(item.finding_ids),
-                "remediation_of": item.remediation_of,
+                "remediation_of": parent_of(item),
+                "product_review": (
+                    None
+                    if item.review_operation_id is None
+                    else {
+                        "operation_id": item.review_operation_id,
+                        "delivery_status": item.review_operation_status,
+                        "review_id": item.review_id,
+                        "verdict": item.review_verdict.value if item.review_verdict is not None else None,
+                    }
+                ),
                 "acceptance_id": item.acceptance_id,
                 "intervention_ids": list(item.intervention_ids),
                 "effective_usage": effective,

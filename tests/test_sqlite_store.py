@@ -1089,6 +1089,31 @@ def test_codec_rejects_unknown_versions_and_append_only_history_rejects_mutation
             _connection(store).execute("UPDATE history SET actor_id = 'forged' WHERE sequence = 1")
 
 
+def test_remediation_attempt_codec_preserves_legacy_and_new_lineage() -> None:
+    program = Program.create(spec()).apply(ActivateProgram(0, OWNER))
+    first = _attempt(program, "attempt-1", "first")
+    program = program.apply(PrepareAttempt(program.revision, WORKER, first))
+    program = program.apply(StartAttempt(program.revision, WORKER, "attempt-1"))
+    program = program.apply(FinishAttempt(program.revision, WORKER, "attempt-1"))
+    legacy = program_json(program)
+    assert "remediation_of" not in json.loads(legacy)["value"]["attempts"][0]["spec"]
+    assert program_from_json(legacy) == program
+
+    retry = AttemptSpec(
+        "attempt-2",
+        program.program_id,
+        "first",
+        program.spec.revision,
+        program.spec.digest,
+        program.resolved_inputs("first"),
+        remediation_of="attempt-1",
+    )
+    remediated = program.apply(PrepareAttempt(program.revision, WORKER, retry))
+    encoded = program_json(remediated)
+    assert json.loads(encoded)["value"]["attempts"][1]["spec"]["remediation_of"] == "attempt-1"
+    assert program_from_json(encoded) == remediated
+
+
 def test_rehydration_rejects_unreferenced_and_out_of_order_terminal_facts() -> None:
     initial = Program.create(spec())
     payload = json.loads(program_json(initial))

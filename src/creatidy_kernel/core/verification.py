@@ -5,6 +5,8 @@ Callers must supply evidence from trusted, independently operated check producer
 this module validates their subjects and makes the acceptance decision, not their truth.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 from collections.abc import Callable
@@ -165,6 +167,151 @@ class Evidence:
             raise InvalidDomainValue("invalid evidence subject, time, or result")
         if self.reviewer_session is not None:
             _required(self.reviewer_session)
+
+
+class ProductReviewVerdict(StrEnum):
+    APPROVE = "approve"
+    REQUEST_CHANGES = "request_changes"
+    COMMENT = "comment"
+    OWNER_DECISION_NEEDED = "owner_decision_needed"
+
+
+@dataclass(frozen=True, slots=True)
+class ProductReviewRequest:
+    """Cold review input assembled from immutable candidate evidence, not conversation state."""
+
+    candidate: CandidateResult
+    subject: EvidenceSubject
+    author_attempt_id: str
+    author_actor_id: str
+    policy: PolicyReference
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.candidate) is not CandidateResult
+            or type(self.subject) is not EvidenceSubject
+            or type(self.policy) is not PolicyReference
+        ):
+            raise InvalidDomainValue("review request requires trusted candidate, subject and policy")
+        for value in (self.author_attempt_id, self.author_actor_id):
+            _required(value)
+        if self.candidate.digest != self.subject.candidate_digest:
+            raise InvalidDomainValue("review request candidate differs from exact subject")
+        if self.candidate.publication.spec_digest != self.subject.attempt_digest:
+            raise InvalidDomainValue("review request Attempt digest differs from exact subject")
+        if self.candidate.publication.attempt_id != self.author_attempt_id:
+            raise InvalidDomainValue("review request author Attempt differs from candidate")
+        if self.policy.digest != self.subject.policy_digest:
+            raise InvalidDomainValue("review request policy differs from exact subject")
+
+    @property
+    def input_reference(self) -> str:
+        return f"candidate:{self.candidate.digest}"
+
+    @property
+    def input_digest(self) -> str:
+        payload = {
+            "candidate_digest": self.candidate.digest,
+            "policy": self.policy.payload(),
+            "subject": {
+                "attempt_digest": self.subject.attempt_digest,
+                "base_revision": self.subject.base_revision,
+                "candidate_digest": self.subject.candidate_digest,
+                "head_revision": self.subject.head_revision,
+                "policy_digest": self.subject.policy_digest,
+                "repository": self.subject.repository,
+                "spec_digest": self.subject.spec_digest,
+            },
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ProductReviewReceipt:
+    """Substantive reviewer result, distinct from any forge/platform review state."""
+
+    review_id: str
+    request_digest: str
+    subject: EvidenceSubject
+    reviewer_id: str
+    reviewer_session: str
+    verdict: ProductReviewVerdict
+    findings: tuple[Finding, ...]
+    observed_at: int
+    fresh_until: int
+    owner_decision_reference: str | None = None
+    owner_decision_reason: str | None = None
+    owner_decision_options: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for value in (self.review_id, self.request_digest, self.reviewer_id, self.reviewer_session):
+            _required(value)
+        if (
+            type(self.subject) is not EvidenceSubject
+            or type(self.verdict) is not ProductReviewVerdict
+            or type(self.findings) is not tuple
+            or any(type(item) is not Finding or item.subject != self.subject for item in self.findings)
+            or type(self.observed_at) is not int
+            or type(self.fresh_until) is not int
+            or self.fresh_until < self.observed_at
+        ):
+            raise InvalidDomainValue("invalid product review receipt")
+        if self.verdict is ProductReviewVerdict.APPROVE and self.findings:
+            raise InvalidDomainValue("approved product review cannot contain findings")
+        if self.verdict is ProductReviewVerdict.REQUEST_CHANGES and not self.findings:
+            raise InvalidDomainValue("change-request review must retain actionable findings")
+        for value in (self.owner_decision_reference, self.owner_decision_reason):
+            if value is not None:
+                _required(value)
+        if self.verdict is ProductReviewVerdict.OWNER_DECISION_NEEDED:
+            if (
+                self.findings
+                or self.owner_decision_reference is None
+                or self.owner_decision_reason is None
+                or type(self.owner_decision_options) is not tuple
+                or len(self.owner_decision_options) not in (2, 3)
+                or any(type(item) is not str or not item.strip() for item in self.owner_decision_options)
+                or len(set(self.owner_decision_options)) != len(self.owner_decision_options)
+            ):
+                raise InvalidDomainValue("owner decision requires a distinct reference, reason and concrete options")
+        elif (
+            self.owner_decision_reference is not None
+            or self.owner_decision_reason is not None
+            or self.owner_decision_options
+        ):
+            raise InvalidDomainValue("owner-decision details cannot be merged into a software review verdict")
+
+
+def product_review_matches_request(request: ProductReviewRequest, receipt: ProductReviewReceipt) -> bool:
+    if (
+        type(request) is not ProductReviewRequest
+        or type(receipt) is not ProductReviewReceipt
+        or receipt.subject != request.subject
+        or receipt.request_digest != request.input_digest
+        or receipt.reviewer_id == request.author_actor_id
+        or receipt.reviewer_session == request.author_attempt_id
+    ):
+        return False
+    return True
+
+
+def validate_product_review(request: ProductReviewRequest, receipt: ProductReviewReceipt) -> Evidence | None:
+    """Accept only a fresh, exact-subject receipt from an independent cold session."""
+    if not product_review_matches_request(request, receipt) or receipt.verdict is not ProductReviewVerdict.APPROVE:
+        return None
+    return Evidence(
+        receipt.review_id,
+        "independent_review",
+        receipt.subject,
+        receipt.reviewer_id,
+        "product-review:v1",
+        request.input_reference,
+        receipt.observed_at,
+        receipt.fresh_until,
+        True,
+        receipt.reviewer_session,
+    )
 
 
 class CheckProducer(Protocol):

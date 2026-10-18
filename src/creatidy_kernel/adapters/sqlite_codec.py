@@ -226,7 +226,7 @@ def _spec_from(data: object) -> ProgramSpec:
 
 
 def _attempt_spec_data(spec: AttemptSpec) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "attempt_id": spec.attempt_id,
         "program_id": spec.program_id,
         "work_unit_id": spec.work_unit_id,
@@ -238,25 +238,28 @@ def _attempt_spec_data(spec: AttemptSpec) -> dict[str, object]:
         "workspace_reference": spec.workspace_reference,
         "context_reference": spec.context_reference,
     }
+    if spec.remediation_of is not None:
+        value["remediation_of"] = spec.remediation_of
+    return value
 
 
 def _attempt_spec_from(data: object) -> AttemptSpec:
-    value = _mapping(
-        data,
-        {
-            "attempt_id",
-            "program_id",
-            "work_unit_id",
-            "spec_revision",
-            "spec_digest",
-            "effective_inputs",
-            "allocation_reference",
-            "agent_definition_reference",
-            "workspace_reference",
-            "context_reference",
-        },
-        "AttemptSpec",
-    )
+    fields = {
+        "attempt_id",
+        "program_id",
+        "work_unit_id",
+        "spec_revision",
+        "spec_digest",
+        "effective_inputs",
+        "allocation_reference",
+        "agent_definition_reference",
+        "workspace_reference",
+        "context_reference",
+    }
+    raw = _object(data, "AttemptSpec")
+    if set(raw) not in (fields, fields | {"remediation_of"}):
+        raise RecordCodecError("AttemptSpec has missing or unknown fields")
+    value = raw
     return AttemptSpec(
         attempt_id=_text(value["attempt_id"], "attempt_id"),
         program_id=_text(value["program_id"], "program_id"),
@@ -270,6 +273,7 @@ def _attempt_spec_from(data: object) -> AttemptSpec:
         agent_definition_reference=_optional_text(value["agent_definition_reference"], "agent_definition_reference"),
         workspace_reference=_optional_text(value["workspace_reference"], "workspace_reference"),
         context_reference=_optional_text(value["context_reference"], "context_reference"),
+        remediation_of=_optional_text(value.get("remediation_of"), "remediation_of"),
     )
 
 

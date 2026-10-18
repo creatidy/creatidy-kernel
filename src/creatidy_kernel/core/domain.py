@@ -605,6 +605,7 @@ class AttemptSpec:
     agent_definition_reference: str | None = dataclass_field(init=False)
     workspace_reference: str | None = dataclass_field(init=False)
     context_reference: str | None = dataclass_field(init=False)
+    remediation_of: str | None = dataclass_field(init=False)
 
     def __init__(
         self,
@@ -618,6 +619,7 @@ class AttemptSpec:
         agent_definition_reference: str | None = None,
         workspace_reference: str | None = None,
         context_reference: str | None = None,
+        remediation_of: str | None = None,
     ) -> None:
         _begin_init(self, AttemptSpec, "attempt_id")
         for field, value in (
@@ -633,6 +635,7 @@ class AttemptSpec:
             ("agent_definition_reference", agent_definition_reference),
             ("workspace_reference", workspace_reference),
             ("context_reference", context_reference),
+            ("remediation_of", remediation_of),
         ):
             _optional_nonempty(value, field)
         _set_fields(
@@ -647,6 +650,7 @@ class AttemptSpec:
             agent_definition_reference=agent_definition_reference,
             workspace_reference=workspace_reference,
             context_reference=context_reference,
+            remediation_of=remediation_of,
         )
 
     @property
@@ -655,20 +659,21 @@ class AttemptSpec:
 
     @property
     def digest(self) -> str:
-        return _digest(
-            {
-                "attempt_id": self.attempt_id,
-                "program_id": self.program_id,
-                "work_unit_id": self.work_unit_id,
-                "spec_revision": self.spec_revision,
-                "spec_digest": self.spec_digest,
-                "effective_inputs": [item.payload() for item in self.effective_inputs],
-                "allocation_reference": self.allocation_reference,
-                "agent_definition_reference": self.agent_definition_reference,
-                "workspace_reference": self.workspace_reference,
-                "context_reference": self.context_reference,
-            }
-        )
+        payload: dict[str, object] = {
+            "attempt_id": self.attempt_id,
+            "program_id": self.program_id,
+            "work_unit_id": self.work_unit_id,
+            "spec_revision": self.spec_revision,
+            "spec_digest": self.spec_digest,
+            "effective_inputs": [item.payload() for item in self.effective_inputs],
+            "allocation_reference": self.allocation_reference,
+            "agent_definition_reference": self.agent_definition_reference,
+            "workspace_reference": self.workspace_reference,
+            "context_reference": self.context_reference,
+        }
+        if self.remediation_of is not None:
+            payload["remediation_of"] = self.remediation_of
+        return _digest(payload)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -1336,6 +1341,7 @@ class Program:
             raise InvalidDomainValue("satisfaction IDs must be unique")
         history = {(item.revision, item.digest): item for item in self.spec_history}
         attempts = {item.attempt_id: item for item in self.attempts}
+        attempt_positions = {item.attempt_id: index for index, item in enumerate(self.attempts)}
         for attempt in self.attempts:
             historical = history.get((attempt.spec.spec_revision, attempt.spec.spec_digest))
             if historical is None or attempt.spec.program_id != self.program_id:
@@ -1344,6 +1350,17 @@ class Program:
                 historical.work_unit(attempt.spec.work_unit_id)
             except MissingReference as error:
                 raise InvalidDomainValue("Attempt cites a foreign WorkUnit") from error
+            if attempt.spec.remediation_of is not None:
+                source = attempts.get(attempt.spec.remediation_of)
+                if (
+                    source is None
+                    or attempt_positions[source.attempt_id] >= attempt_positions[attempt.attempt_id]
+                    or source.status is not AttemptStatus.FINISHED
+                    or source.spec.work_unit_id != attempt.spec.work_unit_id
+                    or (source.spec.spec_revision, source.spec.spec_digest)
+                    != (attempt.spec.spec_revision, attempt.spec.spec_digest)
+                ):
+                    raise InvalidDomainValue("Attempt remediation lineage must cite an earlier finished subject")
         for satisfaction in self.satisfactions:
             historical = history.get((satisfaction.spec_revision, satisfaction.spec_digest))
             if historical is None or satisfaction.program_id != self.program_id:
@@ -1516,6 +1533,20 @@ class Program:
                 raise IllegalTransition("a WorkUnit already has an outstanding Attempt")
             if requested.effective_inputs != self.resolved_inputs(unit.id):
                 raise MissingInput("Attempt bindings must exactly match current approved references and provenance")
+            if requested.remediation_of is not None:
+                source = self.attempt(requested.remediation_of)
+                previous = next(
+                    (item for item in reversed(attempts) if item.spec.work_unit_id == unit.id),
+                    None,
+                )
+                if (
+                    source.status is not AttemptStatus.FINISHED
+                    or source.spec.work_unit_id != unit.id
+                    or (source.spec.spec_revision, source.spec.spec_digest) != (spec.revision, spec.digest)
+                    or previous is None
+                    or previous.attempt_id != source.attempt_id
+                ):
+                    raise IllegalTransition("remediation must link the latest finished Attempt for this WorkUnit")
             if len(attempts) >= min(spec.budget.max_attempts, spec.authority.max_attempts):
                 raise BudgetExceeded("attempt admission limit exceeded")
             if sum(item.status in (AttemptStatus.PREPARED, AttemptStatus.EXECUTING) for item in attempts) >= (

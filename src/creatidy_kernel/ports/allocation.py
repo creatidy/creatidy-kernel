@@ -140,11 +140,34 @@ def load_attempt_inputs(store: ApplicationStore, attempt: AttemptSpec) -> tuple[
         inputs.append(data)
     allocation, context = inputs
     decode_allocation(allocation)
-    expected_context = json.dumps(
-        [asdict(item) for item in attempt.effective_inputs], sort_keys=True, separators=(",", ":")
-    ).encode()
+    expected_inputs = [asdict(item) for item in attempt.effective_inputs]
+    expected_context = json.dumps(expected_inputs, sort_keys=True, separators=(",", ":")).encode()
     if context != expected_context:
-        raise ValueError("original context differs from Attempt inputs")
+        remediation = _object(context)
+        if set(remediation) != {"inputs", "remediation", "version"} or remediation["version"] != 1:
+            raise ValueError("original context differs from Attempt inputs")
+        if remediation["inputs"] != expected_inputs or type(remediation["remediation"]) is not dict:
+            raise ValueError("remediation context differs from Attempt inputs")
+        details = cast(dict[str, object], remediation["remediation"])
+        if set(details) != {"findings", "review_operation_id", "source_attempt_id"}:
+            raise ValueError("invalid remediation context")
+        if type(details["source_attempt_id"]) is not str or not details["source_attempt_id"].strip():
+            raise ValueError("remediation context lacks source Attempt")
+        if attempt.remediation_of != details["source_attempt_id"]:
+            raise ValueError("remediation context source differs from immutable Attempt lineage")
+        if details["review_operation_id"] is not None and (
+            type(details["review_operation_id"]) is not str or not details["review_operation_id"].strip()
+        ):
+            raise ValueError("invalid remediation review reference")
+        findings = details["findings"]
+        if type(findings) is not list or not findings:
+            raise ValueError("remediation context requires retained findings")
+        for finding in cast(list[object], findings):
+            fields = cast(dict[str, object], finding) if type(finding) is dict else {}
+            if set(fields) != {"finding_id", "fingerprint", "reason"} or any(
+                type(fields[name]) is not str or not cast(str, fields[name]).strip() for name in fields
+            ):
+                raise ValueError("invalid remediation finding")
     return allocation, context
 
 
