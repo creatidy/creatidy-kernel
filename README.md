@@ -323,9 +323,15 @@ Native-shaped offline fixtures are not live model or remote-Forge acceptance.
 In the current trusted-development Codex path, the persisted deadline prevents new Kernel-controlled
 dispatch/acceptance and triggers cancellation; it does not atomically revoke a native process's
 filesystem or subprocess syscalls. Local effects may occur while the active process group is being
-terminated. A stop/interrupt acknowledgement is not settlement, cancellation is not rollback, and
-no candidate is accepted while outcome or settlement is unknown. This is not a hostile-worker
-sandbox or a strict no-native-effect-after-expiry guarantee. [Proposed ADR 0011](docs/adr/0011-task-level-authority-and-trusted-development.md)
+terminated. A stop/interrupt acknowledgement is not settlement, and cancellation is not rollback.
+The proposed contract requires acceptance/publication to remain blocked while outcome or
+owned-process settlement is unknown, but the current code does not yet enforce that gate at the
+process-group boundary: a terminal Codex turn can finalize cancellation or reach candidate
+acceptance before the controller's `CodexStdio.close()` records `owned_group_settled`. This is the
+unresolved implementation gap tracked by [#90](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/90),
+not a guarantee established by this proposal. The proposed #56/#60 criteria require the same gate
+for deadline-triggered cancellation. This is not a hostile-worker sandbox or a strict
+no-native-effect-after-expiry guarantee. [Proposed ADR 0011](docs/adr/0011-task-level-authority-and-trusted-development.md)
 and its [issue-description patches](docs/architecture/ac4-issue-description-proposals.md) are not
 accepted; the existing AC4 remains binding until an explicit owner decision. The native app-server
 requires provider auth in `HOME`, and the repository does not prove the terminal child cannot read it.

@@ -15,8 +15,13 @@ The current trusted-development Codex path does not enforce grant expiry at each
 or subprocess syscall. Deadline expiry and user STOP prevent new Kernel-controlled dispatch and
 initiate cancellation/termination; an already-running worker or descendant may still make local
 effects during teardown. A stop/interrupt acknowledgement is not settlement, and local changes are
-not rolled back. Unknown termination/effect outcomes must remain unknown and cannot be accepted or
-published.
+not rolled back. The proposed AC4 requires unknown termination/effect outcomes to remain unknown
+and block acceptance/publication, but current owned-process settlement does not yet enforce that
+gate: a terminal turn can reach candidate acceptance or finalize cancellation before the CLI closes
+`CodexStdio` and obtains its owned-group settlement result. This is the unresolved implementation
+gap tracked by [#90](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/90), not a current
+security guarantee. The proposed #56/#60 acceptance criteria require deadline-triggered cancellation
+to use the same gate.
 
 `TRUSTED_DEVELOPMENT` is an explicit owner-trusted coding profile, not hostile-worker isolation. The
 Codex app-server needs provider authentication in `HOME`; the native terminal may share the same
