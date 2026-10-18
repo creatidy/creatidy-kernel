@@ -181,6 +181,36 @@ proposal text or a local Kernel implementation alone remains UNKNOWN. Destructiv
 downgrade policy, signing, publication and new platform commitments are not selected here. No real
 profile/key/ciphertext was read, changed or used.
 
+## G01-G13 Reception Preparation (Planned)
+
+This is the fixture/protocol preparation slice permitted by #60. It is an inventory of independent
+component evidence and future composition seams, not a working end-to-end receipt, capability pass or
+owner approval. Existing synthetic tests remain component evidence only.
+
+| Reception seam | Reusable deterministic evidence | Required before counting composed acceptance |
+| --- | --- | --- |
+| Installed local operator path | `tests/test_cli.py`, `tests/test_source_admission.py`, `make package-check` | Exact built artifact/hash and clean installed environment outside the checkout; no private path, inference or remote effect |
+| Router decision to Attempt-bound harness | `tests/test_codex_runtime.py`, `tests/test_task_execution.py` | Accepted route/admission/pin producer-consumer contract and versioned exact selected/resolved/observed identity; no recommendation-as-execution inference |
+| Knowledge, review and whole-task result | `tests/test_context_outcomes.py`, `tests/test_task_execution.py` | Accepted MI reference path, per-Attempt costs/unknowns, exact-subject review and changed-candidate lineage; receipts stay distinct from live remote state |
+| State, reconnect and concurrent ownership | `tests/test_task_execution.py`, `tests/test_sqlite_store.py`, `tests/test_cli.py` | Owner-served snapshot/event/command contract plus one-controller concurrency/manual-edit ownership; no second SQLite reader or frontend scheduler |
+| Export, upgrade and platform | `tests/test_context_outcomes.py`, `tests/test_sqlite_store.py`, `tests/test_operator_profile.py`, `make package-check` | Exact producer/schema matrix, Linux/WSL storage fixtures and synthetic ciphertext refusal/rollback evidence; never use real profiles or infer a platform pass |
+| STOP, deadline and cleanup | `tests/test_codex_stdio.py`, `tests/test_task_execution.py` | Exact owned-process settlement receipt and explicit native-effect interval; the #90 baseline does not satisfy strict per-syscall expiry or hostile-worker isolation |
+
+A future offline composition fixture may reuse these test families and producer-shaped synthetic
+records. It must stop at an unavailable contract, preserve unknown/failure, and never count a stubbed
+producer as received. Planned negative scenarios include a stale or changed exact subject, unsupported
+contract revision, missing/corrupt evidence, producer outage, duplicate/lost reply, event gap, concurrent
+controller, manual workspace edit, migration refusal and escaped/unsettled child. Their wire shapes,
+versions and success claims remain contingent on the corresponding accepted component contracts.
+
+Any live acceptance protocol remains a draft until a separate owner decision records the exact installed
+artifact and source SHAs, disposable repository/workspace and permitted edits, provider/Router/MI/service
+and credential scopes, numeric attempt/time/cost envelope, privacy/profile treatment, trust and network
+limits, STOP/unknown handling, evidence retention and explicit no-merge/no-deploy boundary. No field has
+a default here. This preparation does not authorize inference, service access, profile access, repository
+effects, publication, merge, release or deployment; unavailable functionality cannot be counted as
+received.
+
 ## First-Priority Deviations
 
 These remain product defects/proof blockers after ADR 0011 acceptance. Static code facts are
