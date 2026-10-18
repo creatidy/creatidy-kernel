@@ -67,6 +67,22 @@ for line in sys.stdin:
         os.close(read_fd)
         result = {{'child': child, 'group': os.getpgrp(), 'turn': {{'id': 'turn-1'}}}}
         print(json.dumps({{'id': message['id'], 'result': result}}), flush=True)
+    elif message['method'] == 'spawn/exited-leader':
+        read_fd, write_fd = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(read_fd)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            os.write(write_fd, b'ready')
+            os.close(write_fd)
+            while True:
+                signal.pause()
+        os.close(write_fd)
+        assert os.read(read_fd, 5) == b'ready'
+        os.close(read_fd)
+        result = {{'child': child, 'group': os.getpgrp(), 'leader': os.getpid()}}
+        print(json.dumps({{'id': message['id'], 'result': result}}), flush=True)
+        os._exit(0)
     elif os.environ.get('KERNEL_LIFECYCLE') == '1':
         method = message['method']
         if method == 'thread/start':
@@ -204,6 +220,52 @@ def test_owned_cleanup_escalates_stubborn_child_without_signalling_bystander(
         bystander.wait(timeout=5)
         try:
             original_killpg(owned_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_owned_cleanup_escalates_surviving_child_after_leader_exits(
+    command: tuple[str, ...], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transport = CodexStdio(command, "0.99.1", timeout=1, environment={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"})
+    spawned = transport.request("spawn/exited-leader", {})
+    child = int(str(spawned["child"]))
+    owned_group = int(str(spawned["group"]))
+    leader = int(str(spawned["leader"]))
+    leader_state = Path(f"/proc/{leader}/stat")
+    deadline = time.monotonic() + 5
+    while (
+        leader_state.exists()
+        and leader_state.read_text().split(")", 1)[1].split()[0] != "Z"
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+    assert not leader_state.exists() or leader_state.read_text().split(")", 1)[1].split()[0] == "Z"
+    assert os.getpgid(child) == owned_group
+    original_killpg = os.killpg
+    signals: list[tuple[int, int]] = []
+
+    def capture(group: int, sig: int) -> None:
+        assert group == owned_group
+        signals.append((group, sig))
+        original_killpg(group, sig)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "killpg", capture)
+            transport.close()
+        assert (owned_group, signal.SIGTERM) in signals
+        assert (owned_group, signal.SIGKILL) in signals
+        # The child was in the owned group even though its leader had exited.
+        assert transport.owned_group_settled is False
+    finally:
+        transport.close()
+        try:
+            original_killpg(owned_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.kill(child, signal.SIGKILL)
         except ProcessLookupError:
             pass
 

@@ -135,11 +135,21 @@ class CodexStdio:
                 if os.getpgid(process.pid) != process.pid:
                     return False  # Never signal or adopt a shared/foreign process group.
             except ProcessLookupError:
-                return False
+                # The leader may exit between poll() and getpgid(); its original
+                # process-group ID can still be occupied by owned descendants.
+                pass
+        else:
+            process.wait()
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            settled = True
+        if not settled:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
-                pass
+                settled = True
+        if not settled:
             try:
                 process.wait(timeout=self.timeout)
             except subprocess.TimeoutExpired:
