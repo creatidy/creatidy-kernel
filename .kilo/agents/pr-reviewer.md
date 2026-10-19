@@ -133,6 +133,29 @@ owns all Git fetch and checkout preparation. You must not fetch/switch/create
 branches, create worktrees, commit, push or mutate Git/Forgejo state. Recheck PR and
 ref metadata through MCP plus local HEAD/clean status before returning.
 
+## Read-only Git command discipline
+
+The `bash` permission list is an exact allowlist, not a general Git capability. Use
+only commands matching it, one tool call per command, with the exact supplied
+checkout path. For the normal checkout the permitted forms include:
+
+```text
+git -C /home/adrian/workspace/creatidy/creatidy-kernel status --short
+git -C /home/adrian/workspace/creatidy/creatidy-kernel rev-parse HEAD
+git -C /home/adrian/workspace/creatidy/creatidy-kernel rev-parse --verify EXPECTED_SHA^{commit}
+git -C /home/adrian/workspace/creatidy/creatidy-kernel merge-base HEAD BASE_SHA
+git -C /home/adrian/workspace/creatidy/creatidy-kernel diff MERGE_BASE...HEAD_SHA
+```
+
+For an authorized temporary checkout, substitute its exact path matching the
+allowlisted `creatidy-kernel-*` pattern. Do not add flags such as `--branch` to the
+allowlisted `status --short` command; `git status --short` is sufficient to verify
+cleanliness. Do not use `git cat-file`; substitute the expected SHA into the individually
+allowed `rev-parse --verify SHA^{commit}` form to verify a commit object. Never chain Git commands with
+`&&`, `;`, pipes, redirection or command substitution. If a command is denied, compare
+its exact syntax with the allowlist and correct only that syntax; do not broaden
+permissions or claim Git unavailable before trying the exact permitted form.
+
 Read the linked issue and relevant referenced acceptance context, AGENTS.md and
 all applicable rules, and the COMPLETE merge-base-to-HEAD diff/current implementation.
 Review correctness,
