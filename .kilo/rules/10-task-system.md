@@ -121,8 +121,9 @@ does not create a workflow status or authorize broader work.
   (2) review infrastructure failure: no verdict could be established; and (3) reviewer
   disagreement/uncertainty: evidence exists but its interpretation is unresolved.
   Infrastructure failure consumes its ordinal; change strategy/environment before
-  another review. Use any authorized independent reviewer path satisfying the same
-  isolation, exact-HEAD and full-review contract. If none remains, report a precise
+  another review. Use any authorized independent reviewer path satisfying AGENTS.md's
+  conversational-independence policy and the same read-only, execution-safety,
+  exact-HEAD and full-review contract. If none remains, report a precise
   external capability blocker, not an artificial owner question.
 - Class-B owner decisions include materially different architecture, authority/trust
   boundary, scope/acceptance, paid/live inference or external effects, new access to

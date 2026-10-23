@@ -7,6 +7,7 @@ description: Fresh read-only whole-PR review through the native pr-reviewer suba
 Review the exact Forgejo PR: $ARGUMENTS
 
 Run in the primary context; do not require a separate owner-opened session.
+Follow AGENTS.md's "Independent Review — Conversational Independence" policy.
 Fetch actual PR metadata and its linked issue through `forgejo-mcp`. Require an
 open, unmerged canonical Creatidy/creatidy-kernel PR targeting `develop`.
 Read AGENTS.md and its rules, verify the canonical remote, and use normal Git to
@@ -31,8 +32,8 @@ findings or owner decisions. Diagnose and change the execution condition before 
 attempt: for example use a sanitized environment, synthetic HOME/cache/temp, clean
 ephemeral container when suitable, exact pinned public source checkout, split source
 inspection from test execution, or another authorized independent reviewer path.
-Do not weaken isolation, permissions, validation, exact-HEAD checks or independence;
-never self-review. Return a precise BLOCKED only after no authorized alternative
+Do not weaken required execution-safety protections, permissions, validation,
+exact-HEAD checks or independence; never self-review. Return a precise BLOCKED only after no authorized alternative
 remains, without an artificial owner question. Distinguish this from findings and
 evidence-backed reviewer judgment uncertainty.
 

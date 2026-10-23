@@ -7,6 +7,7 @@ description: Finish an existing PR through bounded native review and in-scope re
 Finish the owner-selected Forgejo PR: $ARGUMENTS
 
 Operate in the primary implementation context. Read AGENTS.md and its rules.
+Its "Independent Review — Conversational Independence" policy governs reviewer sessions.
 This invocation authorizes only the selected PR's linked issue scope and normal
 remediation commits/pushes; no additional issue, replacement PR or merge.
 An explicit owner `/loop` may reuse this procedure in its sole primary context;
@@ -39,7 +40,8 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    reviewer verifies canonical repository/PR/ref commit metadata through read-only
    Forgejo MCP and checks those exact commits against this primary-prepared clean
    local checkout. It does not need anonymous Git transport. Review frozen objects/
-   current clean branch in this SAME checkout. The parent must not edit/switch
+   current clean branch in this same checkout by default; a separate environment
+   requires concrete technical necessity under AGENTS.md. The parent must not edit/switch
    branches while the reviewer is active.
    A missing native task/agent is a review-infrastructure failure: diagnose it and
    try an authorized independent read-only reviewer path with the same exact-HEAD

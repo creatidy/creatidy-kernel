@@ -23,9 +23,9 @@ or merging. It consumes native `task` results directly, with at most 10 whole-PR
 review invocations per issue delivery, including initial/COMMENT/retries; its
 excluded progress ledger preserves the count across finish/phase/session reentry.
 `/review-pr` is standalone read-only review using the same
-`.kilo/agents/pr-reviewer.md` agent. A newly spawned reviewer subagent's isolated
-context satisfies independence; implementation self-review and resumed reviewers
-do not. Every changed HEAD/base requires a fresh whole-PR review. Forgejo review
+`.kilo/agents/pr-reviewer.md` agent. A newly spawned reviewer subagent's fresh
+conversation satisfies the independent-review policy below; implementation self-review
+and resumed reviewers do not. Every changed HEAD/base requires a fresh whole-PR review. Forgejo review
 publication is optional, never orchestration state. No external controller exists.
 
 Only an explicit owner `/loop` invocation delegates autonomous selection and
@@ -39,6 +39,47 @@ STOP_AND_ASK, STOP_REVISE or BLOCKED; no eligible issues yields QUEUE_EMPTY.
 This does not authorize product GO, cross-repository mutation, Scarcity Router
 operation, main, releases or deployments. Standalone implementation remains
 owner-selected and unmerged; standalone review remains read-only.
+
+## Independent Review — Conversational Independence
+
+An independent review MUST use a fresh, separate reviewer session without the implementation agent's
+prior conversational context.
+
+Reviewer independence means independent reasoning and conversational state. It does NOT require an
+isolated filesystem, separate worktree, separate checkout, container, sandbox, duplicated Git
+repository, custom permission profile, or independent runtime infrastructure.
+
+The reviewer may use the same repository, working directory, Git objects, tools, and existing
+execution environment as the implementation agent.
+
+The reviewer receives the minimum sufficient context: the task, scope, acceptance criteria, exact
+source/PR references, and necessary source-access instructions.
+
+Do not transmit the implementation conversation, implementation rationale, private deliberations, or
+a desired review verdict.
+
+The reviewer evaluates the actual implementation independently and reports material findings,
+limitations, and a clear verdict.
+
+Read-only reviewer behavior, exact source identification, and source stability during review remain
+mandatory.
+
+A separate execution environment may be used only when justified by a concrete technical necessity,
+not merely to establish reviewer independence.
+
+For owner-authorized autonomous development workflows, use supported native agent/session-management
+facilities to create the ordinary reviewer session and deliver its result automatically.
+
+Do not require the owner to manually copy reviewer prompts, transfer answers, or approve ordinary
+technical operations between agents.
+
+Prefer the existing agent framework's native session functionality. Do not build a second
+orchestrator, shell-based model launcher, HTTP inference wrapper, or custom security infrastructure.
+
+A separate model family may improve review quality but is not a prerequisite for independence.
+
+Existing finite review budgets, genuine owner decisions, acceptance gates, and explicitly mandatory
+manual security reviews remain binding.
 
 ## Architecture Boundaries
 
