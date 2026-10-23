@@ -24,8 +24,9 @@
   change-caused failures from unrelated/environmental blockers; no claim
   of passing checks, push or PR creation without successful evidence.
 - Parent prepares a clean exact PR HEAD and existing offline locked development
-  environment before invoking a reviewer. Use a normal checkout by default; a
-  specific owner-authorized task may use one isolated temporary worktree to preserve
+  environment before invoking a reviewer under AGENTS.md's conversational-independence
+  policy. Use a normal checkout by default; a specific owner-authorized task may use
+  one isolated temporary worktree to preserve
   concurrent work. No switching/editing of the reviewed checkout during review.
   Reviewer independently verifies canonical repository/PR/ref commits through
   read-only Forgejo MCP, then matches them to the prepared local exact HEAD/base

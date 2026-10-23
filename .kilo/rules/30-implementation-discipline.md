@@ -87,6 +87,7 @@ Before commit inspect status/diff and confirm only intended files are staged; ne
 state or secrets. Record material skipped checks/blockers in the delivery report and issue when applicable.
 
 The implementation session is not an independent reviewer. Every whole-PR review uses a fresh
-isolated foreground read-only `pr-reviewer` task on the frozen exact HEAD/base and complete PR.
+foreground read-only `pr-reviewer` task on the frozen exact HEAD/base and complete PR,
+following AGENTS.md's "Independent Review — Conversational Independence" policy.
 The parent must not edit the reviewed checkout while review runs. Never resume a reviewer or substitute parent self-review. Reviewer infrastructure inconvenience is not a finding; remediate by a changed authorized path within the preserved ordinal budget.
 Inspect checks before execution; permissions do not make untrusted PR code safe.
