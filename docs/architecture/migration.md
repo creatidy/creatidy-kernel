@@ -129,6 +129,52 @@ recovery never rewrites an old Source field, renews the deadline, or substitutes
 New admissions validate source under a use lease and copy without hardlinks, validating the exact
 snapshot before dispatch. A returned acquisition Path carries no protected lifetime after release.
 
+## Platform, Storage And Profile Reception (G13)
+
+Bounded exercised reception for [#62](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/62)
+(2026-10-26). Synthetic fixtures only; no real WSL/Windows/macOS host, real
+profile, key or ciphertext was used, and no release, publication or live task
+is claimed.
+
+**Storage and platform.** Store startup and `validate_local_storage` accept
+exactly the verified native local Linux filesystems (`bcachefs`, `btrfs`,
+`ext2`/`ext3`/`ext4`, `f2fs` without checkpoint-disable, `ntfs3`, `xfs`, `zfs`)
+and refuse anything else. Synthetic mount-table fixtures exercise the WSL
+shapes: WSL2-native root storage is plain `ext4` and passes the same gate as
+native Linux, while Windows drives mounted as `9p` (WSL2 DrvFS) or `drvfs`
+(WSL1) refuse with `UnsupportedSQLiteConfiguration` instead of a quiet unsafe
+fallback, and non-Linux runtimes refuse storage validation explicitly. A
+database announcing a schema version newer than supported refuses at startup;
+its records and announced version survive the refusal unchanged, are never
+reinterpreted, and no lost-effect dispatch or relabelled identity occurs. Real WSL, Windows and macOS execution remains explicit
+evidence work, not implicit support; each eventual platform cell must name its
+executed host, filesystem and revisions.
+
+**Operator profile.** Kernel never writes the user profile. Plaintext dotenv
+and SOPS loading are read-only: failed decryption (executable unavailable,
+nonzero exit, key unavailable), corrupt or oversized decrypted output leaves
+the original ciphertext byte-identical — including modification time — and
+diagnostics stay fixed messages that never contain profile values. Encrypted
+fixtures in tests are synthetic stand-ins; real key rotation, recipient
+migration or an actual encrypted-profile transition requires separately scoped
+owner authority and remains unclaimed.
+
+**Trust labeling.** `TRUSTED_DEVELOPMENT` in this matrix means trusted native
+execution with task-level deadline/STOP semantics, not strict per-syscall
+expiry or hostile-worker isolation. Codex provider auth in `HOME` may be
+readable to terminal tools; production/remote-write secrets are not permitted
+in the task identity; native egress is unverified unless an exact sandbox test
+proves it. Ordinary same-principal local coding is an explicit trust choice; a
+task requiring secret secrecy or enforced egress control is unsupported
+without evidence, and Kernel never falls back to a broader profile.
+
+**Cleanup ownership.** Kernel owns the SQLite state directory it creates
+(database, `-wal`/`-shm` sidecars, `.artifacts` content-addressed store and
+backup bundles with verified manifests). The user owns the operator profile
+and any SOPS key material; the source cache follows the #61 ownership
+contract. Uninstalling removes Kernel-owned state only under an explicit
+operator action; no component deletes or rewrites the user profile.
+
 ## Historical Second-Pass Mapping
 
 ## Scarcity Router

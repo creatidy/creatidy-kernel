@@ -155,3 +155,62 @@ def test_default_profile_location_and_template_are_user_local_and_generic() -> N
     parsed = parse_dotenv(template)
     assert parsed["CREATIDY_KERNEL_ROUTER_URL"].startswith("REPLACE_")
     assert os.environ.get("PATH", "") in parsed["PATH"] or parsed["PATH"] == os.defpath
+
+
+# Issue #62 synthetic ciphertext safety contract: Kernel never writes the user
+# profile, failed decryption leaves ciphertext byte-identical, and diagnostics
+# stay fixed messages. The fake sops executable stands in for the user's own
+# encrypted profile; no real profile, key or ciphertext is used.
+def _fake_sops(tools: Path, script: str) -> Path:
+    tools.mkdir(exist_ok=True)
+    executable = tools / "sops"
+    executable.write_text(f"#!{sys.executable}\n{script}")
+    executable.chmod(0o700)
+    return executable
+
+
+def test_failed_decryption_leaves_ciphertext_bytes_untouched(tmp_path: Path) -> None:
+    ciphertext = write_profile(tmp_path / "kernel.env.sops.yaml", "ENC[synthetic-ciphertext]\n")
+    before = ciphertext.read_bytes()
+    stat_before = ciphertext.stat()
+    _fake_sops(
+        tmp_path / "tools",
+        "import sys\nsys.stderr.write('key unavailable\\n')\nsys.exit(1)\n",
+    )
+    with pytest.raises(ProfileError, match="profile decryption failed") as error:
+        load_profile(ciphertext, sops=True, environment={"PATH": str(tmp_path / "tools")})
+    assert ciphertext.read_bytes() == before
+    stat_after = ciphertext.stat()
+    assert (stat_after.st_mtime_ns, stat_after.st_mode, stat_after.st_size) == (
+        stat_before.st_mtime_ns,
+        stat_before.st_mode,
+        stat_before.st_size,
+    )
+    assert "key unavailable" not in str(error.value)
+    assert "ENC" not in str(error.value)
+
+
+@pytest.mark.parametrize("output", ["", "not json at all ", '{"KEY": 1}', "[" * 33 + "]" * 33])
+def test_corrupt_decrypted_output_refuses_and_preserves_the_profile(tmp_path: Path, output: str) -> None:
+    ciphertext = write_profile(tmp_path / "kernel.env.sops.yaml", "ENC[synthetic-ciphertext]\n")
+    before = ciphertext.read_bytes()
+    _fake_sops(tmp_path / "tools", f"import sys\nsys.stdout.write({output!r})\n")
+    with pytest.raises(ProfileError):
+        load_profile(ciphertext, sops=True, environment={"PATH": str(tmp_path / "tools")})
+    assert ciphertext.read_bytes() == before
+
+
+def test_successful_loading_never_writes_the_profile(tmp_path: Path) -> None:
+    plaintext = write_profile(tmp_path / "kernel.env", "CREATIDY_KERNEL_ROUTER_URL=http://127.0.0.1:8765\n")
+    stat_before = plaintext.stat()
+    before = plaintext.read_bytes()
+    assert load_profile(plaintext) == {"CREATIDY_KERNEL_ROUTER_URL": "http://127.0.0.1:8765"}
+    ciphertext = write_profile(tmp_path / "kernel.env.sops.yaml", "ENC[synthetic-ciphertext]\n")
+    encrypted_before = ciphertext.read_bytes()
+    _fake_sops(tmp_path / "tools", 'import sys\nsys.stdout.write(\'{"HOME": "/home/operator"}\')\n')
+    assert load_profile(ciphertext, sops=True, environment={"PATH": str(tmp_path / "tools")}) == {
+        "HOME": "/home/operator"
+    }
+    assert plaintext.read_bytes() == before
+    assert ciphertext.read_bytes() == encrypted_before
+    assert plaintext.stat().st_mtime_ns == stat_before.st_mtime_ns
