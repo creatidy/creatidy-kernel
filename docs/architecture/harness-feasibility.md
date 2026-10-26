@@ -179,6 +179,71 @@ the authorized observation above. UI observer tooling itself is not implemented 
 IDE session is attached merely to test ownership. Hidden retries must be counted across harness,
 SDK, tools and gateway; unavailable monetary/quota/identity observations remain unknown, not zero.
 
+## Bounded #52 Kilo Offline Falsification
+
+Owner authorization selected Kilo CLI **7.8.18**, source
+[`0bc1c373a9d9c5abd2a1a941f2bcebb321f467f1`](https://github.com/Kilo-Org/kilocode/tree/0bc1c373a9d9c5abd2a1a941f2bcebb321f467f1),
+as a first **non-exclusive offline candidate**, not a permanent harness or runtime dependency.
+The harness-agnostic ports and Codex reference adapter remain unchanged.
+
+`tools/check_kilo52.py` and `tests/fixtures/kilo52/` preserve an early negative against actual pinned
+Kilo Server/Session/Provider/SDK code and a synthetic loopback response source. The latter deliberately
+accepts raw serialized input for observation; it is **not** a Router implementation or acceptance
+oracle. The captured request is separately checked by the actual Router parser at
+`4162f6fa9f774beaf6e92d86b7ebc92f306da4bd`. A valid execution-context round trip and a parser-only
+string-message control distinguish a real multipart refusal from a malformed synthetic binding.
+That control is never forwarded or described as a semantics-preserving prompt translation.
+
+| Observation | Bounded result |
+| --- | --- |
+| Pin, full `execution_requirements`, explicit no-profile nulls, effort and output limit | Retained through the real final serialized main request. SDK configuration uses `reasoningEffort`; the wire field is `reasoning_effort`. This is not a route/admission receipt. |
+| Ordinary one-text user prompt | Kilo appends a separate `<environment_details>` text part; the compatible SDK serializes a content array. Actual Router Chat surface 1 refuses with `unsupported_parameter`, `param=messages`. |
+| Final guard refuses multipart instead of flattening/dropping it | Zero requests reach the fake response source; no synthetic completion is accepted. |
+| Absent/missing plugin, initialization/configuration throw before publication | The isolated explicit provider is absent and the tested main path makes zero fake dispatches. |
+| Plugin bypass through `KILO_PURE` in a fresh process | Zero fake dispatches in the same controlled missing-provider profile. Not proof against arbitrary bypasses. |
+| Guard throws | Zero fake dispatches; no global-fetch fallback observed in this main path. |
+| Deliberately publish an unguarded provider, then throw | A fake dispatch still occurs: upstream hook failure does not roll back configuration. Optional plugin failure itself is not enforcement. |
+| Streaming | One synthetic text SSE completion decoded on the permissive capture control; not Router stream compatibility or cancellation/settlement. |
+| Tool continuation, compaction, title, subagents, review, fallback, other inference paths | **UNPROVED**. Early main-path incompatibility stops the feasibility proof; disabling helpers in this fixture does not prove explicit refusal across their entry points. |
+| Durable Attempt-bound claims, ambiguous execution, no replay, owned-process STOP/settlement/recovery | **UNPROVED**, not implemented by an in-memory test guard. No production adapter is justified. |
+
+The issue-local gate is ordinary prompt compatibility, not missing access or an unavailable producer.
+Kilo's messages-transform hook precedes context injection. The SDK offers a later
+`transformRequestBody` callback, but its existence does not prove an exact semantic mapping of ordered
+text parts and their metadata to one string. No invented joining rule, context suppression, producer
+contract change, proxy, fork or replacement agent loop is introduced here. This negative is not a
+proof that every possible future bounded adaptation is impossible.
+
+Execution uses Bun **1.4.4**, the source's package-manager version, an unchanged complete source
+export and its frozen upstream `bun.lock`, with install scripts disabled. It does not run Kilo's root
+postinstall/prepare hooks. The runner verifies the complete tracked export against the exact public
+Git object, records its archive/lock/runtime/fixture digests, and requires a fresh receipt directory.
+It is an explicit opt-in developer proof, not a normal Python/package dependency or a `make check`
+substitute. With disposable prepared inputs, reproduce using:
+
+```sh
+uv run --locked python tools/check_kilo52.py \
+  --kilo-objects /path/to/public-pinned-git-objects \
+  --kilo-export /path/to/disposable-frozen-source-export \
+  --router-source /path/to/clean-pinned-router-source \
+  --bun /path/to/disposable-bun-1.4.4 \
+  --receipts /path/to/new-synthetic-receipts
+```
+
+The controlled profile is **TRUSTED_DEVELOPMENT**: synthetic HOME/XDG/managed config/auth, a dedicated
+fake endpoint, no ambient credential inheritance, default plugins/telemetry/catalog refresh disabled,
+and test-level refusal of non-loopback global fetch. This is neither an OS/network sandbox nor proof
+against raw sockets, a hostile worker, arbitrary same-principal configuration mutation or an
+untrusted plugin. The real native process-group STOP and descendant boundary are not exercised.
+Receipt payloads contain only synthetic prompts/state; they are not committed private runtime data.
+
+Kilo's applicable MIT notices for adapted test setup are in `NOTICE`; the fixture is Apache-2.0
+except for that attributed adaptation. No Kilo distribution or runtime dependency is adopted.
+Potential later adoption still requires exact source/build/dependency closure, transitive notices
+and distribution rights, supported-profile/maintenance acceptance and the remaining lifecycle proofs.
+Live inference, credentials, paid calls and production operations remain separately unauthorized.
+This #52 gate does not gate unrelated independently eligible Kernel issues.
+
 ## Reuse And Downstream Reception
 
 The ladder yields **retain existing seams and prove bounded adaptation**, not BUILD a replacement
