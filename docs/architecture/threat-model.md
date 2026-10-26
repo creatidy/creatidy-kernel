@@ -1,5 +1,13 @@
 # Initial Threat Model
 
+Current target extension: [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md), pending
+integration. Pull clients do not grant process ownership: revoked/expired work claims fence Kernel
+actions, not native effects in an external Kilo session. Cooperative task-scope quiescence is weaker
+than managed settlement and must not satisfy a stronger profile. Quarantine uncertain conflicting
+resources; never infer termination from a missed heartbeat or kill an unrelated shared server.
+Independent driver bindings do not inherit each other's credentials or mutate as one transaction.
+Optional IDE/plugin presentation is not a mandatory trusted security boundary.
+
 Scope: a trusted owner and control-plane host, potentially malicious workers and workload content.
 A compromised host administrator can read/change the database and credentials; A0 does not promise
 protection from that administrator. K3 synthetic fakes exercise worker and authority behavior but
@@ -35,6 +43,12 @@ Migration/export must protect actual ciphertext and user data, including uncommi
 synthetic fixtures and local/private-by-default evidence are required, not secret inspection.
 
 ## Boundaries
+
+Current evidence correction at `26c7eb15a71affc11aba760387e2dae806053d4b`: #90/PR93 receives
+bounded cancellation settlement/recovery and #54/PR92 durable synthetic-first review/remediation.
+Historical missing-settlement statements are not a description of all current cancellation paths.
+Normal-completion settlement, boot-scoped deadline projection and stronger isolation remain distinct
+gaps; no historical negative, trusted-development limitation or #53 disposition is reversed.
 
 Owner UI/CLI uses an authenticated control channel. The control process, selected policy and trusted
 adapter/broker code form the trusted computing base. Workers have only a narrow result/evidence

@@ -1,5 +1,12 @@
 # Reference Mechanism Catalogue
 
+Current architecture revision: [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md), pending
+integration. Retain existing durable core, source/Workspace/Runtime, Forgejo/AGit, allocation codecs,
+review/STOP and provenance mechanisms; split provider responsibilities rather than adopt another
+scheduler, harness, inventory or gateway. Pull/CLI/MCP/native integrations are capability-scoped
+mechanisms, not new product dependencies. No upstream code or dependency is adopted by this revision.
+Historical references to #53 as a future adapter owner are not current: it is closed/not implemented.
+
 Audit date: 2026-09-21/22. This catalogue records reuse decisions, not product endorsements.
 References describe upstream behavior; they do not establish guarantees in this A0 skeleton.
 A0 copied no upstream product source. K8's bounded transport adaptation is recorded below.

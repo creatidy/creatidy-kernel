@@ -1,5 +1,13 @@
 # Bounded Harness Feasibility
 
+Historical feasibility evidence, retained unchanged below. The revised target in
+[ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md) (pending integration) uses one durable
+core with complementary pull work clients and dedicated managed push adapters. Owned Sessions was
+the first proof choice, not an exclusive product architecture. #53 remains closed/not implemented;
+references below to its future adapter reception are historical, not current dependency authority.
+The #52 multipart/plugin negative remains valid at its exact pins and gates that strict route path,
+not basic Kilo participation in work coordination.
+
 Research result for [Kernel #47](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/47),
 2026-10-05. This receives a **demonstrated gap and bounded adaptation direction**, not a working
 new adapter, selected harness, approved dependency or live integration. Follow-on implementation

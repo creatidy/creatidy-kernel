@@ -1,9 +1,40 @@
 # Current Creatidy Mapping
 
-Current direction: [ADR 0007](../adr/0007-shared-harness-routing-observability.md) and
-[registered coverage](successor.md). The dated second-pass mappings below are history, not current
+Current revision: [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md), pending integration,
+and [registered coverage/publication plan](backlog-alignment.md). The dated second-pass mappings below are history, not current
 rollout instructions or authorization to move code. No private source,
 secrets, operational payloads or customer data are incorporated in this public foundation.
+
+## Unified Core Migration
+
+This is a full-product transition, not a new PoC or automatic data upgrade. The implementation
+sequence lives in [successor](successor.md#full-product-delivery-sequence); no code changes occur in
+the architecture mandate.
+
+| Current mechanism | Disposition | Replacement or extension and acceptance |
+| --- | --- | --- |
+| Program/WorkUnit/Attempt, policies and satisfaction applicability | Retain | One shared decision path for both modes; ordinary planner/dispatcher consumes approved intake, not frozen TaskSpec registry |
+| SQLite owner, command dedupe, outbox/delivery claims and artifacts | Retain and extend | Add work-claim/resource generation and expiry semantics separately from delivery leases; preserve thread/process ownership and atomic intent |
+| Numeric `IssueSubject`, Forgejo refs/binding and `IntakeForge` | Legacy-readable; extend for new intake | Provider-qualified opaque tracker identities and independent SCM/CI/context bindings with explicit new encoding; never reinterpret existing digests or numeric IDs |
+| Monolithic `Forge` | Versioned compatibility facade | Split Work Management, SCM and CI responsibilities using existing read/effect seams; keep Forgejo conformance and AGit-specific receipts, no required write transport for reads |
+| Codex five-method Runtime, Workspace and reference paths | Retain bounded adapter | Add evidenced ownership/settlement and generic new Program composition; pull enters application directly, not fake managed Runtime. No takeover of Kilo or generic sandbox claim |
+| Product review/remediation #54 and STOP #90 | Retain delivered code | Reuse in ordinary engine; extend normal-completion witness and original boot-scoped deadlines under #59/#56. Do not reopen completed bounded deliveries |
+| Router recommendation and allocation codecs 1/2/3 | Retain exact historical bytes | Separate optional executable-route contract receipt, never relabel recommendation as enforced inference or synthesize missing identity |
+| Existing harness configuration | Supported target input for basic cooperative work | Record unavailable model-level admission/usage honestly. Strict route/pin/no-hidden-call tasks require #52 capability or refuse; no gateway interception required just to manage work |
+| MI utilized reference #101 | Retain immutable provenance/local-only | Optional content/harness evidence #55 remains separately scoped; no new catalogue, ranking or knowledge authority |
+| Offline status/export and directory-based CLI | Retain recovery/compatibility use | Shared owner-served #57 view and commands for active operation; #58 complete private outcomes. No second SQLite reader |
+| Platform/profile/source safety and #102 fixtures | Retain | Per-combination version matrix and interrupted/non-destructive migration/refusal under #62, with real-host claims only after actual receipts |
+| Push-only/default-gateway interpretation | Superseded target assumption | One core, pull and push with different proven capability profiles; strict Router integration remains required in its own supported profile |
+| #53 / PR85 experiment | Closed/not implemented; evidence only | No automatic code reuse, reopening, strict syscall-expiry or isolation claim. A new delivery must satisfy the revised accepted profile |
+
+Compatibility manifests bind producer/contract, driver/harness/build/profile/platform and evidence
+revisions, not merely a package version. Unsupported/future major versions and unavailable required
+capabilities refuse before effects. Preserve original handles/deadlines/unknowns across backup/reopen;
+never select a new route or recreate a lost effect during migration. New encoding requires installed
+old/new/unsupported/interrupted fixtures, recoverable backups and explicit safe downgrade policy.
+Do not rewrite real profiles, rotate keys, delete user work or widen platform/trust support through a
+schema migration. Destructive operations, release activation and real user-data transitions remain
+separate owner decisions. Linux/local-storage limitations remain until an actual received alternative.
 
 ## Current Public Transition
 

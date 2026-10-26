@@ -2,6 +2,10 @@
 
 Status: accepted, 2026-09-21; target fixed before the Creatidy implementation audit.
 
+Revision cross-reference: [ADR 0012](0012-unified-work-coordination-and-drivers.md), pending integration,
+extends Runtime participation with cooperative pull and splits Work Management/SCM/CI/context bindings.
+It supersedes a mandatory managed/gateway interpretation, not these durable port/authority invariants.
+
 Historical decision retained. [ADR 0007](0007-shared-harness-routing-observability.md) makes existing
 harness control and Router-backed inference the agreed target, without discarding the delivered
 FixedAllocator/recommendation proof. Dynamic executable selection/admission/pin, distinct identity

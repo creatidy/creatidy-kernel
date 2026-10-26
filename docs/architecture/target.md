@@ -1,86 +1,136 @@
-# Greenfield Target
+# Unified Work Coordination Target
 
-The original target below predates the implementation audit. The current ownership direction is
-[ADR 0007](../adr/0007-shared-harness-routing-observability.md); the
-[coverage roadmap](successor.md) records revision-verified subsets and registered missing work.
-Historical A0 exclusions are not descriptions of the entire current checkout. Nothing here claims
-a complete operational Program engine or live shared integration.
+The owner-authorized revision is recorded in [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md).
+While its PR is unmerged, this is the proposed recording of that direction, not integrated product
+authority or an implemented capability. After integration it is the single current target; older
+push/gateway-only diagrams are historical, not alternate architectures. See the
+[publication plan and current evidence](backlog-alignment.md) and [roadmap](successor.md).
 
-## Shared System Target
+## One Core, Two Modes
 
-**Agreed:** Kernel owns approved task intent/requirements/scope/authority, WorkUnit/Attempt inputs,
-workspace/context, harness lifecycle, durable state, candidate verification/review/remediation,
-external-effect reconciliation and outcome evidence. Existing harnesses own model-tool-result loops.
-Router owns execution sources/accounts/pools, private telemetry, channel compatibility, cost and
-selection/admission policy, gateway and provider execution. MI owns external evidence and versioned
-knowledge publication; Console owns views and command forwarding, not scheduling/ranking/permissions
-or direct producer-database access. See ADR 0007 for the source/status vocabulary and decision history.
+Kernel owns engineering work identity, approved intent, dependencies, selection, admission, claims,
+work-level capacity/budgets, review/acceptance, effect recovery and owner decisions. It reuses existing
+harnesses and external work resources. It is not a tracker, coding agent, CI platform, model catalogue,
+quota collector or gateway. Kilo remains a user's primary agent interface; Codex remains the bounded
+managed reference, not the required product runtime.
 
 ```mermaid
 flowchart LR
-    Owner[Owner / CLI] --> Kernel[Kernel work controller]
-    Kernel --> Adapter[Version-evidenced harness adapter]
-    Adapter --> Harness[Existing harness]
-    Harness --> Workspace[Task workspace]
-    Harness --> Gateway[Scarcity Router gateway]
-    Gateway --> Source[Permitted execution source]
-    MI[Model Intelligence] --> Router[Router admitted knowledge]
-    Router --> Gateway
-    Kernel --> View[Owner-served state / events]
-    Gateway --> View
-    MI --> View
-    View --> Console[Console / CLI clients]
+    User[Owner CLI or TUI] --> API[One Kernel application command and state boundary]
+    Pull[Existing work client e.g. Kilo] --> API
+    API --> Core[Program WorkUnit Attempt decisions]
+    Core <--> Store[(Single-writer history operations evidence)]
+    Core --> Push[Managed Runtime adapter]
+    Push --> Harness[Dedicated existing harness session]
+    Core --> Drivers[Independent resource bindings]
+    Drivers --> Work[Work Management e.g. Jira]
+    Drivers --> SCM[SCM and Review e.g. GitHub]
+    Drivers --> CI[CI e.g. Jenkins]
+    Drivers --> Knowledge[Context e.g. Confluence or repository docs]
+    Drivers --> Capacity[Work capacity and optional Router allocation]
+    API --> Views[Console and optional IDE UI]
 ```
 
-This is a target responsibility diagram, not implemented API/dataflow or a service deployment. No
-private onprem runtime is required; public modules may be dependencies when useful. The design does
-not mandate four processes, a common package/ontology/database, broker or Kubernetes.
+This describes responsibility, not network endpoints or a required deployment. CLI, MCP, SDK/API and
+ACP can adapt supported boundaries. None supplies lifecycle, sandbox or authorization guarantees
+merely by its protocol name. No mandatory server fleet, private repository, cloud account or telemetry.
 
-**Verified at Kernel `eb4f4a2956712bfaf39a3271e1523e7f77a91e26`:** immutable domain, dedicated-writer
-SQLite, effects/artifacts, exact-subject verification, native Codex and Forgejo adapters, offline
-reference and two frozen TaskSpecs/public operator exist. Router use is recommendation-only followed
-by native Codex with one configured binding. General intake, gateway, product reviewer/remediation,
-full-cost collection, owner-served events and hostile-code isolation are not delivered by those seams.
+Pull clients request work through the same decision path that push initiation uses. Only the latter
+may own a dedicated native process. Both carry the same approved spec, Attempt, generation, authority,
+deadline, resource reservation, operation identities and candidate/evidence subjects. The selected
+profile states whether task-scope settlement is cooperative or managed; no implied session takeover.
 
-**To prove:** meaningful approved requirements precede admission, with fresh issue/source/PR/baseline
-evidence. Issue/AGENTS/model prose cannot approve or widen a spec. Kernel controls an explicitly owned
-harness session; real progress/permissions/cancel/resume/recovery/IDE attachment capabilities are
-version-specific. ACP is a candidate, and its file/terminal executor must be identified. Opening a
-workspace in an editor shows that workspace, not automatically the original checkout; neither UI
-closure nor a native interrupt proves process or descendant lifetime.
+## Lifecycle And Failure Boundaries
 
-**Agreed route semantics:** Router's dynamic executable decision is persisted before main dispatch
-and bound to Attempt; explicit owner pin is an exception. Main calls do not silently reroute. Review
-or helper roles can have separately authorized routes. Harness control and model-backend API
-compatibility are different proofs. Provider/model/resource/access mode/explicit effort/opaque variant/
-harness and versions remain separate with requested/resolved/observed/unknown evidence. Plan-managed
-identity is weaker, not a physical-model inference. No pin is permission, reservation or response replay.
+The semantic sequence is refresh -> validate explicit dependencies -> approve/amend -> claim/reserve
+-> handoff -> progress -> submit -> verify/review/remediate -> accept -> external synchronization.
+These are conceptual stages, not extra enums or an executable DSL. Exact contracts and refusal cases
+are defined in ADR 0012; existing implemented values below remain distinct.
 
-**Agreed acceptance/effect semantics:** every changed candidate gets fresh exact-SHA checks and
-independent review; platform review and substantive verdict differ. Product review/remediation is
-durable and budgeted, not repository `/finish-pr` or `/loop`. Intent/claim/dispatch/receipt/reconciliation
-remain distinct; incomplete not-found or unknown outcome cannot justify retry or route change. SDK,
-harness and gateway retries/auxiliary calls need correlation, accounting and uncertainty evidence.
+One single-writer command atomically checks current revision/authority, DAG eligibility, work/resource
+conflicts and capacity before reserving a claim generation. The work claim is distinct from an outbox
+delivery claim. Late/stale generations cannot publish or invoke Kernel effects. Lease expiry prevents
+new authority but does not terminate an agent or justify a conflicting successor. Uncertain resources
+remain retained/quarantined while unrelated work can proceed. No distributed consensus or exactly-once
+external effects is asserted.
 
-**Agreed state/knowledge/cost semantics:** Kernel retains necessary durable facts; progress and
-telemetry can be lossy without losing authority. CLI/Console get owner-served snapshots and bounded
-reconnectable events, with cursor/dedup/gap/resync and task/Attempt/session/route/call/candidate
-correlation. UI commands recheck current revision/grant in Kernel. Useful notifications concern real
-states/decisions, not mandatory dashboard vigilance. MI normally feeds Router; utilized publication
-references are retained, while direct harness evidence creates no ranking. Costs include all Attempts,
-review/fixes/tests/tools/retries/helpers and distinguish money/quota/tokens/time/attention, estimates,
-reports, measurements and unknowns. Local/private export is the default; PASS/APPROVE is conditional
-evidence, not causal model quality.
+Intent, delivery attempt, native receipt, runtime terminality, task-scope settlement and acceptance are
+different facts. In pull, revocation withdraws Kernel authority and requests cooperative stop; Kernel
+cannot kill the owner's external session. In push, cancel/termination targets only the exact owned
+supported worker, and success needs its profile's witness. Missing heartbeat, UI close or an interrupt
+receipt never proves descendants stopped. Unknown mutation/settlement blocks acceptance/publication
+and conflicting reuse. A pure immutable candidate snapshot does not settle the producer's effects.
 
-**Proposed clarification:** a minimal owner-served view or controlled projection can preserve current
-SQLite exclusivity without a new platform. Exact transport/auth/retention semantics and process handoff
-require their owning issue and any necessary ADR/owner approval, not specification by diagram.
+Trusted verification precedes candidate-controlled tooling; independent product review is a fresh
+conversation on exact candidate/base/spec/policy. A new candidate needs fresh applicable evidence.
+Acceptance enables successors atomically, but tracker updates, PR effects and merge remain separate
+authorized operations with native preconditions and durable receipts. No transport, frontend or agent
+sets state directly. #60 acceptance does not substitute for the component implementations.
 
-**To prove:** use maintained sandbox mechanisms for untrusted workers/tests/review, one mutating
-controller per Attempt, manual-edit detection/journaling, host-qualified source ownership/locking and
-safe cleanup. Migrations preserve actual ciphertext/state and immutable identities. Platform and
-installed acceptance are evidence work, not XDG-default or package-build assumptions. All these known
-requirements are registered in the roadmap; a vertical example does not replace them.
+## Drivers And Identity
+
+Use separately bound Work Management, SCM/Code Review, CI/Verification, Knowledge/Context,
+Harness/Execution and Resource/Capacity responsibilities. A provider can implement several families;
+a task need not use the same provider or credentials for them. The concrete port split and Forgejo
+facade migration are specified in ADR 0012, not a parallel generic integration framework.
+
+Every source identity carries instance/host/port, project/namespace, opaque native key, resource kind,
+driver/contract version, exact revision or explicit unavailability and provenance. Internal work IDs
+are not remote issue numbers. Preserve native dependency/update/check semantics alongside validated
+common fields. Incomplete/moving/permission-limited reads remain unknown. Required unsupported
+operations, compatibility or mutation preconditions refuse rather than silently weakening policy.
+
+All drivers share existing journal/effect principles: bind exact operation/authority before send,
+persist receipts and observed outcomes, reconcile ambiguity and never blindly retry unknown effects.
+There is no cross-provider transaction or promise that another provider implements Forgejo AGit.
+Existing Workspace, artifact storage and authority ports are retained; no speculative IAM, artifact
+service or notification framework is added.
+
+## Resources, Clients And Trust
+
+Kernel work policy governs project/task concurrency, workspaces, attempts, review/remediation,
+time and owner-approved economic envelopes. Router governs model execution sources, subscriptions,
+compatibility, ranking/admission and gateway evidence. Preserve sourced unitful money/quota/tokens/
+time/attention and unknowns; no invented budgets, billing accuracy or quota-token conversion.
+
+Basic work coordination uses an explicitly acknowledged existing harness configuration without
+requiring Router gateway compatibility or intercepting every model HTTP call. That path reports model
+resource control/consumption as unavailable where not observed. Strict routing, exact pins, inference
+admission, hard quota or no-hidden-call profiles still require proven Router/harness capabilities and
+refuse otherwise. #52 remains a real full executable-integration obligation; its Kilo multipart and
+fail-open-plugin negative evidence is preserved, not flattened away or made a global work gate.
+
+Console, CLI/TUI and optional IDE/Kilo UI consume the same owner-served snapshot/events/command
+authority. An agent work integration and a UI extension are distinct clients. Authentication and
+owner/worker/observer scopes are enforced by Kernel, not a plugin-supplied principal. Durable facts
+are distinct from lossy progress; producer-scoped cursors, gap/resync, dedupe and current-revision
+commands are required. No client opens active exclusive SQLite or implements a second scheduler.
+
+ADR 0011's original deadline, clock/recovery requirements, same-principal trusted-development
+limitations and no strict syscall-expiry guarantee remain. ADR 0008 is verification-only. Pull is
+weaker cooperative task control, not managed process enforcement. A sensitive task requiring an
+unproved capability refuses that profile without prohibiting ordinary explicitly trusted work.
+
+## Current Implementation Cut
+
+Inspected `develop` `26c7eb15a71affc11aba760387e2dae806053d4b`, 2026-10-26:
+
+| Evidence | Actual status | Still missing |
+| --- | --- | --- |
+| Domain, SQLite, outbox/artifacts, source ownership | Integrated bounded foundations | Ordinary work claims/planning/selection and shared multi-resource control |
+| #49/#51 ordinary intake | Inert approved DRAFT and strict recommendation handoff/recovery | Ordinary Program activation/dispatch and rich semantic relevance; no prose authority |
+| #54 / PR #92 | Durable synthetic-first product review/remediation implementation | Installed ordinary/native composition and profile-specific acceptance, not another review engine |
+| #90 / PR #93 | Bounded cancellation identity/owned-group settlement recovery | Normal-completion settlement, escaped descendants and missing cold witness; ADR 0011 boot-clock projection is still unimplemented |
+| #100 | Executable pinned offline Kilo/Router incompatibility and plugin negatives | Production Kilo adapter, Router main/tool/helper/lifecycle conformance |
+| #101 | Codec-v3 immutable utilized-MI reference, local/provenance-only | Direct content retrieval/freshness and live reception; no knowledge authority upgrade |
+| #102 | Synthetic WSL-storage, future-schema and ciphertext byte/mtime safety | Real platform/installed migration journeys and key/profile/release decisions |
+| Codex Runtime / Forgejo / status/export | Bounded dedicated runtime and exact-SHA AGit; offline directory views | Driver split/heterogeneous adapters and served shared commands/events, full outcomes |
+
+No whole-product completeness, live inference, production operation or installation support beyond
+named evidence is claimed. The historical v1.0 shared source file was unavailable in accessible public
+sources; use only recorded decisions, not invented unseen contents.
+
+## Retained Foundations
 
 ## Smallest Kernel
 
@@ -101,7 +151,7 @@ flowchart TD
     R --> RA[Fixed / Scarcity Router adapter]
     W --> WA[Git / existing sandbox adapter]
     X --> XA[Existing coding harness]
-    F --> FA[Forgejo first / other forge adapters]
+    F --> FA[Forgejo compatibility facade / split drivers]
     XA --> CR[CandidateResult and artifacts]
     CR --> V[Deterministic and independent verification]
     V --> E[Evidence and decision]
@@ -121,7 +171,7 @@ inside this package, not four new products.
 | --- | --- | --- |
 | Intent, Program graph, acceptance criteria, limits | Owner-approved versioned ProgramSpec | Durable snapshot and decision history |
 | Legal actions, WorkUnit readiness, accepted outcomes, grants | Kernel application/domain layer | Atomic journal plus current projections |
-| Commits, branches, issues, PRs, reviews, CI, merge | Selected forge/Git | Referenced external identities and timestamped observations, never fictitious authoritative copies |
+| Work records / code / checks / context | Independently selected tracker / SCM / CI / knowledge provider | Qualified native records and observations; no monolithic forge or fictitious authoritative copy |
 | Runtime liveness, session identity, raw usage | Runtime / authenticated adapter observations | Receipts, freshness and uncertainty; completion does not imply acceptance |
 | Quota and reservation reality | Allocator/provider | Versioned observation/receipt, not an invented global quota balance |
 | Artifact contents | Content-addressed user storage / Git objects | Validated digests and manifests, not model prose |
@@ -132,7 +182,7 @@ An issue can represent a requirement or WorkUnit but is not the Program itself. 
 do not directly set Kernel status. Authenticated domain commands validate and record their meaning.
 Forge edits to requirements require a ProgramSpec amendment, not silent adoption by a worker.
 
-## Vocabulary
+## Retained Vocabulary
 
 Durable means represented in local history/storage, not necessarily its own table or class. IDs are
 opaque within an installation; external identities are qualified by adapter/endpoint/repository.
@@ -141,8 +191,8 @@ opaque within an installation; external identities are qualified by adapter/endp
 | --- | --- | --- | --- |
 | Objective | Owner's intended outcome within ProgramSpec | Versioned value, no independent lifecycle initially | An extra orchestration service |
 | Program / ProgramSpec | Kernel's bounded graph and owner's immutable intent, criteria, resource/authority envelope | Program ID; spec revision+digest; draft, active, paused, completed or cancelled | A chat, ticket queue, generic workflow language, or harness session |
-| WorkUnit | Kernel-owned bounded obligation and graph node, dependencies, required inputs/outputs and acceptance policy | ID scoped to Program; immutable spec revisions; pending, ready, active, accepted or cancelled | An Attempt or necessarily an issue |
-| Attempt / AttemptSpec | One execution try with pinned inputs, allocation, agent definition, policy, workspace and context | New ID each try; immutable effective spec digest; prepared, executing, candidate, then accepted/rejected/failed/cancelled | A mutable session reused to erase failures; `Run` is only an upstream synonym |
+| WorkUnit | Kernel-owned bounded obligation and graph node, dependencies, required inputs/outputs and acceptance policy | ID scoped to Program; immutable spec revisions; implemented states pending, ready, active, satisfied or cancelled | An Attempt or necessarily an issue |
+| Attempt / AttemptSpec | One execution try with pinned inputs, allocation, agent definition, policy, workspace and context | New ID each try; immutable effective spec digest; implemented states prepared, executing, finished, failed or cancelled; candidate/verification/acceptance are separate records | A mutable session reused to erase failures; `Run` is only an upstream synonym |
 | Operation | Kernel's record of one intended external effect and its delivery/observations | Stable ID, input digest and dedupe key; intent through receipt/observation to resolved disposition or uncertainty | Proof of effect merely because intent exists |
 | Artifact | Produced or consumed bytes/Git object owned by the user | Digest plus locator, size/type; staged then durable, retained or explicitly collected | Evidence of correctness by existence alone |
 | CandidateResult | Untrusted proposed output from an Attempt | Immutable candidate ID, spec and artifact subjects; pending verification, rejected or accepted by a separate decision | A trusted verdict |
@@ -159,8 +209,10 @@ opaque within an installation; external identities are qualified by adapter/endp
 | ContextPackage | Bounded, source-pinned compiled input | Manifest digest and compiler/policy version; generated then retained or reproducible | Conversation history as project memory |
 | Event / Decision | Durable fact / legal choice with reason | Journal ID, aggregate sequence, schema, actor, correlation and causation | Arbitrary row mutation or log parsing |
 
-`Node` is not a second entity: the WorkUnit is the graph node. The public bounded `TaskSpec` is an
-input contract, not a competing core WorkUnit/Attempt lifecycle. Do not add `job`, `child` or `run`
+Task identity associates approved engineering meaning and external subjects with a Program; it is not
+a second lifecycle or a numeric tracker key. `Node` is not a second entity: the WorkUnit is the graph
+node. The public bounded `TaskSpec` is an input contract, not a competing core WorkUnit/Attempt lifecycle.
+Do not add `job`, `child` or `run`
 as competing core synonyms. Runtime vocabulary stays in adapters. The labels above are historical
 target vocabulary; actual implemented enums/codecs determine serialized state, not this table.
 
@@ -177,7 +229,7 @@ target vocabulary; actual implemented enums/codecs determine serialized state, n
 9. Providers, runtimes, forges and allocators are replaceable. No private dependency or mandatory cloud.
 10. Context and outcome history are user-owned; derived indexes and telemetry are not authoritative state.
 
-## Legal Actions And Recovery
+## Retained Legal Actions And Recovery
 
 The first Program graph is a validated finite DAG, not arbitrary workflow code. Readiness requires
 accepted predecessor outputs still applicable to the pinned spec. Planning can be assisted by an LLM,

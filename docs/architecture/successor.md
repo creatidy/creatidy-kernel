@@ -1,11 +1,60 @@
 # Coverage And Delivery Roadmap
 
-Current alignment: [Kernel #46](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/46),
-[ADR 0007](../adr/0007-shared-harness-routing-observability.md). This is a requirement/evidence/issue
-map, **not an execution queue or Program authorization**. Functional work is selected one issue at
-a time, explicitly by the owner or under an explicit owner-invoked repository `/loop`. This map is
-not invocation authority. The known full product scope is retained; a vertical proof or documentation
-approval does not close missing requirements, authorize inference or mean `READY_FOR_LIVE_TASK`.
+Current revision: [Kernel #103](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/103),
+[ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md) and the
+[single target](target.md). This recording and its issue changes remain proposed until integration
+and canonical publication. It does not select functional work or authorize `/loop`, inference,
+production effects or a feature implementation. Ordinary development is paused by the architecture
+mandate until architecture/backlog alignment is accepted. The older G01-G13 corpus below is retained
+with its dated evidence, not a competing push-only plan or a current eligibility observation.
+
+## Full-Product Delivery Sequence
+
+The [complete backlog publication plan](backlog-alignment.md) gives every open issue's disposition,
+exact amendment payload, priority rationale and native-edge changes. It distinguishes proposed work
+aliases from registered IDs and preserves historical closed/wontfix dispositions. Do not select from
+this table or infer eligibility from a closed prerequisite alone; refresh actual canonical evidence.
+
+| Workstream | Complete receivable outcome | Ordering and non-gates |
+| --- | --- | --- |
+| Driver delivery (proposed new functional issue A) | Split tracker/SCM/CI/context bindings, Forgejo compatibility and executable heterogeneous provider adapters with native semantics and failure recovery | Architecture integration first; no Router gateway, MI direct-read or Console prerequisite |
+| Claims and ownership #59 | Atomic work claims/reservations/fencing, conflicting-workspace/session/manual-edit reconciliation and safe cleanup across pull/push | Reuse accepted #48/#50/#61/#90; no dependency on #57 or the new dispatcher |
+| Whole-work policy #56 | Configurable project/work limits, original boot-scoped time envelope, unitful attributable consumption/unknowns, review/retry/output bounds | Existing #54 review reused; no real numerical owner budget needed to implement validation with synthetic fixtures; strict Router facts lane-local |
+| Ordinary work engine (proposed new functional issue B) | Discover/plan/validate approved ordinary Programs, select/claim/reserve, pull handoff and managed push, submit/review/remediate/accept/synchronize through one application path | A + #59 + #56; existing #49/#51/#54 are retained foundations, not missing preparation series. Local CLI works without waiting for optional UI/server deployment |
+| Shared command/state #57 | Authenticated owner/worker/observer boundary and useful installed CLI/MCP/API surfaces, snapshots/events/gaps/STOP, optional UI consumers | #59 for claim semantics; consumes B's ordinary execution for full end-to-end commands. Does not make B's local core depend on #57 transport |
+| Strict executable Router profile #52 | Actual Attempt-bound route/pin/identity/admission and supported harness/tool/helper/recovery receipt | Genuine separate obligation. Existing Kilo multipart incompatibility affects this exact combination, not ordinary coordination |
+| Complete local outcomes #58 | Private versioned full-result lineage and corrected known/unknown unitful costs across drivers/modes | #56 and actual execution facts; absent strict-route facts stay unknown for basic profile; Router #177/MI sharing are not gates |
+| Compatibility #62 | Installed driver/harness/profile/state compatibility, supported-platform evidence and non-destructive upgrades/refusals | Accompanies each delivery; never waits for every adapter or release. Existing #102 synthetic evidence retained |
+| Optional MI expansion #55 | Direct source/harness evidence only when requested, with immutable provenance and unsupported policy refusal | #101 retention already integrated; direct MI knowledge is not a core/gateway prerequisite |
+| Full acceptance #60 | Installed same-core pull/push plus heterogeneous stack, strict-profile receipt, authorization/STOP/recovery, negative cases and migrations | Downstream of implemented components and declared profile support; never a prerequisite for them, and no every-future-harness promise |
+
+Architecture enables useful ordinary work without weakening the strict Router obligation. Each
+functional issue delivers working behavior, not merely another specification, research or synthetic
+demo. Deterministic tests use synthetic external systems; executable provider adapters and installed
+composition must actually ship before a capability is called implemented. Live acceptance remains
+separately authorized and cannot be manufactured by documentation or fixture success.
+
+## Current Evidence Corrections
+
+At `26c7eb15a71affc11aba760387e2dae806053d4b` (2026-10-26), #54/PR #92 supplies durable
+synthetic-first product review/remediation; #90/PR #93 supplies bounded cancellation settlement and
+recovery. They are not still absent. Neither supplies a general ordinary dispatcher, all native
+reviewer profiles, normal-completion settlement or ADR 0011's missing boot-clock implementation.
+PR #100 preserves a negative Kilo/Router result, #101 retains utilized MI provenance using codec v3,
+and #102 exercises synthetic platform/ciphertext safety; none completes its parent issue.
+
+Router #174/#179/#180/#181/#184/#185 and MI #13/#16/#18/#19 have accepted bounded producer work
+as recorded in the current [pinned cross-project matrix](backlog-alignment.md#cross-project-impact).
+Old statements below that these are open are historical observation cuts. In particular, Router #183
+is not required to implement Kernel's owner-served API, MI #17 is a rejected sharing path rather than
+a local-export prerequisite, and #53 is closed/not implemented, never a successor adapter dependency.
+
+## Historical G01-G13 Alignment
+
+Original alignment: [Kernel #46](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/46),
+[ADR 0007](../adr/0007-shared-harness-routing-observability.md). The following retains its original
+source/evidence mapping and historical delivery slices. Where it conflicts with current target or
+ordering, ADR 0012 and the preceding current sequence supersede it; no historical proof is upgraded.
 
 ## Accepted AC4 Baseline And Status (2026-10-18)
 

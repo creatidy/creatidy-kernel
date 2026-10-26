@@ -2,6 +2,10 @@
 
 Status: accepted from the A0 owner constraints, 2026-09-21.
 
+Revision cross-reference: [ADR 0012](0012-unified-work-coordination-and-drivers.md) records the
+2026-10-26 owner direction for unified pull/push and independently bound external drivers, pending
+integration. It extends product-neutral ownership; this historical decision is preserved.
+
 Historical decision retained. [ADR 0007](0007-shared-harness-routing-observability.md) extends the
 public ownership map with MI/Console and supersedes interpreting optional recommendation-only
 allocation or private composition as the complete shared product architecture. No namespace changes.

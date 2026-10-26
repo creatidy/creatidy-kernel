@@ -1,5 +1,12 @@
 # Port And Recovery Contracts
 
+Current target and planned port split: [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md)
+and [unified work architecture](target.md), pending their PR integration. Their unified pull/push
+semantics and six independently bound driver families replace a universal managed/gateway-only
+interpretation, not the existing wire contracts below. New work claims are distinct from outbox
+delivery claims. Legacy numeric intake, `Forge` facade, Codex, allocation bytes and AGit recovery stay
+readable and keep their original guarantees. See [current migration](migration.md#unified-core-migration).
+
 The table records post-A0 requirements, not a claim that every adapter passes every case. A0 coded
 only the narrower ResourceAllocator; subsequent bounded ports/adapters exist. Current verification
 and missing receipts are in the [coverage roadmap](successor.md), governed by
@@ -7,6 +14,11 @@ and missing receipts are in the [coverage roadmap](successor.md), governed by
 unsupported requirements must fail closed, not through weaker fallbacks.
 
 ## Current Boundary Evidence
+
+This section's original cut is historical; #54/PR92 and #90/PR93 now provide bounded durable product
+review and cancellation-settlement machinery, #101 utilized-reference retention and #102 synthetic
+platform/profile safety. The [current evidence table](target.md#current-implementation-cut) names
+what remains missing. Normal completion and external pull quiescence still require their own evidence.
 
 Inspected Kernel revision: `eb4f4a2956712bfaf39a3271e1523e7f77a91e26`. Source/test definitions prove
 bounded mechanisms, not deployment or live reception.
