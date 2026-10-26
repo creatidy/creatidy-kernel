@@ -165,7 +165,7 @@ def test_intake_http_original_subject_and_durable_unknown_recovery(
             },
         )
         original_operation = store.operation(operation)
-        assert decode_allocation(data) == allocation and json.loads(data)["version"] == 2
+        assert decode_allocation(data) == allocation and json.loads(data)["version"] == 3
 
     class UnknownRuntime(RecordingRuntime):
         def reconcile(self, operation: OperationKey, handle: str | None = None) -> Lookup:
@@ -645,6 +645,7 @@ def test_profile_quality_cannot_omit_structural_floor_or_version_before_transpor
 def test_original_v1_allocation_encoding_and_invalid_v2_evidence() -> None:
     original: dict[str, object] = asdict(BINDING)
     original.pop("requirements_provenance")
+    original.pop("knowledge_utilization")
     original["capabilities"] = sorted(BINDING.capabilities)
     assert encode_allocation(BINDING) == encode({"version": 1, "allocation": original})
     invalid: tuple[object, ...] = (None, "", 1, {})

@@ -40,6 +40,7 @@ from creatidy_kernel.core.execution import (
     WorkspaceHandle,
     WorkspaceSpec,
 )
+from creatidy_kernel.core.knowledge import export_document
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
 from creatidy_kernel.ports.allocation import decode_identity, identity_matches, is_legacy_allocation, load_allocation
@@ -347,6 +348,7 @@ def reference_export(store: SQLiteProgramStore) -> dict[str, object]:
         allocation = load_allocation(store, attempt.spec)
         allocation_data = asdict(allocation)
         allocation_data["capabilities"] = sorted(allocation.capabilities)
+        allocation_data["knowledge_utilization"] = export_document(allocation.knowledge_utilization)
         entry["allocation"] = allocation_data
         try:
             entry["identity"] = json.loads(store.artifact(operation.operation_id, "identity"))

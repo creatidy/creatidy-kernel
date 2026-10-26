@@ -1,5 +1,10 @@
 {
   "schema_version": 1,
+  "mi_utilization": {
+    "source": "model_intelligence",
+    "identifier": "urn:mi:utilization:sha256:a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+    "version": "mi.utilization-working/1"
+  },
   "decision": {
     "evaluated_at": "2026-09-28T08:00:00Z",
     "requirement": {

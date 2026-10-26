@@ -8,6 +8,7 @@ from typing import cast
 
 from creatidy_kernel.core.domain import AttemptSpec
 from creatidy_kernel.core.execution import RuntimeIdentity
+from creatidy_kernel.core.knowledge import UtilizedKnowledge
 from creatidy_kernel.core.resources import Allocation
 from creatidy_kernel.ports.program_store import ApplicationStore
 
@@ -41,27 +42,42 @@ def _object(data: bytes) -> dict[str, object]:
 def encode_allocation(allocation: Allocation) -> bytes:
     value = asdict(allocation)
     value["capabilities"] = sorted(allocation.capabilities)
-    version = 2 if allocation.requirements_provenance is not None else 1
+    knowledge = allocation.knowledge_utilization
+    version = 3 if knowledge is not None else 2 if allocation.requirements_provenance is not None else 1
     if version == 1:
         del value["requirements_provenance"]
+    if knowledge is None:
+        del value["knowledge_utilization"]
+    else:
+        value["knowledge_utilization"] = knowledge.to_document()
     return json.dumps({"version": version, "allocation": value}, sort_keys=True, separators=(",", ":")).encode()
 
 
 def decode_allocation(data: bytes) -> Allocation:
     value = _object(data)
+    knowledge: UtilizedKnowledge | None = None
     if "version" in value:
         version = value["version"]
-        if set(value) != {"version", "allocation"} or type(version) is not int or version not in (1, 2):
+        if set(value) != {"version", "allocation"} or type(version) is not int or version not in (1, 2, 3):
             raise ValueError("unsupported allocation document version")
         raw = value["allocation"]
         if not isinstance(raw, dict):
             raise ValueError("invalid allocation document")
         value = cast(dict[str, object], raw)
         expected = _LEGACY_ALLOCATION | {"variant", "decision_provenance"}
-        if version == 2:
+        if version >= 2:
             expected |= {"requirements_provenance"}
-            if type(value.get("requirements_provenance")) is not str or not value["requirements_provenance"]:
+            requirements = value.get("requirements_provenance")
+            if version == 2 and (type(requirements) is not str or not requirements):
                 raise ValueError("ordinary allocation requires original requirements evidence")
+            if requirements is not None and (type(requirements) is not str or not requirements):
+                raise ValueError("invalid allocation requirements evidence")
+        if version == 3:
+            expected |= {"knowledge_utilization"}
+            retained = value.get("knowledge_utilization")
+            if not isinstance(retained, dict):
+                raise ValueError("retained knowledge utilization evidence required")
+            knowledge = UtilizedKnowledge.from_document(cast(dict[str, object], retained))
     else:
         expected = _LEGACY_ALLOCATION
     if set(value) != expected:
@@ -85,6 +101,7 @@ def decode_allocation(data: bytes) -> Allocation:
         cast(str | None, value.get("variant")),
         cast(str | None, value.get("decision_provenance")),
         cast(str | None, value.get("requirements_provenance")),
+        knowledge,
     )
 
 

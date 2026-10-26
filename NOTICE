@@ -30,6 +30,23 @@ profile expansion, catalogues, ranking and admission are not incorporated.
 The exact public source has no separate NOTICE file; LICENSE distributes
 the complete Apache-2.0 license. No runtime dependency or endorsement implied.
 
+The retained MI knowledge-utilization reference consumer in
+src/creatidy_kernel/core/knowledge.py, the mi_utilization extraction in
+src/creatidy_kernel/adapters/scarcity_router.py, allocation codec version 3
+in src/creatidy_kernel/ports/allocation.py and tests/test_knowledge_utilization.py
+adapt the public producer contract of Scarcity Router's accepted #176 consumer
+at revision 4162f6fa9f774beaf6e92d86b7ebc92f306da4bd (scarcity_router/mi_consumer.py,
+machine_api.py) consuming the Model Intelligence publication at
+d65891668b7e79f7b666c021f02a1b4bf8c4ca9c (model_intelligence/utilization.py),
+both Apache-2.0. Modified for Kernel's provenance-only retention: bounded
+reference-grammar validation with an explicit unsupported/corrupt distinction,
+no sidecar decoding, no freshness, TTL, admission or authority semantics,
+immutable allocation retention across restart and local-only export labels.
+The synthetic tests adapt the public wire-contract reference shape, not Router
+or Model Intelligence implementation or policy. No runtime dependency or
+endorsement is implied; the complete Apache-2.0 license is distributed in
+LICENSE.
+
 The repository development commands, supporting workflow guidance, read-only
 pr-reviewer definition and tests/test_workflow_contract.py are adapted from
 Model Intelligence, Copyright 2026 Creatidy, under the Apache License, Version 2.0.
