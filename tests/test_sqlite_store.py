@@ -971,6 +971,73 @@ def test_mountinfo_rejects_duplicate_and_missing_mount_ids() -> None:
         _topology_for_mount_ids(Path("/synthetic/database-directory"), 999, {}, mounts)
 
 
+# Synthetic mount tables model the observed WSL shapes (issue #62): a WSL2
+# native root is plain ext4 and passes the same gate as native Linux, while
+# Windows drives appear as 9p (WSL2 DrvFS) or drvfs (WSL1) and must refuse.
+# No real WSL, Windows or macOS host is exercised by these fixtures.
+@pytest.mark.parametrize("filesystem_type", ["9p", "drvfs"])
+def test_wsl_drvfs_topologies_refuse_rather_than_fallback(filesystem_type: str) -> None:
+    data_directory = Path("/synthetic/wsl-database-directory")
+    mounts = _parse_mount_records(
+        (
+            _mountinfo_record(1, 0, "8:1", b"/", b"/", "ext4", b"/dev/root"),
+            _mountinfo_record(
+                7,
+                1,
+                "8:1",
+                b"/persistent",
+                os.fsencode(data_directory),
+                filesystem_type,
+                b"/mnt/c",
+            ),
+        )
+    )
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="native local filesystem"):
+        _topology_for_mount_ids(data_directory, 7, {"database": 7}, mounts)
+
+
+def test_wsl_native_root_ext4_passes_the_same_gate_as_native_linux() -> None:
+    data_directory = Path("/synthetic/wsl-native-database-directory")
+    mounts = _parse_mount_records(
+        (
+            _mountinfo_record(1, 0, "8:1", b"/", b"/", "ext4", b"/dev/root"),
+            _mountinfo_record(7, 1, "8:1", b"/persistent", os.fsencode(data_directory), "ext4", b"/dev/sda1"),
+        )
+    )
+    topology = _topology_for_mount_ids(data_directory, 7, {"database": 7}, mounts)
+    assert cast(Any, topology).filesystem_type == "ext4"
+
+
+@pytest.mark.parametrize("platform", ["win32", "darwin"])
+def test_non_linux_platforms_refuse_storage_validation_without_quiet_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    monkeypatch.setattr(sys, "platform", platform)
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="runtime that can inspect fdinfo mount IDs"):
+        sqlite_store_module.validate_local_storage(tmp_path)
+
+
+def test_future_schema_version_refuses_safely_and_preserves_records(sqlite_tmp_path: Path) -> None:
+    database = sqlite_tmp_path / "future.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE durable (fact TEXT)")
+    connection.execute("INSERT INTO durable VALUES ('original-immutable-fact')")
+    connection.execute("PRAGMA user_version = 99")
+    connection.commit()
+    connection.close()
+    original = database.read_bytes()
+    with pytest.raises(UnsupportedSQLiteConfiguration, match="newer than supported"):
+        SQLiteProgramStore(database)
+    raw = sqlite3.connect(database)
+    try:
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == 99
+        assert raw.execute("SELECT fact FROM durable").fetchall() == [("original-immutable-fact",)]
+        assert raw.execute("SELECT count(*) FROM durable").fetchone()[0] == 1
+    finally:
+        raw.close()
+    assert len(database.read_bytes()) >= len(original)
+
+
 def test_storage_probe_rejects_dangling_sidecar_symlink_and_closes_probes(
     sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
