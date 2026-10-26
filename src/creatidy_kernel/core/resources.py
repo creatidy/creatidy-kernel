@@ -6,6 +6,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from creatidy_kernel.core.knowledge import UtilizedKnowledge
+
 if TYPE_CHECKING:
     from creatidy_kernel.core.intake import RequirementsHandoff
 
@@ -52,6 +54,7 @@ class Allocation:
     variant: str | None = None
     decision_provenance: str | None = None
     requirements_provenance: str | None = field(default=None, repr=False)
+    knowledge_utilization: UtilizedKnowledge | None = None
 
     def __post_init__(self) -> None:
         if any(
@@ -66,6 +69,8 @@ class Allocation:
         for value in (self.variant, self.decision_provenance, self.requirements_provenance):
             if value is not None and (type(value) is not str or not value.strip()):
                 raise ValueError("optional allocation evidence must be nonempty when specified")
+        if self.knowledge_utilization is not None and type(self.knowledge_utilization) is not UtilizedKnowledge:
+            raise ValueError("invalid knowledge utilization evidence")
         _validate_limits(self.capabilities, self.context_tokens)
 
 

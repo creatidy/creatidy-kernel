@@ -31,6 +31,7 @@ from typing import cast
 from urllib.parse import urlsplit
 
 from creatidy_kernel.core.intake import RequirementsHandoff, TranslationRefusal, object_from
+from creatidy_kernel.core.knowledge import UtilizedKnowledge
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.ports.resources import ResourceAllocator
 
@@ -436,7 +437,7 @@ def _decision(
     requirement: dict[str, object],
     profile_id: str | None = None,
     profile_policy_version: int | None = None,
-) -> tuple[dict[str, object], str]:
+) -> tuple[dict[str, object], str, UtilizedKnowledge | None]:
     if type(document["schema_version"]) is not int or document["schema_version"] != 1:
         raise ValueError("unsupported schema")
     decision = _object(document["decision"])
@@ -479,10 +480,15 @@ def _decision(
             raise ValueError("inconsistent selection")
         if any(_object(item)["identity"] == selected["identity"] for item in _array(decision["alternatives"])):
             raise ValueError("duplicate selection")
+    knowledge: UtilizedKnowledge | None = None
+    if "mi_utilization" in document:
+        # Corrupt reference grammar refuses the envelope; an unsupported
+        # producer version is retained explicitly, never silently dropped.
+        knowledge = UtilizedKnowledge.from_reference(document["mi_utilization"])
     evidence = _canonical(document)
     if len(evidence.encode("utf-8")) > MAX_RESPONSE_BYTES:
         raise ValueError("normalized provenance too large")
-    return decision, evidence
+    return decision, evidence, knowledge
 
 
 @dataclass(frozen=True, slots=True)
@@ -719,7 +725,7 @@ class ScarcityRouterAllocator(ResourceAllocator):
             document = _parse(self._exchange(wire if ordinary is not None else requirement))
             if self.api_key is not None and _contains_credential(document, self.api_key):
                 raise ValueError("response contains configured credential")
-            decision, provenance = _decision(document, requirement, profile, self.profile_policy_version)
+            decision, provenance, knowledge = _decision(document, requirement, profile, self.profile_policy_version)
             if decision["selected"] is None:
                 failure = "Scarcity Router returned no eligible allocation"
                 category = RouterFailureCategory.NO_ELIGIBLE_SELECTION
@@ -779,6 +785,7 @@ class ScarcityRouterAllocator(ResourceAllocator):
                             decision_provenance=provenance,
                             rationale="Scarcity Router: " + ", ".join(_strings(decision["reason_codes"])),
                             requirements_provenance=requirements_provenance,
+                            knowledge_utilization=knowledge,
                         )
                 failure = "Scarcity Router selection is incompatible with configured runtime bindings"
                 category = RouterFailureCategory.SELECTION_INCOMPATIBLE

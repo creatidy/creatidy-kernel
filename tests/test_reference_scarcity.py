@@ -140,6 +140,11 @@ def assert_proof(result: dict[str, object], connection: NativeConnection, transp
         assert allocation["variant"] == "opaque-configuration"
         provenance = cast(dict[str, object], json.loads(str(allocation["decision_provenance"])))
         assert provenance == json.loads(FIXTURE.read_bytes())
+        knowledge = cast(dict[str, object], allocation["knowledge_utilization"])
+        assert knowledge["state"] == "utilized"
+        assert knowledge["identifier"] == "urn:mi:utilization:sha256:" + "a1b2c3d4" * 8
+        assert knowledge["authority"] == "provenance-only"
+        assert knowledge["distribution"] == "local-only"
         identity = cast(dict[str, object], entry["identity"])
         assert identity["requested"] == identity["resolved"] == "fixture-model"
         assert identity["requested_provider"] == identity["resolved_provider"] == "openai"

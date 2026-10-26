@@ -95,6 +95,7 @@ from creatidy_kernel.core.execution import (
     Presence as RuntimePresence,
 )
 from creatidy_kernel.core.forge import EffectStatus, Presence, Reference, UnsupportedForge
+from creatidy_kernel.core.knowledge import export_document
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
 from creatidy_kernel.ports.allocation import (
@@ -1271,6 +1272,7 @@ def export_task_store(store: SQLiteProgramStore) -> dict[str, object]:
                     "provider_id": allocation.provider_id,
                     "model_id": allocation.model_id,
                     "reasoning_effort": allocation.reasoning_effort,
+                    "knowledge_utilization": export_document(allocation.knowledge_utilization),
                 },
             }
         )

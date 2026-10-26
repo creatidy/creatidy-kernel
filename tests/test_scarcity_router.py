@@ -28,6 +28,7 @@ from creatidy_kernel.adapters.scarcity_router import (
     ScarcityRouterAllocator,
     ScarcityRouterUnavailable,
 )
+from creatidy_kernel.core.knowledge import export_document
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 
 REQUEST = ResourceRequest("unit-1", frozenset({"reference"}), 128)
@@ -451,3 +452,99 @@ def test_configuration_and_unsupported_capabilities_fail_before_transport(monkey
             ScarcityRouterAllocator("http://localhost", (BINDING,)).select(
                 replace(REQUEST, required_capabilities=capabilities),
             )
+
+
+UTILIZED_REFERENCE = {
+    "source": "model_intelligence",
+    "identifier": "urn:mi:utilization:sha256:" + "a1b2c3d4" * 8,
+    "version": "mi.utilization-working/1",
+}
+
+
+def test_mi_utilization_reference_is_retained_as_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    document = fixture()
+    document["mi_utilization"] = UTILIZED_REFERENCE
+    allocation = stub(monkeypatch, json.dumps(document).encode()).select(REQUEST)
+    knowledge = allocation.knowledge_utilization
+    assert knowledge is not None
+    assert knowledge.state.value == "utilized"
+    assert knowledge.identifier == UTILIZED_REFERENCE["identifier"]
+    assert knowledge.version == "mi.utilization-working/1"
+    assert json.loads(allocation.decision_provenance or "")["mi_utilization"] == UTILIZED_REFERENCE
+    assert export_document(knowledge)["authority"] == "provenance-only"
+
+
+def test_missing_mi_utilization_reference_is_explicitly_not_retained(monkeypatch: pytest.MonkeyPatch) -> None:
+    document = fixture()
+    document.pop("mi_utilization")
+    allocation = stub(monkeypatch, json.dumps(document).encode()).select(REQUEST)
+    assert allocation.knowledge_utilization is None
+    assert export_document(allocation.knowledge_utilization) == {"state": "not_retained"}
+    assert "mi_utilization" not in json.loads(allocation.decision_provenance or "")
+
+
+def test_unsupported_reference_version_is_retained_not_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    document = fixture()
+    document["mi_utilization"] = {**UTILIZED_REFERENCE, "version": "mi.utilization-working/2"}
+    allocation = stub(monkeypatch, json.dumps(document).encode()).select(REQUEST)
+    knowledge = allocation.knowledge_utilization
+    assert knowledge is not None
+    assert knowledge.state.value == "unsupported_version"
+    assert knowledge.version == "mi.utilization-working/2"
+
+
+@pytest.mark.parametrize(
+    "mi_utilization",
+    [
+        None,
+        "model_intelligence",
+        [],
+        {},
+        {"source": "model_intelligence", "identifier": "urn:mi:utilization:sha256:" + "a1b2c3d4" * 8},
+        {**UTILIZED_REFERENCE, "date": "2026-01-01"},
+        {**UTILIZED_REFERENCE, "source": "Model Intelligence"},
+        {**UTILIZED_REFERENCE, "identifier": "x" * 513},
+        {**UTILIZED_REFERENCE, "version": "x" * 129},
+    ],
+)
+def test_corrupt_mi_utilization_reference_refuses_selection(
+    monkeypatch: pytest.MonkeyPatch, mi_utilization: object
+) -> None:
+    document = fixture()
+    document["mi_utilization"] = mi_utilization
+    with pytest.raises(AllocationUnavailable, match="invalid public response"):
+        stub(monkeypatch, json.dumps(document).encode()).select(REQUEST)
+
+
+def test_retained_knowledge_grants_no_runtime_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    with_reference = fixture()
+    with_reference["mi_utilization"] = UTILIZED_REFERENCE
+    referenced = stub(monkeypatch, json.dumps(with_reference).encode()).select(REQUEST)
+    without_reference = fixture()
+    without_reference.pop("mi_utilization")
+    unreferenced = stub(monkeypatch, json.dumps(without_reference).encode()).select(REQUEST)
+    assert (
+        referenced.runtime_id,
+        referenced.provider_id,
+        referenced.model_id,
+        referenced.reasoning_effort,
+        referenced.variant,
+        referenced.capabilities,
+        referenced.context_tokens,
+        referenced.rationale,
+    ) == (
+        unreferenced.runtime_id,
+        unreferenced.provider_id,
+        unreferenced.model_id,
+        unreferenced.reasoning_effort,
+        unreferenced.variant,
+        unreferenced.capabilities,
+        unreferenced.context_tokens,
+        unreferenced.rationale,
+    )
+    incompatible = replace(
+        stub(monkeypatch, json.dumps(with_reference).encode()),
+        runtime_bindings=(replace(BINDING, model_id="other-model"),),
+    )
+    with pytest.raises(AllocationUnavailable, match="incompatible"):
+        incompatible.select(REQUEST)
