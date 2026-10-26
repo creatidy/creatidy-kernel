@@ -194,10 +194,26 @@ def test_failed_decryption_leaves_ciphertext_bytes_untouched(tmp_path: Path) -> 
 def test_corrupt_decrypted_output_refuses_and_preserves_the_profile(tmp_path: Path, output: str) -> None:
     ciphertext = write_profile(tmp_path / "kernel.env.sops.yaml", "ENC[synthetic-ciphertext]\n")
     before = ciphertext.read_bytes()
+    stat_before = ciphertext.stat()
     _fake_sops(tmp_path / "tools", f"import sys\nsys.stdout.write({output!r})\n")
     with pytest.raises(ProfileError):
         load_profile(ciphertext, sops=True, environment={"PATH": str(tmp_path / "tools")})
     assert ciphertext.read_bytes() == before
+    assert ciphertext.stat().st_mtime_ns == stat_before.st_mtime_ns
+
+
+def test_oversized_decrypted_output_hits_the_documented_bound(tmp_path: Path) -> None:
+    ciphertext = write_profile(tmp_path / "kernel.env.sops.yaml", "ENC[synthetic-ciphertext]\n")
+    before = ciphertext.read_bytes()
+    stat_before = ciphertext.stat()
+    _fake_sops(
+        tmp_path / "tools",
+        "import sys\nsys.stdout.write('x' * (4 * 1024 * 1024 + 1))\n",
+    )
+    with pytest.raises(ProfileError, match="profile decryption failed"):
+        load_profile(ciphertext, sops=True, environment={"PATH": str(tmp_path / "tools")})
+    assert ciphertext.read_bytes() == before
+    assert ciphertext.stat().st_mtime_ns == stat_before.st_mtime_ns
 
 
 def test_successful_loading_never_writes_the_profile(tmp_path: Path) -> None:
