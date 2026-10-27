@@ -33,6 +33,41 @@ bounded mechanisms, not deployment or live reception.
 | State/observation | Dedicated EXCLUSIVE SQLite and offline CLI export/status | [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) owner-served snapshot/events/commands/notifications. Console cannot open active SQLite or weaken durability. |
 | Knowledge/outcomes | Durable context/allocation artifacts, pure unitful `core.outcomes`, richer reference and thin task export | [#55](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/55) utilized MI references, [#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56) full budgets/costs, [#58](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/58) versioned private export. Unknown is not zero or model quality. |
 
+## Local Work And Resource Ownership
+
+The concrete #59 handler is `ports.ownership.WorkOwnership`, composed by the trusted local host with
+an authenticated principal, a `LocalOwnedWorkspace`, explicit scopes/mode/profile and any native witness
+producer. No request-body Principal, independent SQL reader, remote authentication channel or scheduler
+is introduced. The same handler serves cooperative pull and managed handoffs; the ordinary dispatcher
+and remote entrance remain #106/#57.
+
+Claim acceptance atomically combines current domain preparation/eligibility, exact spec and actor,
+original work-clock authority, project/work capacity, Operation intent, claimant, resource conflicts
+and increasing generation. These immutable journal records are not outbox delivery claims. Duplicate
+command/input returns its historical result; changed claimant/input refuses. Original wall/boot
+projection, pending marker and committed high-water evidence are reused for reports/renewal/delivery,
+never reprojected. Expiry/revoke/heartbeat loss fences authority but does not release unsettled resources.
+
+Pull `kernel:cooperative-task-scope:v1` receipts are authenticated task-scope promises only. Managed
+`CodexOwnedSessionWitness` uses the original dedicated `CodexStdio`, exact opaque group, version-qualified
+profile and exact task resources, with a start witness required before normal/STOP settlement. A missing
+owner, unsupported profile, reported escape or cold PID is unknown, not a completed process. The handler
+never signals an owner Kilo server and does not upgrade ADR 0011 or the test-child profile.
+
+Every candidate/acceptance guard and protected publication compares the claim generation and exact
+captured subject. Filesystem changes retain bounded original bytes and unknown attribution until explicit
+owner reconciliation; no manual change is silently model output. `candidate_subject` is the fresh guard
+for an existing trusted verification/acceptance producer, not a verification verdict. Owned effects use
+`dispatch` for a fresh subject plus the existing outbox fence; receipt/reconciliation is still separate.
+
+Workspace ownership records and capacity-authority binding live in a protected controller parent, outside
+the mutable leaf. Source-cache use leases do not confer mutation ownership. Cleanup requires applicable
+task settlement and reconciliation of every reserved effect; no bare lease or leader PID qualifies.
+Only empty exact owned leaves can be moved into custody and removed nonrecursively. Identity replacement,
+late writes, nonempty/unknown data and artifacts are preserved. An exact durable post-rmdir witness can
+complete an interrupted SQLite release; absence alone cannot. Explicit owner release can instead retain
+settled, reconciled bytes and admit later nonconflicting ownership with a higher generation.
+
 ## Cross-Product Contract Obligations
 
 These are **agreed semantic requirements and to-prove contracts**, not approved new wire shapes,

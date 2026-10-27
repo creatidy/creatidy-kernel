@@ -12,6 +12,7 @@ from pathlib import Path
 
 PINNED_BASE_ID = "e2348656238a2ff9a3244868e2beb543d86f15a5"  # Exact public Git object ID, not a credential.
 PINNED_PRECLOCK_ID = "23a28e31c17018acb9900efeed2da1b9b03330cf"  # Published schema-3 public Git object ID.
+PINNED_PREOWNERSHIP_ID = "b11aae420517b14bbb4d85c84f9a0d82c14446c6"  # Published schema-4 public Git object ID.
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -73,7 +74,7 @@ from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy
 clock = lambda: BootClockReading(100, 1000000000, 'installed-synthetic-boot')
 path = Path(sys.argv[1])
 with SQLiteProgramStore(path, boot_clock=clock) as store:
-    assert store.startup_evidence.schema_version == 4
+    assert store.startup_evidence.schema_version == 5
     program = store.load('reference')
     assert store.artifact('legacy-evidence', 'original') == b'synthetic retained original bytes'
     policy = WorkBudgetPolicy.basic(1, 1, verifications=1, retained_bytes=1024)
@@ -86,7 +87,7 @@ with SQLiteProgramStore(path, boot_clock=clock) as store:
     store.revoke_work_budget('reference', 'synthetic owner stop')
     before = store.work_budget_status('reference')
     bundle = store.backup(path.parent / 'schema-four-backup')
-    assert bundle.schema_version == 4
+    assert bundle.schema_version == 5
 restored = SQLiteProgramStore.restore_backup(bundle, path.parent / 'restored-four.sqlite3')
 with SQLiteProgramStore(restored, boot_clock=clock) as store:
     assert store.work_budget_status('reference') == before
@@ -98,17 +99,17 @@ with SQLiteProgramStore(restored, boot_clock=clock) as store:
     else:
         raise AssertionError('restored revocation lost its dispatch fence')
     assert store.operation('runtime:installed-attempt').attempts == 0
-backups = list(path.parent.glob(path.name + '.pre-schema-4-*'))
+old_schema = int(sys.argv[2]) if len(sys.argv) > 2 else 2
+backups = list(path.parent.glob(path.name + ('.pre-schema-5-*' if old_schema == 4 else '.pre-schema-4-*')))
 assert len(backups) == 1
 import json
 manifest = json.loads((backups[0] / 'manifest.json').read_text())
-old_schema = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 assert manifest['schema_version'] == old_schema
 old_bundle = BackupBundle(backups[0], backups[0] / 'kernel.sqlite3', backups[0] / 'manifest.json',
                           manifest['database_sha256'], manifest['history_record_count'], old_schema)
 restored = SQLiteProgramStore.restore_backup(old_bundle, path.parent / 'restored-original.sqlite3')
 with SQLiteProgramStore(restored, boot_clock=clock) as store:
-    assert store.startup_evidence.schema_version == 4
+    assert store.startup_evidence.schema_version == 5
     assert not store.has_work_budget('reference')
     assert store.artifact('legacy-evidence', 'original') == b'synthetic retained original bytes'
 """
@@ -131,7 +132,7 @@ else:
 def main(new_python: Path, storage_root: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="installed-schema-upgrade-", dir=storage_root) as value:
         directory = Path(value)
-        for schema, commit_id in ((2, PINNED_BASE_ID), (3, PINNED_PRECLOCK_ID)):
+        for schema, commit_id in ((2, PINNED_BASE_ID), (3, PINNED_PRECLOCK_ID), (4, PINNED_PREOWNERSHIP_ID)):
             fixture = directory / f"schema-{schema}"
             fixture.mkdir()
             old_python = install_pinned_reader(fixture, commit_id=commit_id)
@@ -160,15 +161,15 @@ def main(new_python: Path, storage_root: Path) -> None:
             with closing(sqlite3.connect(path)) as current:
                 if (
                     tuple(current.iterdump()) != before
-                    or current.execute("PRAGMA user_version").fetchone()[0] != 4
+                    or current.execute("PRAGMA user_version").fetchone()[0] != 5
                     or current.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] != 0
                 ):
                     raise RuntimeError("downgraded reader changed protected records or dispatched")
             if marker.exists():
                 raise RuntimeError("downgraded reader performed an effect")
         print(
-            f"Installed schema upgrade: actual readers {PINNED_BASE_ID} and {PINNED_PRECLOCK_ID} refuse schema 4; "
-            "original bytes, v2/v3/v4 backups and artifacts preserved."
+            f"Installed schema upgrade: actual readers {PINNED_BASE_ID}, {PINNED_PRECLOCK_ID}, "
+            f"{PINNED_PREOWNERSHIP_ID} refuse schema 5; original bytes, v2/v3/v4/v5 backups and artifacts preserved."
         )
 
 

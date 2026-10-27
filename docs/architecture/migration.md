@@ -119,6 +119,36 @@ ordinary declarations remain historical meaning and explicit refusal, not auto-u
 new meaning requires the normal explicit draft amendment and fresh owner decision. Installed smoke
 receives typed selection via synthetic loopback HTTP and checks exact evidence after reopening.
 
+## Work Ownership Compatibility
+
+#59 extends the current SQLite authority boundary to schema 5. Before migration, an existing
+schema-1/2/3/4 store publishes a verified online backup with complete artifact inventory as
+`<database>.pre-schema-5-<logical-digest>`. The schema-4 original work-clock rows, schema-3 contract
+marker, immutable history/admissions, old Program/Attempt IDs, allocation bytes, unknown effects and
+artifacts remain intact. Migration installs only the new ownership-contract boundary; it never infers
+claims, rewrites old Attempts or promotes old receipts. Failure before backup publication prevents the
+migration; interruption rolls back and reuses the same verified original image on retry.
+
+New claim/renewal/profile-proof/observation/reconciliation/candidate/release/quarantine records use
+explicit `ownership-*` types in the existing non-dispatchable work-budget journal namespace. Unknown
+record fields/types or mismatched exact subjects refuse recovery. The actual installed schema-4 reader
+at `b11aae420517b14bbb4d85c84f9a0d82c14446c6`, together with the retained schema-2/3 pinned readers,
+refuses schema 5 before claims/effects. Backups restore to a new offline path with the current reader;
+they do not authorize downgrade, native PID adoption or effect replay.
+
+`LocalOwnedWorkspace` uses new owner-qualified leaves under a private controller-owned parent. Existing
+unmarked directories are never adopted. Its separate durable capacity-authority binding prevents a
+second SQLite identity from using that mutable tree, including a backup restored to a new database.
+The original owner may explicitly release settled, exact-subject reconciled resources without deleting
+bytes; a later claim then receives a higher generation. Physical cleanup is empty-only, guarded and
+nonrecursive; artifact references and controller ownership history survive. An exact durable post-rmdir
+receipt supports retry if the SQL release commit failed. Interrupted custody, missing receipts, replaced
+identities and reappearing data remain retained/unknown; do not delete sidecars or relabel trees.
+
+Source-cache v2 acquisition/object-copy leases and frozen #143/#166 task records are unchanged. Neither
+source-read ownership nor a cooperative handoff becomes a managed native witness. Ordinary preparation
+still creates no worker grant by itself; #106/#57 consume the new local handlers in their own deliveries.
+
 ## Verification Compatibility
 
 Verification changes under #50 preserve the original Task #143/#166 payloads, policy references,

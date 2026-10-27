@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol, cast
 
-from creatidy_kernel.adapters.codex_stdio import CodexRPCError
+from creatidy_kernel.adapters.codex_stdio import CodexRPCError, CodexStdio
 from creatidy_kernel.core.execution import (
     Activity,
     Candidate,
@@ -26,7 +26,65 @@ from creatidy_kernel.core.execution import (
     TrustMode,
     UnsupportedExecution,
 )
+from creatidy_kernel.core.ownership import HandoffMode, HandoffProof, ResourceScope, WorkClaim
 from creatidy_kernel.ports.execution import Runtime
+
+
+class CodexOwnedSessionWitness:
+    """Retained dedicated native owner, using the existing bounded group profile.
+
+    No signaling, cold PID adoption, escaped-descendant containment or stronger
+    isolation is added. A reported escape/uncertain scope invalidates this owner.
+    """
+
+    def __init__(self, connection: CodexStdio) -> None:
+        self._connection = connection
+        self._reference = connection.owned_group_reference
+        self.profile = f"codex:owned-session:{connection.version}"
+        self._started: tuple[str, int] | None = None
+        self._unknown = False
+
+    @property
+    def resource(self) -> ResourceScope:
+        return ResourceScope("session", self._reference)
+
+    def invalidate(self) -> None:
+        """Latch an observed escape/ownership gap; application calls durably quarantine it."""
+        self._unknown = True
+
+    @property
+    def scope_unknown(self) -> bool:
+        return self._unknown
+
+    def witness(self, claim: WorkClaim, stage: str) -> HandoffProof | None:
+        if (
+            self._unknown
+            or claim.mode is not HandoffMode.MANAGED
+            or claim.profile != self.profile
+            or self._connection.owned_group_reference != self._reference
+            or self.resource not in claim.resources
+        ):
+            return None
+        key = (claim.attempt.digest, claim.generation)
+        if stage == "start":
+            if not self._connection.owned_group_active or self._started not in (None, key):
+                return None
+            self._started = key
+        elif stage in {"complete", "stop"}:
+            if self._started != key or self._connection.owned_group_settled is not True:
+                return None
+        else:
+            return None
+        return HandoffProof(
+            f"codex-app-server:{self._connection.version}",
+            self.profile,
+            claim.mode,
+            claim.attempt.digest,
+            claim.generation,
+            claim.resources,
+            stage,
+            self._reference,
+        )
 
 
 class CodexConnection(Protocol):

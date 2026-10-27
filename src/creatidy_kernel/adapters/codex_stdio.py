@@ -125,6 +125,17 @@ class CodexStdio:
         return self._owned_group_reference
 
     @property
+    def owned_group_active(self) -> bool:
+        """Witness only this retained dedicated Popen, never an adopted PID."""
+        process = self._process
+        if process is None or process.poll() is not None:
+            return False
+        try:
+            return os.getpgid(process.pid) == process.pid
+        except ProcessLookupError:
+            return False
+
+    @property
     def methods(self) -> frozenset[str]:
         return self._methods
 
