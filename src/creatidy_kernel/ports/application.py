@@ -42,7 +42,7 @@ from creatidy_kernel.core.verification import (
     admit_accepted,
     verify_candidate,
 )
-from creatidy_kernel.core.work_budget import WorkKind
+from creatidy_kernel.core.work_budget import BudgetRefused, WorkKind
 from creatidy_kernel.ports.allocation import (
     decode_allocation,
     decode_identity,
@@ -184,6 +184,8 @@ class BudgetedChecks:
     def check(self, name: str, subject: EvidenceSubject) -> Evidence | None:
         self.store.check_work_authority(self.program_id)
         if name == "independent_review":
+            if not isinstance(self.checks, DurableProductReviewChecks):
+                raise BudgetRefused("independent review requires the durable budgeted dispatcher")
             return self.checks.check(name, subject)
         key = f"verification:{self.attempt_id}:{hashlib.sha256(manifest_bytes([name, asdict(subject)])).hexdigest()}"
         operation = self.store.budgeted_intent(
@@ -273,6 +275,8 @@ def advance_work_unit(
     """
     program = store.load(program.program_id)
     decision_clock = clock if clock is not None else lambda: now
+    if "independent_review" in policy.checks and not policy.reviewer_required:
+        raise BudgetRefused("explicit independent_review requires the durable product review policy")
     if program.state(unit_id).status is WorkUnitStatus.SATISFIED:
         return "accepted"
     if policy.reviewer_required and product_reviewer is None:

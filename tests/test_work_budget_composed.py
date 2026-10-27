@@ -9,16 +9,20 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from test_allocation_recovery import WORKSPACE, CountingAllocator
+from test_product_review import CandidateCollector, Dispatcher, ReviewRuntime
 from test_sqlite_store import OWNER, WORKER, spec
 from test_task_execution import FixtureConnection, deflake_edit, fixture_task, fixture_verification, make_source, run
 from test_work_budget import Clock, policy, prepare
 
-from creatidy_kernel.adapters import task_execution
+from creatidy_kernel.adapters import reference, task_execution
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.task_execution import TaskInterrupted, VerificationCommand
 from creatidy_kernel.core.domain import ActivateProgram, FinishAttempt, StartAttempt
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
+from creatidy_kernel.core.verification import VerificationPolicy
 from creatidy_kernel.core.work_budget import BudgetRefused, ResourceCeiling, WorkKind
+from creatidy_kernel.ports.application import advance_work_unit
 
 pytest_plugins = ["test_sqlite_store"]
 
@@ -214,3 +218,37 @@ def test_every_reservation_entry_validates_before_replay_and_preserves_capacity(
         assert store.work_budget_status("program-1") == retained and store.available_retained_bytes("program-1") == 0
     with SQLiteProgramStore(path, boot_clock=Clock()) as store:
         assert store.work_budget_status("program-1") == retained and store.available_retained_bytes("program-1") == 0
+
+
+@pytest.mark.parametrize("supply_dispatcher", [False, True])
+def test_explicit_review_check_cannot_bypass_zero_review_capacity(
+    sqlite_tmp_path: Path, supply_dispatcher: bool
+) -> None:
+    runtime = ReviewRuntime()
+    allocator = CountingAllocator()
+    reviewer = Dispatcher()
+    with SQLiteProgramStore(sqlite_tmp_path / "review-alias.sqlite3", boot_clock=Clock()) as store:
+        program = store.create(reference.reference_spec(), "create")
+        basic = policy()
+        configured = replace(
+            basic, counts=tuple((kind, 0 if kind is WorkKind.REVIEW else count) for kind, count in basic.counts)
+        )
+        store.bind_work_budget(program.program_id, "project", configured, configured, 110)
+        program = store.admit(program.program_id, "activate", ActivateProgram(0, "owner"))
+        original = store.work_budget_status(program.program_id)
+        operations = store.operations()
+        with pytest.raises(BudgetRefused, match="explicit independent_review requires"):
+            advance_work_unit(
+                store,
+                program,
+                "first",
+                allocator=allocator,
+                runtime=runtime,
+                workspace=WORKSPACE,
+                collector=CandidateCollector(),
+                policy=VerificationPolicy(reference.POLICY.reference, ("exact-content", "independent_review"), False),
+                now=100,
+                product_reviewer=reviewer if supply_dispatcher else None,
+            )
+        assert runtime.requests == {} and allocator.calls == 0 and reviewer.calls == 0
+        assert store.work_budget_status(program.program_id) == original and store.operations() == operations
