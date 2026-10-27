@@ -14,11 +14,13 @@ import sys
 import tempfile
 import threading
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import closing, contextmanager
+from dataclasses import asdict, dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
+from creatidy_kernel.adapters.boot_clock import read_boot_clock
 from creatidy_kernel.adapters.sqlite_codec import (
     CODEC_VERSION,
     RecordCodecError,
@@ -32,15 +34,23 @@ from creatidy_kernel.adapters.sqlite_codec import (
     validate_create_input,
     validate_history_input,
 )
+from creatidy_kernel.core.deadlines import BootClockReading, DeadlineProjection
 from creatidy_kernel.core.domain import (
+    AmendProgramSpec,
+    AttemptStatus,
     DomainCommandType,
+    PrepareAttempt,
     Program,
     ProgramSpec,
     ProgramStatus,
+    SatisfyWorkUnit,
+    WorkUnitStatus,
 )
+from creatidy_kernel.core.outcomes import Provenance, UsageObservation
+from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 _APPLICATION_ID = 0x43544B31
 _DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _LOCAL_FILESYSTEMS = {
@@ -183,7 +193,13 @@ class SQLiteProgramStore:
     _connection: sqlite3.Connection
     _startup_evidence: SQLiteStartupEvidence
 
-    def __init__(self, path: str | Path, *, busy_timeout_ms: int = _DEFAULT_BUSY_TIMEOUT_MS) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        busy_timeout_ms: int = _DEFAULT_BUSY_TIMEOUT_MS,
+        boot_clock: Callable[[], BootClockReading | None] = read_boot_clock,
+    ) -> None:
         if type(busy_timeout_ms) is not int or not 1 <= busy_timeout_ms <= 60_000:
             raise ValueError("busy_timeout_ms must be between 1 and 60000")
         raw_path = str(path)
@@ -205,6 +221,10 @@ class SQLiteProgramStore:
         self._owner_thread_local.store_token = self._owner_thread_token
         self._gate = threading.RLock()
         self._busy_timeout_ms = busy_timeout_ms
+        self._boot_clock = boot_clock
+        self._clock_watermarks: dict[str, BootClockReading] = {}
+        self._clock_uncommitted: dict[str, BootClockReading | None] = {}
+        self._transaction_clock_readings: dict[str, BootClockReading | None] | None = None
         self._cache_mode = "private"
         self._closed = False
         try:
@@ -226,6 +246,7 @@ class SQLiteProgramStore:
                 if _is_sqlite_lock_contention(error):
                     raise ConcurrentWriter("another controller owns SQLite EXCLUSIVE locking mode") from error
                 raise
+            self._startup_evidence = self._read_startup_evidence()
             self._migrate()
             self.rebuild_projections()
             self._validate_operation_records()
@@ -261,45 +282,49 @@ class SQLiteProgramStore:
 
     def create(self, spec: ProgramSpec, command_key: str) -> Program:
         self._assert_writer_thread()
+        with self._gate, self._transaction():
+            return self._create(spec, command_key)
+
+    def _create(self, spec: ProgramSpec, command_key: str) -> Program:
+        self._assert_writer_thread()
         self._validate_command_key(command_key)
         if type(spec) is not ProgramSpec:
             raise TypeError("spec must be an exact K1 ProgramSpec")
         input_json = create_input_json(spec)
         input_digest = digest_json(json.loads(input_json))
-        with self._gate, self._transaction():
-            duplicate = self._duplicate_result(command_key, input_digest)
-            if duplicate is not None:
-                return duplicate
-            existing = self._connection.execute(
-                "SELECT 1 FROM program_projection WHERE program_id = ?", (spec.program_id,)
-            ).fetchone()
-            if existing is not None:
-                raise ProgramAlreadyExists(f"Program {spec.program_id!r} already exists")
-            initial = Program.create(spec)
-            facts_json = program_json(initial)
-            facts_digest = hashlib.sha256(facts_json.encode("utf-8")).hexdigest()
-            self._insert_history(
-                program_id=spec.program_id,
-                sequence=1,
-                command_key=command_key,
-                command_type="create_program",
-                actor_id=spec.authority.owner_id,
-                input_digest=input_digest,
-                input_json=input_json,
-                program=initial,
-                facts_json=facts_json,
-                facts_digest=facts_digest,
-            )
-            self._write_projections(initial, history_sequence=1, facts_json=facts_json, facts_digest=facts_digest)
-            self._insert_command_result(
-                command_key=command_key,
-                program_id=spec.program_id,
-                command_type="create_program",
-                input_digest=input_digest,
-                result_sequence=1,
-                result_json=facts_json,
-                result_digest=facts_digest,
-            )
+        duplicate = self._duplicate_result(command_key, input_digest)
+        if duplicate is not None:
+            return duplicate
+        existing = self._connection.execute(
+            "SELECT 1 FROM program_projection WHERE program_id = ?", (spec.program_id,)
+        ).fetchone()
+        if existing is not None:
+            raise ProgramAlreadyExists(f"Program {spec.program_id!r} already exists")
+        initial = Program.create(spec)
+        facts_json = program_json(initial)
+        facts_digest = hashlib.sha256(facts_json.encode("utf-8")).hexdigest()
+        self._insert_history(
+            program_id=spec.program_id,
+            sequence=1,
+            command_key=command_key,
+            command_type="create_program",
+            actor_id=spec.authority.owner_id,
+            input_digest=input_digest,
+            input_json=input_json,
+            program=initial,
+            facts_json=facts_json,
+            facts_digest=facts_digest,
+        )
+        self._write_projections(initial, history_sequence=1, facts_json=facts_json, facts_digest=facts_digest)
+        self._insert_command_result(
+            command_key=command_key,
+            program_id=spec.program_id,
+            command_type="create_program",
+            input_digest=input_digest,
+            result_sequence=1,
+            result_json=facts_json,
+            result_digest=facts_digest,
+        )
         return initial
 
     def load(self, program_id: str) -> Program:
@@ -384,59 +409,111 @@ class SQLiteProgramStore:
         intent: tuple[str, str, dict[str, object]] | None,
     ) -> Program:
         self._assert_writer_thread()
+        with self._gate, self._transaction():
+            return self._admit_decision(program_id, command_key, command, intent)
+
+    def _admit_decision(
+        self,
+        program_id: str,
+        command_key: str,
+        command: DomainCommandType,
+        intent: tuple[str, str, dict[str, object]] | None,
+    ) -> Program:
+        self._assert_writer_thread()
         self._validate_program_id(program_id)
         self._validate_command_key(command_key)
         input_json = command_input_json(program_id, command)
         input_digest = digest_json(json.loads(input_json))
         command_type = cast(str, json.loads(input_json)["command_type"])
-        with self._gate, self._transaction():
-            duplicate = self._duplicate_result(command_key, input_digest)
-            if duplicate is not None:
-                if intent is not None:
-                    operation_id, effect_key, request = intent
-                    raw = canonical_json({"version": 1, "request": request})
-                    row = self._connection.execute(
-                        "SELECT effect_key, request_json FROM operations WHERE operation_id = ?", (operation_id,)
-                    ).fetchone()
-                    if row is None or (row["effect_key"], row["request_json"]) != (effect_key, raw):
-                        raise OperationConflict("duplicate command has no matching atomically admitted intent")
-                return duplicate
-            current = self._load_head(program_id)
-            next_program = current.apply(command)
-            if next_program.program_id != program_id:
-                raise CorruptHistory("K1 returned a result for a different aggregate")
-            head = self._connection.execute(
-                "SELECT history_sequence FROM program_projection WHERE program_id = ?", (program_id,)
-            ).fetchone()
-            if head is None:
-                raise ProgramNotFound(f"Program {program_id!r} does not exist")
-            sequence = cast(int, head["history_sequence"]) + 1
-            facts_json = program_json(next_program)
-            facts_digest = hashlib.sha256(facts_json.encode("utf-8")).hexdigest()
-            self._insert_history(
-                program_id=program_id,
-                sequence=sequence,
-                command_key=command_key,
-                command_type=command_type,
-                actor_id=command.actor_id,
-                input_digest=input_digest,
-                input_json=input_json,
-                program=next_program,
-                facts_json=facts_json,
-                facts_digest=facts_digest,
-            )
-            self._write_projections(next_program, sequence, facts_json, facts_digest)
-            self._insert_command_result(
-                command_key=command_key,
-                program_id=program_id,
-                command_type=command_type,
-                input_digest=input_digest,
-                result_sequence=sequence,
-                result_json=facts_json,
-                result_digest=facts_digest,
-            )
+        duplicate = self._duplicate_result(command_key, input_digest)
+        if duplicate is not None:
             if intent is not None:
-                self._insert_intent(*intent, allow_existing=False)
+                operation_id, effect_key, request = intent
+                raw = canonical_json({"version": 1, "request": request})
+                row = self._connection.execute(
+                    "SELECT effect_key, request_json FROM operations WHERE operation_id = ?", (operation_id,)
+                ).fetchone()
+                if row is None or (row["effect_key"], row["request_json"]) != (effect_key, raw):
+                    raise OperationConflict("duplicate command has no matching atomically admitted intent")
+            return duplicate
+        current = self._load_head(program_id)
+        next_program = current.apply(command)
+        if isinstance(command, SatisfyWorkUnit) and self._work_binding(program_id) is not None:
+            self.check_work_authority(program_id)
+            completed_reservations = [
+                item
+                for item in self._work_records("reservation")
+                if item["program"] == program_id
+                and item["attempt"] == command.satisfaction.source_attempt_id
+                and item["category"] == WorkKind.ATTEMPT.value
+            ]
+            if len(completed_reservations) != 1:
+                raise BudgetRefused("acceptance lacks original Attempt capacity reservation")
+            completed_operation = cast(str, completed_reservations[0]["operation"])
+            if self._work_record("settlement", completed_operation) is None:
+                self._write_work_record(
+                    "settlement",
+                    completed_operation,
+                    {"operation": completed_operation, "evidence": command.satisfaction.reference_id},
+                )
+        if isinstance(command, PrepareAttempt):
+            # Pure historical domain facts remain writable/readable. They do
+            # not authorize a dispatch without original envelope proof.
+            binding = self._work_binding(program_id)
+            if binding is not None:
+                attempt = command.attempt
+                if attempt.remediation_of is not None:
+                    self._reserve_work(
+                        program_id, attempt.attempt_id, f"remediation:{attempt.attempt_id}", WorkKind.REMEDIATION
+                    )
+                self._reserve_work(
+                    program_id,
+                    attempt.attempt_id,
+                    intent[0] if intent is not None else f"runtime:{attempt.attempt_id}",
+                    WorkKind.ATTEMPT,
+                )
+            elif intent is not None:
+                self._write_work_record(
+                    "unbound-attempt",
+                    intent[0],
+                    {"program": program_id, "attempt": command.attempt.attempt_id, "operation": intent[0]},
+                )
+        if next_program.program_id != program_id:
+            raise CorruptHistory("K1 returned a result for a different aggregate")
+        head = self._connection.execute(
+            "SELECT history_sequence FROM program_projection WHERE program_id = ?", (program_id,)
+        ).fetchone()
+        if head is None:
+            raise ProgramNotFound(f"Program {program_id!r} does not exist")
+        sequence = cast(int, head["history_sequence"]) + 1
+        facts_json = program_json(next_program)
+        facts_digest = hashlib.sha256(facts_json.encode("utf-8")).hexdigest()
+        self._insert_history(
+            program_id=program_id,
+            sequence=sequence,
+            command_key=command_key,
+            command_type=command_type,
+            actor_id=command.actor_id,
+            input_digest=input_digest,
+            input_json=input_json,
+            program=next_program,
+            facts_json=facts_json,
+            facts_digest=facts_digest,
+        )
+        self._write_projections(next_program, sequence, facts_json, facts_digest)
+        self._insert_command_result(
+            command_key=command_key,
+            program_id=program_id,
+            command_type=command_type,
+            input_digest=input_digest,
+            result_sequence=sequence,
+            result_json=facts_json,
+            result_digest=facts_digest,
+        )
+        if intent is not None:
+            self._insert_intent(*intent, allow_existing=False)
+            if isinstance(command, PrepareAttempt) and self._work_binding(program_id) is not None:
+                self._bind_work_dispatch(program_id, command.attempt.attempt_id, intent[0])
         return next_program
 
     def history(self, program_id: str) -> tuple[HistoryRecord, ...]:
@@ -546,8 +623,24 @@ class SQLiteProgramStore:
             raise ValueError("now must be an integer and lease_seconds positive")
         with self._gate, self._transaction():
             op = self.operation(operation_id)
+            reservation = self._work_record("reservation", operation_id)
+            if reservation is None and (
+                operation_id.startswith("runtime:") or self._work_record("unbound-attempt", operation_id) is not None
+            ):
+                raise BudgetRefused("runtime dispatch lacks original work-budget/clock proof")
+            if reservation is not None:
+                self.check_work_dispatch(operation_id)
+                if op.attempts:
+                    self._reserve_work(
+                        cast(str, reservation["program"]),
+                        cast(str, reservation["attempt"]),
+                        f"retry:{operation_id}:{op.fence + 1}",
+                        WorkKind.RETRY,
+                    )
             if json.loads(op.request_json)["request"].get("kind") == "ordinary-intake-record":
                 raise OperationConflict("inert intake metadata cannot be dispatched")
+            if json.loads(op.request_json)["request"].get("kind") == "work-budget-record":
+                raise OperationConflict("budget metadata cannot be dispatched")
             if op.lease_until is not None and op.lease_until > now:
                 raise OperationConflict("delivery lease is held")
             if op.status in {"accepted", "running", "waiting", "terminal", "rejected"}:
@@ -565,6 +658,779 @@ class SQLiteProgramStore:
                 (operation_id, fence, now, now + lease_seconds),
             )
             return fence
+
+    @staticmethod
+    def _work_key(record_type: str, identity: str) -> str:
+        return f"work-budget:v1:{record_type}:{hashlib.sha256(identity.encode()).hexdigest()}"
+
+    def _work_record(self, record_type: str, identity: str) -> dict[str, object] | None:
+        key = self._work_key(record_type, identity)
+        row = self._connection.execute("SELECT request_json FROM operations WHERE operation_id = ?", (key,)).fetchone()
+        return None if row is None else cast(dict[str, object], json.loads(row["request_json"])["request"])
+
+    def _work_records(self, record_type: str) -> list[dict[str, object]]:
+        return [
+            cast(dict[str, object], json.loads(item.request_json)["request"])
+            for item in self.operations(f"work-budget:v1:{record_type}:")
+        ]
+
+    def _write_work_record(self, record_type: str, identity: str, fields: dict[str, object]) -> None:
+        key = self._work_key(record_type, identity)
+        self._insert_intent(key, key, {"kind": "work-budget-record", "type": record_type, **fields})
+
+    def _work_binding(self, program_id: str) -> dict[str, object] | None:
+        original = self._work_record("binding", program_id)
+        if original is None:
+            return None
+        current_digest = self._load_head(program_id).spec.digest
+        revised = self._work_record("binding-revision", canonical_json([program_id, current_digest]))
+        return original if revised is None else revised
+
+    def configure_work_budget(
+        self,
+        program_id: str,
+        project_id: str,
+        project: WorkBudgetPolicy,
+        task: WorkBudgetPolicy,
+        projection: DeadlineProjection,
+    ) -> None:
+        """Bind immutable approved policy on the existing single writer, without rewriting old bytes.
+
+        Project capacity spans Programs in THIS store only. Separate databases do
+        not constitute one project capacity authority.
+        """
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        self._validate_command_key(project_id)
+        if project.strict_inference or task.strict_inference:
+            raise BudgetRefused("strict inference bounds unavailable for the installed profiles")
+        with self._gate, self._transaction():
+            self._configure_work_budget(program_id, project_id, project, task, projection)
+
+    def _configure_work_budget(
+        self,
+        program_id: str,
+        project_id: str,
+        project: WorkBudgetPolicy,
+        task: WorkBudgetPolicy,
+        projection: DeadlineProjection,
+    ) -> None:
+        existing = self._work_binding(program_id)
+        if existing is None and self._load_head(program_id).attempts:
+            raise BudgetRefused("legacy Attempt lacks original work-budget proof; reconciliation required")
+        origin = self._work_record("clock-origin", program_id)
+        if origin is not None:
+            if projection != DeadlineProjection.decode(origin["projection"]):
+                raise BudgetRefused("original work projection cannot be renewed")
+            if existing is None and origin["spec_digest"] != self._load_head(program_id).spec.digest:
+                raise BudgetRefused("prepared clock origin belongs to a different specification")
+        self._write_work_record("project", project_id, {"project": project_id, "policy": project.payload()})
+        fields: dict[str, object] = {
+            "program": program_id,
+            "project": project_id,
+            "policy": task.payload(),
+            "projection": asdict(projection),
+            "spec_digest": self._load_head(program_id).spec.digest,
+        }
+        original = self._work_record("binding", program_id)
+        if existing is not None and original is not None and original["spec_digest"] != fields["spec_digest"]:
+            if any(existing[name] != fields[name] for name in ("program", "project", "policy", "projection")):
+                raise BudgetRefused("specification revision cannot reset original work envelope")
+            self._write_work_record("binding-revision", canonical_json([program_id, fields["spec_digest"]]), fields)
+        else:
+            self._write_work_record("binding", program_id, fields)
+
+    def accept_work_budget(
+        self,
+        spec: ProgramSpec,
+        command_key: str,
+        project_id: str,
+        project: WorkBudgetPolicy,
+        task: WorkBudgetPolicy,
+        deadline: int | DeadlineProjection,
+        *,
+        amendment: AmendProgramSpec | None = None,
+        records: tuple[tuple[str, dict[str, object], bytes | None], ...] = (),
+        validate: Callable[[], None] | None = None,
+    ) -> Program:
+        """Publish one budgeted Program decision, its inert records and binding atomically.
+
+        Only these private write internals share the transaction. Clock evidence
+        and caller validation commit/run beforehand; rejection cannot erase a
+        reentrant cancellation or an observed clock floor. Orphan blob bytes are
+        harmless: their references join the same acceptance commit.
+        """
+        self._assert_writer_thread()
+        self._validate_program_id(spec.program_id)
+        self._validate_command_key(command_key)
+        self._validate_command_key(project_id)
+        with self._gate:
+            readings = self._prepare_work_clocks()
+            changes = self._connection.total_changes
+            current = self.find_program(spec.program_id)
+            existing = self._work_binding(spec.program_id)
+            origin = self.pending_work_projection(spec)
+            if existing is not None or origin is not None:
+                projection = DeadlineProjection.decode(existing["projection"]) if existing is not None else origin
+                assert projection is not None  # noqa: S101 - original evidence checked above.
+                if (
+                    deadline.wall_deadline if isinstance(deadline, DeadlineProjection) else deadline
+                ) != projection.wall_deadline:
+                    raise BudgetRefused("original work expiry cannot be renewed")
+                if isinstance(deadline, DeadlineProjection) and deadline != projection:
+                    raise BudgetRefused("original work projection cannot be renewed")
+                if existing is not None and (existing["project"] != project_id or existing["policy"] != task.payload()):
+                    raise BudgetRefused("specification revision cannot reset original work envelope")
+                if existing is None or validate is not None or amendment is not None:
+                    self._check_work_projection(spec.program_id, projection, readings.get(spec.program_id))
+            else:
+                projection = self._new_work_projection(deadline, readings)
+            if project.strict_inference or task.strict_inference:
+                raise BudgetRefused("strict inference bounds unavailable for the installed profiles")
+            project_record = self._work_record("project", project_id)
+            if project_record is not None and project_record["policy"] != project.payload():
+                raise BudgetRefused("project policy cannot replace original capacity authority")
+            if current is not None and existing is None and current.attempts:
+                raise BudgetRefused("legacy Attempt lacks original work-budget proof; reconciliation required")
+            if self._closed or self._connection.total_changes != changes:
+                raise ProgramReadChanged("final store read cut changed during a callback")
+            if existing is None and origin is None:
+                # A prepared clock origin is evidence, not an accepted budget or
+                # Program. Keep it independently so failure/retry cannot renew it.
+                with self._transaction(readings):
+                    self._write_work_record(
+                        "clock-origin",
+                        spec.program_id,
+                        {"program": spec.program_id, "spec_digest": spec.digest, "projection": asdict(projection)},
+                    )
+                changes = self._connection.total_changes
+            if validate is not None:
+                validate()
+            if self._closed or self._connection.total_changes != changes:
+                raise ProgramReadChanged("final store read cut changed during a callback")
+            # Nothing that can block on caller validation runs after this final
+            # independent capture. Preserve the original anchors, not a new bind.
+            readings = self._prepare_work_clocks()
+            if existing is None or validate is not None or amendment is not None:
+                self._check_work_projection(spec.program_id, projection, readings.get(spec.program_id))
+            with self._transaction(readings):
+                if current is None:
+                    if amendment is not None:
+                        raise ProgramReadChanged("approval amendment has no original Program")
+                    program = self._create(spec, command_key)
+                elif current.spec == spec:
+                    program = current
+                elif amendment is not None:
+                    program = self._admit_decision(spec.program_id, command_key, amendment, None)
+                else:
+                    raise ProgramReadChanged("current Program binding changed")
+                if program.spec != spec:
+                    raise ProgramReadChanged("admitted Program differs from approved specification")
+                self._configure_work_budget(spec.program_id, project_id, project, task, projection)
+                for key, request, raw in records:
+                    self._validate_command_key(key)
+                    self._insert_intent(key, key, request)
+                    if raw is not None:
+                        self._finalize_artifact(key, "record", raw)
+            return program
+
+    def has_work_budget(self, program_id: str) -> bool:
+        self._assert_writer_thread()
+        return self._work_binding(program_id) is not None
+
+    def pending_work_projection(self, spec: ProgramSpec) -> DeadlineProjection | None:
+        """Recover a prepared clock origin, never accepted work/dispatch authority."""
+        self._assert_writer_thread()
+        origin = self._work_record("clock-origin", spec.program_id)
+        if origin is None or self._work_binding(spec.program_id) is not None:
+            return None
+        if origin["spec_digest"] != spec.digest:
+            raise BudgetRefused("prepared clock origin belongs to a different specification")
+        return DeadlineProjection.decode(origin["projection"])
+
+    def _check_work_projection(
+        self, program_id: str, projection: DeadlineProjection, reading: BootClockReading | None
+    ) -> None:
+        if reading is None:
+            raise BudgetRefused("clock observation persistence unverified; no new work authority")
+        if not projection.verifiable(reading):
+            raise BudgetRefused("original work deadline expired or boot clock unverifiable")
+        previous = self._clock_watermarks[program_id]
+        if reading.wall < previous.wall or reading.boot_ns < previous.boot_ns:
+            raise BudgetRefused("observed wall/boot clock rollback; no new work authority")
+        if projection.decision_time(reading) >= projection.wall_deadline:
+            raise BudgetRefused("original work deadline expired or boot clock unverifiable")
+
+    def _new_work_projection(
+        self, deadline: int | DeadlineProjection, readings: dict[str, BootClockReading | None]
+    ) -> DeadlineProjection:
+        if readings:
+            if any(item is None for item in readings.values()):
+                raise BudgetRefused("clock observation persistence unverified; no new work envelope")
+            reading = next(iter(readings.values()))
+            assert reading is not None  # noqa: S101 - checked all captured readings above.
+            for program_id in readings:
+                previous = self._clock_watermarks[program_id]
+                if previous.boot_id == reading.boot_id and (
+                    reading.wall < previous.wall or reading.boot_ns < previous.boot_ns
+                ):
+                    raise BudgetRefused("observed wall/boot clock rollback; no new work envelope")
+        elif isinstance(deadline, DeadlineProjection):
+            return deadline  # Caller already captured this original proof, not a recovery reprojection.
+        else:
+            reading = self._boot_clock()
+        if reading is None:
+            raise BudgetRefused("verified suspend-inclusive clock unavailable")
+        if isinstance(deadline, DeadlineProjection):
+            if not deadline.verifiable(reading) or deadline.decision_time(reading) >= deadline.wall_deadline:
+                raise BudgetRefused("original work deadline expired or boot clock unverifiable")
+            return deadline
+        return DeadlineProjection.bind(deadline, reading)
+
+    def bind_work_budget(
+        self, program_id: str, project_id: str, project: WorkBudgetPolicy, task: WorkBudgetPolicy, deadline: int
+    ) -> None:
+        """First binding only; reopening never projects a deadline again."""
+        self._assert_writer_thread()
+        existing = self._work_binding(program_id)
+        origin = existing if existing is not None else self._work_record("clock-origin", program_id)
+        if origin is not None:
+            projection = DeadlineProjection.decode(origin["projection"])
+            if projection.wall_deadline != deadline:
+                raise BudgetRefused("original work expiry cannot be renewed")
+        else:
+            projection = self._new_work_projection(
+                deadline, self._prepare_work_clocks() if self._work_records("binding") else {}
+            )
+        self.configure_work_budget(program_id, project_id, project, task, projection)
+
+    def original_work_deadline(self, program_id: str) -> int | None:
+        self._assert_writer_thread()
+        binding = self._work_binding(program_id)
+        origin = binding if binding is not None else self._work_record("clock-origin", program_id)
+        return None if origin is None else DeadlineProjection.decode(origin["projection"]).wall_deadline
+
+    def check_work_authority(self, program_id: str) -> None:
+        self._assert_writer_thread()
+        binding = self._work_binding(program_id)
+        if binding is None:
+            raise BudgetRefused("configured original work envelope required")
+        if binding["spec_digest"] != self._load_head(program_id).spec.digest:
+            raise BudgetRefused("work envelope belongs to a different current specification")
+        projection = DeadlineProjection.decode(binding["projection"])
+        if self.work_decision_time(program_id) >= projection.wall_deadline:
+            raise BudgetRefused("original work deadline expired or boot clock unverifiable")
+        if (
+            self._work_record("revoked", program_id) is not None
+            or self._load_head(program_id).status is ProgramStatus.CANCELLED
+        ):
+            raise BudgetRefused("work authority revoked")
+
+    def work_decision_time(self, program_id: str) -> int:
+        """Use the same durably captured reading for application authority clocks.
+
+        This proves time only, not dispatch permission. Expired/revoked work may
+        still reconcile receipts; unverifiable time or rollback never becomes a
+        fresh projection or a new authority grant.
+        """
+        self._assert_writer_thread()
+        binding = self._work_binding(program_id)
+        if binding is None:
+            raise BudgetRefused("configured original work envelope required")
+        projection = DeadlineProjection.decode(binding["projection"])
+        readings = self._transaction_clock_readings if self._connection.in_transaction else self._prepare_work_clocks()
+        state = self._connection.execute(
+            "SELECT * FROM work_clock_state WHERE program_id = ?", (program_id,)
+        ).fetchone()
+        if state is None or state["pending"] or readings is None or program_id not in readings:
+            raise BudgetRefused("clock observation persistence unverified; no new work authority")
+        reading = readings[program_id]
+        if not projection.verifiable(reading):
+            raise BudgetRefused("original work deadline expired or boot clock unverifiable")
+        assert reading is not None  # noqa: S101 - projection verification established reading.
+        previous = self._clock_watermarks[program_id]
+        if reading.wall < previous.wall or reading.boot_ns < previous.boot_ns:
+            raise BudgetRefused("observed wall/boot clock rollback; no new work authority")
+        return projection.decision_time(reading)
+
+    def _flush_clock_observations(self) -> None:
+        """Commit only captured clock evidence, never capacity/outbox/domain rows."""
+        if not self._clock_uncommitted:
+            return
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            for program_id, reading in self._clock_uncommitted.items():
+                row = self._connection.execute(
+                    "SELECT * FROM work_clock_state WHERE program_id = ?", (program_id,)
+                ).fetchone()
+                if row is None:
+                    raise BudgetRefused("original pending clock observation is missing")
+                wall, boot_ns = cast(int, row["wall"]), cast(int, row["boot_ns"])
+                if reading is not None and (reading.boot_id, reading.clock) == (row["boot_id"], row["clock"]):
+                    wall, boot_ns = max(wall, reading.wall), max(boot_ns, reading.boot_ns)
+                self._connection.execute(
+                    "UPDATE work_clock_state SET wall = ?, boot_ns = ?, pending = 0 WHERE program_id = ?",
+                    (wall, boot_ns, program_id),
+                )
+            self._connection.execute("COMMIT")
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+        # Cache only committed guard floors. These maxima never reproject expiry.
+        for program_id in self._clock_uncommitted:
+            row = self._connection.execute(
+                "SELECT * FROM work_clock_state WHERE program_id = ?", (program_id,)
+            ).fetchone()
+            assert row is not None  # noqa: S101 - transaction retained the existing row.
+            self._clock_watermarks[program_id] = BootClockReading(
+                row["wall"], row["boot_ns"], row["boot_id"], row["clock"]
+            )
+        self._clock_uncommitted.clear()
+
+    def _prepare_work_clocks(self) -> dict[str, BootClockReading | None]:
+        """Durable pending marker BEFORE acquisition; durable floors BEFORE admission.
+
+        A lost pending read cannot be reconstructed from a recovery wall clock.
+        The same live owner may retry flushing the exact captured sample. Historical
+        reads and cancellation journaling remain possible when authority is unknown.
+        """
+        if self._connection.in_transaction:
+            return {}  # Never roll back or join an outer admission transaction.
+        if self._connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            return {}
+        bindings = self._work_records("binding")
+        bound = {item["program"] for item in bindings}
+        bindings.extend(item for item in self._work_records("clock-origin") if item["program"] not in bound)
+        if not bindings:
+            return {}
+        result: dict[str, BootClockReading | None] = {cast(str, item["program"]): None for item in bindings}
+        try:
+            self._flush_clock_observations()
+            self._connection.execute("BEGIN IMMEDIATE")
+            eligible: list[str] = []
+            try:
+                for binding in bindings:
+                    program_id = cast(str, binding["program"])
+                    row = self._connection.execute(
+                        "SELECT * FROM work_clock_state WHERE program_id = ?", (program_id,)
+                    ).fetchone()
+                    if row is None:
+                        projection = DeadlineProjection.decode(binding["projection"])
+                        legacy = self._work_records(f"clock-{hashlib.sha256(program_id.encode()).hexdigest()}")
+                        wall = max([projection.wall_anchor, *(cast(int, item["wall"]) for item in legacy)])
+                        boot_ns = max([projection.boot_anchor_ns, *(cast(int, item["boot_ns"]) for item in legacy)])
+                        self._connection.execute(
+                            "INSERT INTO work_clock_state VALUES (?, ?, ?, ?, ?, 0)",
+                            (program_id, wall, boot_ns, projection.boot_id, projection.clock),
+                        )
+                    elif row["pending"]:
+                        continue
+                    self._connection.execute(
+                        "UPDATE work_clock_state SET pending = 1 WHERE program_id = ?", (program_id,)
+                    )
+                    eligible.append(program_id)
+                self._connection.execute("COMMIT")
+            except BaseException:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+            if not eligible:
+                return result
+            changes = self._connection.total_changes
+            try:
+                reading = self._boot_clock()
+            except (OSError, ValueError):
+                reading = None
+            callback_changed = self._closed or self._connection.total_changes != changes
+            for program_id in eligible:
+                self._clock_uncommitted[program_id] = reading
+            self._flush_clock_observations()
+            for program_id in eligible:
+                result[program_id] = None if callback_changed else reading
+        except (OSError, sqlite3.DatabaseError, BudgetRefused):
+            # No authority is derived from an uncommitted sample. The committed
+            # pending marker survives failed flush and fresh-process recovery.
+            return result
+        return result
+
+    def revoke_work_budget(self, program_id: str, evidence: str) -> None:
+        self._assert_writer_thread()
+        self._validate_command_key(evidence)
+        with self._gate, self._transaction():
+            if self._work_record("revoked", program_id) is None:
+                self._write_work_record("revoked", program_id, {"program": program_id, "evidence": evidence})
+
+    def _bind_work_dispatch(self, program_id: str, attempt_id: str, operation_id: str) -> None:
+        attempt = self._load_head(program_id).attempt(attempt_id).spec
+        operation = self.operation(operation_id)
+        self._write_work_record(
+            "dispatch-binding",
+            operation_id,
+            {
+                "program": program_id,
+                "attempt": attempt_id,
+                "attempt_digest": attempt.digest,
+                "spec_digest": attempt.spec_digest,
+                "spec_revision": attempt.spec_revision,
+                "operation": operation_id,
+                "effect_key": operation.effect_key,
+                "request_digest": operation.request_digest,
+            },
+        )
+
+    def check_work_dispatch(self, operation_id: str) -> None:
+        """Revalidate NEW dispatch, not historical receipt or reservation replay."""
+        self._assert_writer_thread()
+        reservation = self._work_record("reservation", operation_id)
+        if reservation is None:
+            raise BudgetRefused("dispatch lacks original work reservation")
+        program_id, attempt_id = cast(str, reservation["program"]), cast(str, reservation["attempt"])
+        self.check_work_authority(program_id)
+        program = self._load_head(program_id)
+        try:
+            attempt = program.attempt(attempt_id)
+        except ValueError as error:
+            raise BudgetRefused("dispatch lacks its originating Attempt") from error
+        if (attempt.spec.spec_revision, attempt.spec.spec_digest) != (program.spec.revision, program.spec.digest):
+            raise BudgetRefused("reserved Attempt belongs to a superseded specification")
+        operation = self.operation(operation_id)
+        binding = self._work_record("dispatch-binding", operation_id)
+        expected = {
+            "program": program_id,
+            "attempt": attempt_id,
+            "attempt_digest": attempt.spec.digest,
+            "spec_digest": attempt.spec.spec_digest,
+            "spec_revision": attempt.spec.spec_revision,
+            "operation": operation_id,
+            "effect_key": operation.effect_key,
+            "request_digest": operation.request_digest,
+        }
+        if binding is None:
+            # Existing original typed requests remain evidence, never a new projection.
+            request = cast(dict[str, object], json.loads(operation.request_json)["request"])
+            subject = request.get("subject")
+            subject_fields = cast(dict[str, object], subject) if type(subject) is dict else {}
+            if not (
+                reservation["category"] == WorkKind.ATTEMPT.value and request.get("attempt") == attempt.spec.digest
+            ) and not (
+                subject_fields.get("attempt_digest") == attempt.spec.digest
+                and subject_fields.get("spec_digest") == program.spec.digest
+            ):
+                raise BudgetRefused("original exact dispatch binding unavailable")
+        elif binding != {"kind": "work-budget-record", "type": "dispatch-binding", **expected}:
+            raise BudgetRefused("Operation differs from original Attempt dispatch binding")
+        state = program.state(attempt.spec.work_unit_id)
+        category = WorkKind(cast(str, reservation["category"]))
+        if category is WorkKind.ATTEMPT:
+            if json.loads(operation.request_json)["request"].get("attempt") != attempt.spec.digest:
+                raise BudgetRefused("runtime Operation request differs from originating Attempt")
+            permitted = (
+                program.status is ProgramStatus.ACTIVE
+                and attempt.status in {AttemptStatus.PREPARED, AttemptStatus.EXECUTING}
+                and state.status is WorkUnitStatus.ACTIVE
+                and state.active_attempt_id == attempt_id
+            )
+        elif category is WorkKind.AUXILIARY:
+            permitted = (
+                program.status in {ProgramStatus.ACTIVE, ProgramStatus.COMPLETED}
+                and attempt.status is AttemptStatus.FINISHED
+                and state.status is WorkUnitStatus.SATISFIED
+                and any(
+                    item.reference_id == state.satisfaction_id and item.source_attempt_id == attempt_id
+                    for item in program.satisfactions
+                )
+            )
+        else:
+            latest = next(
+                (item for item in reversed(program.attempts) if item.spec.work_unit_id == attempt.spec.work_unit_id),
+                None,
+            )
+            permitted = (
+                program.status is ProgramStatus.ACTIVE
+                and attempt.status is AttemptStatus.FINISHED
+                and state.status is WorkUnitStatus.READY
+                and latest is not None
+                and latest.attempt_id == attempt_id
+            )
+        if not permitted:
+            raise BudgetRefused("Attempt/WorkUnit state no longer permits this dispatch")
+        self._check_resource_headroom(program_id, exclude_operation=operation_id)
+
+    def _check_resource_headroom(self, program_id: str, *, exclude_operation: str | None = None) -> None:
+        binding = self._work_binding(program_id)
+        if binding is None:
+            raise BudgetRefused("configured original work envelope required")
+        project = self._work_record("project", cast(str, binding["project"]))
+        if project is None:
+            raise BudgetRefused("project capacity authority unavailable")
+        records = self._work_records("reservation")
+        for scope, identity, policy in (
+            ("program", program_id, WorkBudgetPolicy.decode(binding["policy"])),
+            ("project", binding["project"], WorkBudgetPolicy.decode(project["policy"])),
+        ):
+            scoped = [item for item in records if item[scope] == identity]
+            effective = self._effective_usage(scoped)
+            for ceiling in policy.resources:
+                authoritative = {
+                    Provenance.MEASUREMENT.value,
+                    Provenance.PROVIDER_REPORT.value,
+                    Provenance.OWNER_RECORD.value,
+                }
+                matching = [
+                    item for item in effective if (item["metric"], item["unit"]) == (ceiling.metric, ceiling.unit)
+                ]
+                if (
+                    sum(
+                        (
+                            Decimal(cast(str, item["quantity"]))
+                            for item in matching
+                            if item["quantity"] is not None and item["provenance"] in authoritative
+                        ),
+                        Decimal(0),
+                    )
+                    >= ceiling.quantity
+                ):
+                    raise BudgetRefused(f"{scope} observed resource ceiling exhausted")
+                # A numeric receipt, even after physical settlement, does not prove
+                # complete hidden-client consumption. No installed profile supplies
+                # a resource-specific conservative final bound to release this hold.
+                if any(item["operation"] != exclude_operation for item in scoped) or any(
+                    item["quantity"] is None or item["provenance"] not in authoritative for item in matching
+                ):
+                    raise BudgetRefused(f"{scope} resource headroom unknown")
+
+    def _reserve_work(
+        self, program_id: str, attempt_id: str, operation_id: str, category: WorkKind, retained_bytes: int = 0
+    ) -> None:
+        if type(category) is not WorkKind or type(retained_bytes) is not int or retained_bytes < 0:
+            raise ValueError("invalid work reservation")
+        binding = self._work_binding(program_id)
+        if binding is None:
+            raise BudgetRefused("configured original work envelope required")
+        reservation = {
+            "program": program_id,
+            "project": binding["project"],
+            "attempt": attempt_id,
+            "operation": operation_id,
+            "category": category.value,
+            "retained_bytes": retained_bytes,
+        }
+        prior = self._work_record("reservation", operation_id)
+        if prior is not None:
+            if prior != {"kind": "work-budget-record", "type": "reservation", **reservation}:
+                raise BudgetRefused("reservation identity conflicts with original input")
+            return
+        self.check_work_authority(program_id)
+        records = self._work_records("reservation")
+        if category is WorkKind.ATTEMPT and any(
+            item["program"] == program_id and item["attempt"] == attempt_id and item["category"] == category.value
+            for item in records
+        ):
+            raise BudgetRefused("Attempt capacity already belongs to another Operation")
+        project = self._work_record("project", cast(str, binding["project"]))
+        if project is None:
+            raise BudgetRefused("project capacity authority unavailable")
+        for scope, identity, policy in (
+            ("program", program_id, WorkBudgetPolicy.decode(binding["policy"])),
+            ("project", binding["project"], WorkBudgetPolicy.decode(project["policy"])),
+        ):
+            scoped = [item for item in records if item[scope] == identity]
+            if sum(item["category"] == category.value for item in scoped) >= dict(policy.counts)[category]:
+                raise BudgetRefused(f"{scope} {category.value} capacity exhausted")
+            active = {
+                (cast(str, item["program"]), cast(str, item["attempt"]))
+                for item in scoped
+                if item["category"] not in {WorkKind.REMEDIATION.value, WorkKind.RETRY.value}
+                and self._work_record("settlement", cast(str, item["operation"])) is None
+            }
+            if (program_id, attempt_id) not in active and len(active) >= policy.max_active:
+                raise BudgetRefused(f"{scope} active work capacity exhausted")
+            retained = 0
+            for item in scoped:
+                result = self._work_record("retained", cast(str, item["operation"]))
+                retained += cast(int, result["bytes"] if result is not None else item["retained_bytes"])
+            if retained + retained_bytes > policy.retained_bytes:
+                raise BudgetRefused(f"{scope} retained streaming byte capacity exhausted")
+        self._check_resource_headroom(program_id)
+        self._write_work_record("reservation", operation_id, reservation)
+
+    def reserve_work(
+        self, program_id: str, attempt_id: str, operation_id: str, category: WorkKind, *, retained_bytes: int = 0
+    ) -> None:
+        self._assert_writer_thread()
+        with self._gate, self._transaction():
+            self._reserve_work(program_id, attempt_id, operation_id, category, retained_bytes)
+
+    def budgeted_intent(
+        self,
+        program_id: str,
+        attempt_id: str,
+        category: WorkKind,
+        operation_id: str,
+        effect_key: str,
+        request: dict[str, object],
+        *,
+        retained_bytes: int = 0,
+    ) -> OperationRecord:
+        self._assert_writer_thread()
+        with self._gate, self._transaction():
+            existed = self._work_record("reservation", operation_id) is not None
+            self._reserve_work(program_id, attempt_id, operation_id, category, retained_bytes)
+            self._insert_intent(operation_id, effect_key, request)
+            if not existed:
+                self._bind_work_dispatch(program_id, attempt_id, operation_id)
+        return self.operation(operation_id)
+
+    def work_program_for_attempt(self, attempt_id: str) -> str:
+        self._assert_writer_thread()
+        programs = {
+            cast(str, item["program"]) for item in self._work_records("reservation") if item["attempt"] == attempt_id
+        }
+        if len(programs) != 1:
+            raise BudgetRefused("exact Attempt work-budget binding unavailable")
+        program_id = programs.pop()
+        if not any(item.attempt_id == attempt_id for item in self._load_head(program_id).attempts):
+            raise BudgetRefused("reserved work is not a prepared Attempt")
+        return program_id
+
+    def retry_work(self, operation_id: str) -> None:
+        self._assert_writer_thread()
+        with self._gate, self._transaction():
+            original = self._work_record("reservation", operation_id)
+            if original is None:
+                raise BudgetRefused("retry lacks original reservation")
+            prefix = f"work-retry:{operation_id}:"
+            count = sum(cast(str, item["operation"]).startswith(prefix) for item in self._work_records("reservation"))
+            self._reserve_work(
+                cast(str, original["program"]), cast(str, original["attempt"]), f"{prefix}{count + 1}", WorkKind.RETRY
+            )
+
+    def record_work_settlement(self, operation_id: str, evidence: str) -> None:
+        """Trusted profile-specific exact witness, never a lease/turn-terminal inference."""
+        self._assert_writer_thread()
+        self._validate_command_key(evidence)
+        with self._gate, self._transaction():
+            if self._work_record("reservation", operation_id) is None:
+                raise BudgetRefused("settlement has no original reservation")
+            if self._work_record("settlement", operation_id) is None:
+                self._write_work_record("settlement", operation_id, {"operation": operation_id, "evidence": evidence})
+
+    def record_retained_bytes(self, operation_id: str, retained_bytes: int) -> None:
+        self._assert_writer_thread()
+        with self._gate, self._transaction():
+            reservation = self._work_record("reservation", operation_id)
+            if (
+                reservation is None
+                or type(retained_bytes) is not int
+                or not 0 <= retained_bytes <= cast(int, reservation["retained_bytes"])
+            ):
+                raise BudgetRefused("retained bytes exceed original reservation")
+            self._write_work_record("retained", operation_id, {"operation": operation_id, "bytes": retained_bytes})
+
+    def available_retained_bytes(self, program_id: str) -> int:
+        self._assert_writer_thread()
+        binding = self._work_binding(program_id)
+        if binding is None:
+            raise BudgetRefused("configured work envelope required")
+        project = self._work_record("project", cast(str, binding["project"]))
+        if project is None:
+            raise BudgetRefused("configured project envelope required")
+        records = self._work_records("reservation")
+        available: list[int] = []
+        for scope, identity, policy in (
+            ("program", program_id, WorkBudgetPolicy.decode(binding["policy"])),
+            ("project", binding["project"], WorkBudgetPolicy.decode(project["policy"])),
+        ):
+            used = 0
+            for item in records:
+                if item[scope] == identity:
+                    retained = self._work_record("retained", cast(str, item["operation"]))
+                    used += cast(int, item["retained_bytes"] if retained is None else retained["bytes"])
+            available.append(policy.retained_bytes - used)
+        return max(0, min(available))
+
+    def _effective_usage(self, reservations: list[dict[str, object]]) -> list[dict[str, object]]:
+        operations = {item["operation"] for item in reservations}
+        facts = [item for item in self._work_records("usage") if item["operation"] in operations]
+        superseded = {(item["source"], item["supersedes_id"]) for item in facts if item["supersedes_id"] is not None}
+        return [item for item in facts if (item["source"], item["observation_id"]) not in superseded]
+
+    def record_usage(self, operation_id: str, observation: UsageObservation) -> None:
+        self._assert_writer_thread()
+        with self._gate, self._transaction():
+            reservation = self._work_record("reservation", operation_id)
+            if reservation is None or reservation["attempt"] != observation.attempt_id:
+                raise BudgetRefused("usage must bind its original reserved Attempt/Operation")
+            fields = {"operation": operation_id, **observation.payload()}
+            observation_key = canonical_json([observation.source, observation.observation_id])
+            existing = self._work_record("usage", observation_key)
+            if existing is not None:
+                self._write_work_record("usage", observation_key, fields)
+                return
+            facts = self._effective_usage(self._work_records("reservation"))
+            identity = (observation.source, observation.receipt_id, observation.metric, observation.unit)
+            prior = [
+                item for item in facts if (item["source"], item["receipt_id"], item["metric"], item["unit"]) == identity
+            ]
+            if any(item["operation"] != operation_id or item["attempt_id"] != observation.attempt_id for item in prior):
+                raise BudgetRefused("source receipt retains its original Attempt/Operation attribution")
+            if (not prior and observation.supersedes_id is not None) or (
+                prior and (len(prior) != 1 or observation.supersedes_id != prior[0]["observation_id"])
+            ):
+                raise BudgetRefused("usage correction requires the latest same-source receipt and unit")
+            self._write_work_record("usage", observation_key, fields)
+
+    def work_budget_status(self, program_id: str) -> dict[str, object]:
+        self._assert_writer_thread()
+        binding = self._work_binding(program_id)
+        reservations = [item for item in self._work_records("reservation") if item["program"] == program_id]
+        effective = self._effective_usage(reservations)
+        groups = {
+            (cast(str, item["metric"]), cast(str, item["unit"]), cast(str, item["provenance"])) for item in effective
+        }
+        totals: list[dict[str, object]] = []
+        for metric, unit, provenance in sorted(groups):
+            observations = [
+                item
+                for item in effective
+                if (item["metric"], item["unit"], item["provenance"]) == (metric, unit, provenance)
+            ]
+            subtotal = sum(
+                (Decimal(cast(str, item["quantity"])) for item in observations if item["quantity"] is not None),
+                Decimal(0),
+            )
+            missing = len({item["operation"] for item in reservations} - {item["operation"] for item in observations})
+            unknown = sum(item["quantity"] is None for item in observations)
+            totals.append(
+                {
+                    "metric": metric,
+                    "unit": unit,
+                    "provenance": provenance,
+                    "known_subtotal": str(subtotal),
+                    "quantity": None,
+                    "coverage": "observed receipts only; hidden external-client work unverified",
+                    "unknown_receipts": unknown,
+                    "unreported_operations": missing,
+                }
+            )
+        return {
+            "version": 1,
+            "binding": binding,
+            "reservations": reservations,
+            "effective_usage": effective,
+            "resource_totals": totals,
+            "usage_history": [
+                item
+                for item in self._work_records("usage")
+                if item["operation"] in {record["operation"] for record in reservations}
+            ],
+            "reservation_is_usage": False,
+            "missing_usage": "unknown",
+            "inference_usage_coverage": "unknown; a known receipt does not prove hidden work absent",
+            "hard_inference_cap": False,
+            "scope": "single configured SQLite owner; no cross-database capacity claim",
+        }
 
     def deliver_fake(
         self,
@@ -720,6 +1586,11 @@ class SQLiteProgramStore:
     def finalize_artifact(self, operation_id: str, name: str, data: bytes) -> str:
         """Flush bytes to a content address before publishing an immutable DB reference."""
         self._assert_writer_thread()
+        with self._gate, self._transaction():
+            return self._finalize_artifact(operation_id, name, data)
+
+    def _finalize_artifact(self, operation_id: str, name: str, data: bytes) -> str:
+        self._assert_writer_thread()
         self.operation(operation_id)
         self._validate_command_key(name)
         if type(data) is not bytes:
@@ -751,19 +1622,18 @@ class SQLiteProgramStore:
                 finally:
                     if os.path.exists(temporary):
                         os.unlink(temporary)
-            with self._transaction():
-                existing = self._connection.execute(
-                    "SELECT digest, size FROM artifact_references WHERE operation_id = ? AND name = ?",
-                    (operation_id, name),
-                ).fetchone()
-                if existing is not None:
-                    if (existing["digest"], existing["size"]) != (digest, len(data)):
-                        raise OperationConflict("artifact reference is immutable")
-                else:
-                    self._connection.execute(
-                        "INSERT INTO artifact_references VALUES (?, ?, ?, ?)",
-                        (operation_id, name, digest, len(data)),
-                    )
+            existing = self._connection.execute(
+                "SELECT digest, size FROM artifact_references WHERE operation_id = ? AND name = ?",
+                (operation_id, name),
+            ).fetchone()
+            if existing is not None:
+                if (existing["digest"], existing["size"]) != (digest, len(data)):
+                    raise OperationConflict("artifact reference is immutable")
+            else:
+                self._connection.execute(
+                    "INSERT INTO artifact_references VALUES (?, ?, ?, ?)",
+                    (operation_id, name, digest, len(data)),
+                )
         return f"sha256:{digest}"
 
     def artifact(self, operation_id: str, name: str) -> bytes:
@@ -856,18 +1726,44 @@ class SQLiteProgramStore:
     def _verify_backup_manifest(directory: Path) -> None:
         try:
             manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-            if manifest["format"] != "creatidy-kernel-sqlite-backup" or manifest["schema_version"] not in (1, 2):
+            if (
+                manifest["format"] != "creatidy-kernel-sqlite-backup"
+                or type(manifest["schema_version"]) is not int
+                or manifest["schema_version"] not in (1, 2, 3, 4)
+            ):
                 raise ValueError("unsupported backup manifest")
             with (directory / "kernel.sqlite3").open("rb") as stream:
                 if hashlib.file_digest(stream, "sha256").hexdigest() != manifest["database_sha256"]:
                     raise ValueError("backup database digest mismatch")
-            entries = cast(list[dict[str, object]], manifest["artifacts"]) if manifest["schema_version"] == 2 else []
+            entries = cast(list[dict[str, object]], manifest["artifacts"]) if manifest["schema_version"] >= 2 else []
+            if type(entries) is not list:
+                raise ValueError("invalid artifact manifest")
+            with closing(
+                sqlite3.connect(f"{(directory / 'kernel.sqlite3').as_uri()}?mode=ro&immutable=1", uri=True)
+            ) as image:
+                if image.execute("PRAGMA user_version").fetchone()[0] != manifest["schema_version"]:
+                    raise ValueError("backup manifest/database schema mismatch")
+                expected = (
+                    sorted(image.execute("SELECT DISTINCT digest, size FROM artifact_references").fetchall())
+                    if manifest["schema_version"] >= 2
+                    else []
+                )
+            listed: list[tuple[str, int]] = []
             for entry in entries:
                 digest, size = entry["digest"], entry["size"]
-                if type(digest) is not str or len(digest) != 64 or type(size) is not int:
+                if (
+                    type(digest) is not str
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                    or type(size) is not int
+                    or size < 0
+                ):
                     raise ValueError("invalid artifact manifest entry")
+                listed.append((digest, size))
                 SQLiteProgramStore._verify_blob(directory / "kernel.sqlite3.artifacts" / digest, digest, size)
-        except (OSError, ValueError, KeyError, TypeError) as error:
+            if sorted(listed) != expected:
+                raise ValueError("artifact manifest does not cover database references exactly")
+        except (OSError, ValueError, KeyError, TypeError, sqlite3.DatabaseError) as error:
             raise CorruptHistory("backup bundle manifest verification failed") from error
 
     @classmethod
@@ -1045,12 +1941,16 @@ class SQLiteProgramStore:
                 _fsync_file(database)
                 with database.open("rb") as stream:
                     file_digest = hashlib.file_digest(stream, "sha256").hexdigest()
-                artifacts = [
-                    (cast(str, row["digest"]), cast(int, row["size"]))
-                    for row in self._connection.execute(
-                        "SELECT DISTINCT digest, size FROM artifact_references ORDER BY digest"
-                    )
-                ]
+                artifacts = (
+                    []
+                    if schema_version == 1
+                    else [
+                        (cast(str, row["digest"]), cast(int, row["size"]))
+                        for row in self._connection.execute(
+                            "SELECT DISTINCT digest, size FROM artifact_references ORDER BY digest"
+                        )
+                    ]
+                )
                 if artifacts:
                     artifact_target = temporary / "kernel.sqlite3.artifacts"
                     artifact_target.mkdir()
@@ -1185,6 +2085,9 @@ class SQLiteProgramStore:
             )
 
     def _migrate(self) -> None:
+        original_version = cast(int, self._connection.execute("PRAGMA user_version").fetchone()[0])
+        if original_version in (1, 2, 3):
+            self._backup_before_schema_four()
         with self._transaction():
             version = cast(int, self._connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SCHEMA_VERSION:
@@ -1195,10 +2098,38 @@ class SQLiteProgramStore:
             if version == 1:
                 self._migrate_1_to_2()
                 version = 2
+            if version == 2:
+                self._migrate_2_to_3()
+                version = 3
+            if version == 3:
+                self._migrate_3_to_4()
+                version = 4
             if version != SCHEMA_VERSION:
                 raise UnsupportedSQLiteConfiguration(f"no migration path from schema version {version}")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        self._validate_schema()
+            self._validate_schema()
+
+    def _backup_before_schema_four(self) -> None:
+        # A content-qualified name reuses the same complete backup after an
+        # interrupted upgrade, never overwriting an earlier recovery image.
+        digest = hashlib.sha256()
+        for statement in self._connection.iterdump():
+            digest.update(statement.encode("utf-8"))
+            digest.update(b"\n")
+        target = self._path.parent / f"{self._path.name}.pre-schema-4-{digest.hexdigest()}"
+        if target.exists():
+            self._verify_backup_manifest(target)
+            original = hashlib.sha256()
+            with closing(
+                sqlite3.connect(f"{(target / 'kernel.sqlite3').as_uri()}?mode=ro&immutable=1", uri=True)
+            ) as backup:
+                for statement in backup.iterdump():
+                    original.update(statement.encode("utf-8"))
+                    original.update(b"\n")
+            if original.digest() != digest.digest():
+                raise CorruptHistory("pre-upgrade backup differs from current original records")
+        else:
+            self.backup(target)
 
     def _migrate_0_to_1(self) -> None:
         statements = (
@@ -1346,6 +2277,28 @@ class SQLiteProgramStore:
                     f"BEGIN SELECT RAISE(ABORT, '{table} is immutable'); END"
                 )
 
+    def _migrate_2_to_3(self) -> None:
+        # This is an authority compatibility boundary, not a data rewrite. Older
+        # readers reject user_version=3 before they can ignore work-budget facts.
+        self._connection.execute(
+            "CREATE TABLE store_contract (schema_version INTEGER PRIMARY KEY CHECK(schema_version = 3), "
+            "authority_contract TEXT NOT NULL CHECK(authority_contract = 'work-budget:v1')) WITHOUT ROWID"
+        )
+        self._connection.execute("INSERT INTO store_contract VALUES (3, 'work-budget:v1')")
+        for action in ("UPDATE", "DELETE"):
+            self._connection.execute(
+                f"CREATE TRIGGER store_contract_no_{action.lower()} BEFORE {action} ON store_contract "
+                "BEGIN SELECT RAISE(ABORT, 'store contract is immutable'); END"
+            )
+
+    def _migrate_3_to_4(self) -> None:
+        self._connection.execute(
+            "CREATE TABLE work_clock_state (program_id TEXT PRIMARY KEY, wall INTEGER NOT NULL CHECK(wall >= 0), "
+            "boot_ns INTEGER NOT NULL CHECK(boot_ns >= 0), boot_id TEXT NOT NULL, "
+            "clock TEXT NOT NULL CHECK(clock = 'linux:CLOCK_BOOTTIME'), "
+            "pending INTEGER NOT NULL CHECK(pending IN (0,1))) WITHOUT ROWID"
+        )
+
     def _validate_schema(self) -> None:
         tables = {
             cast(str, row[0])
@@ -1364,6 +2317,8 @@ class SQLiteProgramStore:
             "operation_transports",
             "operation_reconciliations",
             "artifact_references",
+            "store_contract",
+            "work_clock_state",
         }
         if not required <= tables:
             raise UnsupportedSQLiteConfiguration("database schema is missing required K2 tables")
@@ -1394,6 +2349,8 @@ class SQLiteProgramStore:
                 "authoritative_absence",
             },
             "artifact_references": {"operation_id", "name", "digest", "size"},
+            "store_contract": {"schema_version", "authority_contract"},
+            "work_clock_state": {"program_id", "wall", "boot_ns", "boot_id", "clock", "pending"},
         }
         for table, expected in columns.items():
             actual = {cast(str, row["name"]) for row in self._connection.execute(f"PRAGMA table_info({table})")}
@@ -1405,6 +2362,7 @@ class SQLiteProgramStore:
         }
         required_triggers = {"history_no_update", "history_no_delete", "admissions_no_update", "admissions_no_delete"}
         required_triggers |= {"operations_no_delete", "outbox_no_update", "outbox_no_delete"}
+        required_triggers |= {"store_contract_no_update", "store_contract_no_delete"}
         required_triggers |= {
             f"{table}_no_{action}"
             for table in (
@@ -1418,13 +2376,21 @@ class SQLiteProgramStore:
         }
         if not required_triggers <= triggers:
             raise UnsupportedSQLiteConfiguration("database schema is missing append-only history constraints")
+        if [
+            tuple(row)
+            for row in self._connection.execute("SELECT schema_version, authority_contract FROM store_contract")
+        ] != [(3, "work-budget:v1")]:
+            raise UnsupportedSQLiteConfiguration("database authority compatibility contract is invalid")
         if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise CorruptHistory("database contains a foreign-key violation")
 
     @contextmanager
-    def _transaction(self) -> Generator[None, None, None]:
+    def _transaction(self, readings: dict[str, BootClockReading | None] | None = None) -> Generator[None, None, None]:
         self._assert_writer_thread()
+        if readings is None:
+            readings = self._prepare_work_clocks()
         self._connection.execute("BEGIN IMMEDIATE")
+        self._transaction_clock_readings = readings
         try:
             yield
             self._connection.execute("COMMIT")
@@ -1432,6 +2398,8 @@ class SQLiteProgramStore:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
             raise
+        finally:
+            self._transaction_clock_readings = None
 
     def _duplicate_result(self, command_key: str, input_digest: str) -> Program | None:
         row = self._connection.execute(

@@ -18,19 +18,24 @@ import json
 import math
 import os
 import re
+import selectors
 import shutil
+import signal
 import sqlite3
 import subprocess
 import tempfile
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, closing
 from dataclasses import asdict, dataclass, field, replace
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
 
+from creatidy_kernel.adapters.boot_clock import read_boot_clock
 from creatidy_kernel.adapters.codex_discovery import (
     CODEX_VERSION_PATTERN,
     CodexDiscoveryFailure,
@@ -41,7 +46,7 @@ from creatidy_kernel.adapters.codex_stdio import CodexStdio
 from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
 from creatidy_kernel.adapters.forge_refs import AGitPush, ForgeBinding, https_origin, oid, repository_path, valid_branch
 from creatidy_kernel.adapters.forgejo import ForgejoForge
-from creatidy_kernel.adapters.forgejo_transport import ConditionalGitTransport, HTTPSForgejoTransport
+from creatidy_kernel.adapters.forgejo_transport import ConditionalGitTransport, HTTPSForgejoTransport, run_git_bounded
 from creatidy_kernel.adapters.reference import reference_git, reference_git_bytes
 from creatidy_kernel.adapters.reference_forge import deliver_reference_pr
 from creatidy_kernel.adapters.scarcity_router import ScarcityRouterAllocator, ScarcityRouterUnavailable
@@ -58,10 +63,10 @@ from creatidy_kernel.adapters.source_cache import (
 )
 from creatidy_kernel.adapters.sqlite_store import (
     OperationConflict,
-    ProgramNotFound,
     SQLiteProgramStore,
     validate_local_storage,
 )
+from creatidy_kernel.core.deadlines import BootClockReading, DeadlineProjection
 from creatidy_kernel.core.domain import (
     ActivateProgram,
     Attempt,
@@ -96,8 +101,10 @@ from creatidy_kernel.core.execution import (
 )
 from creatidy_kernel.core.forge import EffectStatus, Presence, Reference, UnsupportedForge
 from creatidy_kernel.core.knowledge import export_document
+from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
+from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind, WorkUncertain
 from creatidy_kernel.ports.allocation import (
     decode_runtime_receipt_with_group,
     encode_allocation,
@@ -847,32 +854,333 @@ def _install_candidate(workspace: Path, objects: Path, head: str) -> None:
     git_text(objects, "fetch", "--no-tags", str(workspace), "HEAD", timeout=GIT_TIMEOUT_SECONDS)
 
 
+class OwnedVerificationCommand:
+    """Only this live Popen owner may retire its original group; never restore a PID."""
+
+    def __init__(self, operation: OperationRecord, started: Callable[[], None] = lambda: None) -> None:
+        self.binding: dict[str, object] = {
+            "version": 1,
+            "operation": operation.operation_id,
+            "effect_key": operation.effect_key,
+            "request_digest": operation.request_digest,
+            "fence": operation.fence,
+            "group_reference": uuid.uuid4().hex,
+            "profile": "trusted-development:owned-verification-group",
+        }
+        self.process: subprocess.Popen[bytes] | None = None
+        self.result: dict[str, object] | None = None
+        self.started = started
+        self.retirement_attempted = False
+
+    def attach(self, process: subprocess.Popen[bytes]) -> None:
+        if self.process is not None:
+            raise WorkUncertain("command owner already has an original process")
+        self.process = process
+        self.started()
+
+    def settled(self) -> bool | None:
+        if self.result is not None and self.result.get("dispatch") == "not_started":
+            return True
+        if self.process is None:
+            return None
+        self.process.poll()
+        try:
+            os.killpg(self.process.pid, 0)
+        except ProcessLookupError:
+            return self.process.returncode is not None
+        except OSError:
+            return None
+        return False
+
+    def retire(self) -> bool | None:
+        process = self.process
+        if process is None or self.retirement_attempted:
+            return self.settled()
+        self.retirement_attempted = True
+        if process.poll() is None:
+            try:
+                if os.getpgid(process.pid) != process.pid:
+                    return False
+            except ProcessLookupError:
+                pass
+            except OSError:
+                return None
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return None
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return self.settled()
+
+    def persist(self, store: SQLiteProgramStore) -> None:
+        key = cast(str, self.binding["operation"])
+        if self.result is not None:
+            store.finalize_artifact(OPERATION_ID, key, manifest_bytes(self.result))
+        data = manifest_bytes(
+            {
+                **self.binding,
+                "owned_group_settled": self.settled(),
+                "result_reconciled": self.result is not None,
+                "result_digest": None
+                if self.result is None
+                else "sha256:" + hashlib.sha256(manifest_bytes(self.result)).hexdigest(),
+                "descendants": "unproven; trusted-development is not containment",
+            }
+        )
+        identity = f"command-settlement:{key}:{hashlib.sha256(data).hexdigest()}"
+        store.intent(identity, identity, {"kind": "work-budget-record", "witness": json.loads(data)})
+
+
+def _command_settled(store: SQLiteProgramStore, key: str, result: dict[str, object] | None) -> bool:
+    binding_data = store.find_artifact(OPERATION_ID, f"command-owner:{key}")
+    if binding_data is None:
+        # Historical completed receipts remain readable; missing/failed proof does not improve.
+        return result is not None and result.get("owned_group_settled") is True
+    binding = cast(dict[str, object], json.loads(binding_data))
+    operation = store.operation(key)
+    if (
+        binding.get("operation") != key
+        or binding.get("request_digest") != operation.request_digest
+        or binding.get("fence") != operation.fence
+    ):
+        return False
+    for fact in store.operations(f"command-settlement:{key}:"):
+        witness = cast(dict[str, object], json.loads(fact.request_json)["request"]["witness"])
+        if (
+            all(witness.get(name) == value for name, value in binding.items())
+            and witness.get("owned_group_settled") is True
+        ):
+            return True
+    return False
+
+
+def _command_recovery(
+    store: SQLiteProgramStore, owners: Mapping[str, OwnedVerificationCommand] | None = None, *, record: bool = True
+) -> tuple[tuple[str, ...], bool]:
+    """Return unresolved commands and whether every original owned group is settled."""
+    pending: list[str] = []
+    all_settled = True
+    reservations = cast(list[dict[str, object]], store.work_budget_status(PROGRAM_ID)["reservations"])
+    for reservation in reservations:
+        if reservation["category"] != WorkKind.TOOL.value:
+            continue
+        key = cast(str, reservation["operation"])
+        data = store.find_artifact(OPERATION_ID, key)
+        result = None if data is None else cast(dict[str, object], json.loads(data))
+        settled = _command_settled(store, key, result)
+        if (result is None or not settled) and owners is not None and key in owners:
+            owner = owners[key]
+            original = store.find_artifact(OPERATION_ID, f"command-owner:{key}")
+            if original is not None and manifest_bytes(owner.binding) == original:
+                owner.retire()
+                owner.persist(store)
+                data = store.find_artifact(OPERATION_ID, key)
+                result = None if data is None else cast(dict[str, object], json.loads(data))
+                settled = _command_settled(store, key, result)
+        integrity_unknown = (
+            result is not None and _command_succeeded(result) and _command_integrity(store, key, result) is None
+        )
+        if result is None or not settled or integrity_unknown:
+            pending.append(key)
+            all_settled = all_settled and settled
+            if record:
+                store.intent(
+                    f"command-unknown:{key}",
+                    f"command-unknown:{key}",
+                    {
+                        "kind": "work-budget-record",
+                        "operation": key,
+                        "reason": "original command result or qualified ownership settlement unresolved",
+                    },
+                )
+    return tuple(pending), all_settled
+
+
+def _command_succeeded(result: dict[str, object]) -> bool:
+    return (
+        type(result.get("exit_code")) is int
+        and result["exit_code"] == 0
+        and all(result.get(name) is False for name in ("timed_out", "output_exhausted", "authority_lost"))
+    )
+
+
+def _command_integrity(store: SQLiteProgramStore, key: str, result: dict[str, object]) -> dict[str, object] | None:
+    data = store.find_artifact(OPERATION_ID, f"command-integrity:{key}")
+    if data is None:
+        return None
+    raw: object = json.loads(data)
+    if type(raw) is not dict:
+        return None
+    value = cast(dict[str, object], raw)
+    request = cast(dict[str, object], json.loads(store.operation(key).request_json)["request"])
+    subject = cast(dict[str, object], request["subject"])
+    if (
+        value.get("version") != 1
+        or value.get("operation") != key
+        or value.get("head") != subject.get("head_revision")
+        or value.get("result_digest") != "sha256:" + hashlib.sha256(manifest_bytes(result)).hexdigest()
+        or type(value.get("complete")) is not bool
+        or type(value.get("clean")) is not bool
+        or len(data) > MAX_CAPTURE_BYTES
+    ):
+        return None
+    return value
+
+
+def _capture_command_integrity(
+    store: SQLiteProgramStore, workspace: Path, head: str, key: str, result: dict[str, object]
+) -> None:
+    raw: str | None = None
+    executable = shutil.which("git", path=os.defpath)
+    if executable is not None:
+        try:
+            completed = run_git_bounded(
+                [executable, "status", "--porcelain", "-z"],
+                workspace,
+                {
+                    "HOME": str(workspace),
+                    "PATH": os.defpath,
+                    "LANG": "C.UTF-8",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_TERMINAL_PROMPT": "0",
+                },
+                GIT_TIMEOUT_SECONDS,
+                MAX_CAPTURE_BYTES,
+            )
+            if completed.returncode == 0:
+                raw = completed.stdout
+        except (OSError, OverflowError, ValueError, subprocess.SubprocessError):
+            pass
+    observed_head = git_text(workspace, "rev-parse", "HEAD")
+    entries: list[dict[str, str]] = []
+    if raw is not None:
+        fields = raw.split("\0")
+        index = 0
+        while index < len(fields):
+            field = fields[index]
+            index += 1
+            if not field:
+                continue
+            text = field
+            entries.append({"status": text[:2], "path": text[3:]})
+            if text[0] in "RC":
+                index += 1
+    payload: dict[str, object] = {
+        "version": 1,
+        "operation": key,
+        "head": head,
+        "observed_head": observed_head,
+        "result_digest": "sha256:" + hashlib.sha256(manifest_bytes(result)).hexdigest(),
+        "complete": raw is not None,
+        "clean": raw is not None and not entries and observed_head == head,
+        "entries": entries,
+    }
+    while len(manifest_bytes(payload)) > MAX_CAPTURE_BYTES:
+        entries = entries[: len(entries) // 2]
+        payload.update(entries=entries, complete=False, clean=False)
+    store.finalize_artifact(OPERATION_ID, f"command-integrity:{key}", manifest_bytes(payload))
+
+
+def _require_command_results(store: SQLiteProgramStore) -> None:
+    pending, _ = _command_recovery(store)
+    if pending:
+        raise WorkUncertain("verification command ownership/result unresolved; workspace reuse refused")
+
+
 def _run_command(
     workspace: Path,
     command: VerificationCommand,
     repeat: int,
     supplied: Mapping[str, str],
+    authorized: Callable[[], bool] = lambda: True,
+    max_bytes: int = MAX_CAPTURE_BYTES,
+    *,
+    owner: OwnedVerificationCommand | None = None,
 ) -> dict[str, object]:
     environment = {"HOME": str(workspace), "PATH": os.defpath, "LANG": "C.UTF-8"}
     for key in COMMAND_ENV_KEYS:
         if supplied.get(key):
             environment[key] = supplied[key]
     started = time.monotonic()
+    output = [bytearray(), bytearray()]
+    timed_out = False
+    output_exhausted = False
+    authority_lost = False
+    settled = False
+    if not authorized():
+        return {
+            "argv": list(command.argv),
+            "repeat": repeat,
+            "exit_code": None,
+            "timed_out": False,
+            "duration_ms": 0,
+            "observed_at": int(time.time()),
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "retained_bytes": 0,
+            "output_exhausted": False,
+            "authority_lost": True,
+            "owned_group_settled": True,
+            "dispatch": "not_started",
+        }
+    process = subprocess.Popen(  # noqa: S603 - trusted task-spec argv, no shell, pinned cwd.
+        list(command.argv),
+        cwd=workspace,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
     try:
-        completed = subprocess.run(  # noqa: S603 - trusted task-spec argv, no shell, pinned cwd.
-            list(command.argv),
-            cwd=workspace,
-            env=environment,
-            capture_output=True,  # noqa: S603
-            timeout=command.timeout_seconds,
-        )
-        exit_code: int | None = completed.returncode
-        timed_out = False
-        stdout, stderr = completed.stdout, completed.stderr
-    except subprocess.TimeoutExpired as expired:
-        exit_code, timed_out = None, True
-        stdout = expired.stdout or b""
-        stderr = expired.stderr or b""
+        if owner is not None:
+            owner.attach(process)
+        with selectors.DefaultSelector() as selector:
+            for index, pipe in enumerate((process.stdout, process.stderr)):
+                if pipe is not None:
+                    selector.register(pipe, selectors.EVENT_READ, index)
+            while selector.get_map() or process.poll() is None:
+                timed_out = time.monotonic() - started >= command.timeout_seconds
+                authority_lost = not authorized()
+                if timed_out or authority_lost or output_exhausted:
+                    break
+                for key, _ in selector.select(0.05):
+                    chunk = os.read(key.fd, min(8192, max_bytes + 1))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    remaining = max_bytes - sum(len(part) for part in output)
+                    output[int(key.data)].extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        output_exhausted = True
+                        break
+    finally:
+        # The original group is owned for this invocation only. Never recover a PID.
+        if owner is not None:
+            settled = owner.retire() is True
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                settled = True
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+    exit_code = process.returncode
     duration_ms = int((time.monotonic() - started) * 1000)
     return {
         "argv": list(command.argv),
@@ -880,8 +1188,14 @@ def _run_command(
         "exit_code": exit_code,
         "timed_out": timed_out,
         "duration_ms": duration_ms,
-        "stdout_tail": stdout[-MAX_CAPTURE_BYTES:].decode("utf-8", "replace"),
-        "stderr_tail": stderr[-MAX_CAPTURE_BYTES:].decode("utf-8", "replace"),
+        "observed_at": int(time.time()),
+        "stdout_tail": output[0].decode("utf-8", "replace"),
+        "stderr_tail": output[1].decode("utf-8", "replace"),
+        "retained_bytes": sum(len(part) for part in output),
+        "output_exhausted": output_exhausted,
+        "authority_lost": authority_lost,
+        "owned_group_settled": settled,
+        "escaped_descendants": "unverified; trusted-development is not containment",
     }
 
 
@@ -901,6 +1215,7 @@ class TaskChecks:
         captured: dict[str, dict[str, object]] | None = None,
         command_environment: Mapping[str, str] | None = None,
         authorized: Callable[[], bool] = lambda: True,
+        command_owners: dict[str, OwnedVerificationCommand] | None = None,
     ) -> None:
         self.store = store
         self.task = task
@@ -913,6 +1228,7 @@ class TaskChecks:
         self.captured = captured if captured is not None else {}
         self.command_environment = dict(command_environment or {})
         self.authorized = authorized
+        self.command_owners = command_owners if command_owners is not None else {}
         self._last_payload: dict[str, object] = {}
 
     def _evidence(self, name: str, subject: EvidenceSubject, passed: bool, payload: dict[str, object]) -> Evidence:
@@ -973,6 +1289,7 @@ class TaskChecks:
                 name, subject, passed, {"changed_paths": list(self.paths), "allowed_paths": sorted(allowed)}
             )
         if name == "verification-commands":
+            _require_command_results(self.store)
             # POLICY's shipped order/digest is durable. Enforce the structural
             # prerequisite here as well, including direct producer calls.
             actual_paths = _changed_paths(self.workspace, self.base, self.head)
@@ -993,16 +1310,112 @@ class TaskChecks:
                 f"{len(self.task.verification)} trusted command(s)"
             )
             runs: list[dict[str, object]] = []
-            for command in self.task.verification:
+            integrities: list[dict[str, object]] = []
+            for command_index, command in enumerate(self.task.verification):
                 for repeat in range(1, command.repeats + 1):
                     if not self.authorized():
                         return self._evidence(name, subject, False, {"runs": runs, "reason": "authority unavailable"})
-                    runs.append(_run_command(self.workspace, command, repeat, self.command_environment))
+                    key = f"command:{ATTEMPT_ID}:{self.head}:{command_index}:{repeat}"
+                    result_data = self.store.find_artifact(OPERATION_ID, key)
+                    if result_data is not None:
+                        run = cast(dict[str, object], json.loads(result_data))
+                    else:
+                        # A crash after reservation but before the durable result is
+                        # uncertain work, not permission to execute the command twice.
+                        prior = self.store.work_budget_status(PROGRAM_ID)["reservations"]
+                        if any(item["operation"] == key for item in cast(list[dict[str, object]], prior)):
+                            raise WorkUncertain("prior verification command result unknown")
+                        allowance = min(MAX_CAPTURE_BYTES, self.store.available_retained_bytes(PROGRAM_ID))
+                        if allowance <= 0:
+                            return self._evidence(
+                                name, subject, False, {"runs": runs, "reason": "retained byte budget exhausted"}
+                            )
+                        self.store.budgeted_intent(
+                            PROGRAM_ID,
+                            ATTEMPT_ID,
+                            WorkKind.TOOL,
+                            key,
+                            key,
+                            {
+                                "subject": asdict(subject),
+                                "argv": list(command.argv),
+                                "repeat": repeat,
+                                "command_index": command_index,
+                            },
+                            retained_bytes=allowance,
+                        )
+                        self.store.claim(key, now=int(time.time()), lease_seconds=command.timeout_seconds)
+                        owner = OwnedVerificationCommand(
+                            self.store.operation(key),
+                            lambda: self.fault("command-dispatched") if self.fault is not None else None,
+                        )
+                        self.command_owners[key] = owner
+                        self.store.finalize_artifact(
+                            OPERATION_ID, f"command-owner:{key}", manifest_bytes(owner.binding)
+                        )
+
+                        def authorized(operation_id: str = key) -> bool:
+                            if not self.authorized():
+                                return False
+                            self.store.check_work_dispatch(operation_id)
+                            return True
+
+                        try:
+                            run = _run_command(
+                                self.workspace,
+                                command,
+                                repeat,
+                                self.command_environment,
+                                authorized,
+                                allowance,
+                                owner=owner,
+                            )
+                            owner.result = run
+                        finally:
+                            owner.persist(self.store)
+                        if _command_settled(self.store, key, run):
+                            _capture_command_integrity(self.store, self.workspace, self.head, key, run)
+                    reference = self.store.finalize_artifact(OPERATION_ID, key, manifest_bytes(run))
+                    self.store.record_retained_bytes(key, cast(int, run["retained_bytes"]))
+                    self.store.record_usage(
+                        key,
+                        UsageObservation(
+                            f"{key}:elapsed",
+                            ATTEMPT_ID,
+                            key,
+                            "elapsed",
+                            "milliseconds",
+                            Decimal(cast(int, run["duration_ms"])),
+                            Provenance.MEASUREMENT,
+                            "kernel:verification-clock",
+                            cast(int, run["observed_at"]),
+                        ),
+                    )
+                    if _command_settled(self.store, key, run):
+                        self.store.record_work_settlement(key, reference)
+                    else:
+                        raise WorkUncertain("verification command group settlement unknown")
+                    runs.append(run)
+                    integrity = _command_integrity(self.store, key, run)
+                    if integrity is None and _command_succeeded(run):
+                        raise WorkUncertain("successful command lacks original workspace-integrity result")
+                    if integrity is not None:
+                        integrities.append(integrity)
+                    if (
+                        any(runs[-1].get(key) is True for key in ("timed_out", "authority_lost", "output_exhausted"))
+                        or runs[-1].get("owned_group_settled") is not True
+                    ):
+                        return self._evidence(name, subject, False, {"runs": runs, "reason": "bounded command stopped"})
                     if self.fault is not None:
                         self.fault("verification")
-            entries = _porcelain(self.workspace)
-            mutations = [{"status": status, "path": path} for status, path in entries if status != "??"]
-            untracked = sorted(path for status, path in entries if status == "??")
+            entries = [entry for integrity in integrities for entry in cast(list[dict[str, str]], integrity["entries"])]
+            mutations = [
+                dict(status=status, path=path)
+                for status, path in sorted(
+                    {(entry["status"], entry["path"]) for entry in entries if entry["status"] != "??"}
+                )
+            ]
+            untracked = sorted({entry["path"] for entry in entries if entry["status"] == "??"})
             # Every non-ignored Git-visible change after verification fails: the
             # workspace must be Git-clean with respect to all non-ignored state, so
             # the recorded evidence depends on the candidate subject alone. Ignored
@@ -1012,7 +1425,8 @@ class TaskChecks:
                     isinstance(run["exit_code"], int) and run["exit_code"] == 0 and run["timed_out"] is False
                     for run in runs
                 )
-                and not entries
+                and len(integrities) == len(runs)
+                and all(integrity["complete"] is True and integrity["clean"] is True for integrity in integrities)
             )
             self.lifecycle.append("verification passed" if passed else "verification failed")
             return self._evidence(
@@ -1095,6 +1509,7 @@ class TaskCollector:
         captured: dict[str, dict[str, object]] | None = None,
         command_environment: Mapping[str, str] | None = None,
         authorized: Callable[[], bool] = lambda: True,
+        command_owners: dict[str, OwnedVerificationCommand] | None = None,
     ) -> None:
         self.store = store
         self.task = task
@@ -1106,8 +1521,10 @@ class TaskCollector:
         self.captured = captured if captured is not None else {}
         self.command_environment = dict(command_environment or {})
         self.authorized = authorized
+        self.command_owners = command_owners if command_owners is not None else {}
 
     def runtime_candidate(self, request: ExecutionRequest) -> Candidate | None:
+        _require_command_results(self.store)
         try:
             recorded = _request(self.store, CANDIDATE_OPERATION)
         except OperationConflict as error:
@@ -1130,6 +1547,7 @@ class TaskCollector:
         )
 
     def collect(self, request: ExecutionRequest, candidate: Candidate, *, now: int) -> Collection:
+        _require_command_results(self.store)
         try:
             recorded = _request(self.store, CANDIDATE_OPERATION)
         except OperationConflict as error:
@@ -1180,6 +1598,7 @@ class TaskCollector:
                 captured=self.captured,
                 command_environment=self.command_environment,
                 authorized=self.authorized,
+                command_owners=self.command_owners,
             ),
         )
 
@@ -1283,6 +1702,8 @@ def export_task_store(store: SQLiteProgramStore) -> dict[str, object]:
         "mode": mode.get("mode"),
         "task": mode.get("task"),
         "deadline": mode.get("deadline"),
+        "deadline_projection": mode.get("deadline_projection"),
+        "work_budget": store.work_budget_status(PROGRAM_ID),
         "base": base,
         "attempts": attempts,
         "trust_mode": "trusted_development",
@@ -1290,6 +1711,8 @@ def export_task_store(store: SQLiteProgramStore) -> dict[str, object]:
         "automatic_merge": False,
         "automatic_deploy": False,
     }
+    unresolved_commands, command_groups_settled = _command_recovery(store, record=False)
+    result.update(unresolved_commands=list(unresolved_commands), command_groups_settled=command_groups_settled)
     try:
         store.operation(OPERATION_ID)
     except OperationConflict as error:
@@ -1379,8 +1802,13 @@ def task_status(directory: Path) -> dict[str, object]:
     cancellation_state = cancellation.get("settlement_state") if cancellation is not None else None
     expired = type(result["deadline"]) is int and int(time.time()) >= result["deadline"]
     terminal = bool(operations) and all(item["status"] == "terminal" for item in operations)
+    command_uncertain = bool(result["unresolved_commands"]) and not (
+        result["command_groups_settled"] is True and cancellation_state == "settled"
+    )
     condition = (
-        "accepted"
+        "cancel_uncertain"
+        if command_uncertain
+        else "accepted"
         if acceptance is not None
         else "cancelled_no_dispatch"
         if cancellation is not None
@@ -1420,7 +1848,9 @@ def task_status(directory: Path) -> dict[str, object]:
         "expired": expired,
         "condition": condition,
         "next_action": (
-            "Cancelled before dispatch; new execution requires separate approval."
+            "Retain workspace; reconcile original command ownership/result. Never adopt a stored PID or blindly retry."
+            if command_uncertain
+            else "Cancelled before dispatch; new execution requires separate approval."
             if condition == "cancelled_no_dispatch"
             else "Cancellation is recorded and waiting at the existing bounded owner-thread cleanup boundary."
             if condition == "cancel_requested"
@@ -1437,6 +1867,8 @@ def task_status(directory: Path) -> dict[str, object]:
         ),
         "runtime_state": "status is recorded evidence, not a fresh native observation",
         "cancellation": result.get("cancellation"),
+        "unresolved_commands": result["unresolved_commands"],
+        "command_groups_settled": result["command_groups_settled"],
         "attempts": result["attempts"],
         "workspace_state": "candidate collected" if candidate else "prepared or untouched",
         "candidate_head": candidate.get("head") if candidate else None,
@@ -1466,6 +1898,9 @@ def run_task(
     fault: str | None = None,
     cancel_requested: bool = False,
     cancellation_requested: Callable[[], bool] | None = None,
+    boot_clock: Callable[[], BootClockReading | None] = read_boot_clock,
+    work_policy: WorkBudgetPolicy | None = None,
+    command_owners: dict[str, OwnedVerificationCommand] | None = None,
 ) -> dict[str, object]:
     """Run or recover one frozen task through the bounded K1-K8 composition.
 
@@ -1483,6 +1918,8 @@ def run_task(
     assert resource_allocator is not None  # noqa: S101 - established by the exclusive input check.
     if owner_approved is not True or trusted_development_acknowledged is not True:
         raise ValueError("explicit owner approval and trusted-development acknowledgment required")
+    if work_policy is not None and work_policy.strict_inference:
+        raise BudgetRefused("strict inference bounds unavailable for the installed profiles")
     if deadline is not None and (type(deadline) is not int or deadline > now + 3600):
         raise ValueError("owner deadline must be within one hour ahead")
     _suitable_path(directory)
@@ -1499,6 +1936,13 @@ def run_task(
         raise ValueError("owner deadline must be within one hour ahead")
     if directory.exists() and not existing_database and any(directory.iterdir()):
         raise ValueError("unjournaled task control directory must be empty")
+    initial_projection: DeadlineProjection | None = None
+    if not existing_database:
+        deadline = deadline if deadline is not None else now + 3300
+        reading = boot_clock()
+        if reading is None:
+            raise UnsupportedExecution("verified suspend-inclusive boot clock unavailable")
+        initial_projection = DeadlineProjection.bind(deadline, reading)
     directory.mkdir(parents=True, exist_ok=True)
     lifecycle: list[str] = []
     captured: dict[str, dict[str, object]] = {}
@@ -1508,7 +1952,7 @@ def run_task(
             lifecycle.append(f"interrupted after {boundary}; rerun to reconcile")
             raise TaskInterrupted(f"interrupted after {boundary}; rerun to reconcile")
 
-    with SQLiteProgramStore(directory / "kernel.sqlite3") as store, ExitStack() as cleanup:
+    with SQLiteProgramStore(directory / "kernel.sqlite3", boot_clock=boot_clock) as store, ExitStack() as cleanup:
         cancellation_lease = _owned_group_lease_seconds(connection)
         cancellation_latched = False
         close_owned_group, observe_owned_group, observe_owned_group_reference = owned_group_callbacks(connection)
@@ -1519,6 +1963,7 @@ def run_task(
             nonlocal cancellation_latched
             cancellation_latched = True
             key = f"cancel:{attempt_id}"
+            store.revoke_work_budget(PROGRAM_ID, key)
             try:
                 recorded = store.operation(key)
             except OperationConflict as error:
@@ -1897,6 +2342,8 @@ def run_task(
                     reference=handle,
                 )
             finish_cancelled_attempt(attempt.attempt_id)
+            if store.has_work_budget(PROGRAM_ID):
+                store.record_work_settlement(operation.operation_id, settlement_reference)
 
         def mark_cancellation_uncertain(cancellation_id: str, cancellation: OperationRecord) -> None:
             if cancellation.status == "dispatched":
@@ -1919,40 +2366,78 @@ def run_task(
             )
             return result
 
+        approved_spec = task_program_spec(task)
+        counts = WorkBudgetPolicy.basic(
+            approved_spec.budget.max_attempts,
+            approved_spec.budget.max_active_attempts,
+            verifications=approved_spec.budget.max_attempts * len(POLICY.checks),
+            retained_bytes=MAX_CAPTURE_BYTES,
+            auxiliary=1,
+        )
+        counts = replace(
+            counts,
+            counts=tuple(
+                (kind, sum(command.repeats for command in task.verification) if kind is WorkKind.TOOL else count)
+                for kind, count in counts.counts
+            ),
+        )
+        configured = work_policy if work_policy is not None else counts
         try:
             mode_recorded = _request(store, "task_execution:mode")
         except OperationConflict as error:
             if str(error) != "unknown operation":
                 raise
             mode_recorded = None
+        projection: DeadlineProjection | None = None
         if mode_recorded is None:
             if existing_database:
-                raise ValueError("existing database is not this neutral task")
-            deadline = deadline if deadline is not None else now + 3300
-            store.intent(
-                "task_execution:mode",
-                "task_execution:mode",
-                {
-                    "mode": "live" if forge_factory is not None else "synthetic",
-                    "task": task.task_id,
-                    "task_digest": task.digest,
-                    "expected_base_sha": task.expected_base_sha,
-                    "deadline": deadline,
-                    "version": version,
-                    "repository": task.forge_repository,
-                    "source": str(source_repository),
-                    **(
-                        {
-                            "model": allocation.model_id,
-                            "provider": allocation.provider_id,
-                            "fixed_allocation": encode_allocation(allocation).decode(),
-                        }
-                        if allocation is not None
-                        else {"allocator": "external"}
-                    ),
-                    **({"supported_efforts": sorted(supported_efforts)} if supported_efforts else {}),
-                },
-            )
+                projection = store.pending_work_projection(approved_spec)
+                if projection is None or store.find_program(PROGRAM_ID) is not None or len(store.operations()) != 1:
+                    raise ValueError("existing database is not this neutral task")
+                if deadline is not None and deadline != projection.wall_deadline:
+                    raise BudgetRefused("original work expiry cannot be renewed")
+                deadline = projection.wall_deadline
+            else:
+                assert initial_projection is not None  # noqa: S101 - validated before fresh store initialization.
+                projection = initial_projection
+            mode_request: dict[str, object] = {
+                "mode": "live" if forge_factory is not None else "synthetic",
+                "task": task.task_id,
+                "task_digest": task.digest,
+                "expected_base_sha": task.expected_base_sha,
+                "deadline": deadline,
+                "deadline_projection": asdict(projection),
+                "version": version,
+                "repository": task.forge_repository,
+                "source": str(source_repository),
+                **(
+                    {
+                        "model": allocation.model_id,
+                        "provider": allocation.provider_id,
+                        "fixed_allocation": encode_allocation(allocation).decode(),
+                    }
+                    if allocation is not None
+                    else {"allocator": "external"}
+                ),
+                **({"supported_efforts": sorted(supported_efforts)} if supported_efforts else {}),
+            }
+            try:
+                store.accept_work_budget(
+                    approved_spec,
+                    "create",
+                    task.forge_repository,
+                    configured,
+                    configured,
+                    projection,
+                    records=(("task_execution:mode", mode_request, None),),
+                )
+            except BaseException:
+                # This invocation created the database. A fully rolled-back
+                # initialization has no identity to recover or adopt on retry.
+                if store.find_program(PROGRAM_ID) is None and not store.operations():
+                    store.close()
+                    (directory / "kernel.sqlite3").unlink()
+                raise
         elif str(mode_recorded["task_digest"]) != task.digest:
             raise ValueError("durable task mode belongs to a different frozen task")
         else:
@@ -1992,13 +2477,46 @@ def run_task(
                 raise UnsupportedExecution("recovery requires original trusted support evidence")
             deadline = recorded_deadline
         assert deadline is not None  # noqa: S101 - established by durable envelope validation.
+        if mode_recorded is not None:
+            raw_projection = mode_recorded.get("deadline_projection")
+            projection = None
+            if type(raw_projection) is dict:
+                try:
+                    projection = DeadlineProjection.decode(cast(dict[str, object], raw_projection))
+                except (TypeError, ValueError):
+                    pass
+            if projection is not None and projection.wall_deadline != deadline:
+                raise ValueError("original deadline projection differs from wall envelope")
+
+        clock_unverified = projection is None
+
+        def decision_time() -> int:
+            nonlocal clock_unverified
+            if clock_unverified:
+                return deadline
+            try:
+                return store.work_decision_time(PROGRAM_ID)
+            except BudgetRefused:
+                clock_unverified = True
+                return deadline  # Original expiry is a refusal sentinel, never a renewed allowance.
+
+        def authority_current() -> bool:
+            if cancellation_requested_now() or clock_unverified:
+                return False
+            try:
+                store.check_work_authority(PROGRAM_ID)
+            except BudgetRefused:
+                record_cancellation(ATTEMPT_ID, OPERATION_ID)
+                return False
+            return True
+
         if isinstance(connection, CodexStdio):
             previous_before_close = connection.before_close
             previous_after_close = connection.after_close
 
             def before_owned_close() -> None:
                 nonlocal retirement_context
-                if cancellation_requested_now() or int(time.time()) >= deadline:
+                if cancellation_requested_now() or decision_time() >= deadline:
                     cancel_record = record_cancellation(ATTEMPT_ID, OPERATION_ID)
                     if (
                         retirement_context is None
@@ -2115,20 +2633,37 @@ def run_task(
         except OperationConflict as error:
             if str(error) != "unknown operation":
                 raise
-        try:
+        if projection is not None and mode_recorded is not None:
+            program = store.accept_work_budget(
+                task_program_spec(task), "create", task.forge_repository, configured, configured, projection
+            )
+        else:
             program = store.load(PROGRAM_ID)
-        except ProgramNotFound:
-            program = store.create(task_program_spec(task), "create")
         if program.spec != task_program_spec(task):
             raise ValueError("durable task intent differs from the frozen task specification")
         if program.status is ProgramStatus.DRAFT:
             program = store.admit(PROGRAM_ID, "activate", ActivateProgram(program.revision, "owner"))
             lifecycle.append("task admitted: owner-approved frozen task")
             crash("task-admitted")
+        pending_commands, commands_settled = _command_recovery(store, command_owners)
+        workspace_refusal = "refused before restoration; qualified command owner/result unavailable"
+        if pending_commands and commands_settled:
+            # A qualified command owner can prove retirement, not invent a lost
+            # result. Only the existing exact runtime cancellation path may finish.
+            cancellation_pending = True
+            cancellation_latched = True
         attempt_exists = any(item.spec.attempt_id == ATTEMPT_ID for item in program.attempts)
         if cancellation_pending and not attempt_exists:
             return cancelled_without_attempt()
-        if not attempt_exists:
+        if pending_commands:
+            # Recover inert request bindings only. Unresolved TOOL ownership must
+            # not prevent STOP, or permit preparing/restoring the workspace.
+            recorded_base = _request(store, "task_execution:base")
+            base = oid(str(recorded_base["base"]))
+            if recorded_base["task"] != task.task_id:
+                raise ValueError("durable base belongs to a different task")
+            objects, workspace = directory / "objects.git", directory / "workspace"
+        elif not attempt_exists:
             with source_use(source_repository, task.repository_url):
                 frozen_base = (
                     _request(store, "task_execution:base")["base"] if (directory / "objects.git").exists() else None
@@ -2163,7 +2698,8 @@ def run_task(
             base, objects, workspace = prepare_workspace(
                 store, directory, source_repository, task, lifecycle, attempt_exists=True
             )
-        crash("workspace-prepared")
+        if not pending_commands:
+            crash("workspace-prepared")
         if cancellation_requested_now():
             cancellation_pending = True
         if cancellation_pending:
@@ -2173,7 +2709,7 @@ def run_task(
                 operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
                 record_cancellation(attempt.spec.attempt_id, operation.operation_id)
         status = "accepted"
-        if program.state(UNIT_ID).status is not WorkUnitStatus.SATISFIED:
+        if pending_commands or program.state(UNIT_ID).status is not WorkUnitStatus.SATISFIED:
             lifecycle.append("allocation recovered from durable Attempt" if attempt_exists else "allocation selected")
             workspace_handle = WorkspaceHandle(
                 WORKSPACE_KEY,
@@ -2196,7 +2732,8 @@ def run_task(
                 fault=crash,
                 captured=captured,
                 command_environment=command_environment,
-                authorized=lambda: not cancellation_requested_now() and int(time.time()) < deadline,
+                authorized=authority_current,
+                command_owners=command_owners,
             )
 
             def resolve(request: ExecutionRequest) -> CodexInputs:
@@ -2224,9 +2761,13 @@ def run_task(
             def authorize(request: ExecutionRequest) -> bool:
                 def current() -> bool:
                     operation = store.operation(request.operation.operation_id)
+                    try:
+                        store.check_work_dispatch(request.operation.operation_id)
+                    except BudgetRefused:
+                        record_cancellation(ATTEMPT_ID, OPERATION_ID)
+                        return False
                     return (
-                        not cancellation_requested_now()
-                        and int(time.time()) < deadline
+                        authority_current()
                         and operation.status == "dispatched"
                         and operation.fence == request.fence
                         and operation.request_digest == request.operation.request_digest
@@ -2246,7 +2787,7 @@ def run_task(
                 authorize=authorize,
                 collect=collector.runtime_candidate,
                 supported_efforts=supported_efforts,
-                clock=lambda: int(time.time()),
+                clock=decision_time,
                 retire=retire_owned_group if close_owned_group is not None else None,
                 settled=observe_owned_group,
                 group_reference=observe_owned_group_reference,
@@ -2258,7 +2799,7 @@ def run_task(
             try:
                 status = (
                     "cancel_uncertain"
-                    if cancellation_pending
+                    if cancellation_pending or pending_commands
                     else advance_work_unit(
                         store,
                         program,
@@ -2272,18 +2813,26 @@ def run_task(
                         fault=crash,
                         restore=restore,
                         artifact_path=CANDIDATE_PATH,
-                        clock=lambda: int(time.time()),
+                        clock=decision_time,
                         deadline=deadline,
                         cancel_requested=cancellation_requested_now,
                     )
                 )
+            except WorkUncertain as error:
+                pending_commands, _ = _command_recovery(store)
+                workspace_refusal = str(error)
+                status = "cancel_uncertain"
+            except BudgetRefused as error:
+                lifecycle.append(f"work admission refused: {error}")
+                status = "budget_exhausted"
+                cancellation_pending = bool(store.load(PROGRAM_ID).attempts)
             except (ExecutionConflict, OSError, RuntimeError, ValueError):
-                if not cancellation_requested_now() and int(time.time()) < deadline:
+                if authority_current():
                     raise
                 status = "cancel_uncertain"
             cancellation_pending = cancellation_pending or cancellation_requested_now()
-            if cancellation_pending or (int(time.time()) >= deadline and status != "accepted"):
-                status = "expired" if int(time.time()) >= deadline else "cancel_uncertain"
+            if cancellation_pending or (decision_time() >= deadline and status != "accepted"):
+                status = "expired" if decision_time() >= deadline else "cancel_uncertain"
                 program = store.load(PROGRAM_ID)
                 for attempt in program.attempts:
                     operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
@@ -2632,13 +3181,24 @@ def run_task(
             program = store.load(PROGRAM_ID)
             if cancellation_pending and not program.attempts:
                 return cancelled_without_attempt()
+        if pending_commands:
+            # Runtime settlement is not TOOL settlement or a reusable workspace.
+            result = export_task_store(store)
+            result.update(
+                condition="cancel_uncertain",
+                unresolved_commands=list(pending_commands),
+                workspace_reuse=workspace_refusal,
+                lifecycle=lifecycle,
+                automatic_merge=False,
+            )
+            return result
         if cancellation_requested_now() and not cancellation_pending:
             cancellation_pending = True
             for attempt in program.attempts:
                 operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
                 record_cancellation(attempt.spec.attempt_id, operation.operation_id)
         if program.state(UNIT_ID).status is WorkUnitStatus.SATISFIED:
-            if cancellation_pending or int(time.time()) >= deadline:
+            if cancellation_pending or decision_time() >= deadline:
                 try:
                     delivery = store.operation(PR_OPERATION)
                 except OperationConflict as error:
@@ -2669,7 +3229,8 @@ def run_task(
                 schema="task-pr-v1",
                 title=task.pr_title,
                 body=f"{task.pr_body}\n\nTask: {task.task_id}. Accepted result: {accepted['manifest']}.",
-                authorize_dispatch=lambda: not cancellation_requested_now() and int(time.time()) < deadline,
+                authorize_dispatch=authority_current,
+                budget_subject=(PROGRAM_ID, ATTEMPT_ID),
             )
             if receipt.get("interrupted"):
                 raise TaskInterrupted(f"interrupted after {receipt['interrupted']}; rerun to reconcile")
@@ -2700,7 +3261,7 @@ def run_task(
             return result
         result = export_task_store(store)
         result.update(
-            condition=status,
+            condition="unknown" if clock_unverified else status,
             verification=captured,
             lifecycle=lifecycle,
             isolation="not attested; trusted development only",

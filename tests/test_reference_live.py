@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live composition wiring proved with native-shaped responses, never a paid call."""
 
+import time
 from pathlib import Path
 from typing import cast
 
@@ -12,11 +13,18 @@ from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.reference import export_reference, reference_commit, reference_git
 from creatidy_kernel.adapters.reference_live import run_live_reference
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.execution import RuntimeObservation
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.resources import Allocation
 
 pytest_plugins = ["test_sqlite_store"]
+
+
+def controlled_reference_clock() -> BootClockReading:
+    """Follow deliberate wall changes without real elapsed time in frozen fixtures."""
+    wall = int(time.time())
+    return BootClockReading(wall, wall * 1_000_000_000, "synthetic-reference-clock")
 
 
 class Connection:
@@ -81,6 +89,7 @@ def test_finite_native_composition(sqlite_tmp_path: Path, monkeypatch: pytest.Mo
         object_source=objects,
         deadline=100,
         max_observations=3,
+        boot_clock=controlled_reference_clock,
     )
     assert result["status"] == "completed"
     assert result["mode"] == "live"
@@ -132,6 +141,7 @@ def test_observation_budget_and_expiry_survive_restart(
             object_source=objects,
             deadline=100,
             max_observations=1,
+            boot_clock=controlled_reference_clock,
         )
 
     if interrupt_failure in {"before-send", "after-send"}:

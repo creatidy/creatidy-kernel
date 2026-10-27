@@ -13,7 +13,7 @@ from typing import cast
 
 from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
 from creatidy_kernel.adapters.reference_forge import deliver_reference_pr
-from creatidy_kernel.adapters.sqlite_store import OperationConflict, ProgramNotFound, SQLiteProgramStore
+from creatidy_kernel.adapters.sqlite_store import OperationConflict, SQLiteProgramStore
 from creatidy_kernel.core.domain import (
     ActivateProgram,
     AuthorityEnvelope,
@@ -43,6 +43,7 @@ from creatidy_kernel.core.execution import (
 from creatidy_kernel.core.knowledge import export_document
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy
 from creatidy_kernel.ports.allocation import decode_identity, identity_matches, is_legacy_allocation, load_allocation
 from creatidy_kernel.ports.application import Collection, advance_work_unit, manifest_bytes
 from creatidy_kernel.ports.resources import ResourceAllocator
@@ -385,6 +386,7 @@ def reference_export(store: SQLiteProgramStore) -> dict[str, object]:
         "mode": mode,
         "program": program.program_id,
         "status": program.status.value,
+        "work_budget": store.work_budget_status(program.program_id),
         "trust_mode": "trusted_development",
         "isolation": "none; deterministic synthetic worker" if mode == "offline" else "not attested",
         "attempts": attempts,
@@ -462,13 +464,23 @@ def run_reference(
         SQLiteProgramStore(directory / "kernel.sqlite3") as store,
         SQLiteProgramStore(directory / "runtime.sqlite3") as external,
     ):
-        store.intent("reference:mode", "reference:mode", {"mode": "offline"})
-        try:
-            program = store.load("reference")
-        except ProgramNotFound:
-            program = store.create(reference_spec(), "create")
-        if program.spec != reference_spec():
-            raise ValueError("reference intent differs from durable owner-approved spec")
+        spec = reference_spec()
+        budget = WorkBudgetPolicy.basic(
+            spec.budget.max_attempts,
+            spec.budget.max_active_attempts,
+            verifications=spec.budget.max_attempts * len(POLICY.checks),
+            retained_bytes=64 * 1024,
+            auxiliary=1,
+        )
+        program = store.accept_work_budget(
+            spec,
+            "create",
+            "synthetic-reference",
+            budget,
+            budget,
+            store.original_work_deadline("reference") or int(time.time()) + 3600,
+            records=(("reference:mode", {"mode": "offline"}, None),),
+        )
         if program.status is ProgramStatus.DRAFT:
             program = store.admit("reference", "activate", ActivateProgram(program.revision, "owner"))
 
@@ -514,6 +526,8 @@ def run_reference(
             head=str(accepted["head"]),
             acceptance_reference=str(accepted["manifest"]),
             fault=fault,
+            authorize_dispatch=lambda: _reference_authorized(store),
+            budget_subject=("reference", "reference:second"),
         )
         if receipt.get("status") == "accepted":
             try:
@@ -525,3 +539,8 @@ def run_reference(
         result["pr_observation"] = "current adapter readback"
         result["head"] = accepted["head"]
         return result
+
+
+def _reference_authorized(store: SQLiteProgramStore) -> bool:
+    store.check_work_authority("reference")
+    return True

@@ -120,6 +120,12 @@ class NoCollection:
 
 def initial(store: SQLiteProgramStore) -> Program:
     store.create(reference_spec(), "create")
+    import time
+
+    from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+
+    budget = WorkBudgetPolicy.basic(2, 1, verifications=2, retained_bytes=65536)
+    store.bind_work_budget("reference", "fixture", budget, budget, int(time.time()) + 3600)
     return store.admit("reference", "activate", ActivateProgram(0, "owner"))
 
 

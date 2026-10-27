@@ -34,6 +34,7 @@ from creatidy_kernel.core.verification import (
     AcceptedResult,
     CandidateResult,
     CheckProducer,
+    Evidence,
     EvidenceSubject,
     ProductReviewRequest,
     ProductReviewVerdict,
@@ -41,6 +42,7 @@ from creatidy_kernel.core.verification import (
     admit_accepted,
     verify_candidate,
 )
+from creatidy_kernel.core.work_budget import BudgetRefused, WorkKind
 from creatidy_kernel.ports.allocation import (
     decode_allocation,
     decode_identity,
@@ -169,6 +171,81 @@ class Collector(Protocol):
     def collect(self, request: ExecutionRequest, candidate: Candidate, *, now: int) -> Collection: ...
 
 
+class BudgetedChecks:
+    def __init__(
+        self, store: ApplicationStore, checks: CheckProducer, program_id: str, attempt_id: str, clock: Callable[[], int]
+    ) -> None:
+        self.store = store
+        self.checks = checks
+        self.program_id = program_id
+        self.attempt_id = attempt_id
+        self.clock = clock
+
+    def check(self, name: str, subject: EvidenceSubject) -> Evidence | None:
+        self.store.check_work_authority(self.program_id)
+        if name == "independent_review":
+            if not isinstance(self.checks, DurableProductReviewChecks):
+                raise BudgetRefused("independent review requires the durable budgeted dispatcher")
+            return self.checks.check(name, subject)
+        key = f"verification:{self.attempt_id}:{hashlib.sha256(manifest_bytes([name, asdict(subject)])).hexdigest()}"
+        operation = self.store.budgeted_intent(
+            self.program_id,
+            self.attempt_id,
+            WorkKind.VERIFICATION,
+            key,
+            key,
+            {"subject": asdict(subject), "check": name},
+        )
+        cached = self.store.find_artifact(key, "result")
+        if cached is not None:
+            self._record_result(key, cached)
+            raw: object = json.loads(cached)
+            if raw is None:
+                return None
+            if type(raw) is not dict:
+                raise ValueError("invalid durable verification result")
+            value = cast(dict[str, object], raw)
+            if value.get("subject") != asdict(subject) or value.get("check") != name:
+                raise ValueError("verification result differs from original subject")
+            return Evidence(
+                cast(str, value["evidence_id"]),
+                name,
+                subject,
+                cast(str, value["producer"]),
+                cast(str, value["tool_version"]),
+                cast(str, value["artifact_reference"]),
+                cast(int, value["observed_at"]),
+                cast(int, value["fresh_until"]),
+                cast(bool, value["passed"]),
+                cast(str | None, value["reviewer_session"]),
+            )
+        if operation.attempts:
+            self.store.retry_work(key)
+            # Rechecking trusted deterministic observations is not replay of an
+            # uncertain external effect. Native command producers retain their
+            # separate exact per-command reservations and crash receipts.
+            return self._run(name, subject, key)
+        self.store.claim(key, now=self.clock(), lease_seconds=1)
+        return self._run(name, subject, key)
+
+    def _run(self, name: str, subject: EvidenceSubject, key: str) -> Evidence | None:
+        self.store.check_work_dispatch(key)
+        result = self.checks.check(name, subject)
+        data = manifest_bytes(None if result is None else asdict(result))
+        self.store.finalize_artifact(key, "result", data)
+        self._record_result(key, data)
+        return result
+
+    def _record_result(self, key: str, data: bytes) -> None:
+        reference = f"sha256:{hashlib.sha256(data).hexdigest()}"
+        operation = self.store.operation(key)
+        if operation.status == "dispatched":
+            self.store.observe(
+                key, operation.fence, f"verification-result:{reference}", "accepted", reference=reference
+            )
+        self.store.record_work_settlement(key, reference)
+
+
 def advance_work_unit(
     store: ApplicationStore,
     program: Program,
@@ -198,6 +275,8 @@ def advance_work_unit(
     """
     program = store.load(program.program_id)
     decision_clock = clock if clock is not None else lambda: now
+    if "independent_review" in policy.checks and not policy.reviewer_required:
+        raise BudgetRefused("explicit independent_review requires the durable product review policy")
     if program.state(unit_id).status is WorkUnitStatus.SATISFIED:
         return "accepted"
     if policy.reviewer_required and product_reviewer is None:
@@ -258,6 +337,7 @@ def advance_work_unit(
     if not any(item.spec.attempt_id == attempt_id for item in program.attempts):
         if any(item.name == "ordinary-declaration" for item in program.spec.initial_inputs):
             raise ValueError("ordinary dispatch is not supported by the reference composition")
+        store.check_work_authority(program.program_id)
         if cancel_requested is not None and cancel_requested():
             return "cancel_requested"
         if deadline is not None and decision_clock() >= deadline:
@@ -383,6 +463,7 @@ def advance_work_unit(
         if lookup.presence is Presence.UNKNOWN:
             return "unknown"
     if operation.status == "intent" or operation.retry_proof is not None:
+        store.check_work_authority(program.program_id)
         if deadline is not None and decision_clock() >= deadline:
             return "expired"
         if cancel_requested is not None and cancel_requested():
@@ -407,6 +488,7 @@ def advance_work_unit(
             fence,
             allocation,
         )
+        store.check_work_dispatch(operation_id)
         handle = runtime.start(request)
         if cancel_requested is not None:
             cancel_requested()
@@ -576,6 +658,7 @@ def advance_work_unit(
     if deadline is not None and decision_clock() >= deadline:
         return "expired"
     collection = collector.collect(request, candidate, now=decision_clock())
+    store.check_work_authority(program.program_id)
     unit = program.spec.work_unit(unit_id)
     proposal = CandidateResult(
         f"candidate:{attempt_id}", candidate, tuple((name, artifact_path) for name in sorted(unit.outputs))
@@ -613,7 +696,7 @@ def advance_work_unit(
         proposal,
         collection.manifest,
         policy,
-        checks,
+        BudgetedChecks(store, checks, program.program_id, attempt_id, decision_clock),
         repository=collection.repository,
         base_revision=collection.base,
         head_revision=collection.head,
@@ -625,6 +708,11 @@ def advance_work_unit(
     data = manifest_bytes(asdict(result))
     digest = hashlib.sha256(data).hexdigest()
     reference = store.finalize_artifact(operation_id, f"verification:{digest}", data)
+    if cancel_requested is not None and cancel_requested():
+        return "cancel_requested"
+    if deadline is not None and decision_clock() >= deadline:
+        return "expired"
+    store.check_work_authority(program.program_id)
     if not isinstance(result, AcceptedResult):
         review_result = review_checks.last_result if review_checks is not None else None
         if review_result is not None and review_result.status is ProductReviewStatus.UNKNOWN:
@@ -645,6 +733,7 @@ def advance_work_unit(
             },
         )
         store.finalize_artifact(rejection_id, "rejected-result", data)
+        store.record_work_settlement(operation_id, reference)
         if review_result is not None and review_result.status in {
             ProductReviewStatus.OWNER_DECISION_NEEDED,
             ProductReviewStatus.COMMENT,
@@ -655,6 +744,7 @@ def advance_work_unit(
     if cancel_requested is not None and cancel_requested():
         return "cancel_requested"
     accepted_at = decision_clock()
+    store.check_work_authority(program.program_id)
     if deadline is not None and accepted_at >= deadline:
         return "expired"
     admit_accepted(
@@ -681,4 +771,5 @@ def advance_work_unit(
             "base": collection.base,
         },
     )
+    store.record_work_settlement(operation_id, reference)
     return "accepted"

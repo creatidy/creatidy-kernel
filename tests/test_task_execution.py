@@ -27,6 +27,7 @@ from creatidy_kernel.adapters.task_execution import (
     CODEX_METHODS,
     TASKS,
     LiveTaskComponents,
+    OwnedVerificationCommand,
     TaskChecks,
     TaskInterrupted,
     TaskRuntimeConfig,
@@ -41,6 +42,7 @@ from creatidy_kernel.adapters.task_execution import (
     compose_task_live as _compose_task_live,
 )
 from creatidy_kernel.adapters.task_execution import git_text as task_git
+from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import DomainCommandType, FinishAttempt, Program
 from creatidy_kernel.core.execution import UnsupportedExecution
 from creatidy_kernel.core.forge import Reference
@@ -252,6 +254,7 @@ def run(
     fault: str | None = None,
     cancel_requested: bool = False,
     cancellation_requested: Callable[[], bool] | None = None,
+    command_owners: dict[str, OwnedVerificationCommand] | None = None,
 ) -> dict[str, object]:
     if forge is None:
         forge, _transport = make_forge(base or "0" * 40)
@@ -271,6 +274,7 @@ def run(
         fault=fault,
         cancel_requested=cancel_requested,
         cancellation_requested=cancellation_requested,
+        command_owners=command_owners,
     )
 
 
@@ -349,7 +353,8 @@ def test_invalid_fresh_deadline_does_not_poison_corrected_same_directory_run(
     control = sqlite_tmp_path / "control"
     connection = FixtureConnection(lambda _path: None)
     connection.status = "inProgress"
-    monkeypatch.setattr(time, "time", lambda: 1000)
+    reading = BootClockReading(1000, 1_000_000_000, "synthetic-fresh-deadline-boot")
+    monkeypatch.setattr(time, "time", lambda: reading.wall)
 
     def advance(deadline: int | None) -> dict[str, object]:
         return run_task(
@@ -362,6 +367,7 @@ def test_invalid_fresh_deadline_does_not_poison_corrected_same_directory_run(
             version="1.2.3",
             deadline=deadline,
             allocation=ALLOCATION,
+            boot_clock=lambda: reading,
         )
 
     with pytest.raises(ValueError, match="owner deadline"):
@@ -795,14 +801,21 @@ def test_cancellation_during_verification_stops_further_commands(
     requested = [False]
     calls: list[tuple[str, ...]] = []
     original = cast(
-        "Callable[[Path, VerificationCommand, int, Mapping[str, str]], dict[str, object]]",
+        "Callable[..., dict[str, object]]",
         inspect.getattr_static(task_execution, "_run_command"),
     )
 
     def interrupt_after_command(
-        workspace: Path, command: VerificationCommand, repeat: int, supplied: Mapping[str, str]
+        workspace: Path,
+        command: VerificationCommand,
+        repeat: int,
+        supplied: Mapping[str, str],
+        authorized: Callable[[], bool],
+        max_bytes: int,
+        *,
+        owner: OwnedVerificationCommand | None = None,
     ) -> dict[str, object]:
-        result = original(workspace, command, repeat, supplied)
+        result = original(workspace, command, repeat, supplied, authorized, max_bytes, owner=owner)
         calls.append(command.argv)
         requested[0] = True
         return result

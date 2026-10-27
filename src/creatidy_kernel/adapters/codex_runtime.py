@@ -6,6 +6,7 @@ before waiting. An uncertain start is never retried by this adapter. The control
 not redeliver an uncertain operation after restart without independent reconciliation.
 """
 
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -47,19 +48,26 @@ def owned_group_callbacks(
 ]:
     """Bind retirement only when the connection exposes settlement and identity witnesses."""
     retire = getattr(connection, "close", None)
+    missing = object()
     if (
         not callable(retire)
-        or not hasattr(connection, "owned_group_settled")
-        or not hasattr(connection, "owned_group_reference")
+        or inspect.getattr_static(connection, "owned_group_settled", missing) is missing
+        or inspect.getattr_static(connection, "owned_group_reference", missing) is missing
     ):
         return None, None, None
 
     def settled() -> bool | None:
-        value = getattr(connection, "owned_group_settled", None)
+        try:
+            value = getattr(connection, "owned_group_settled", None)
+        except (OSError, RuntimeError, ValueError):
+            return None
         return value if type(value) is bool else None
 
     def group_reference() -> str | None:
-        value = getattr(connection, "owned_group_reference", None)
+        try:
+            value = getattr(connection, "owned_group_reference", None)
+        except (OSError, RuntimeError, ValueError):
+            return None
         return value if type(value) is str and value.strip() else None
 
     return cast(Callable[[], None], retire), settled, group_reference

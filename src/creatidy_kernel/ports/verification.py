@@ -26,6 +26,7 @@ from creatidy_kernel.core.verification import (
     product_review_matches_request,
     validate_product_review,
 )
+from creatidy_kernel.core.work_budget import WorkKind
 from creatidy_kernel.ports.program_store import ApplicationStore, OperationRecord
 
 
@@ -338,7 +339,17 @@ def dispatch_product_review(
     """Persist review intent and receipt; reconcile uncertain delivery before retry."""
     request_bytes = _review_request_bytes(request)
     operation_id = product_review_operation_id(request)
-    operation = store.intent(
+    program_id = store.work_program_for_attempt(request.author_attempt_id)
+    program = store.load(program_id)
+    if (
+        request.subject.attempt_digest != program.attempt(request.author_attempt_id).spec.digest
+        or request.subject.spec_digest != program.attempt(request.author_attempt_id).spec.spec_digest
+    ):
+        raise ValueError("product review differs from original exact Attempt/specification")
+    operation = store.budgeted_intent(
+        program_id,
+        request.author_attempt_id,
+        WorkKind.REVIEW,
         operation_id,
         operation_id,
         {
@@ -367,6 +378,7 @@ def dispatch_product_review(
                 reference=f"sha256:{hashlib.sha256(receipt_bytes).hexdigest()}",
             )
         status, evidence = _review_outcome(request, receipt)
+        store.record_work_settlement(operation_id, f"sha256:{hashlib.sha256(receipt_bytes).hexdigest()}")
         return ProductReviewResult(status, operation, receipt, evidence)
 
     key = OperationKey(operation_id, operation.effect_key, operation.request_digest)
@@ -398,6 +410,7 @@ def dispatch_product_review(
                 matched_digest=operation.request_digest,
             )
             status, evidence = _review_outcome(request, receipt)
+            store.record_work_settlement(operation_id, reference)
             return ProductReviewResult(status, operation, receipt, evidence)
         store.reconcile(
             operation_id,
@@ -412,6 +425,7 @@ def dispatch_product_review(
     fence = store.claim(operation_id, now=now, lease_seconds=lease_seconds)
     operation = store.operation(operation_id)
     key = OperationKey(operation_id, operation.effect_key, operation.request_digest)
+    store.check_work_dispatch(operation_id)
     try:
         receipt = dispatcher.dispatch(key, request, fence=fence)
     except Exception:
@@ -430,6 +444,7 @@ def dispatch_product_review(
         reference=reference,
     )
     status, evidence = _review_outcome(request, receipt)
+    store.record_work_settlement(operation_id, reference)
     return ProductReviewResult(status, operation, receipt, evidence)
 
 

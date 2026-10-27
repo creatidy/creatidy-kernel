@@ -7,7 +7,7 @@ from typing import cast
 from unittest.mock import patch
 
 import pytest
-from test_reference_live import Connection
+from test_reference_live import Connection, controlled_reference_clock
 
 from creatidy_kernel.adapters.codex_runtime import CodexRuntime
 from creatidy_kernel.adapters.fake_forge import SyntheticForgeTransport
@@ -52,6 +52,7 @@ def live_scenario(directory: Path) -> tuple[Connection, Callable[[], dict[str, o
             object_source=objects,
             deadline=100,
             max_observations=4,
+            boot_clock=controlled_reference_clock,
         )
 
     return connection, run
@@ -133,8 +134,16 @@ def test_legacy_native_receipt_without_resolution_evidence_still_fails_closed(
 
     with patch.object(SQLiteProgramStore, "find_artifact", legacy_artifacts):
         result = run()
-    assert result["condition"] == "identity_unavailable" and result["accepted"] == []
-    assert connection.starts == 1
+    # Missing configuration is also missing STOP-target proof for an already
+    # dispatched operation; it must remain explicitly unsettled, not disappear.
+    assert result["condition"] == "cancel_uncertain" and result["accepted"] == []
+    cleanup = cast(list[dict[str, object]], result["owned_cleanup"])
+    assert len(cleanup) == 1 and cleanup[0]["owned_group_settled"] is None
+    assert cleanup[0]["result_reconciled"] is False
+    assert connection.starts == 1 and connection.interrupts == 0
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
+        assert store.operations("interruption:live-restoration")
+        assert not store.operations("acceptance:")
 
 
 def test_codex_restart_uses_original_durable_resolution_not_a_guessed_model(

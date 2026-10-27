@@ -326,10 +326,11 @@ Cancellation before Attempt preparation remains a stable no-dispatch result; rec
 reactivates allocation or execution and does not delete the original envelope or stop intent.
 Expired work remains observable but cannot be newly dispatched or accepted; checks and admission
 use actual decision times. This is a synthetic-proved owned-session repair, not detached supervision
-or a live conformance receipt. Verification commands retain finite timeouts; full monetary/quota,
-hidden-call and auxiliary-effect accounting remains unimplemented. Remaining work belongs to
-[#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56), not promised detached
-recovery features. [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48) supplies the
+or a live conformance receipt. Verification commands have finite timeouts and shared retained-output
+limits. Configured work envelopes cover Attempts, review, remediation, retries, verification, tools,
+helpers and auxiliary admissions, including the installed paths' single PR publication. These are
+mechanical work limits, not a monetary charge or a hard bound on unobserved inference inside an
+external client. [#48](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/48) supplies the
 bounded owned-session repair. [#53](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/53)
 and PR #85 are closed not implemented; their post-expiry diagnostic proves the historical strict
 native-effect expiry was not achieved, not that the accepted task-level baseline is implemented.
@@ -357,10 +358,11 @@ keep production/remote-write credentials out of the task user's account. This is
 isolation. Tasks requiring provider-key secrecy or enforced shell egress control are not supported by
 the current path unless the selected profile proves those boundaries; ordinary local coding is not
 blanket-refused.
-The current deadline is persisted as a wall-clock Unix timestamp; recovery retains it, but the code
-does not establish the required suspend-inclusive boot-scoped projection. Accepted ADR 0011 requires
-verified `CLOCK_BOOTTIME` where supported and fail-closed recovery, but this clock behavior is not
-implemented or claimed here.
+The original wall deadline is persisted together with a Linux `CLOCK_BOOTTIME` projection, original
+wall/boot anchors and verified host boot identity. Same-boot recovery reuses that projection; it does
+not calculate a fresh allowance. Suspend consumes the original envelope. Expiry, observed clock
+rollback, reboot, unavailable clock proof and legacy records without the original projection refuse
+new authority. Clock qualification does not strengthen the native-effect isolation boundary above.
 
 The separately opt-in [ADR 0008 verification-only profile](docs/adr/0008-linux-bubblewrap-verification.md)
 uses native Linux bubblewrap and libseccomp for untrusted test children, including such execution
@@ -385,6 +387,83 @@ deterministic policy (`reviewer_required=False`), **not independent product revi
 product review/remediation machinery is integrated through [#54](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/54)
 and PR #92 using synthetic-first exact-subject receipts; native ordinary composition remains separate;
 repository `/finish-pr` and `/loop` are development workflow, not its implementation or budget.
+
+### Configured Work Budgets
+
+`core.work_budget.WorkBudgetPolicy` specifies finite category counts, active-work capacity and retained
+streaming bytes. `SQLiteProgramStore.bind_work_budget` binds explicit project and task policies to the
+original envelope. One SQLite owner is the project capacity authority: different databases are not
+silently aggregated into a global project quota. Attempt preparation and its outbox reservation commit
+atomically; review and publication reserve alongside their intents. Recovery retains reservations,
+counts and unknown work. Successful acceptance releases its logical work slot in the same transaction;
+STOP/expiry still requires the bounded cancellation path's exact witness, not a lease or turn status.
+This is not the general resource/workspace fencing or ordinary dispatcher planned in #59/#105/#106.
+
+New delivery rechecks the original Attempt, applicable specification, WorkUnit state, immutable
+Operation binding and current observed resource headroom. Historical reservation/receipt replay is
+not fresh dispatch authority. Source-qualified receipt identities retain their original
+Attempt/Operation attribution across the whole capacity authority, including corrections.
+
+An unresolved verification command result or owned-group settlement is `cancel_uncertain`, not a
+failed check. Recovery checks this before restoring/resetting/cleaning the candidate workspace. A
+retained original `OwnedVerificationCommand` can retire its live `Popen` group and journal an exact
+operation/fence/opaque-group witness; no PID is restored from disk. Without that owner or qualified
+durable settlement, conflicting reuse remains blocked. A lost result is never fabricated: physical
+retirement permits only the existing exact runtime cancellation path, not ordinary acceptance or
+rejection. This adds no daemon or stronger native isolation claim.
+
+Successful command reuse also requires its original bounded workspace-integrity receipt, bound to
+the exact command result and candidate head. Recovery uses the recorded tracked/untracked outcome,
+not the clean workspace produced by restoration. Missing integrity proof stays uncertain before any
+reset/clean; an incomplete bounded integrity capture cannot become a pass.
+
+Ordinary `OwnerPolicy` can carry `work_budget`, `project_budget` and `project_id`. Approval binds those
+policies without dispatching or reporting usage. Authorized meaning amendments keep the original
+envelope and accumulated usage; old policies and Program bytes are not rewritten. Legacy preparation
+remains readable, but a missing budget/clock binding cannot authorize new application dispatch.
+
+`record_usage` retains source-qualified receipts and explicit correction chains for unitful money,
+tokens, quota pools, compute, elapsed time and attention. Status/export separates reservations from
+observations, known subtotals from unknown/unreported work, currencies, units and provenance. No prices,
+routes or quotas are reconstructed. Resource ceilings are stop-on-observed limits; missing/in-flight
+observations prevent further headroom claims. Installed external-client profiles do not prove a hard
+inference cap: `strict_inference=True` is refused, not fulfilled by a synthetic receipt or a future
+Router endpoint. Basic external-client work may retain unknown inference usage without a strict claim.
+An estimate or partial numeric receipt is not complete resource coverage, including after physical
+settlement. No installed producer supplies the final conservative bound needed to release that
+unknown headroom; further resource-constrained admissions refuse rather than infer zero hidden work.
+
+Work-budget authority uses SQLite schema 4. Its bounded per-Program clock row commits a pending-read
+marker before acquiring a clock sample and commits guard floors before the capacity/outbox transaction.
+Admission rollback cannot erase observed high-water evidence, and caches contain committed floors
+only. A failed clock flush leaves durable uncertainty: the same live owner may flush its exact captured
+sample, but a fresh process cannot invent that sample from its recovery wall clock. Historical reads
+and cancellation journaling remain available; new authority refuses while evidence is incomplete.
+Application decision-time callbacks consume the same durably observed store reading, not a separate
+boot-clock sample. A fresh task validates its initial boot proof and projection before creating its
+neutral store; failed initial proof leaves no task state to poison a corrected invocation. Existing
+stores and recorded expiries are never silently adopted or refreshed.
+
+Opening an existing schema-1/2/3 store first publishes a verified online backup named
+`<database>.pre-schema-4-<logical-digest>`, then atomically installs the clock-state compatibility
+boundary without rewriting historical records or the original schema-3 contract marker. Backup failure prevents migration;
+transaction interruption retains the original schema and published recovery image. After commit,
+reopen retains schema 4 rather than replaying effects. Actual installed readers from public base
+`e2348656238a2ff9a3244868e2beb543d86f15a5` and schema-3 revision
+`23a28e31c17018acb9900efeed2da1b9b03330cf` refuse schema 4 before claims/effects. Schema-2/3/4
+bundles retain their own versioned manifests and complete artifact inventory; restore is
+to a new offline path using the current reader, not downgrade permission or a live migration command.
+
+The finite live reference also routes authority/capacity refusal inside observation or collection
+through its durable STOP journal and bounded original-owned-group cleanup, even after a terminal
+turn receipt. Terminality alone does not prove group settlement. Missing, failed or mismatched
+settlement evidence remains `cancel_uncertain`; accepted receipts cannot publish after refusal.
+An interrupt claim never proves that retirement ran: reentry may perform one bounded retirement of
+the matching retained original owner without replaying an uncertain interrupt. Non-found restoration
+enters the same durable STOP path before observing a handle; replacement groups are never adopted.
+STOP also validates and reconciles a durable runtime receipt published before its accepted-reference
+observation, independently of permission for new work. Missing, stale or mismatched receipts remain
+explicit uncertain cleanup targets; receipt recovery never accepts a candidate or replays execution.
 
 `task export` is a thin persisted task/Allocation/candidate/acceptance/PR summary, not the richer
 reference export or a task-integrated `core.outcomes` pipeline. It lacks full requested/resolved/observed

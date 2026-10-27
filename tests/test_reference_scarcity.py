@@ -8,6 +8,7 @@ from typing import cast
 from unittest.mock import patch
 
 import pytest
+from test_reference_live import controlled_reference_clock
 
 from creatidy_kernel.adapters.fake_forge import SyntheticForgeTransport
 from creatidy_kernel.adapters.forgejo import ForgejoForge
@@ -122,6 +123,7 @@ def scenario(
             object_source=objects,
             deadline=100,
             max_observations=8,
+            boot_clock=controlled_reference_clock,
         )
 
     return recommendations, connection, transport, run

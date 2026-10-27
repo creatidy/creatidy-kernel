@@ -2,6 +2,7 @@
 """Durable candidate-bound product review transport and exact-subject rules."""
 
 import json
+import time
 from dataclasses import asdict, replace
 from hashlib import sha256
 from pathlib import Path
@@ -13,11 +14,15 @@ from creatidy_kernel.adapters.reference import reference_spec
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.domain import (
     ActivateProgram,
+    AttemptSpec,
     AuthorityEnvelope,
     BudgetPolicy,
+    FinishAttempt,
     PolicyReference,
+    PrepareAttempt,
     Program,
     ProgramSpec,
+    StartAttempt,
 )
 from creatidy_kernel.core.execution import (
     Activity,
@@ -45,12 +50,15 @@ from creatidy_kernel.core.verification import (
     VerificationPolicy,
     validate_product_review,
 )
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy
 from creatidy_kernel.ports.application import Collection, advance_work_unit
 from creatidy_kernel.ports.verification import (
     ProductReviewStatus,
     ReviewLookup,
     ReviewLookupStatus,
-    dispatch_product_review,
+)
+from creatidy_kernel.ports.verification import (
+    dispatch_product_review as _dispatch_product_review,
 )
 
 pytest_plugins = ["test_sqlite_store"]
@@ -58,10 +66,66 @@ pytest_plugins = ["test_sqlite_store"]
 POLICY = PolicyReference("product-review", "v1", "sha256:policy")
 
 
+def configure_budget(store: SQLiteProgramStore, program: Program) -> None:
+    budget = WorkBudgetPolicy.basic(
+        program.spec.budget.max_attempts,
+        program.spec.budget.max_active_attempts,
+        verifications=program.spec.budget.max_attempts * 2,
+        retained_bytes=65536,
+    )
+    store.bind_work_budget(
+        program.program_id,
+        "fixture-review",
+        budget,
+        budget,
+        store.original_work_deadline(program.program_id) or int(time.time()) + 3600,
+    )
+
+
+def dispatch_product_review(
+    store: SQLiteProgramStore,
+    review: ProductReviewRequest,
+    dispatcher: "Dispatcher",
+    *,
+    now: int,
+    lease_seconds: int = 60,
+):
+    program = store.find_program("reference") or store.create(reference_spec(), "create")
+    configure_budget(store, program)
+    if not program.attempts:
+        program = store.admit(program.program_id, "activate", ActivateProgram(program.revision, "owner"))
+        attempt = AttemptSpec(
+            "a1",
+            program.program_id,
+            "first",
+            program.spec.revision,
+            program.spec.digest,
+            program.resolved_inputs("first"),
+        )
+        store.admit_with_intent(
+            program.program_id,
+            "prepare:a1",
+            PrepareAttempt(program.revision, "worker", attempt),
+            "runtime:a1",
+            "runtime:a1",
+            {"attempt": attempt.digest},
+        )
+        program = store.load(program.program_id)
+        program = store.admit(program.program_id, "start:a1", StartAttempt(program.revision, "worker", "a1"))
+        store.admit(program.program_id, "finish:a1", FinishAttempt(program.revision, "worker", "a1"))
+    return _dispatch_product_review(store, review, dispatcher, now=now, lease_seconds=lease_seconds)
+
+
 def request() -> ProductReviewRequest:
+    program = Program.create(reference_spec())
+    attempt = AttemptSpec(
+        "a1", program.program_id, "first", program.spec.revision, program.spec.digest, program.spec.initial_inputs
+    )
     manifest = ArtifactManifest("workspace:a1", (Artifact("result.txt", "sha256:output"),))
-    candidate = CandidateResult("candidate:a1", Candidate("a1", "spec", manifest), (("output", "result.txt"),))
-    subject = EvidenceSubject(candidate.digest, "spec", "spec", POLICY.digest, "repo", "base", "head")
+    candidate = CandidateResult("candidate:a1", Candidate("a1", attempt.digest, manifest), (("output", "result.txt"),))
+    subject = EvidenceSubject(
+        candidate.digest, attempt.digest, program.spec.digest, POLICY.digest, "repo", "base", "head"
+    )
     return ProductReviewRequest(candidate, subject, "a1", "worker", POLICY)
 
 
@@ -219,6 +283,7 @@ def _advance_review(
     *,
     remediation_of: str | None = None,
 ) -> str:
+    configure_budget(store, program)
     return advance_work_unit(
         store,
         program,
