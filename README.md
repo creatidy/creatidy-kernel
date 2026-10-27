@@ -454,6 +454,9 @@ The finite live reference also routes authority/capacity refusal inside observat
 through its durable STOP journal and bounded original-owned-group cleanup, even after a terminal
 turn receipt. Terminality alone does not prove group settlement. Missing, failed or mismatched
 settlement evidence remains `cancel_uncertain`; accepted receipts cannot publish after refusal.
+An interrupt claim never proves that retirement ran: reentry may perform one bounded retirement of
+the matching retained original owner without replaying an uncertain interrupt. Non-found restoration
+enters the same durable STOP path before observing a handle; replacement groups are never adopted.
 
 `task export` is a thin persisted task/Allocation/candidate/acceptance/PR summary, not the richer
 reference export or a task-integrated `core.outcomes` pipeline. It lacks full requested/resolved/observed

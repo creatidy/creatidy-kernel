@@ -163,9 +163,10 @@ def test_refusal_inside_admission_uses_durable_stop_and_qualified_cleanup(
             assert not store.operations("acceptance:")
         replay = run()
         assert replay["accepted"] == [] and transport.pulls == [] and connection.starts == 1
-        assert replay["condition"] == result["condition"] and connection.close_calls == (
-            0 if settlement == "missing" else 1
-        )
+        assert replay["condition"] == result["condition"]
+        # A matching, still-unsettled original owner gets one bounded retirement
+        # phase per invocation. An interrupt claim alone never suppresses it.
+        assert connection.close_calls == (0 if settlement == "missing" else 1 if settlement is True else 2)
         assert (sqlite_tmp_path / "repository/protected-worker-output").read_text() == "retain"
     finally:
         connection.retire_fixture()

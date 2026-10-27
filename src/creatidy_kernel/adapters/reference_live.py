@@ -49,9 +49,12 @@ from creatidy_kernel.core.execution import (
     WorkspaceHandle,
     WorkspaceSpec,
 )
+from creatidy_kernel.core.execution import (
+    Presence as RuntimePresence,
+)
 from creatidy_kernel.core.forge import Presence, Reference
 from creatidy_kernel.core.resources import Allocation
-from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy
+from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkUncertain
 from creatidy_kernel.ports.allocation import decode_identity, load_allocation
 from creatidy_kernel.ports.application import advance_work_unit, manifest_bytes
 from creatidy_kernel.ports.forge import Forge
@@ -220,7 +223,8 @@ def run_live_reference(
             nonlocal retirement_attempted
             if not retirement_attempted and retire_owned_group is not None:
                 retirement_attempted = True
-                retire_owned_group()
+                if observe_owned_group is None or observe_owned_group() is not True:
+                    retire_owned_group()
 
         runtime = CodexRuntime(
             connection,
@@ -240,7 +244,7 @@ def run_live_reference(
             receipt: dict[str, object] = {} if data is None else cast(dict[str, object], json.loads(data))
             original_group = receipt.get("owned_group_reference")
             original_identity = receipt.get("identity")
-            runtime.restore(
+            lookup = runtime.restore(
                 request,
                 handle,
                 owned_group_reference=original_group if type(original_group) is str else None,
@@ -248,9 +252,12 @@ def run_live_reference(
                 if type(original_identity) is dict
                 else None,
             )
+            if lookup.presence is not RuntimePresence.FOUND or lookup.handle != handle:
+                raise WorkUncertain("original runtime restoration is unverified; no replacement-group adoption")
 
         status = "budget_exhausted"
         authority_refused = bool(store.operations("interruption:live-authority"))
+        restoration_uncertain = bool(store.operations("interruption:live-restoration"))
         used = len(store.operations("reference:live-poll:"))
         for index in range(used, max_observations + 1):
             if not work_authorized():
@@ -324,6 +331,15 @@ def run_live_reference(
                     "interruption:live-authority",
                     "interruption:live-authority",
                     {"reason": "new work authority refused inside admission"},
+                )
+                break
+            except WorkUncertain:
+                restoration_uncertain = True
+                status = "unknown"
+                store.intent(
+                    "interruption:live-restoration",
+                    "interruption:live-restoration",
+                    {"reason": "original runtime restoration unverified"},
                 )
                 break
             if status in {"unknown", "rejected", "identity_unavailable"}:
@@ -401,7 +417,7 @@ def run_live_reference(
                 except (OSError, RuntimeError, ValueError):
                     current_group = None
                 group_matches = expected_group is not None and current_group == expected_group
-                if retire_owned_group is not None and not group_matches:
+                if not group_matches and (expected_group is not None or retire_owned_group is not None):
                     owned_cleanup.append(
                         {
                             "operation": operation.operation_id,
@@ -410,29 +426,42 @@ def run_live_reference(
                         }
                     )
                     continue
-                restore(request, operation.accepted_reference)
-                if cancellation.attempts == 0:
-                    fence = store.claim(cancellation_id, now=int(time.time()), lease_seconds=1)
-                    # The adapter cannot prove interrupt delivery, even when the RPC returns.
-                    store.observe(cancellation_id, fence, f"uncertain:{cancellation_id}", "unknown")
+                restored = True
+                try:
                     try:
-                        runtime.cancel(operation.accepted_reference)
-                    except (OSError, RuntimeError):
-                        pass
-                    finally:
-                        if group_matches:
+                        restore(request, operation.accepted_reference)
+                    except WorkUncertain:
+                        restored = False
+                        restoration_uncertain = True
+                        store.intent(
+                            "interruption:live-restoration",
+                            "interruption:live-restoration",
+                            {"reason": "original runtime restoration unverified"},
+                        )
+                    if cancellation.attempts == 0:
+                        fence = store.claim(cancellation_id, now=int(time.time()), lease_seconds=1)
+                        # Claim/observation deduplicate interrupt delivery, not physical retirement.
+                        store.observe(cancellation_id, fence, f"uncertain:{cancellation_id}", "unknown")
+                        if restored:
                             try:
-                                retire_once()
+                                runtime.cancel(operation.accepted_reference)
                             except (OSError, RuntimeError):
                                 pass
-                observation = runtime.observe(operation.accepted_reference, now=int(time.time()))
-                observation_data = manifest_bytes(asdict(observation))
-                store.finalize_artifact(
-                    cancellation_id,
-                    f"observation:{hashlib.sha256(observation_data).hexdigest()}",
-                    observation_data,
-                )
-                if observation.activity is Activity.TERMINAL:
+                finally:
+                    if group_matches:
+                        try:
+                            retire_once()
+                        except (OSError, RuntimeError):
+                            pass
+                observation = runtime.observe(operation.accepted_reference, now=int(time.time())) if restored else None
+                if observation is not None:
+                    observation_data = manifest_bytes(asdict(observation))
+                    store.finalize_artifact(
+                        cancellation_id,
+                        f"observation:{hashlib.sha256(observation_data).hexdigest()}",
+                        observation_data,
+                    )
+                if observation is not None and observation.activity is Activity.TERMINAL:
                     # A terminal target is evidence of stopping, not of interrupt delivery or acceptance.
                     store.observe(
                         operation.operation_id,
@@ -446,7 +475,8 @@ def run_live_reference(
                 except (OSError, RuntimeError, ValueError):
                     settled = None
                 reconciled = (
-                    observation.activity is Activity.TERMINAL
+                    observation is not None
+                    and observation.activity is Activity.TERMINAL
                     and observation.handle == operation.accepted_reference
                     and group_matches
                     and manifest_bytes(asdict(observation.identity)) == manifest_bytes(original.get("identity"))
@@ -484,7 +514,7 @@ def run_live_reference(
         result = reference_export(store)
         result.update(
             condition="cancel_uncertain"
-            if authority_refused
+            if (authority_refused or restoration_uncertain or retire_owned_group is not None)
             and any(
                 item.get("owned_group_settled") is not True or item.get("result_reconciled") is not True
                 for item in owned_cleanup
