@@ -583,6 +583,21 @@ claim, budget and Operation still publish atomically; retained capacity is check
 publication. This relies on the existing cooperative reservation protocol and controller custody of the
 path namespace during an owner decision, not hostile same-UID filesystem isolation or physical preemption.
 
+Logical completion and resource settlement are different facts. `SatisfyWorkUnit` and
+`record_work_completion` may settle logical capacity but never prove workspace/session quiescence.
+The trusted-profile `record_work_settlement` entry records separate typed qualification bound to the
+original reservation, Attempt digest, workspace, Operation request and delivery fence; producer code
+supplies the original fence when available. It is not a worker boolean or an evidence-string heuristic.
+Owned claims continue to require their exact cooperative/managed `HandoffProof`, and other real effects
+require applicable qualified settlement. Historical untyped rows stay readable but unqualified; an
+applicable producer can reconcile them without rewriting their original evidence. New typed records
+cause the actual older schema-5 readers to refuse rather than silently erase this distinction.
+
+Retry and remediation reservations consume finite count budgets, not separate physical-effect slots.
+They need no invented termination receipt and are never refunded by resource release. Interrupted
+`BudgetedChecks` recovery uses the same physical preflight and fresh independently durable clock cut
+before reserving a retry; unknown tool/publication effects remain held separately.
+
 The explicit `kernel:cooperative-task-scope:v1` pull profile supports authenticated `quiesce` receipts.
 They cover only the claimed task resources, not the user's Kilo process/server, physical model identity
 or managed cancellation. Managed work can use `CodexOwnedSessionWitness` over the original retained

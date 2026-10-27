@@ -378,7 +378,9 @@ def dispatch_product_review(
                 reference=f"sha256:{hashlib.sha256(receipt_bytes).hexdigest()}",
             )
         status, evidence = _review_outcome(request, receipt)
-        store.record_work_settlement(operation_id, f"sha256:{hashlib.sha256(receipt_bytes).hexdigest()}")
+        store.record_work_settlement(
+            operation_id, f"sha256:{hashlib.sha256(receipt_bytes).hexdigest()}", expected_fence=operation.fence
+        )
         return ProductReviewResult(status, operation, receipt, evidence)
 
     key = OperationKey(operation_id, operation.effect_key, operation.request_digest)
@@ -410,7 +412,7 @@ def dispatch_product_review(
                 matched_digest=operation.request_digest,
             )
             status, evidence = _review_outcome(request, receipt)
-            store.record_work_settlement(operation_id, reference)
+            store.record_work_settlement(operation_id, reference, expected_fence=operation.fence)
             return ProductReviewResult(status, operation, receipt, evidence)
         store.reconcile(
             operation_id,
@@ -444,7 +446,7 @@ def dispatch_product_review(
         reference=reference,
     )
     status, evidence = _review_outcome(request, receipt)
-    store.record_work_settlement(operation_id, reference)
+    store.record_work_settlement(operation_id, reference, expected_fence=fence)
     return ProductReviewResult(status, operation, receipt, evidence)
 
 

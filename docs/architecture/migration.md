@@ -149,6 +149,16 @@ Source-cache v2 acquisition/object-copy leases and frozen #143/#166 task records
 source-read ownership nor a cooperative handoff becomes a managed native witness. Ordinary preparation
 still creates no worker grant by itself; #106/#57 consume the new local handlers in their own deliveries.
 
+Schema-5 settlement qualification is additive in the existing non-dispatchable journal. New
+`ownership-settlement` records explicitly distinguish logical capacity completion from a trusted
+operation-specific resource settlement and bind the original subject and effect fence. Existing
+untyped settlement rows and their evidence bytes are not rewritten or inferred physical. The actual
+prequalification schema-5 producer at `3aa2b8f0232892ddfc61545bff7c646176253628` remains readable with
+resource reuse refused until applicable qualification; the actual `b9aae79d36e1a1ece046dd565a07be028c8f865a`
+and prequalification readers reject the new typed category before effects. Installed tests verify
+both directions and preserve original rows. Counter-only RETRY/REMEDIATION rows remain counts, not
+effect receipts or refundable capacity.
+
 ## Verification Compatibility
 
 Verification changes under #50 preserve the original Task #143/#166 payloads, policy references,

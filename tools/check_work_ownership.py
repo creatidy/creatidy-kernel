@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Installed application conformance: real SQLite/local handlers, no harness/provider."""
 
+import json
 import os
 import sys
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 from creatidy_kernel.adapters.codex_runtime import CodexOwnedSessionWitness
@@ -13,9 +15,19 @@ from creatidy_kernel.adapters.reference import reference_spec
 from creatidy_kernel.adapters.sqlite_store import OperationConflict, SQLiteProgramStore
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.deadlines import BootClockReading
-from creatidy_kernel.core.domain import ActivateProgram, AttemptSpec, PrepareAttempt, ProgramSpec
+from creatidy_kernel.core.domain import (
+    ActivateProgram,
+    AttemptSpec,
+    FinishAttempt,
+    InputBinding,
+    PrepareAttempt,
+    ProgramSpec,
+    SatisfyWorkUnit,
+    StartAttempt,
+    TrustedSatisfaction,
+)
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, OwnershipConflict
-from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy
+from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.ownership import WorkOwnership
 
 
@@ -24,12 +36,122 @@ def require(condition: object) -> None:
         raise AssertionError("installed ownership invariant failed")
 
 
+def settlement_conformance(directory: Path, binary: Path) -> None:
+    parent = directory / "proof-workspaces"
+    parent.mkdir(mode=0o700)
+    tree = LocalOwnedWorkspace(parent, "one", create=True)
+    base = reference_spec()
+    clock = lambda: BootClockReading(100, 1_000_000_000, "installed-proof-boot")  # noqa: E731
+    with SQLiteProgramStore(directory / "proof.sqlite3", boot_clock=clock) as store:
+        budget = WorkBudgetPolicy.basic(3, 3, verifications=3, retained_bytes=16384)
+        for name in ("logical", "next"):
+            spec = ProgramSpec(
+                name,
+                base.objective,
+                base.work_units,
+                base.initial_inputs,
+                base.budget,
+                base.authority,
+                acceptance_criteria=base.acceptance_criteria,
+                policy_references=base.policy_references,
+            )
+            program = store.create(spec, f"create:{name}")
+            store.bind_work_budget(name, "proof-project", budget, budget, 110)
+            store.admit(name, f"activate:{name}", ActivateProgram(program.revision, "owner"))
+        connection = CodexStdio(
+            (str(binary), "app-server"), "0.99.1", environment={"HOME": str(directory), "PATH": os.defpath}
+        )
+        try:
+            program = store.load("logical")
+            attempt = AttemptSpec(
+                "logical-generic",
+                "logical",
+                "first",
+                program.spec.revision,
+                program.spec.digest,
+                program.resolved_inputs("first"),
+                workspace_reference=str(tree.path),
+            )
+            program = store.admit_with_intent(
+                "logical",
+                "prepare:logical",
+                PrepareAttempt(program.revision, "worker", attempt),
+                "runtime:logical-generic",
+                "runtime:logical-generic",
+                {"attempt": attempt.digest},
+            )
+            program = store.admit(
+                "logical", "start:logical", StartAttempt(program.revision, "worker", attempt.attempt_id)
+            )
+            program = store.admit(
+                "logical", "finish:logical", FinishAttempt(program.revision, "worker", attempt.attempt_id)
+            )
+            accepted = TrustedSatisfaction(
+                "logical:accepted",
+                "logical",
+                "first",
+                program.spec.revision,
+                program.spec.digest,
+                program.spec.work_unit_applicability_fingerprint("first"),
+                "verifier",
+                attempt.attempt_id,
+                tuple(
+                    InputBinding(name, f"artifact:{name}") for name in sorted(program.spec.work_unit("first").outputs)
+                ),
+            )
+            store.admit("logical", "accept:logical", SatisfyWorkUnit(program.revision, "verifier", accepted))
+            program = store.load("next")
+            successor = AttemptSpec(
+                "next",
+                "next",
+                "first",
+                program.spec.revision,
+                program.spec.digest,
+                program.resolved_inputs("first"),
+                workspace_reference=str(tree.path),
+            )
+            app = WorkOwnership(
+                store, Principal("worker", "worker"), tree, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
+            )
+            try:
+                app.claim("claim:next", program.revision, successor, lease_seconds=5)
+            except OwnershipConflict:
+                pass
+            else:
+                raise AssertionError("logical accepted fact released a generic physical workspace")
+            original_capacity = store.operations("work-budget:v1:settlement:")
+            operation = store.operation("runtime:logical-generic")
+            connection.close()
+            require(connection.owned_group_settled is True)
+            evidence = store.finalize_artifact(
+                operation.operation_id,
+                "owned-stop",
+                json.dumps(
+                    {
+                        "operation": operation.operation_id,
+                        "request_digest": operation.request_digest,
+                        "fence": operation.fence,
+                        "attempt": attempt.digest,
+                        "workspace": str(tree.path),
+                        "owned_group_reference": connection.owned_group_reference,
+                        "owned_group_settled": connection.owned_group_settled,
+                    },
+                    sort_keys=True,
+                ).encode(),
+            )
+            store.record_work_settlement(operation.operation_id, evidence, expected_fence=operation.fence)
+            require(store.operations("work-budget:v1:settlement:") == original_capacity)
+            require(app.claim("claim:next", program.revision, successor, lease_seconds=5).generation == 1)
+        finally:
+            connection.close()
+
+
 def main(directory: Path) -> None:
     parent = directory / "workspaces"
     parent.mkdir(mode=0o700)
     one = LocalOwnedWorkspace(parent, "one", create=True)
     two = LocalOwnedWorkspace(parent, "two", create=True)
-    policy = WorkBudgetPolicy.basic(3, 3, verifications=3, retained_bytes=16384)
+    policy = WorkBudgetPolicy.basic(4, 3, verifications=3, retained_bytes=16384)
     reading = BootClockReading(100, 1_000_000_000, "installed-synthetic-boot")
     clock = lambda: reading  # noqa: E731
     path = directory / "kernel.sqlite3"
@@ -185,6 +307,10 @@ for line in sys.stdin:
                 lease_seconds=5,
             )
             managed.witness(handoff, "start")
+            current = store.load("managed")
+            store.admit(
+                "managed", "start:managed", StartAttempt(current.revision, "worker", handoff.attempt.attempt_id)
+            )
             control = WorkOwnership(
                 store,
                 Principal("owner", "owner"),
@@ -195,6 +321,18 @@ for line in sys.stdin:
                 witness=witness,
             )
             require(control.dispatch(handoff, handoff.operation_id, lease_seconds=1) == 1)
+            store.record_transport(handoff.operation_id, 1, False)
+            store.observe(handoff.operation_id, 1, "managed:first-unknown", "unknown")
+            reading = BootClockReading(102, 3_000_000_000, "installed-synthetic-boot")
+            store.reconcile(
+                handoff.operation_id,
+                1,
+                "idempotent",
+                now=102,
+                evidence="trusted:original-key-retry",
+                matched_digest=store.operation(handoff.operation_id).request_digest,
+            )
+            require(control.dispatch(handoff, handoff.operation_id, lease_seconds=1) == 2)
             try:
                 managed.witness(handoff, "complete")
             except OwnershipConflict:
@@ -204,6 +342,33 @@ for line in sys.stdin:
             connection.close()
             managed.witness(handoff, "complete")
             require(managed.submit(handoff) == three.capture()[0])
+            current = store.load("managed")
+            current = store.admit(
+                "managed", "finish:managed", FinishAttempt(current.revision, "worker", handoff.attempt.attempt_id)
+            )
+            control.release(handoff, evidence="owner:managed-scope-settled-for-remediation")
+            remedy = AttemptSpec(
+                "installed-remedy",
+                "managed",
+                "first",
+                current.spec.revision,
+                current.spec.digest,
+                current.resolved_inputs("first"),
+                workspace_reference=str(three.path),
+                remediation_of=handoff.attempt.attempt_id,
+            )
+            pull = app(three)
+            repaired = pull.claim("claim:remedy", current.revision, remedy, lease_seconds=5)
+            current = store.load("managed")
+            store.admit("managed", "start:remedy", StartAttempt(current.revision, "worker", remedy.attempt_id))
+            pull.quiesce(repaired, "client:remediation-task-quiescent")
+            require(pull.submit(repaired) == three.capture()[0])
+            current = store.load("managed")
+            store.admit("managed", "finish:remedy", FinishAttempt(current.revision, "worker", remedy.attempt_id))
+            app(three, owner=True).release(repaired, evidence="owner:remediation-scope-settled")
+            reservations = cast(list[dict[str, object]], store.work_budget_status("managed")["reservations"])
+            require(sum(item["category"] == WorkKind.RETRY.value for item in reservations) == 1)
+            require(sum(item["category"] == WorkKind.REMEDIATION.value for item in reservations) == 1)
             witness.invalidate()
             require(managed.claim("claim:managed", managed_revision, managed_attempt, lease_seconds=5) == handoff)
             try:
@@ -287,10 +452,12 @@ for line in sys.stdin:
         require(store.operation(claimed.operation_id).attempts == 0)
         require((one.path / "unknown-user-data").read_bytes() == b"synthetic manual bytes must survive")
         require(store.startup_evidence.schema_version == 5)
+    settlement_conformance(directory, fixture)
     print(
         "Installed ownership: atomic pull claims, conflicts, independent work, original renewal, quiescence, "
         "immutable capture, manual preservation, empty cleanup, explicit-request replay after edit/retirement/reopen, "
-        "global generic preparation fencing, cold managed history and fresh post-filesystem boot expiry passed."
+        "global generic preparation fencing, cold managed history, fresh post-filesystem boot expiry, "
+        "logical/profile proof separation and counter-only retry/remediation completion passed."
     )
 
 

@@ -58,7 +58,7 @@ from creatidy_kernel.core.ownership import (
     ResourceScope,
     WorkClaim,
 )
-from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
+from creatidy_kernel.core.work_budget import COUNT_ONLY_WORK, BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
 
 SCHEMA_VERSION = 5
@@ -471,13 +471,7 @@ class SQLiteProgramStore:
             ]
             if len(completed_reservations) != 1:
                 raise BudgetRefused("acceptance lacks original Attempt capacity reservation")
-            completed_operation = cast(str, completed_reservations[0]["operation"])
-            if self._work_record("settlement", completed_operation) is None:
-                self._write_work_record(
-                    "settlement",
-                    completed_operation,
-                    {"operation": completed_operation, "evidence": command.satisfaction.reference_id},
-                )
+            self._record_work_completion(completed_reservations[0], command.satisfaction.reference_id)
         if isinstance(command, PrepareAttempt):
             # Pure historical domain facts remain writable/readable. They do
             # not authorize a dispatch without original envelope proof.
@@ -781,6 +775,19 @@ class SQLiteProgramStore:
             "ownership-candidate": {"claim", "subject"},
             "ownership-release": {"claim", "evidence"},
             "ownership-unknown": {"claim", "evidence"},
+            "ownership-settlement": {
+                "operation",
+                "program",
+                "attempt",
+                "category",
+                "attempt_digest",
+                "workspace_reference",
+                "effect_key",
+                "request_digest",
+                "fence",
+                "basis",
+                "evidence",
+            },
         }
         for operation in self.operations("work-budget:v1:ownership-"):
             record = cast(dict[str, object], json.loads(operation.request_json)["request"])
@@ -797,6 +804,8 @@ class SQLiteProgramStore:
                     claim = self._decode_work_claim(record)
                     if self._work_key(kind, claim.command_key) != operation.operation_id:
                         raise OwnershipConflict("claim namespace differs from command identity")
+                elif kind == "ownership-settlement":
+                    self._validate_resource_settlement(record, operation.operation_id)
                 else:
                     claim_record = self._work_record("ownership-claim", cast(str, record["claim"]))
                     if claim_record is None:
@@ -1110,9 +1119,12 @@ class SQLiteProgramStore:
                 raise OwnershipConflict("task-scope settlement unknown; preserve conflicting resources")
             for item in self._work_records("reservation"):
                 if (item["program"], item["attempt"]) == (claim.attempt.program_id, claim.attempt.attempt_id):
-                    if (
-                        item["operation"] != exclude_operation
-                        and self._work_record("settlement", cast(str, item["operation"])) is None
+                    if WorkKind(cast(str, item["category"])) in COUNT_ONLY_WORK:
+                        continue
+                    if item["operation"] != exclude_operation and (
+                        self._work_record("settlement", claim.operation_id) is None
+                        if item["operation"] == claim.operation_id
+                        else not self._resource_settled(item)
                     ):
                         raise OwnershipConflict("unreconciled effect retains conflicting resources")
 
@@ -1176,15 +1188,8 @@ class SQLiteProgramStore:
                     "proof": proof.payload(),
                 },
             )
-            if proof.stage != "start" and self._work_record("settlement", claim.operation_id) is None:
-                self._write_work_record(
-                    "settlement",
-                    claim.operation_id,
-                    {
-                        "operation": claim.operation_id,
-                        "evidence": proof.reference,
-                    },
-                )
+            if proof.stage != "start":
+                self._settle_work_operation(claim.operation_id, proof.reference)
 
     def observe_claim_workspace(
         self,
@@ -1495,11 +1500,9 @@ class SQLiteProgramStore:
                         program.program_id,
                         attempt.attempt_id,
                     )
-                    and item["category"] not in {WorkKind.RETRY.value, WorkKind.REMEDIATION.value}
+                    and WorkKind(cast(str, item["category"])) not in COUNT_ONLY_WORK
                 ]
-                if not effects or any(
-                    self._work_record("settlement", cast(str, item["operation"])) is None for item in effects
-                ):
+                if not effects or any(not self._resource_settled(item) for item in effects):
                     raise OwnershipConflict(
                         "generic workspace work lacks applicable exact settlement; cannot adopt its resource"
                     )
@@ -1956,6 +1959,11 @@ class SQLiteProgramStore:
         except ValueError as error:
             raise BudgetRefused("dispatch lacks its originating Attempt") from error
         self._check_workspace_claims(attempt.spec)
+        if any(
+            item["operation"] == operation_id and item["basis"] == "trusted-profile"
+            for item in self._work_records("ownership-settlement")
+        ):
+            raise OwnershipConflict("qualified resource settlement closes this operation; no new dispatch")
         if (attempt.spec.spec_revision, attempt.spec.spec_digest) != (program.spec.revision, program.spec.digest):
             raise BudgetRefused("reserved Attempt belongs to a superseded specification")
         operation = self.operation(operation_id)
@@ -2136,7 +2144,7 @@ class SQLiteProgramStore:
             active = {
                 (cast(str, item["program"]), cast(str, item["attempt"]))
                 for item in scoped
-                if item["category"] not in {WorkKind.REMEDIATION.value, WorkKind.RETRY.value}
+                if WorkKind(cast(str, item["category"])) not in COUNT_ONLY_WORK
                 and self._work_record("settlement", cast(str, item["operation"])) is None
             }
             if (program_id, attempt_id) not in active and len(active) >= policy.max_active:
@@ -2190,7 +2198,7 @@ class SQLiteProgramStore:
 
     def retry_work(self, operation_id: str) -> None:
         self._assert_writer_thread()
-        with self._gate, self._transaction():
+        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
             original = self._work_record("reservation", operation_id)
             if original is None:
                 raise BudgetRefused("retry lacks original reservation")
@@ -2200,10 +2208,105 @@ class SQLiteProgramStore:
                 cast(str, original["program"]), cast(str, original["attempt"]), f"{prefix}{count + 1}", WorkKind.RETRY
             )
 
-    def record_work_settlement(self, operation_id: str, evidence: str) -> None:
+    def _settle_work_operation(self, operation_id: str, evidence: str) -> None:
+        if self._work_record("settlement", operation_id) is None:
+            self._write_work_record("settlement", operation_id, {"operation": operation_id, "evidence": evidence})
+
+    def _settlement_subject(self, reservation: dict[str, object]) -> dict[str, object]:
+        program_id, attempt_id = cast(str, reservation["program"]), cast(str, reservation["attempt"])
+        attempt = next(
+            (item.spec for item in self._load_head(program_id).attempts if item.attempt_id == attempt_id), None
+        )
+        try:
+            operation = self.operation(cast(str, reservation["operation"]))
+        except OperationConflict:
+            operation = None
+        return {
+            "operation": reservation["operation"],
+            "program": program_id,
+            "attempt": attempt_id,
+            "category": reservation["category"],
+            "attempt_digest": None if attempt is None else attempt.digest,
+            "workspace_reference": None if attempt is None else attempt.workspace_reference,
+            "effect_key": None if operation is None else operation.effect_key,
+            "request_digest": None if operation is None else operation.request_digest,
+            "fence": None if operation is None else operation.fence,
+        }
+
+    @staticmethod
+    def _settlement_identity(subject: dict[str, object], basis: str) -> str:
+        return canonical_json([subject["operation"], basis, subject["request_digest"], subject["fence"]])
+
+    def _record_settlement_basis(self, reservation: dict[str, object], evidence: str, basis: str) -> None:
+        if WorkKind(cast(str, reservation["category"])) in COUNT_ONLY_WORK:
+            raise BudgetRefused("count-only reservation has no effect settlement receipt")
+        subject = self._settlement_subject(reservation)
+        identity = self._settlement_identity(subject, basis)
+        if self._work_record("ownership-settlement", identity) is None:
+            self._write_work_record("ownership-settlement", identity, {**subject, "basis": basis, "evidence": evidence})
+
+    def _record_work_completion(self, reservation: dict[str, object], evidence: str) -> None:
+        self._settle_work_operation(cast(str, reservation["operation"]), evidence)
+        self._record_settlement_basis(reservation, evidence, "logical-completion")
+
+    def record_work_completion(self, operation_id: str, evidence: str) -> None:
+        """Logical work/capacity completion, never task/resource quiescence."""
+        self._assert_writer_thread()
+        self._validate_command_key(evidence)
+        with self._gate, self._transaction():
+            reservation = self._work_record("reservation", operation_id)
+            if reservation is None:
+                raise BudgetRefused("completion has no original reservation")
+            self._record_work_completion(reservation, evidence)
+
+    def _resource_settled(self, reservation: dict[str, object]) -> bool:
+        subject = self._settlement_subject(reservation)
+        record = self._work_record("ownership-settlement", self._settlement_identity(subject, "trusted-profile"))
+        return record is not None and all(record[key] == value for key, value in subject.items())
+
+    def _validate_resource_settlement(self, record: dict[str, object], operation_id: str) -> None:
+        reservation = self._work_record("reservation", cast(str, record["operation"]))
+        if reservation is None or WorkKind(cast(str, reservation["category"])) in COUNT_ONLY_WORK:
+            raise OwnershipConflict("resource settlement lacks an original effect reservation")
+        if record["basis"] not in {"logical-completion", "trusted-profile"}:
+            raise OwnershipConflict("unknown settlement qualification")
+        subject = self._settlement_subject(reservation)
+        stable = {"operation", "program", "attempt", "category"}
+        if any(record[key] != subject[key] for key in stable):
+            raise OwnershipConflict("settlement differs from exact originating Attempt/resource")
+        if record["attempt_digest"] is None:
+            if record["workspace_reference"] is not None:
+                raise OwnershipConflict("unprepared settlement cannot assert a physical workspace")
+        elif (record["attempt_digest"], record["workspace_reference"]) != (
+            subject["attempt_digest"],
+            subject["workspace_reference"],
+        ):
+            raise OwnershipConflict("settlement differs from exact originating Attempt/resource")
+        if record["fence"] is None:
+            if record["effect_key"] is not None or record["request_digest"] is not None:
+                raise OwnershipConflict("partial settlement effect identity")
+        elif (
+            type(record["fence"]) is not int
+            or record["fence"] < 0
+            or subject["fence"] is None
+            or record["effect_key"] != subject["effect_key"]
+            or record["request_digest"] != subject["request_digest"]
+            or record["fence"] > cast(int, subject["fence"])
+        ):
+            raise OwnershipConflict("settlement differs from original effect/fence")
+        self._validate_command_key(cast(str, record["evidence"]))
+        if (
+            self._work_key("ownership-settlement", self._settlement_identity(record, cast(str, record["basis"])))
+            != operation_id
+        ):
+            raise OwnershipConflict("settlement identity differs from recorded subject")
+
+    def record_work_settlement(self, operation_id: str, evidence: str, *, expected_fence: int | None = None) -> None:
         """Trusted profile-specific exact witness, never a lease/turn-terminal inference."""
         self._assert_writer_thread()
         self._validate_command_key(evidence)
+        if expected_fence is not None and (type(expected_fence) is not int or expected_fence < 0):
+            raise OwnershipConflict("profile settlement requires an exact nonnegative delivery fence")
         with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
             reservation = self._work_record("reservation", operation_id)
             if reservation is None:
@@ -2211,8 +2314,11 @@ class SQLiteProgramStore:
             claim = self._attempt_work_claim(cast(str, reservation["program"]), cast(str, reservation["attempt"]))
             if claim is not None and operation_id == claim.operation_id:
                 self._check_work_claim(claim, authority=False, settled=True)
-            if self._work_record("settlement", operation_id) is None:
-                self._write_work_record("settlement", operation_id, {"operation": operation_id, "evidence": evidence})
+            subject = self._settlement_subject(reservation)
+            if expected_fence is not None and subject["fence"] != expected_fence:
+                raise OwnershipConflict("profile settlement differs from original delivery fence")
+            self._record_settlement_basis(reservation, evidence, "trusted-profile")
+            self._settle_work_operation(operation_id, evidence)
 
     def record_retained_bytes(self, operation_id: str, retained_bytes: int) -> None:
         self._assert_writer_thread()

@@ -65,6 +65,19 @@ or validating artifact storage after that cut. Changed preflight paths/store sta
 erasing committed cancellations or clock evidence; staged orphan bytes confer no authority. Controller
 custody and cooperative namespace stability remain required, not a new hostile-filesystem guarantee.
 
+Logical capacity completion is not physical/task-scope resource proof. Acceptance and
+`record_work_completion` record the former; the trusted-profile settlement entry and exact owned
+`HandoffProof` establish only their applicable operation/resource scope. Typed `ownership-settlement`
+records distinguish the basis and bind original reservation/Attempt/workspace/request/fence identity.
+No operation status, arbitrary evidence-string contents or historical untyped row is promoted to
+quiescence. Old untyped records remain intact and require a qualified producer reconciliation. A
+closed operation cannot restart by reusing its old proof, and another effect/fence cannot borrow it.
+
+RETRY and REMEDIATION are count-only reservations, not external effects. They remain consumed and
+deduplicated without fabricated receipts; actual runtime/tool/helper/verification/review/publication
+effects retain their separate settlement requirements. All retry reservation paths, including
+interrupted `BudgetedChecks` recovery, use the same outside-SQL preflight/final durable clock cut.
+
 Pull `kernel:cooperative-task-scope:v1` receipts are authenticated task-scope promises only. Managed
 `CodexOwnedSessionWitness` uses the original dedicated `CodexStdio`, exact opaque group, version-qualified
 profile and exact task resources, with a start witness required before normal/STOP settlement. A missing

@@ -14,6 +14,7 @@ PINNED_BASE_ID = "e2348656238a2ff9a3244868e2beb543d86f15a5"  # Exact public Git 
 PINNED_PRECLOCK_ID = "23a28e31c17018acb9900efeed2da1b9b03330cf"  # Published schema-3 public Git object ID.
 PINNED_PREOWNERSHIP_ID = "b11aae420517b14bbb4d85c84f9a0d82c14446c6"  # Published schema-4 public Git object ID.
 PINNED_INITIAL_OWNERSHIP_ID = "b9aae79d36e1a1ece046dd565a07be028c8f865a"  # Original PR110 schema-5 record producer.
+PINNED_PREQUALIFICATION_ID = "3aa2b8f0232892ddfc61545bff7c646176253628"  # Exact schema-5 prequalification producer.
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -206,6 +207,81 @@ with SQLiteProgramStore(directory / 'kernel.sqlite3', boot_clock=clock) as store
 """
 
 
+CREATE_LOGICAL_GENERIC = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.reference import reference_spec
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
+from creatidy_kernel.core.deadlines import BootClockReading
+from creatidy_kernel.core.domain import (ActivateProgram, AttemptSpec, PrepareAttempt, StartAttempt, FinishAttempt,
+                                        SatisfyWorkUnit, TrustedSatisfaction, InputBinding, ProgramSpec)
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+directory = Path(sys.argv[1])
+parent = directory / 'workspaces'
+parent.mkdir(mode=0o700)
+tree = LocalOwnedWorkspace(parent,'one',create=True)
+clock = lambda: BootClockReading(100,1000000000,'synthetic-boot-a')
+with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
+    base = reference_spec()
+    budget = WorkBudgetPolicy.basic(3,3,verifications=3,retained_bytes=16384)
+    for name in ('reference','successor'):
+        spec = ProgramSpec(name,base.objective,base.work_units,base.initial_inputs,base.budget,base.authority,
+                           acceptance_criteria=base.acceptance_criteria,policy_references=base.policy_references)
+        program = store.create(spec,'create:'+name)
+        store.bind_work_budget(name,'project',budget,budget,110)
+        store.admit(name,'activate:'+name,ActivateProgram(program.revision,'owner'))
+    program = store.load('reference')
+    attempt = AttemptSpec('generic','reference','first',program.spec.revision,program.spec.digest,
+                          program.resolved_inputs('first'),workspace_reference=str(tree.path))
+    program = store.admit_with_intent('reference','prepare',PrepareAttempt(program.revision,'worker',attempt),
+                                     'runtime:generic','runtime:generic',{'attempt':attempt.digest})
+    program = store.admit('reference','start',StartAttempt(program.revision,'worker','generic'))
+    program = store.admit('reference','finish',FinishAttempt(program.revision,'worker','generic'))
+    accepted = TrustedSatisfaction('logical:owned-group-stopped','reference','first',program.spec.revision,
+        program.spec.digest,program.spec.work_unit_applicability_fingerprint('first'),'verifier','generic',
+        tuple(InputBinding(name,'artifact:'+name) for name in sorted(program.spec.work_unit('first').outputs)))
+    store.admit('reference','accept',SatisfyWorkUnit(program.revision,'verifier',accepted))
+"""
+
+REFUSE_LOGICAL_REUSE = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
+from creatidy_kernel.core.authority import Principal
+from creatidy_kernel.core.deadlines import BootClockReading
+from creatidy_kernel.core.domain import AttemptSpec
+from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE,HandoffMode,OwnershipConflict
+from creatidy_kernel.ports.ownership import WorkOwnership
+directory = Path(sys.argv[1])
+clock = lambda: BootClockReading(100,1000000000,'synthetic-boot-a')
+with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
+    tree = LocalOwnedWorkspace(directory / 'workspaces','one')
+    app = WorkOwnership(store,Principal('worker','worker'),tree,mode=HandoffMode.PULL,profile=COOPERATIVE_PROFILE)
+    program = store.load('successor')
+    attempt = AttemptSpec('next','successor','first',program.spec.revision,program.spec.digest,
+                          program.resolved_inputs('first'),workspace_reference=str(tree.path))
+    try:
+        app.claim('claim:next',program.revision,attempt,lease_seconds=5)
+    except OwnershipConflict:
+        pass
+    else:
+        raise AssertionError('logical acceptance became physical task/resource proof')
+"""
+
+REFUSE_QUALIFICATION_DOWNGRADE = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.sqlite_store import CorruptHistory,SQLiteProgramStore
+try:
+    with SQLiteProgramStore(Path(sys.argv[1])):
+        raise AssertionError('old reader ignored the logical/profile settlement distinction')
+except CorruptHistory:
+    pass
+"""
+
+
 def main(new_python: Path, storage_root: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="installed-schema-upgrade-", dir=storage_root) as value:
         directory = Path(value)
@@ -265,11 +341,39 @@ def main(new_python: Path, storage_root: Path) -> None:
                         raise RuntimeError(
                             "historical explicit-request replay rewrote original claim/history/clock rows"
                         )
+        qualification = directory / "qualification"
+        qualification.mkdir()
+        prior_python = install_pinned_reader(qualification, commit_id=PINNED_PREQUALIFICATION_ID)
+        legacy = qualification / "untyped"
+        legacy.mkdir()
+        subprocess.run([str(prior_python), "-I", "-c", CREATE_LOGICAL_GENERIC, str(legacy)], cwd=legacy, check=True)
+        path = legacy / "kernel.sqlite3"
+        with closing(sqlite3.connect(path)) as current:
+            before = tuple(current.iterdump())
+        subprocess.run([str(new_python), "-I", "-c", REFUSE_LOGICAL_REUSE, str(legacy)], cwd=legacy, check=True)
+        with closing(sqlite3.connect(path)) as current:
+            if tuple(current.iterdump()) != before:
+                raise RuntimeError("old untyped settlement was rewritten/promoted on recovery")
+        typed = qualification / "typed"
+        typed.mkdir()
+        subprocess.run([str(new_python), "-I", "-c", CREATE_LOGICAL_GENERIC, str(typed)], cwd=typed, check=True)
+        path = typed / "kernel.sqlite3"
+        with closing(sqlite3.connect(path)) as current:
+            before = tuple(current.iterdump())
+        for reader in (old_python, prior_python):
+            subprocess.run([str(reader), "-I", "-c", REFUSE_QUALIFICATION_DOWNGRADE, str(path)], cwd=typed, check=True)
+        with closing(sqlite3.connect(path)) as current:
+            if tuple(current.iterdump()) != before:
+                raise RuntimeError("old schema5 reader changed typed settlement records")
         print(
             f"Installed schema upgrade: actual readers {PINNED_BASE_ID}, {PINNED_PRECLOCK_ID}, "
             f"{PINNED_PREOWNERSHIP_ID} refuse schema 5; original bytes, v2/v3/v4/v5 backups and artifacts preserved; "
             f"original schema-5 claims from {PINNED_INITIAL_OWNERSHIP_ID} replay unchanged "
             "and conflicting work stays fenced."
+        )
+        print(
+            "Installed settlement qualification: untyped logical history stays unknown; "
+            "old schema5 readers refuse new proof categories."
         )
 
 

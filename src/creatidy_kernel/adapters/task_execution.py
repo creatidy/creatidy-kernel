@@ -1392,7 +1392,9 @@ class TaskChecks:
                         ),
                     )
                     if _command_settled(self.store, key, run):
-                        self.store.record_work_settlement(key, reference)
+                        self.store.record_work_settlement(
+                            key, reference, expected_fence=self.store.operation(key).fence
+                        )
                     else:
                         raise WorkUncertain("verification command group settlement unknown")
                     runs.append(run)
@@ -2343,7 +2345,9 @@ def run_task(
                 )
             finish_cancelled_attempt(attempt.attempt_id)
             if store.has_work_budget(PROGRAM_ID):
-                store.record_work_settlement(operation.operation_id, settlement_reference)
+                store.record_work_settlement(
+                    operation.operation_id, settlement_reference, expected_fence=operation.fence
+                )
 
         def mark_cancellation_uncertain(cancellation_id: str, cancellation: OperationRecord) -> None:
             if cancellation.status == "dispatched":
