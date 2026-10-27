@@ -3,6 +3,11 @@
 - Status: Accepted
 - Date: 2026-10-18
 
+Compatible revision: [ADR 0012](0012-unified-work-coordination-and-drivers.md), pending integration,
+retains this accepted managed trusted-development baseline. Cooperative external pull clients have
+explicitly weaker task-scope control and cannot claim this profile's process-settlement guarantee.
+No historical #53 evidence, strict-expiry disposition or clock requirement is superseded here.
+
 ## Purpose And Decision Boundary
 
 This decision aligns Kernel acceptance with the product's purpose: reliable

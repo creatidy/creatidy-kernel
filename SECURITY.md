@@ -11,17 +11,21 @@ The [threat model](docs/architecture/threat-model.md) separates target controls 
 
 ## Trusted-Development Expiry Status
 
+The [unified architecture revision](docs/adr/0012-unified-work-coordination-and-drivers.md), pending
+integration, distinguishes cooperative pull authorization from physical managed-process control.
+Expired claims and absent heartbeats do not prove termination. An external session cannot satisfy a
+stronger profile by loading an optional plugin; quarantine uncertain conflicting task resources and
+refuse unsupported sensitive profiles. No new security enforcement mechanism is adopted here.
+
 The current trusted-development Codex path does not enforce grant expiry at each native filesystem
 or subprocess syscall. Deadline expiry and user STOP prevent new Kernel-controlled dispatch and
 initiate cancellation/termination; an already-running worker or descendant may still make local
 effects during teardown. A stop/interrupt acknowledgement is not settlement, and local changes are
 not rolled back. The accepted AC4 requires unknown termination/effect outcomes to remain unknown
-and block acceptance/publication, but current owned-process settlement does not yet enforce that
-gate: a terminal turn can reach candidate acceptance or finalize cancellation before the CLI closes
-`CodexStdio` and obtains its owned-group settlement result. This is the unresolved implementation
-gap tracked by [#90](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/90), not a current
-runtime guarantee. The approved #56/#60 body changes require deadline-triggered cancellation
-to use the same gate once synchronized.
+and block acceptance/publication. #90/PR #93 implements the bounded cancellation path's exact
+runtime/cancel-fence and owned-group witness, honest uncertain settlement and durable recovery without
+replay. It does not establish a general normal-completion settlement gate or escaped-descendant
+containment; #56/#59/#60 retain those separate obligations. A terminal turn alone remains insufficient.
 
 `TRUSTED_DEVELOPMENT` is an explicit owner-trusted coding profile, not hostile-worker isolation. The
 Codex app-server needs provider authentication in `HOME`; the native terminal may share the same

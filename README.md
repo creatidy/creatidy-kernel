@@ -6,6 +6,15 @@ Creatidy Kernel is a local-first work controller for engineering with existing A
 for individual creators and small teams with limited money, subscription quota, time and attention.
 The objective is an accepted result including verification, review and fixes, not the cheapest token.
 
+The owner's 2026-10-26 revision defines [one work-control core with complementary pull/push modes](docs/architecture/target.md)
+and independently bound tracker, SCM, CI, knowledge, harness and resource drivers.
+[ADR 0012](docs/adr/0012-unified-work-coordination-and-drivers.md) and its
+[backlog/impact publication plan](docs/architecture/backlog-alignment.md) are proposed records pending
+review/integration, not implemented features. Basic work coordination must complement existing Kilo
+configuration without requiring Router gateway interception; strict routing/pin/admission profiles
+still require actual proven compatibility or refuse. Neither Console nor an IDE plugin is mandatory.
+Ordinary feature development remains paused until this architecture/backlog alignment is accepted.
+
 **Status: deterministic domain, durable persistence, bounded Forge and Codex Runtime adapters,
 an offline two-node CLI reference flow, bounded TaskSpec support for two frozen real
 tasks, and inert ordinary preparation/approval through a trusted local API, not a general
@@ -62,8 +71,10 @@ already exist.
 private quota/telemetry, selection/admission policy and the provider gateway. Today the optional
 `ScarcityRouterAllocator` consumes its model recommendation interface, **not the execution gateway**;
 the bounded live composition then uses native Codex and one configured binding. The agreed target is
-dynamic Router-backed harness inference, with an explicit user pin as an exception, not a permanent
-hand-maintained model table. The offline example remains a FixedAllocator proof.
+dynamic Router-backed harness inference within the route-enabled profile, with an explicit user pin
+as an exception, not a permanent hand-maintained model table. Basic work coordination and externally
+configured pull clients do not require that profile; they cannot claim its guarantees. The offline
+example remains a FixedAllocator proof.
 
 [Model Intelligence](https://forgejo.creatidy.com/Creatidy/model-intelligence) owns versioned external
 model/interface/benchmark/public-offer evidence, not private balances or routing. Router normally
@@ -77,7 +88,9 @@ shared-architecture direction and source availability. [The coverage roadmap](do
 maps the accepted AC4 baseline separately from observed evidence and registered work still to prove.
 The current foundations and bounded intake are not evidence that ordinary execution, rich routing, gateway,
 product review, isolation, full costs or
-Console integration are complete. No Creatidy cloud account is required by the target architecture.
+Console integration are complete. Durable synthetic-first product review/remediation is now integrated
+through #54/PR #92 and bounded cancellation settlement through #90/PR #93; ordinary/native full-path
+composition is still incomplete. No Creatidy cloud account is required by the target architecture.
 
 ## Development Authority
 
@@ -326,12 +339,11 @@ dispatch/acceptance and triggers cancellation; it does not atomically revoke a n
 filesystem or subprocess syscalls. Local effects may occur while the active process group is being
 terminated. A stop/interrupt acknowledgement is not settlement, and cancellation is not rollback.
 The accepted contract requires acceptance/publication to remain blocked while outcome or
-owned-process settlement is unknown, but the current code does not yet enforce that gate at the
-process-group boundary: a terminal Codex turn can finalize cancellation or reach candidate
-acceptance before the controller's `CodexStdio.close()` records `owned_group_settled`. This is the
-unresolved implementation gap tracked by [#90](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/90),
-not a guarantee established by this documentation. The approved #56/#60 body changes
-require the same gate for deadline-triggered cancellation when synchronized. This is not
+owned-process settlement is unknown. #90/PR #93 now enforces the bounded cancellation path's exact
+runtime/cancellation fence and group witness, preserving `cancel_uncertain` on missing evidence and
+recovering durable settlement without replay. This does not establish a general normal-completion
+settlement gate or escaped-descendant containment. The broader #56/#59/#60 requirements retain those
+distinctions. This is not
 a hostile-worker sandbox or a strict no-native-effect-after-expiry guarantee. [Accepted ADR 0011](docs/adr/0011-task-level-authority-and-trusted-development.md)
 defines the authoritative baseline for this profile; its [approved Kernel issue-body patches](docs/architecture/ac4-issue-description-proposals.md)
 record the corresponding acceptance alignment. The native app-server
@@ -363,9 +375,11 @@ restart cannot reconstruct that resolution from a native thread read: without pr
 resolution evidence it reports `identity_unavailable` and cannot accept a candidate. Unknown
 generated-turn attestation remains distinct from verified configuration resolution. The live reference's
 cancellation journal separates uncertain interrupt delivery from terminal observation; the task
-composition does not yet supply that loop or its export. Task acceptance currently satisfies a frozen
+composition now retains its own bounded cancellation Operation/receipt/group witness in status/export,
+not generic native session recovery. Task acceptance currently satisfies a frozen
 deterministic policy (`reviewer_required=False`), **not independent product review**. The durable
-product review/remediation loop is [#54](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/54);
+product review/remediation machinery is integrated through [#54](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/54)
+and PR #92 using synthetic-first exact-subject receipts; native ordinary composition remains separate;
 repository `/finish-pr` and `/loop` are development workflow, not its implementation or budget.
 
 `task export` is a thin persisted task/Allocation/candidate/acceptance/PR summary, not the richer
@@ -574,7 +588,7 @@ Forge effect are unchanged, and neither path can merge or deploy.
 
 | Contract | Document |
 | --- | --- |
-| Components, authority map, vocabulary and invariants | [Greenfield target](docs/architecture/target.md) |
+| Components, authority map, vocabulary and invariants | [Unified work target](docs/architecture/target.md) |
 | Existing mechanisms and reuse choices, including upstream limitations | [Reference catalogue](docs/architecture/reuse.md) |
 | Adapter conformance, effect recovery and merge races | [Port contracts](docs/architecture/contracts.md) |
 | Trust boundaries and malicious-worker assumptions | [Threat model](docs/architecture/threat-model.md) |
@@ -592,6 +606,8 @@ Forge effect are unchanged, and neither path can merge or deploy.
 | [0005](docs/adr/0005-authority-and-acceptance.md) | Capabilities, independent verification and genuine Human Gates |
 | [0006](docs/adr/0006-context-and-outcomes.md) | Bounded context and user-owned outcome history |
 | [0007](docs/adr/0007-shared-harness-routing-observability.md) | Shared product/harness/routing/state ownership and explicit proof gaps |
+| [0011](docs/adr/0011-task-level-authority-and-trusted-development.md) | Accepted trusted-development authority, STOP and deadline/recovery baseline |
+| [0012](docs/adr/0012-unified-work-coordination-and-drivers.md) | Owner-authorized unified pull/push core and independent drivers; recording pending integration |
 
 Contributions: [CONTRIBUTING.md](CONTRIBUTING.md). Security: [SECURITY.md](SECURITY.md).
 Licensed under [Apache-2.0](LICENSE). Adapted-source attribution is distributed in [NOTICE](NOTICE).
