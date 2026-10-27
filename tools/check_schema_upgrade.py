@@ -13,6 +13,7 @@ from pathlib import Path
 PINNED_BASE_ID = "e2348656238a2ff9a3244868e2beb543d86f15a5"  # Exact public Git object ID, not a credential.
 PINNED_PRECLOCK_ID = "23a28e31c17018acb9900efeed2da1b9b03330cf"  # Published schema-3 public Git object ID.
 PINNED_PREOWNERSHIP_ID = "b11aae420517b14bbb4d85c84f9a0d82c14446c6"  # Published schema-4 public Git object ID.
+PINNED_INITIAL_OWNERSHIP_ID = "b9aae79d36e1a1ece046dd565a07be028c8f865a"  # Original PR110 schema-5 record producer.
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -128,6 +129,82 @@ else:
     raise AssertionError('actual pinned old reader failed to refuse the new authority schema')
 """
 
+CREATE_ORIGINAL_CLAIM = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.reference import reference_spec
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
+from creatidy_kernel.core.authority import Principal
+from creatidy_kernel.core.deadlines import BootClockReading
+from creatidy_kernel.core.domain import ActivateProgram, AttemptSpec, PrepareAttempt, ProgramSpec
+from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+from creatidy_kernel.ports.ownership import WorkOwnership
+directory, state = Path(sys.argv[1]), sys.argv[2]
+parent = directory / 'workspaces'
+parent.mkdir(mode=0o700)
+tree = LocalOwnedWorkspace(parent, 'one', create=True)
+clock = lambda: BootClockReading(100,1000000000,'synthetic-boot-a')
+with SQLiteProgramStore(directory / 'kernel.sqlite3', boot_clock=clock) as store:
+    spec = reference_spec()
+    program = store.create(spec, 'create')
+    policy = WorkBudgetPolicy.basic(3,3,verifications=3,retained_bytes=4096)
+    store.bind_work_budget('reference','project',policy,policy,110)
+    program = store.admit('reference','activate',ActivateProgram(program.revision,'owner'))
+    app = WorkOwnership(store,Principal('worker','worker'),tree,mode=HandoffMode.PULL,profile=COOPERATIVE_PROFILE)
+    attempt = AttemptSpec('original','reference','first',program.spec.revision,program.spec.digest,
+                          program.resolved_inputs('first'),workspace_reference=str(tree.path))
+    original = app.claim('claim:original',program.revision,attempt,lease_seconds=5)
+    app.quiesce(original,'client:exact-scope-quiescent')
+    if state == 'edited':
+        (tree.path / 'manual').write_bytes(b'synthetic manually retained bytes')
+    elif state == 'retired':
+        owner = WorkOwnership(store,Principal('owner','owner'),tree,mode=HandoffMode.PULL,profile=COOPERATIVE_PROFILE)
+        owner.cleanup(original,evidence='owner:exact-empty-retirement')
+    elif state == 'conflict':
+        other = ProgramSpec('generic',spec.objective,spec.work_units,spec.initial_inputs,spec.budget,spec.authority,
+                            acceptance_criteria=spec.acceptance_criteria,policy_references=spec.policy_references)
+        other_program = store.create(other,'create:generic')
+        store.bind_work_budget('generic','project',policy,policy,110)
+        other_program = store.admit('generic','activate:generic',ActivateProgram(other_program.revision,'owner'))
+        competing = AttemptSpec('competing','generic','first',other.revision,other.digest,
+                                other_program.resolved_inputs('first'),workspace_reference=str(tree.path))
+        store.admit_with_intent('generic','prepare:competing',PrepareAttempt(other_program.revision,'worker',competing),
+                               'runtime:competing','runtime:competing',{'attempt':competing.digest})
+"""
+
+REPLAY_ORIGINAL_CLAIM = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
+from creatidy_kernel.core.authority import Principal
+from creatidy_kernel.core.deadlines import BootClockReading
+from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, OwnershipConflict
+from creatidy_kernel.ports.ownership import WorkOwnership
+directory, state = Path(sys.argv[1]), sys.argv[2]
+clock = lambda: BootClockReading(100,1000000000,'synthetic-boot-a')
+with SQLiteProgramStore(directory / 'kernel.sqlite3', boot_clock=clock) as store:
+    tree = LocalOwnedWorkspace(directory / 'workspaces','one')
+    app = WorkOwnership(store,Principal('worker','worker'),tree,mode=HandoffMode.PULL,profile=COOPERATIVE_PROFILE)
+    attempt = store.load('reference').attempt('original').spec
+    original = app.claim('claim:original',1,attempt,lease_seconds=5)
+    assert original.attempt == attempt and original.generation == 1 and original.expires_at == 105
+    assert store.artifact(original.operation_id,'ownership-baseline')
+    assert store.operation(original.operation_id).attempts == 0
+    if state == 'conflict':
+        for action in (lambda: app.submit(original), lambda: store.check_work_dispatch('runtime:competing'),
+                       lambda: store.claim('runtime:competing',now=100,lease_seconds=1)):
+            try:
+                action()
+            except OwnershipConflict:
+                pass
+            else:
+                raise AssertionError('retained conflicting original work was treated as current authority')
+        assert store.operation('runtime:competing').attempts == 0
+"""
+
 
 def main(new_python: Path, storage_root: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="installed-schema-upgrade-", dir=storage_root) as value:
@@ -167,9 +244,32 @@ def main(new_python: Path, storage_root: Path) -> None:
                     raise RuntimeError("downgraded reader changed protected records or dispatched")
             if marker.exists():
                 raise RuntimeError("downgraded reader performed an effect")
+        original = directory / "original-ownership"
+        original.mkdir()
+        old_python = install_pinned_reader(original, commit_id=PINNED_INITIAL_OWNERSHIP_ID)
+        for state in ("edited", "retired", "conflict"):
+            fixture = original / state
+            fixture.mkdir()
+            subprocess.run(
+                [str(old_python), "-I", "-c", CREATE_ORIGINAL_CLAIM, str(fixture), state], cwd=fixture, check=True
+            )
+            path = fixture / "kernel.sqlite3"
+            with closing(sqlite3.connect(path)) as current:
+                before = tuple(current.iterdump())
+            subprocess.run(
+                [str(new_python), "-I", "-c", REPLAY_ORIGINAL_CLAIM, str(fixture), state], cwd=fixture, check=True
+            )
+            if state != "conflict":
+                with closing(sqlite3.connect(path)) as current:
+                    if tuple(current.iterdump()) != before:
+                        raise RuntimeError(
+                            "historical explicit-request replay rewrote original claim/history/clock rows"
+                        )
         print(
             f"Installed schema upgrade: actual readers {PINNED_BASE_ID}, {PINNED_PRECLOCK_ID}, "
-            f"{PINNED_PREOWNERSHIP_ID} refuse schema 5; original bytes, v2/v3/v4/v5 backups and artifacts preserved."
+            f"{PINNED_PREOWNERSHIP_ID} refuse schema 5; original bytes, v2/v3/v4/v5 backups and artifacts preserved; "
+            f"original schema-5 claims from {PINNED_INITIAL_OWNERSHIP_ID} replay unchanged "
+            "and conflicting work stays fenced."
         )
 
 

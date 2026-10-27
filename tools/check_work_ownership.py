@@ -4,17 +4,18 @@
 import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 from creatidy_kernel.adapters.codex_runtime import CodexOwnedSessionWitness
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
 from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
 from creatidy_kernel.adapters.reference import reference_spec
-from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.adapters.sqlite_store import OperationConflict, SQLiteProgramStore
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.deadlines import BootClockReading
-from creatidy_kernel.core.domain import ActivateProgram, AttemptSpec, ProgramSpec
+from creatidy_kernel.core.domain import ActivateProgram, AttemptSpec, PrepareAttempt, ProgramSpec
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, OwnershipConflict
-from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy
 from creatidy_kernel.ports.ownership import WorkOwnership
 
 
@@ -29,7 +30,8 @@ def main(directory: Path) -> None:
     one = LocalOwnedWorkspace(parent, "one", create=True)
     two = LocalOwnedWorkspace(parent, "two", create=True)
     policy = WorkBudgetPolicy.basic(3, 3, verifications=3, retained_bytes=16384)
-    clock = lambda: BootClockReading(100, 1_000_000_000, "installed-synthetic-boot")  # noqa: E731
+    reading = BootClockReading(100, 1_000_000_000, "installed-synthetic-boot")
+    clock = lambda: reading  # noqa: E731
     path = directory / "kernel.sqlite3"
     base = reference_spec()
     with SQLiteProgramStore(path, boot_clock=clock) as store:
@@ -74,6 +76,28 @@ def main(directory: Path) -> None:
         claimed = app(one).claim("claim:one", program.revision, original, lease_seconds=5)
         require(app(one).claim("claim:one", program.revision, original, lease_seconds=5) == claimed)
         require(app(one).renew("renew:one", claimed, lease_seconds=100) == 110)
+        competing = attempt("independent", "generic-conflict", one)
+        generic_before = store.load("independent")
+        try:
+            store.admit_with_intent(
+                "independent",
+                "prepare:generic-conflict",
+                PrepareAttempt(generic_before.revision, "worker", competing),
+                "runtime:generic-conflict",
+                "runtime:generic-conflict",
+                {"attempt": competing.digest},
+            )
+        except OwnershipConflict:
+            pass
+        else:
+            raise AssertionError("generic typed preparation bypassed installed global workspace ownership")
+        require(store.load("independent") == generic_before)
+        try:
+            store.operation("runtime:generic-conflict")
+        except OperationConflict:
+            pass
+        else:
+            raise AssertionError("refused generic preparation retained an executable Operation")
         try:
             app(one).claim(
                 "claim:conflict",
@@ -85,10 +109,12 @@ def main(directory: Path) -> None:
             pass
         else:
             raise AssertionError("installed handler allowed conflicting workspace mutation ownership")
+        independent_revision = store.load("independent").revision
+        independent_attempt = attempt("independent", "independent-pull", two)
         unrelated = app(two).claim(
             "claim:two",
-            store.load("independent").revision,
-            attempt("independent", "independent-pull", two),
+            independent_revision,
+            independent_attempt,
             lease_seconds=5,
         )
         require(unrelated.generation > claimed.generation)
@@ -101,6 +127,9 @@ def main(directory: Path) -> None:
         app(one).quiesce(claimed, "installed-client:exact-task-handoff")
         original_subject = app(one).submit(claimed)
         (one.path / "unknown-user-data").write_bytes(b"synthetic manual bytes must survive")
+        before_replay = store.operations()
+        require(app(one).claim("claim:one", program.revision, original, lease_seconds=5) == claimed)
+        require(store.operations() == before_replay)
         app(one).observe(claimed)
         try:
             app(one, owner=True).cleanup(claimed, evidence="not permission to delete unknown data")
@@ -114,6 +143,9 @@ def main(directory: Path) -> None:
         app(two).quiesce(unrelated, "installed-client:independent-handoff")
         app(two, owner=True).cleanup(unrelated, evidence="exact empty resource retired")
         require(not two.path.exists())
+        before_replay = store.operations()
+        require(app(two).claim("claim:two", independent_revision, independent_attempt, lease_seconds=5) == unrelated)
+        require(store.operations() == before_replay)
         three = LocalOwnedWorkspace(parent, "managed", create=True)
         fixture = directory / "synthetic-app-server"
         fixture.write_text(
@@ -144,10 +176,12 @@ for line in sys.stdin:
                 resources=(witness.resource,),
                 witness=witness,
             )
+            managed_revision = store.load("managed").revision
+            managed_attempt = attempt("managed", "installed-managed", three)
             handoff = managed.claim(
                 "claim:managed",
-                store.load("managed").revision,
-                attempt("managed", "installed-managed", three),
+                managed_revision,
+                managed_attempt,
                 lease_seconds=5,
             )
             managed.witness(handoff, "start")
@@ -170,17 +204,93 @@ for line in sys.stdin:
             connection.close()
             managed.witness(handoff, "complete")
             require(managed.submit(handoff) == three.capture()[0])
+            witness.invalidate()
+            require(managed.claim("claim:managed", managed_revision, managed_attempt, lease_seconds=5) == handoff)
+            try:
+                managed.submit(handoff)
+            except OwnershipConflict:
+                pass
+            else:
+                raise AssertionError("historical claim replay renewed an invalidated managed profile")
         finally:
             connection.close()
+        temporal_spec = ProgramSpec(
+            "temporal",
+            base.objective,
+            base.work_units,
+            base.initial_inputs,
+            base.budget,
+            base.authority,
+            acceptance_criteria=base.acceptance_criteria,
+            policy_references=base.policy_references,
+        )
+        temporal = store.create(temporal_spec, "create:temporal")
+        temporal_policy = WorkBudgetPolicy.basic(1, 1, verifications=1, retained_bytes=4096)
+        store.bind_work_budget("temporal", "installed-temporal-project", temporal_policy, temporal_policy, 110)
+        temporal = store.admit("temporal", "activate:temporal", ActivateProgram(temporal.revision, "owner"))
+        four = LocalOwnedWorkspace(parent, "temporal", create=True)
+        pending = attempt("temporal", "installed-temporal", four)
+        store.admit_with_intent(
+            "temporal",
+            "prepare:temporal",
+            PrepareAttempt(temporal.revision, "worker", pending),
+            "runtime:installed-temporal",
+            "runtime:installed-temporal",
+            {"attempt": pending.digest},
+        )
+        actual_resolve = Path.resolve
+        expired = False
+
+        def slow_resolve(path: Path, strict: bool = False) -> Path:
+            nonlocal reading, expired
+            result = actual_resolve(path, strict=strict)
+            if path == four.path and not expired:
+                expired = True
+                reading = BootClockReading(100, 21_000_000_000, "installed-synthetic-boot")
+            return result
+
+        with patch.object(Path, "resolve", slow_resolve):
+            try:
+                store.claim("runtime:installed-temporal", now=100, lease_seconds=1)
+            except BudgetRefused:
+                pass
+            else:
+                raise AssertionError("installed generic delivery spent clock authority captured before filesystem I/O")
+        require(expired and store.operation("runtime:installed-temporal").attempts == 0)
+        require(store.original_work_deadline("temporal") == 110)
         retained = store.work_budget_status("reference")
     with SQLiteProgramStore(path, boot_clock=clock) as store:
+        before_replay = store.operations()
+        require(
+            app(LocalOwnedWorkspace(parent, "one")).claim("claim:one", program.revision, original, lease_seconds=5)
+            == claimed
+        )
+        require(
+            app(LocalOwnedWorkspace(parent, "two")).claim(
+                "claim:two", independent_revision, independent_attempt, lease_seconds=5
+            )
+            == unrelated
+        )
+        historical_managed = WorkOwnership(
+            store,
+            Principal("worker", "worker"),
+            LocalOwnedWorkspace(parent, "managed"),
+            mode=HandoffMode.MANAGED,
+            profile=witness.profile,
+            resources=(witness.resource,),
+        )
+        require(
+            historical_managed.claim("claim:managed", managed_revision, managed_attempt, lease_seconds=5) == handoff
+        )
+        require(store.operations() == before_replay)
         require(store.work_budget_status("reference") == retained)
         require(store.operation(claimed.operation_id).attempts == 0)
         require((one.path / "unknown-user-data").read_bytes() == b"synthetic manual bytes must survive")
         require(store.startup_evidence.schema_version == 5)
     print(
         "Installed ownership: atomic pull claims, conflicts, independent work, original renewal, quiescence, "
-        "immutable capture, manual preservation, empty cleanup and reopen passed."
+        "immutable capture, manual preservation, empty cleanup, explicit-request replay after edit/retirement/reopen, "
+        "global generic preparation fencing, cold managed history and fresh post-filesystem boot expiry passed."
     )
 
 

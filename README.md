@@ -556,11 +556,32 @@ interleaved clients and Programs; a second process cannot open that owner's acti
 
 `claim` commits exact Program/WorkUnit/Attempt preparation, Operation intent, existing work-budget
 reservation, claimant and increasing resource generation together. Identical command/input returns the
-historical claim, not renewed authority; changed input or claimant conflicts. `renew`, observations,
+historical claim, not renewed authority; changed input or claimant conflicts. Historical lookup compares
+only the explicit revision/Attempt/claimant/mode/profile/resources/lease request before any new capture
+or live-capability check. The first selected workspace baseline remains immutable observation, not a
+caller input: edits, expiry, revocation, quarantine, reopen or exact physical retirement do not prevent
+reading the same recorded result and never make it a renewed grant. `renew`, observations,
 candidate handoff and delivery fences retain the original durably verified wall/boot horizon. Source
 cache acquisition leases remain read-only object-copy leases, not mutation claims. Expiry, revocation
 and missed heartbeats never release conflicting workspace/session/effect resources. Nonconflicting
 work remains independently admissible within its configured project/work capacity.
+
+These physical workspace fences also apply to common store preparation, known-Attempt reservations and
+delivery, including generic/unowned typed callers in other Programs. WorkUnit identity stays
+Program-local; canonical absolute workspace scopes conflict globally, including ancestor/descendant
+paths. Noncanonical absolute paths and symlink aliases refuse rather than normalize, and opaque legacy workspace keys are
+not reinterpreted as filesystem paths. Existing generic physical work without applicable exact
+settlement cannot be silently adopted by a new claim or competing generic work; domain terminal state
+alone is not physical settlement. Late delivery rechecks the currently retained owner/generation.
+
+Physical-path and ownership-artifact validation/staging run outside business SQL before a fresh,
+independently durable original wall/boot-clock cut. Decision-local facts and staged content digests are
+then consumed by pure SQL admission guards; no filesystem validation callback runs after that cut.
+Changed preflight paths or reentrant store changes refuse, while clock floors and committed owner
+cancellations survive failure. Unreferenced staged blobs may remain after rejection, but their references,
+claim, budget and Operation still publish atomically; retained capacity is checked before staging and at
+publication. This relies on the existing cooperative reservation protocol and controller custody of the
+path namespace during an owner decision, not hostile same-UID filesystem isolation or physical preemption.
 
 The explicit `kernel:cooperative-task-scope:v1` pull profile supports authenticated `quiesce` receipts.
 They cover only the claimed task resources, not the user's Kilo process/server, physical model identity

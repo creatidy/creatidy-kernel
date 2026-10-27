@@ -44,9 +44,26 @@ and remote entrance remain #106/#57.
 Claim acceptance atomically combines current domain preparation/eligibility, exact spec and actor,
 original work-clock authority, project/work capacity, Operation intent, claimant, resource conflicts
 and increasing generation. These immutable journal records are not outbox delivery claims. Duplicate
-command/input returns its historical result; changed claimant/input refuses. Original wall/boot
+command/explicit request returns its historical result before filesystem capture or live profile checks;
+the first selected baseline is retained observation, not request input. Changed claimant, revision,
+Attempt, mode, profile, resources or lease refuses even after exact retirement. Reading the original
+result does not renew a lease, allocate a generation or restore authority. Original wall/boot
 projection, pending marker and committed high-water evidence are reused for reports/renewal/delivery,
 never reprojected. Expiry/revoke/heartbeat loss fences authority but does not release unsettled resources.
+
+Common store preparation, known-Attempt reservation, candidate/acceptance and delivery paths enforce
+canonical absolute physical workspace conflicts across all Programs, not only callers with a work claim.
+WorkUnit identity remains Program-scoped; ancestor/descendant workspace scopes remain global. Ambiguous
+absolute paths or symlink aliases refuse without normalization, while legacy opaque workspace keys stay uninterpreted.
+Unsettled generic work with a known physical subject blocks silent resource adoption and competing
+generic work; applicable trusted settlement, not cancellation/expiry alone, permits later ownership.
+
+Potentially blocking physical-path and ownership-artifact preflight completes outside business SQL;
+the existing independent pending/high-water capture then takes a fresh original wall/boot sample.
+Business guards consume only decision-local physical facts and staged digests, never resolving paths
+or validating artifact storage after that cut. Changed preflight paths/store state refuse without
+erasing committed cancellations or clock evidence; staged orphan bytes confer no authority. Controller
+custody and cooperative namespace stability remain required, not a new hostile-filesystem guarantee.
 
 Pull `kernel:cooperative-task-scope:v1` receipts are authenticated task-scope promises only. Managed
 `CodexOwnedSessionWitness` uses the original dedicated `CodexStdio`, exact opaque group, version-qualified

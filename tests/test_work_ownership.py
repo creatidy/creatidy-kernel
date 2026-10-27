@@ -8,11 +8,13 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable
+from contextlib import closing, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 import pytest
+from test_clock_transaction_boundaries import CommitFailure, connection
 from test_codex_stdio import FAKE
 from test_sqlite_store import OWNER, VERIFIER, WORKER, spec
 from test_work_budget import Clock, initialize, policy
@@ -20,14 +22,23 @@ from test_work_budget import Clock, initialize, policy
 from creatidy_kernel.adapters.codex_runtime import CodexOwnedSessionWitness
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
 from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
-from creatidy_kernel.adapters.sqlite_store import IdempotencyConflict, OperationConflict, SQLiteProgramStore
+from creatidy_kernel.adapters.sqlite_store import (
+    IdempotencyConflict,
+    OperationConflict,
+    ProgramReadChanged,
+    SQLiteProgramStore,
+)
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import (
     ActivateProgram,
     AttemptSpec,
+    CancelAttempt,
+    CancelProgram,
     FinishAttempt,
     InputBinding,
+    PrepareAttempt,
+    ProgramSpec,
     SatisfyWorkUnit,
     StartAttempt,
     TrustedSatisfaction,
@@ -42,8 +53,9 @@ from creatidy_kernel.core.ownership import (
 )
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.ownership import WorkOwnership
+from tools.check_schema_upgrade import CREATE_ORIGINAL_CLAIM, PINNED_INITIAL_OWNERSHIP_ID, install_pinned_reader
 
-pytest_plugins = ["test_sqlite_store"]
+pytest_plugins = ["test_sqlite_store", "test_clock_transaction_boundaries"]
 
 
 def workspace(root: Path, name: str) -> LocalOwnedWorkspace:
@@ -468,7 +480,9 @@ def test_claim_records_are_nondispatchable_and_migration_keeps_original_rows(sql
         assert len(records) == 1
         with pytest.raises(OperationConflict, match="metadata"):
             store.claim(records[0].operation_id, now=100, lease_seconds=1)
-        assert json.loads(records[0].request_json)["request"]["generation"] == 1
+        record = json.loads(records[0].request_json)["request"]
+        assert record["generation"] == 1
+        assert "workspace_subject" not in json.loads(record["input"])
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
 
@@ -786,3 +800,610 @@ def test_workspace_capture_bytes_share_original_budget_without_partial_claim_or_
         with pytest.raises(BudgetRefused, match="workspace artifact"):
             app.observe(granted)
         assert (tree.path / "large-user-data").read_bytes() == b"y" * 4096
+
+
+def prepare_generic(
+    store: SQLiteProgramStore,
+    program_id: str,
+    attempt_id: str,
+    reference: str,
+    *,
+    intent: bool = True,
+) -> AttemptSpec:
+    program = store.load(program_id)
+    attempt = AttemptSpec(
+        attempt_id,
+        program_id,
+        "first",
+        program.spec.revision,
+        program.spec.digest,
+        program.resolved_inputs("first"),
+        workspace_reference=reference,
+    )
+    command = PrepareAttempt(program.revision, WORKER, attempt)
+    if intent:
+        store.admit_with_intent(
+            program_id,
+            f"prepare:{attempt_id}",
+            command,
+            f"runtime:{attempt_id}",
+            f"runtime:{attempt_id}",
+            {"attempt": attempt.digest},
+        )
+    else:
+        store.admit(program_id, f"prepare:{attempt_id}", command)
+    return attempt
+
+
+@pytest.mark.parametrize("scope", ["same", "ancestor", "descendant"])
+@pytest.mark.parametrize("state", ["active", "expired", "revoked", "quarantined"])
+@pytest.mark.parametrize("intent", [False, True])
+def test_common_preparation_cannot_bypass_other_program_retained_workspace(
+    sqlite_tmp_path: Path,
+    scope: str,
+    state: str,
+    intent: bool,
+) -> None:
+    clock = Clock()
+    tree, independent = workspace(sqlite_tmp_path, "one"), workspace(sqlite_tmp_path, "independent")
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3", boot_clock=clock) as store:
+        initialize(store, project=policy(active=4))
+        before = initialize(store, "program-2", project=policy(active=4))
+        original = claim(store, client(store, tree), tree, lease=1)
+        if state == "expired":
+            clock.reading = BootClockReading(102, 3_000_000_000, "synthetic-boot-a")
+        elif state == "revoked":
+            store.revoke_work_budget("program-1", "owner:revoked")
+        elif state == "quarantined":
+            client(store, tree, owner=True).quarantine(original, evidence="exact scope unknown")
+        reference = {"same": tree.path, "ancestor": tree.path.parent, "descendant": tree.path / "child"}[scope]
+        with pytest.raises(OwnershipConflict, match="workspace"):
+            prepare_generic(store, "program-2", "generic", str(reference), intent=intent)
+        assert store.load("program-2") == before
+        assert store.work_budget_status("program-2")["reservations"] == []
+        with pytest.raises(OperationConflict, match="unknown operation"):
+            store.operation("runtime:generic")
+        prepare_generic(store, "program-2", "independent", str(independent.path))
+        store.check_work_dispatch("runtime:independent")
+        assert store.claim("runtime:independent", now=102, lease_seconds=1) == 1
+
+
+@pytest.mark.parametrize("pending", ["runtime", "verification", "cancelled"])
+@pytest.mark.parametrize("scope", ["same", "ancestor", "descendant"])
+def test_claim_cannot_adopt_preexisting_unsettled_generic_workspace(
+    sqlite_tmp_path: Path,
+    pending: str,
+    scope: str,
+) -> None:
+    tree = workspace(sqlite_tmp_path, "one")
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3", boot_clock=Clock()) as store:
+        before = initialize(store, project=policy(active=4))
+        initialize(store, "program-2", project=policy(active=4))
+        reference = {"same": tree.path, "ancestor": tree.path.parent, "descendant": tree.path / "child"}[scope]
+        prepare_generic(store, "program-2", "earlier", str(reference))
+        if pending == "verification":
+            store.record_work_settlement("runtime:earlier", "trusted:runtime-scope-quiescent")
+            store.reserve_work("program-2", "earlier", "verify:earlier", WorkKind.VERIFICATION)
+        elif pending == "cancelled":
+            program = store.load("program-2")
+            store.admit("program-2", "cancel:earlier", CancelAttempt(program.revision, OWNER, "earlier"))
+        with pytest.raises(OwnershipConflict, match="workspace"):
+            claim(store, client(store, tree), tree)
+        assert store.load("program-1") == before
+        assert store.work_budget_status("program-1")["reservations"] == []
+        with pytest.raises(OperationConflict, match="unknown operation"):
+            store.operation("runtime:a1")
+        store.record_work_settlement(
+            "verify:earlier" if pending == "verification" else "runtime:earlier",
+            "trusted:exact-pending-scope-settled",
+        )
+        assert claim(store, client(store, tree), tree).generation == 1
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+@pytest.mark.parametrize("state", ["active", "expired", "revoked", "quarantined"])
+def test_common_delivery_and_reservation_refuse_later_workspace_owner(
+    sqlite_tmp_path: Path,
+    replacement: bool,
+    state: str,
+) -> None:
+    tree = workspace(sqlite_tmp_path, "one")
+    clock = Clock()
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3", boot_clock=clock) as store:
+        initialize(store, project=policy(active=4))
+        initialize(store, "program-2", project=policy(active=4))
+        initialize(store, "program-3", project=policy(active=4))
+        prepare_generic(store, "program-2", "earlier", str(tree.path))
+        store.record_work_settlement("runtime:earlier", "trusted:original-scope-quiescent")
+        app = client(store, tree)
+        first = claim(store, app, tree, lease=1)
+        current_owner = first
+        if replacement:
+            app.quiesce(first, "client:exact-scope-quiescent")
+            client(store, tree, owner=True).release(first, evidence="owner:retain-settled-tree")
+            newer = claim(store, app, tree, "program-3", "newer", lease=1)
+            assert newer.generation > first.generation
+            current_owner = newer
+        if state == "expired":
+            clock.reading = BootClockReading(102, 3_000_000_000, "synthetic-boot-a")
+        elif state == "revoked":
+            store.revoke_work_budget(current_owner.attempt.program_id, "owner:revoked")
+        elif state == "quarantined":
+            client(store, tree, owner=True).quarantine(current_owner, evidence="exact scope unknown")
+        before = store.work_budget_status("program-2")
+        with pytest.raises(OwnershipConflict, match="workspace"):
+            store.check_work_dispatch("runtime:earlier")
+        with pytest.raises(OwnershipConflict, match="workspace"):
+            store.claim("runtime:earlier", now=100, lease_seconds=1)
+        assert store.operation("runtime:earlier").attempts == 0
+        with pytest.raises(OwnershipConflict, match="workspace"):
+            store.reserve_work("program-2", "earlier", "new:verify", WorkKind.VERIFICATION)
+        with pytest.raises(OwnershipConflict, match="workspace"):
+            store.budgeted_intent("program-2", "earlier", WorkKind.VERIFICATION, "new:verify", "new:verify", {})
+        assert store.work_budget_status("program-2") == before
+        with pytest.raises(OperationConflict, match="unknown operation"):
+            store.operation("new:verify")
+
+
+@pytest.mark.parametrize("suffix", ["/../one", "/./child", "/", "//child"])
+def test_common_preparation_refuses_ambiguous_absolute_workspace_paths(sqlite_tmp_path: Path, suffix: str) -> None:
+    tree = workspace(sqlite_tmp_path, "one")
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3", boot_clock=Clock()) as store:
+        before = initialize(store)
+        with pytest.raises(OwnershipConflict, match="canonical absolute"):
+            prepare_generic(store, "program-1", "ambiguous", str(tree.path) + suffix)
+        assert store.load("program-1") == before
+
+
+@pytest.mark.parametrize("reopen", [False, True])
+@pytest.mark.parametrize("state", ["edited", "expired", "revoked", "retired", "quarantined", "clock-unknown"])
+def test_public_claim_replays_explicit_request_before_capture_without_new_authority(
+    sqlite_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reopen: bool,
+    state: str,
+) -> None:
+    path, clock = sqlite_tmp_path / "kernel.sqlite3", Clock()
+    samples: list[BootClockReading | None] = []
+
+    def observe_clock() -> BootClockReading | None:
+        samples.append(clock.reading)
+        return clock()
+
+    tree = workspace(sqlite_tmp_path, "one")
+    store = SQLiteProgramStore(path, boot_clock=observe_clock)
+    try:
+        program = initialize(store)
+        app = client(store, tree)
+        original = claim(store, app, tree)
+        if state == "edited":
+            (tree.path / "manual-edit").write_bytes(b"preserve changed bytes")
+        elif state == "expired":
+            clock.reading = BootClockReading(106, 7_000_000_000, "synthetic-boot-a")
+        elif state == "revoked":
+            store.revoke_work_budget("program-1", "owner:revoked")
+        elif state == "retired":
+            app.quiesce(original, "client:exact-task-quiescent")
+            client(store, tree, owner=True).cleanup(original, evidence="owner:empty-resource-retired")
+        elif state == "quarantined":
+            client(store, tree, owner=True).quarantine(original, evidence="exact scope unknown")
+        else:
+            clock.reading = None
+        if reopen:
+            store.close()
+            store = SQLiteProgramStore(path, boot_clock=observe_clock)
+            tree = LocalOwnedWorkspace(tree.path.parent, "one")
+            app = client(store, tree)
+
+        def unexpected_capture() -> tuple[str, bytes]:
+            raise AssertionError("historical explicit-request lookup must precede filesystem capture")
+
+        monkeypatch.setattr(tree, "capture", unexpected_capture)
+        before_program, before_budget, before_operations = (
+            store.load("program-1"),
+            store.work_budget_status("program-1"),
+            store.operations(),
+        )
+        before_samples = len(samples)
+        assert app.claim("claim:a1", program.revision, original.attempt, lease_seconds=5) == original
+        assert store.load("program-1") == before_program
+        assert store.work_budget_status("program-1") == before_budget
+        assert store.operations() == before_operations
+        assert len(samples) == before_samples
+        assert store.artifact(original.operation_id, "ownership-baseline")
+        if state != "edited":
+            with pytest.raises((OwnershipConflict, BudgetRefused)):
+                store.check_work_claim(original)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("changed", ["claimant", "revision", "attempt", "mode", "resources", "lease"])
+def test_retired_public_claim_replay_still_rejects_changed_explicit_input(sqlite_tmp_path: Path, changed: str) -> None:
+    tree = workspace(sqlite_tmp_path, "one")
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3", boot_clock=Clock()) as store:
+        program = initialize(store)
+        app = client(store, tree)
+        original = claim(store, app, tree)
+        app.quiesce(original, "client:exact-task-quiescent")
+        client(store, tree, owner=True).cleanup(original, evidence="owner:empty-resource-retired")
+        principal = Principal("different-worker" if changed == "claimant" else WORKER, "worker")
+        configured = WorkOwnership(
+            store,
+            principal,
+            LocalOwnedWorkspace(tree.path.parent, "one"),
+            mode=HandoffMode.MANAGED if changed == "mode" else HandoffMode.PULL,
+            profile=COOPERATIVE_PROFILE,
+            resources=(ResourceScope("session", "changed-session"),) if changed == "resources" else (),
+        )
+        changed_attempt = AttemptSpec(
+            "changed-attempt",
+            program.program_id,
+            "first",
+            program.spec.revision,
+            program.spec.digest,
+            program.resolved_inputs("first"),
+            workspace_reference=str(tree.path),
+        )
+        with pytest.raises(IdempotencyConflict):
+            configured.claim(
+                "claim:a1",
+                program.revision + (1 if changed == "revision" else 0),
+                changed_attempt if changed == "attempt" else original.attempt,
+                lease_seconds=6 if changed == "lease" else 5,
+            )
+
+
+def test_generic_physical_preparation_cannot_compete_with_unsettled_generic_work(sqlite_tmp_path: Path) -> None:
+    tree, independent = workspace(sqlite_tmp_path, "one"), workspace(sqlite_tmp_path, "independent")
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3", boot_clock=Clock()) as store:
+        initialize(store, project=policy(active=4))
+        initialize(store, "program-2", project=policy(active=4))
+        prepare_generic(store, "program-1", "first-generic", str(tree.path))
+        with pytest.raises(OwnershipConflict, match="workspace"):
+            prepare_generic(store, "program-2", "competing", str(tree.path))
+        prepare_generic(store, "program-2", "independent", str(independent.path))
+        assert store.claim("runtime:independent", now=100, lease_seconds=1) == 1
+
+
+def test_full_original_authority_expiry_keeps_workspace_but_not_unrelated_work_blocked(sqlite_tmp_path: Path) -> None:
+    tree, independent = workspace(sqlite_tmp_path, "one"), workspace(sqlite_tmp_path, "independent")
+    clock = Clock()
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3", boot_clock=clock) as store:
+        first = initialize(store, project=policy(active=4))
+        original = first.spec
+        second_spec = ProgramSpec(
+            "program-2",
+            original.objective,
+            original.work_units,
+            original.initial_inputs,
+            original.budget,
+            original.authority,
+            acceptance_criteria=original.acceptance_criteria,
+            policy_references=original.policy_references,
+        )
+        second = store.create(second_spec, "create:program-2")
+        store.bind_work_budget("program-2", "synthetic-project", policy(active=4), policy(), 200)
+        store.admit("program-2", "activate:program-2", ActivateProgram(second.revision, OWNER))
+        claim(store, client(store, tree), tree, lease=1000)
+        clock.reading = BootClockReading(112, 13_000_000_000, "synthetic-boot-a")
+        with pytest.raises(OwnershipConflict, match="workspace"):
+            prepare_generic(store, "program-2", "conflict", str(tree.path))
+        prepare_generic(store, "program-2", "independent", str(independent.path))
+        assert store.claim("runtime:independent", now=112, lease_seconds=1) == 1
+
+
+def test_store_historical_lookup_compares_profile_before_any_live_validation(sqlite_tmp_path: Path) -> None:
+    tree = workspace(sqlite_tmp_path, "one")
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3", boot_clock=Clock()) as store:
+        program = initialize(store)
+        app = client(store, tree)
+        original = claim(store, app, tree)
+        app.quiesce(original, "client:exact-task-quiescent")
+        client(store, tree, owner=True).cleanup(original, evidence="owner:empty-resource-retired")
+        with pytest.raises(IdempotencyConflict):
+            store.find_work_claim(
+                "claim:a1",
+                WORKER,
+                program.revision,
+                original.attempt,
+                original.mode,
+                "changed-profile",
+                original.resources,
+                5,
+            )
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_generic_physical_alias_is_refused_not_normalized_into_an_owned_workspace(
+    sqlite_tmp_path: Path, child: bool
+) -> None:
+    tree = workspace(sqlite_tmp_path, "one")
+    alias = tree.path.parent / "alias"
+    alias.symlink_to(tree.path, target_is_directory=True)
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3", boot_clock=Clock()) as store:
+        initialize(store, project=policy(active=4))
+        before = initialize(store, "program-2", project=policy(active=4))
+        claim(store, client(store, tree), tree)
+        with pytest.raises(OwnershipConflict, match="canonical"):
+            prepare_generic(store, "program-2", "alias", str(alias / "child" if child else alias))
+        assert store.load("program-2") == before
+        assert store.work_budget_status("program-2")["reservations"] == []
+
+
+def test_alias_introduced_after_preparation_fences_delivery_and_candidate(sqlite_tmp_path: Path) -> None:
+    tree = workspace(sqlite_tmp_path, "one")
+    alias = tree.path.parent / "future-workspace"
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3", boot_clock=Clock()) as store:
+        initialize(store, project=policy(active=4))
+        initialize(store, "program-2", project=policy(active=4))
+        prepare_generic(store, "program-2", "earlier", str(alias))
+        app = client(store, tree)
+        original = claim(store, app, tree)
+        app.quiesce(original, "client:exact-task-quiescent")
+        alias.symlink_to(tree.path, target_is_directory=True)
+        with pytest.raises(OwnershipConflict, match="canonical"):
+            store.claim("runtime:earlier", now=100, lease_seconds=1)
+        with pytest.raises(OwnershipConflict, match="canonical"):
+            app.submit(original)
+        assert store.operation("runtime:earlier").attempts == 0
+
+
+@pytest.mark.parametrize("entry", ["claim", "check_dispatch", "prepare", "reserve", "renew", "new_claim", "candidate"])
+@pytest.mark.parametrize("late", ["expiry", "rollback", "fresh"])
+@pytest.mark.parametrize("other_program", [False, True])
+def test_physical_resolution_cannot_spend_stale_store_clock_cut(
+    sqlite_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    late: str,
+    other_program: bool,
+) -> None:
+    events: list[str] = []
+
+    class ObservedClock(Clock):
+        def __call__(self) -> BootClockReading | None:
+            events.append("boot")
+            return super().__call__()
+
+    clock = ObservedClock()
+    tree = workspace(sqlite_tmp_path, "one")
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3", boot_clock=clock) as store:
+        initialize(store, project=policy(active=4))
+        original: WorkClaim | None = None
+        if entry in {"claim", "check_dispatch", "reserve"}:
+            prepare_generic(store, "program-1", "generic", str(tree.path))
+        elif entry in {"renew", "candidate"}:
+            original = claim(store, client(store, tree), tree)
+            if entry == "candidate":
+                client(store, tree).quiesce(original, "client:exact-task-quiescent")
+        resolved_path = tree.path
+        if other_program:
+            other = workspace(sqlite_tmp_path, "other")
+            initialize(store, "program-2", project=policy(active=4))
+            prepare_generic(store, "program-2", "other-generic", str(other.path))
+            resolved_path = other.path
+        captured = tree.capture()
+        before = store.load("program-1"), store.work_budget_status("program-1"), store.operations()
+        actual_resolve = Path.resolve
+        advanced = False
+        events.clear()
+
+        def late_resolve(path: Path, strict: bool = False) -> Path:
+            nonlocal advanced
+            assert not connection(store).in_transaction
+            events.append("path")
+            value = actual_resolve(path, strict=strict)
+            if path == resolved_path and not advanced:
+                advanced = True
+                clock.reading = BootClockReading(
+                    100,
+                    {"expiry": 21_000_000_000, "rollback": 500_000_000, "fresh": 5_000_000_000}[late],
+                    "synthetic-boot-a",
+                )
+            return value
+
+        monkeypatch.setattr(Path, "resolve", late_resolve)
+        with nullcontext() if late == "fresh" else pytest.raises(BudgetRefused):
+            if entry == "claim":
+                store.claim("runtime:generic", now=100, lease_seconds=1)
+            elif entry == "check_dispatch":
+                store.check_work_dispatch("runtime:generic")
+            elif entry == "prepare":
+                prepare_generic(store, "program-1", "late-generic", str(tree.path))
+            elif entry == "reserve":
+                store.reserve_work("program-1", "generic", "late-verify", WorkKind.VERIFICATION)
+            elif entry == "renew":
+                assert original is not None
+                store.renew_work_claim("late-renew", original, 7)
+            elif entry == "candidate":
+                assert original is not None
+                store.submit_claim_candidate(original, *captured)
+            else:
+                claim(store, client(store, tree), tree)
+        assert advanced
+        assert events[-1] == "boot" and "path" in events
+        assert inspect.getattr_static(store, "_workspace_scopes") is None
+        assert inspect.getattr_static(store, "_workspace_artifacts") is None
+        assert store.original_work_deadline("program-1") == 110
+        if late != "fresh":
+            assert (store.load("program-1"), store.work_budget_status("program-1"), store.operations()) == before
+        if late == "expiry":
+            assert (
+                connection(store)
+                .execute(
+                    "SELECT boot_ns FROM work_clock_state WHERE program_id = 'program-1'",
+                )
+                .fetchone()[0]
+                == 21_000_000_000
+            )
+
+
+@pytest.mark.parametrize("change", ["alias", "cancel"])
+def test_physical_preflight_race_refuses_without_rolling_back_owner_changes(
+    sqlite_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    clock = Clock()
+    tree = workspace(sqlite_tmp_path, "one")
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3", boot_clock=clock) as store:
+        initialize(store)
+        prepare_generic(store, "program-1", "generic", str(tree.path))
+        actual_resolve = Path.resolve
+        changed = False
+
+        def changed_resolve(path: Path, strict: bool = False) -> Path:
+            nonlocal changed
+            assert not connection(store).in_transaction
+            result = actual_resolve(path, strict=strict)
+            if path == tree.path and not changed:
+                changed = True
+                clock.reading = BootClockReading(100, 5_000_000_000, "synthetic-boot-a")
+                if change == "alias":
+                    retained = tree.path.with_name("retained-original")
+                    tree.path.rename(retained)
+                    tree.path.symlink_to(retained, target_is_directory=True)
+                else:
+                    program = store.load("program-1")
+                    store.admit("program-1", "callback:cancel", CancelProgram(program.revision, OWNER))
+            return result
+
+        monkeypatch.setattr(Path, "resolve", changed_resolve)
+        with pytest.raises(ProgramReadChanged):
+            store.claim("runtime:generic", now=100, lease_seconds=1)
+        assert changed and store.operation("runtime:generic").attempts == 0
+        assert inspect.getattr_static(store, "_workspace_scopes") is None
+        assert connection(store).execute("SELECT boot_ns FROM work_clock_state").fetchone()[0] == 5_000_000_000
+        if change == "alias":
+            assert tree.path.is_symlink() and tree.path.with_name("retained-original").is_dir()
+        else:
+            assert store.load("program-1").status.value == "cancelled"
+
+
+@pytest.mark.usefixtures("failing_connection")
+@pytest.mark.parametrize("cut", ["pending", "flush", "business"])
+def test_physical_preflight_clock_evidence_survives_failed_decision_and_reopen(
+    sqlite_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cut: str,
+) -> None:
+    path, clock = sqlite_tmp_path / "kernel.sqlite3", Clock()
+    tree = workspace(sqlite_tmp_path, "one")
+    with SQLiteProgramStore(path, boot_clock=clock) as store:
+        initialize(store)
+        prepare_generic(store, "program-1", "generic", str(tree.path))
+        before = store.load("program-1"), store.work_budget_status("program-1"), store.operations()
+        raw = cast(CommitFailure, connection(store))
+        actual_resolve = Path.resolve
+        armed = False
+
+        def fail_after_preflight(path: Path, strict: bool = False) -> Path:
+            nonlocal armed
+            assert not raw.in_transaction
+            result = actual_resolve(path, strict=strict)
+            if path == tree.path and not armed:
+                armed = True
+                clock.reading = BootClockReading(100, 5_000_000_000, "synthetic-boot-a")
+                raw.remaining = {"pending": 1, "flush": 2, "business": 3}[cut]
+            return result
+
+        monkeypatch.setattr(Path, "resolve", fail_after_preflight)
+        with pytest.raises(sqlite3.OperationalError if cut == "business" else BudgetRefused):
+            store.claim("runtime:generic", now=100, lease_seconds=1)
+        assert armed and (store.load("program-1"), store.work_budget_status("program-1"), store.operations()) == before
+        assert inspect.getattr_static(store, "_workspace_scopes") is None
+        assert inspect.getattr_static(store, "_workspace_artifacts") is None
+        row = raw.execute("SELECT boot_ns, pending FROM work_clock_state").fetchone()
+        assert tuple(row) == (5_000_000_000 if cut == "business" else 1_000_000_000, int(cut == "flush"))
+        monkeypatch.undo()
+    with SQLiteProgramStore(path, boot_clock=clock) as store:
+        assert (store.load("program-1"), store.work_budget_status("program-1"), store.operations()) == before
+        assert store.original_work_deadline("program-1") == 110
+        if cut == "flush":
+            with pytest.raises(BudgetRefused, match="persistence unverified"):
+                store.claim("runtime:generic", now=100, lease_seconds=1)
+        else:
+            assert store.claim("runtime:generic", now=100, lease_seconds=1) == 1
+
+
+@pytest.mark.parametrize("entry", ["new_claim", "candidate"])
+def test_artifact_storage_validation_cannot_outlive_ownership_clock_cut(
+    sqlite_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    path, clock = sqlite_tmp_path / "kernel.sqlite3", Clock()
+    tree = workspace(sqlite_tmp_path, "one")
+    with SQLiteProgramStore(path, boot_clock=clock) as store:
+        initialize(store)
+        original: WorkClaim | None = None
+        if entry == "candidate":
+            original = claim(store, client(store, tree), tree)
+            client(store, tree).quiesce(original, "client:exact-task-quiescent")
+        captured = tree.capture()
+        before = store.load("program-1"), store.work_budget_status("program-1"), store.operations()
+        artifact_directory = path.parent / f"{path.name}.artifacts"
+        actual_resolve = Path.resolve
+        expired = False
+
+        def slow_artifact_storage(directory: Path, strict: bool = False) -> Path:
+            nonlocal expired
+            result = actual_resolve(directory, strict=strict)
+            if directory == artifact_directory and not expired:
+                expired = True
+                clock.reading = BootClockReading(100, 21_000_000_000, "synthetic-boot-a")
+            return result
+
+        monkeypatch.setattr(Path, "resolve", slow_artifact_storage)
+        with pytest.raises(BudgetRefused):
+            if original is None:
+                claim(store, client(store, tree), tree)
+            else:
+                store.submit_claim_candidate(original, *captured)
+        assert expired
+        assert (store.load("program-1"), store.work_budget_status("program-1"), store.operations()) == before
+
+
+@pytest.fixture(scope="module")
+def initial_ownership_reader(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return install_pinned_reader(
+        tmp_path_factory.mktemp("original-owned-claim-reader"), commit_id=PINNED_INITIAL_OWNERSHIP_ID
+    )
+
+
+@pytest.mark.parametrize("state", ["edited", "retired", "conflict"])
+def test_actual_original_claim_records_replay_without_rewriting_or_adopting_conflicts(
+    sqlite_tmp_path: Path,
+    initial_ownership_reader: Path,
+    state: str,
+) -> None:
+    subprocess.run(  # noqa: S603 - exact original public source, synthetic closed fixture.
+        [str(initial_ownership_reader), "-I", "-c", CREATE_ORIGINAL_CLAIM, str(sqlite_tmp_path), state],
+        check=True,
+    )
+    path = sqlite_tmp_path / "kernel.sqlite3"
+    with closing(sqlite3.connect(path)) as original:
+        original_rows = tuple(original.iterdump())
+    with SQLiteProgramStore(path, boot_clock=Clock()) as store:
+        original_operation = store.operations("work-budget:v1:ownership-claim:")[0]
+        original_record = json.loads(original_operation.request_json)["request"]
+        assert json.loads(original_record["input"])["workspace_subject"] == original_record["workspace_subject"]
+        tree = LocalOwnedWorkspace(sqlite_tmp_path / "workspaces", "one")
+        app = WorkOwnership(
+            store, Principal("worker", "worker"), tree, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
+        )
+        attempt = store.load("reference").attempt("original").spec
+        result = app.claim("claim:original", 1, attempt, lease_seconds=5)
+        assert result.generation == 1 and result.expires_at == 105
+        assert result.workspace_subject == original_record["workspace_subject"]
+        assert store.operation(original_operation.operation_id) == original_operation
+        if state == "conflict":
+            with pytest.raises(OwnershipConflict, match="workspace"):
+                app.submit(result)
+            with pytest.raises(OwnershipConflict, match="workspace"):
+                store.claim("runtime:competing", now=100, lease_seconds=1)
+            assert store.operation("runtime:competing").attempts == 0
+    if state != "conflict":
+        with closing(sqlite3.connect(path)) as current:
+            assert tuple(current.iterdump()) == original_rows

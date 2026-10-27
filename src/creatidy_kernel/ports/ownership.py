@@ -26,6 +26,18 @@ class OwnershipStore(Protocol):
     @property
     def ownership_authority(self) -> str: ...
 
+    def find_work_claim(
+        self,
+        command_key: str,
+        claimant: str,
+        expected_revision: int,
+        attempt: AttemptSpec,
+        mode: HandoffMode,
+        profile: str,
+        resources: tuple[ResourceScope, ...],
+        lease_seconds: int,
+    ) -> WorkClaim | None: ...
+
     def claim_work(
         self,
         command_key: str,
@@ -163,6 +175,18 @@ class WorkOwnership:
     def claim(self, command_key: str, expected_revision: int, attempt: AttemptSpec, *, lease_seconds: int) -> WorkClaim:
         if self._principal.role != "worker":
             raise OwnershipConflict("handoff must bind an authenticated worker claimant")
+        historical = self._store.find_work_claim(
+            command_key,
+            self._principal.actor_id,
+            expected_revision,
+            attempt,
+            self._mode,
+            self._profile,
+            self._resources,
+            lease_seconds,
+        )
+        if historical is not None:
+            return historical  # Recorded outcome only, never a new live grant.
         if self._mode is HandoffMode.MANAGED and (
             self._witness is None
             or self._witness.profile != self._profile
