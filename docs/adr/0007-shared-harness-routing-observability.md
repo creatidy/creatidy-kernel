@@ -4,8 +4,8 @@ Status: agreed owner direction, 2026-10-04; implementation and public integratio
 to prove. Documentation mandate: [Kernel #46](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/46).
 
 Revision cross-reference: [ADR 0012](0012-unified-work-coordination-and-drivers.md) records the owner's
-2026-10-26 unified pull/push and independent-driver direction, pending review/integration. On integration
-it supersedes interpreting the push/gateway target diagram and dynamic Router default as mandatory
+2026-10-26 unified pull/push and independent-driver direction, integrated through PR #104.
+It supersedes interpreting the push/gateway target diagram and dynamic Router default as mandatory
 for every work-coordination profile. Router's strict executable contract, historical evidence and
 ownership remain intact. The original decision below is preserved, not retroactively reclassified.
 

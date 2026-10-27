@@ -2,7 +2,7 @@
 
 Status: accepted, 2026-09-21; target fixed before the Creatidy implementation audit.
 
-Revision cross-reference: [ADR 0012](0012-unified-work-coordination-and-drivers.md), pending integration,
+Revision cross-reference: [ADR 0012](0012-unified-work-coordination-and-drivers.md), integrated in PR #104,
 extends knowledge/resource drivers and shared presentation clients. Private unitful outcomes,
 provenance-only MI utilization and the separation from authority/routing remain unchanged.
 

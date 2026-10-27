@@ -1,7 +1,7 @@
 # Bounded Harness Feasibility
 
 Historical feasibility evidence, retained unchanged below. The revised target in
-[ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md) (pending integration) uses one durable
+[ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md) (integrated in PR #104) uses one durable
 core with complementary pull work clients and dedicated managed push adapters. Owned Sessions was
 the first proof choice, not an exclusive product architecture. #53 remains closed/not implemented;
 references below to its future adapter reception are historical, not current dependency authority.

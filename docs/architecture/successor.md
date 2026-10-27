@@ -2,26 +2,27 @@
 
 Current revision: [Kernel #103](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/103),
 [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md) and the
-[single target](target.md). This recording and its issue changes remain proposed until integration
-and canonical publication. It does not select functional work or authorize `/loop`, inference,
-production effects or a feature implementation. Ordinary development is paused by the architecture
-mandate until architecture/backlog alignment is accepted. The older G01-G13 corpus below is retained
+[single target](target.md), integrated through PR #104 at
+`ace7175e087cd70e207594f5631c8f4f70fabfd4`. Actual canonical publication and delegated consistency
+acceptance are recorded in #103. The owner's 2026-10-27 instruction delegates that acceptance and
+subsequent normal `/loop`; this roadmap itself does not select work or authorize inference or
+production effects. The older G01-G13 corpus below is retained
 with its dated evidence, not a competing push-only plan or a current eligibility observation.
 
 ## Full-Product Delivery Sequence
 
 The [complete backlog publication plan](backlog-alignment.md) gives every open issue's disposition,
 exact amendment payload, priority rationale and native-edge changes. It distinguishes proposed work
-aliases from registered IDs and preserves historical closed/wontfix dispositions. Do not select from
+aliases A/B (now registered #105/#106) and preserves historical closed/wontfix dispositions. Do not select from
 this table or infer eligibility from a closed prerequisite alone; refresh actual canonical evidence.
 
 | Workstream | Complete receivable outcome | Ordering and non-gates |
 | --- | --- | --- |
-| Driver delivery (proposed new functional issue A) | Split tracker/SCM/CI/context bindings, Forgejo compatibility and executable heterogeneous provider adapters with native semantics and failure recovery | Architecture integration first; no Router gateway, MI direct-read or Console prerequisite |
+| Driver delivery #105 | Split tracker/SCM/CI/context bindings, Forgejo compatibility and executable heterogeneous provider adapters with native semantics and failure recovery | Architecture integrated; no Router gateway, MI direct-read or Console prerequisite |
 | Claims and ownership #59 | Atomic work claims/reservations/fencing, conflicting-workspace/session/manual-edit reconciliation and safe cleanup across pull/push | Reuse accepted #48/#50/#61/#90; no dependency on #57 or the new dispatcher |
 | Whole-work policy #56 | Configurable project/work limits, original boot-scoped time envelope, unitful attributable consumption/unknowns, review/retry/output bounds | Existing #54 review reused; no real numerical owner budget needed to implement validation with synthetic fixtures; strict Router facts lane-local |
-| Ordinary work engine (proposed new functional issue B) | Discover/plan/validate approved ordinary Programs, select/claim/reserve, pull handoff and managed push, submit/review/remediate/accept/synchronize through one application path | A + #59 + #56; existing #49/#51/#54 are retained foundations, not missing preparation series. Local CLI works without waiting for optional UI/server deployment |
-| Shared command/state #57 | Authenticated owner/worker/observer boundary and useful installed CLI/MCP/API surfaces, snapshots/events/gaps/STOP, optional UI consumers | #59 for claim semantics; consumes B's ordinary execution for full end-to-end commands. Does not make B's local core depend on #57 transport |
+| Ordinary work engine #106 | Discover/plan/validate approved ordinary Programs, select/claim/reserve, pull handoff and managed push, submit/review/remediate/accept/synchronize through one application path | #105 + #59 + #56; existing #49/#51/#54 are retained foundations, not missing preparation series. Local CLI works without waiting for optional UI/server deployment |
+| Shared command/state #57 | Authenticated owner/worker/observer boundary and useful installed CLI/MCP/API surfaces, snapshots/events/gaps/STOP, optional UI consumers | #59 for claim semantics; consumes #106's ordinary execution for full end-to-end commands. Does not make #106's local core depend on #57 transport |
 | Strict executable Router profile #52 | Actual Attempt-bound route/pin/identity/admission and supported harness/tool/helper/recovery receipt | Genuine separate obligation. Existing Kilo multipart incompatibility affects this exact combination, not ordinary coordination |
 | Complete local outcomes #58 | Private versioned full-result lineage and corrected known/unknown unitful costs across drivers/modes | #56 and actual execution facts; absent strict-route facts stay unknown for basic profile; Router #177/MI sharing are not gates |
 | Compatibility #62 | Installed driver/harness/profile/state compatibility, supported-platform evidence and non-destructive upgrades/refusals | Accompanies each delivery; never waits for every adapter or release. Existing #102 synthetic evidence retained |

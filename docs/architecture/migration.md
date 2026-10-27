@@ -1,6 +1,6 @@
 # Current Creatidy Mapping
 
-Current revision: [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md), pending integration,
+Current revision: [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md), integrated in PR #104,
 and [registered coverage/publication plan](backlog-alignment.md). The dated second-pass mappings below are history, not current
 rollout instructions or authorization to move code. No private source,
 secrets, operational payloads or customer data are incorporated in this public foundation.

@@ -1,7 +1,7 @@
 # Initial Threat Model
 
-Current target extension: [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md), pending
-integration. Pull clients do not grant process ownership: revoked/expired work claims fence Kernel
+Current target extension: [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md), integrated
+in PR #104. Pull clients do not grant process ownership: revoked/expired work claims fence Kernel
 actions, not native effects in an external Kilo session. Cooperative task-scope quiescence is weaker
 than managed settlement and must not satisfy a stronger profile. Quarantine uncertain conflicting
 resources; never infer termination from a missed heartbeat or kill an unrelated shared server.
