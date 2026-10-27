@@ -1,7 +1,7 @@
 # Port And Recovery Contracts
 
 Current target and planned port split: [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md)
-and [unified work architecture](target.md), pending their PR integration. Their unified pull/push
+and [unified work architecture](target.md), integrated through PR #104. Their unified pull/push
 semantics and six independently bound driver families replace a universal managed/gateway-only
 interpretation, not the existing wire contracts below. New work claims are distinct from outbox
 delivery claims. Legacy numeric intake, `Forge` facade, Codex, allocation bytes and AGit recovery stay

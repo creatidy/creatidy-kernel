@@ -9,11 +9,15 @@ The objective is an accepted result including verification, review and fixes, no
 The owner's 2026-10-26 revision defines [one work-control core with complementary pull/push modes](docs/architecture/target.md)
 and independently bound tracker, SCM, CI, knowledge, harness and resource drivers.
 [ADR 0012](docs/adr/0012-unified-work-coordination-and-drivers.md) and its
-[backlog/impact publication plan](docs/architecture/backlog-alignment.md) are proposed records pending
-review/integration, not implemented features. Basic work coordination must complement existing Kilo
+[backlog/impact publication plan](docs/architecture/backlog-alignment.md) were integrated through
+[PR #104](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/pulls/104) at
+`ace7175e087cd70e207594f5631c8f4f70fabfd4`; architectural acceptance does not establish implemented features.
+Current canonical publication and delegated consistency acceptance receipts are in
+[#103](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/103). Basic work coordination must complement existing Kilo
 configuration without requiring Router gateway interception; strict routing/pin/admission profiles
 still require actual proven compatibility or refuse. Neither Console nor an IDE plugin is mandatory.
-Ordinary feature development remains paused until this architecture/backlog alignment is accepted.
+Ordinary feature development requires verified architecture/backlog alignment; the owner's
+2026-10-27 mandate delegates that objective acceptance and subsequent normal `/loop` continuation.
 
 **Status: deterministic domain, durable persistence, bounded Forge and Codex Runtime adapters,
 an offline two-node CLI reference flow, bounded TaskSpec support for two frozen real
@@ -607,7 +611,7 @@ Forge effect are unchanged, and neither path can merge or deploy.
 | [0006](docs/adr/0006-context-and-outcomes.md) | Bounded context and user-owned outcome history |
 | [0007](docs/adr/0007-shared-harness-routing-observability.md) | Shared product/harness/routing/state ownership and explicit proof gaps |
 | [0011](docs/adr/0011-task-level-authority-and-trusted-development.md) | Accepted trusted-development authority, STOP and deadline/recovery baseline |
-| [0012](docs/adr/0012-unified-work-coordination-and-drivers.md) | Owner-authorized unified pull/push core and independent drivers; recording pending integration |
+| [0012](docs/adr/0012-unified-work-coordination-and-drivers.md) | Integrated unified pull/push core and independent drivers; implementation remains separate |
 
 Contributions: [CONTRIBUTING.md](CONTRIBUTING.md). Security: [SECURITY.md](SECURITY.md).
 Licensed under [Apache-2.0](LICENSE). Adapted-source attribution is distributed in [NOTICE](NOTICE).

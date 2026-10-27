@@ -1,9 +1,11 @@
 # ADR 0012: Unified Work Coordination And Capability-Based Drivers
 
-Status: owner-authorized architectural direction, 2026-10-26; this recording requires independent
-review and canonical PR integration. [Mandate #103](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/103)
-records current delivery/integration evidence.
-An unmerged copy is not integrated architecture or permission to resume development.
+Status: accepted architectural direction, 2026-10-26; independently reviewed and integrated through
+[PR #104](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/pulls/104) on 2026-10-27 at
+`ace7175e087cd70e207594f5631c8f4f70fabfd4`.
+[Mandate #103](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/103) records canonical
+publication and the owner's 2026-10-27 delegated objective consistency-acceptance evidence.
+Architecture integration is not feature implementation or live acceptance.
 
 ## Context And Decision
 
@@ -256,5 +258,6 @@ cell, not every independent driver or unrelated Program.
 The [current target](../architecture/target.md), [roadmap](../architecture/successor.md) and
 [backlog/impact publication plan](../architecture/backlog-alignment.md) form one target and evidence
 map. Integration of this record is not implementation, live readiness, owner numeric budget, merge
-authority or acceptance of the complete product. Ordinary development remains paused until the
-architecture and canonical backlog are consistently published and accepted under the owner mandate.
+authority or acceptance of the complete product. Ordinary development requires consistent canonical
+publication and acceptance under the owner mandate. The 2026-10-27 owner instruction delegates that
+objective acceptance and subsequent normal `/loop`; #103 records whether those gates actually passed.

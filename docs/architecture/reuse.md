@@ -1,7 +1,7 @@
 # Reference Mechanism Catalogue
 
-Current architecture revision: [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md), pending
-integration. Retain existing durable core, source/Workspace/Runtime, Forgejo/AGit, allocation codecs,
+Current architecture revision: [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md), integrated
+in PR #104. Retain existing durable core, source/Workspace/Runtime, Forgejo/AGit, allocation codecs,
 review/STOP and provenance mechanisms; split provider responsibilities rather than adopt another
 scheduler, harness, inventory or gateway. Pull/CLI/MCP/native integrations are capability-scoped
 mechanisms, not new product dependencies. No upstream code or dependency is adopted by this revision.

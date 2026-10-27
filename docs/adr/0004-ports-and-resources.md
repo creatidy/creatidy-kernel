@@ -2,7 +2,7 @@
 
 Status: accepted, 2026-09-21; target fixed before the Creatidy implementation audit.
 
-Revision cross-reference: [ADR 0012](0012-unified-work-coordination-and-drivers.md), pending integration,
+Revision cross-reference: [ADR 0012](0012-unified-work-coordination-and-drivers.md), integrated in PR #104,
 extends Runtime participation with cooperative pull and splits Work Management/SCM/CI/context bindings.
 It supersedes a mandatory managed/gateway interpretation, not these durable port/authority invariants.
 

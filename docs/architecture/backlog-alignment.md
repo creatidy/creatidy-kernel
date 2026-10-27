@@ -2,10 +2,34 @@
 
 Owner mandate: [CK #103](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/103), 2026-10-26.
 Decision: [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md).
-**Publication status: PREPARED, NOT APPLIED.** This branch is an architecture proposal pending
-independent review/integration. It does not claim an unmerged ADR is canonical develop authority.
-The only new registered issue at preparation is #103; A/B below are explicit proposed issue aliases,
-not fabricated Forgejo IDs. No feature implementation or product call is authorized.
+Architecture integrated: [PR #104](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/pulls/104),
+merge `ace7175e087cd70e207594f5631c8f4f70fabfd4`, 2026-10-27.
+The owner's 2026-10-27 instruction authorizes actual CK backlog publication, independent consistency
+review, evidence-conditioned delegated acceptance and subsequent normal `/loop` continuation.
+Canonical publication/verification/acceptance receipts are recorded in
+[#103](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/103), not inferred from this file.
+The original preparation aliases now have real identities:
+[A = #105](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/105), independent drivers;
+[B = #106](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/106), ordinary Program execution.
+References to preparation below preserve the historical audit, not a current claim of nonpublication.
+No functional capability or live acceptance is established by publication or consistency acceptance.
+
+## Publication Revision
+
+Fresh prepublication exhaustion on 2026-10-27 found twelve open issues (5 + 5 + 2 + empty), all
+33 comments, seven labels plus an empty page, no priority labels and no native edges. #103 had already
+been closed at 00:21:03Z after PR #104's owner merge; its closed disposition is preserved, but is not
+publication acceptance evidence. Exact-title all-state and heterogeneous-scope dedup found no A/B
+equivalents. #105 and #106 were registered at 00:29:19Z and 00:29:34Z respectively.
+
+The active issue payloads supersede conflicting historical scope/priority/dependency wording, with the
+entire original body retained under `Historical Scope And Evidence`. Existing comments, accepted
+partial deliveries, failed experiments and review ordinals remain unchanged. The four historical
+`wontfix` issues remain untouched and unranked. The native graph below is the 28-edge publication
+manifest; independent bidirectional native read-back at 00:31:38Z verified all 28 edges across
+23 issues with explicit empty terminal pages, exact inverse consistency and no cycles. Actual body
+read-back and final independent verdict belong to the canonical #103 receipts.
+Neither a write response nor this documentation alone establishes successful final verification.
 
 ## Evidence And Inventory
 
@@ -56,7 +80,7 @@ scope section. Use the following comparable ranks; lower number is earlier, not 
 | Rank | Meaning | Rationale |
 | --- | --- | --- |
 | P0 | Proven urgent safety/data-integrity repair that prevents safe continued use | Reserved for evidenced emergencies; none assigned by this review |
-| P1 | Core authority/data-integrity foundation or complete everyday work capability on the critical path | A, B, #56/#59/#57; #103 is architecture maintenance, not feature eligibility |
+| P1 | Core authority/data-integrity foundation or complete everyday work capability on the critical path | #105, #106, #56/#59/#57; #103 is architecture maintenance, not feature eligibility |
 | P2 | Required integration, evidence/operability or installed reception | #52/#58/#62/#60; #60 important but downstream, not immediately eligible |
 | P3 | Optional capability expansion with a useful independent result | Remaining direct MI work #55; delivered provenance is not demoted or redelivered |
 
@@ -69,9 +93,9 @@ STOP_REVISE. No `.kilo/` authority, reviewer rule, selection mechanism or core c
 
 ## Complete Open-Issue Disposition
 
-All revised scope/priority/edges in this table are **prepared**, not published. Links lead to the
-actual current issues, not claimed mutations. The post-integration payloads below are normative for
-publication, subject to fresh drift/dedup checks. Priorities were previously unranked on every row.
+This is the active publication manifest; verify actual state through the linked issues and #103's
+read-back receipts. Priorities were unranked at the preparation cut. The payloads below retain the
+accepted scope; A/B mean actual #105/#106 everywhere, never numeric API placeholders.
 
 | Issue | Previous scope / priority | Updated scope / priority | Proposed dependencies | Remaining acceptance | Status / owner gate |
 | --- | --- | --- | --- | --- | --- |
@@ -80,21 +104,27 @@ publication, subject to fresh drift/dedup checks. Priorities were previously unr
 | [#37](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/37) | Historical bounded-task integration; wontfix, unranked | Preserve superseded bounded scope; no rank | None | Not ordinary-work execution | OPEN/wontfix; excluded, unchanged |
 | [#44](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/44) | Public operator broad scope; historical PR #45, wontfix/unranked | Preserve integrated subset and rejected broad disposition; no rank | None | #62 owns new compatibility, not revival | OPEN/wontfix; excluded, unchanged |
 | [#52](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/52) | Sticky Router executable route/harness identity; descriptive dependent-integration priority | Full strict resource/harness execution profile, P2 | Accepted #47/#51; exact SR producer contracts lane-local | Route/pin/identity/tool/helper/retry/STOP/recovery receipt through a supported adapter; preserve #100 negative | Incompatible exact Kilo path needs accepted adaptation or producer decision; no global core gate |
-| [#55](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/55) | MI utilized reference plus optional harness evidence; dependent producer priority | Retain delivered provenance; optional direct knowledge/harness source consumption, P3 | A for new generic reader; MI/Router accepted contracts only when consumed | Immutable source cuts, content/rights/freshness/refusal and private boundaries; no catalogue | No mandatory new MI work; direct/live scope separately selected |
+| [#55](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/55) | MI utilized reference plus optional harness evidence; dependent producer priority | Retain delivered provenance; optional direct knowledge/harness source consumption, P3 | #105 for new generic reader; MI/Router accepted contracts only when consumed | Immutable source cuts, content/rights/freshness/refusal and private boundaries; no catalogue | No mandatory new MI work; direct/live scope separately selected |
 | [#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56) | Whole-task costs/budgets, prior #52/#54 gating | Project/work capacity, original clocks, attempts/review/retry, unitful unknown-aware enforcement, P1 | Accepted #48/#49/#54 | Actual configurable policy, bounds/recovery; strict Router facts only for strict profile | No invented real owner numeric budgets; implementing policy is not live spending |
-| [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) | Owner-served view/commands/notifications; #59/#52/Console-like assumptions | One shared owner/worker/observer API for both modes and clients, P1 | #59 and B for full ordinary commands | Auth scopes, command dedupe/revisions, snapshots/events/gaps/resync/STOP and useful CLI | Remote auth/exposure must be received; Console/SR #183 are not CK prerequisites |
-| [#58](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/58) | Complete cost/outcome export, route and sharing assumptions | Private full work/driver/Attempt/effect/review lineage and honest costs, P2 | #56 and B | Installed full export, corrections/missing facts, privacy/refusal and schema compatibility | No MI sharing permission; Router #177 optional downstream |
+| [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) | Owner-served view/commands/notifications; #59/#52/Console-like assumptions | One shared owner/worker/observer API for both modes and clients, P1 | #59 and #106 for full ordinary commands | Auth scopes, command dedupe/revisions, snapshots/events/gaps/resync/STOP and useful CLI | Remote auth/exposure must be received; Console/SR #183 are not CK prerequisites |
+| [#58](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/58) | Complete cost/outcome export, route and sharing assumptions | Private full work/driver/Attempt/effect/review lineage and honest costs, P2 | #56, #106 and accepted #54 | Installed full export, corrections/missing facts, privacy/refusal and schema compatibility | No MI sharing permission; Router #177 optional downstream |
 | [#59](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/59) | Multi-task workspaces/controllers/manual edits; depends in prose on #57 | Claims/capacity/fencing and managed/cooperative resource ownership, P1 | Accepted #48/#50/#61/#90; NOT #57 | Race-safe claims, quiescence/settlement, stale-generation refusal, safe reuse and manual-edit reconciliation | Existing local safe mechanisms; no new distributed service or shared-session takeover |
-| [#60](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/60) | G01-G13 installed final reception, broad component gates | Installed complete declared product profiles: both modes, mixed drivers, strict route and safety/recovery, P2 | A/B and #52/#56/#57/#58/#59/#62 | Exact artifact/version/profile receipts and negatives; component gaps stay open | Downstream acceptance; live inference/effects need separate exact authority |
+| [#60](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/60) | G01-G13 installed final reception, broad component gates | Installed complete declared product profiles: both modes, mixed drivers, strict route and safety/recovery, P2 | #105/#106 and #52/#56/#57/#58/#59/#62 | Exact artifact/version/profile receipts and negatives; component gaps stay open | Downstream acceptance; live inference/effects need separate exact authority |
 | [#62](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/62) | Package/platform/state/SOPS compatibility; descriptive release priority | Driver/harness/profile compatibility and actual installed migrations/platform journeys, P2 | No blanket component gate; per-cell producers only | Executed supported matrix, upgrade/refusal/rollback/uninstall; retain #102 | No release/signing/new OS or real key/profile commitment inferred |
-| [#103](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/103) | New owner architecture/backlog maintenance mandate; unranked | This architecture and exact canonical publication/acceptance, P1 maintenance | Owner integration then verified publication | Reviewed PR + actual issue/edge publication and audit | Not feature implementation, not `/loop`, standalone merge withheld |
+| [#103](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/103) | Owner architecture/backlog maintenance mandate; previously unranked | Integrated architecture and exact canonical publication/acceptance, P1 maintenance | No functional predecessor | Actual issue/edge read-back and independent consistency audit | Already closed before publication; delegated acceptance requires its separate evidence receipt |
+| [#105](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/105) | Prepared alias A; previously unregistered | Executable independent drivers and heterogeneous provider composition, P1 | None | Real adapter transports, Forgejo compatibility and installed mixed-binding behavior | No live credential/inference authority inferred |
+| [#106](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/106) | Prepared alias B; previously unregistered | Ordinary approved Program execution through shared pull/push lifecycle, P1 | #105/#59/#56 and accepted #49/#54 | Claims/handoff/execute/check/review/remediate/accept/reconcile | No #52/#55/#57 or optional UI prerequisite |
 
 Historical wontfix bodies/comments/labels remain byte-preserved: no cosmetic edits are necessary to
 acknowledge them. Closed #53 and other rejected/accepted closed issues are not reopened, relabelled
-or closed again. #103 remains open until architecture and actual canonical publication are verified;
-an approved documentation PR alone is not its completion.
+or closed again. #103's observed prepublication closure is preserved; an approved documentation PR or closed
+issue alone is not completion of actual publication and delegated consistency acceptance.
 
-## Publication Procedure
+## Historical Preparation Procedure
+
+The following records the original sequencing. PR #104 has now integrated; the direct 2026-10-27
+owner mandate additionally delegates objective consistency acceptance and subsequent `/loop` without
+another confirmation. Its actual outcomes must be read in #103, not inferred from these instructions.
 
 1. Obtain a fresh independent full architectural review of the exact PR/base. Record counted ordinal,
    findings/verdict, source evidence and required validation. Standalone work cannot merge.
@@ -117,10 +147,9 @@ an approved documentation PR alone is not its completion.
    resumes only after consistent canonical publication and owner acceptance; no feature is selected
    by this document. Fresh unknown evidence is UNVERIFIED, not readiness or proof of a gate.
 
-No architecture-dependent functional issue bodies, priorities or dependencies have been mutated in
-this delivery. A reporting comment linking the reviewed proposal may be posted without claiming it
-integrated. If merge is withheld, the correct handoff is the exact reviewed PR plus this prepared
-publication plan, not a claim of reconciled canonical backlog.
+At the original preparation cut no architecture-dependent functional bodies/priorities/edges had been
+mutated. This was a historical receipt, not the present publication state. Preserve PR #104's report
+as written; current canonical publication is verified separately under #103.
 
 ## Issue Payloads
 
@@ -132,7 +161,7 @@ path and independent exact-subject review; live inference/effects/releases requi
 Each Links section includes #103, merged ADR 0012, its current target/migration, and the evidence IDs
 named below. These shared paragraphs are expanded into each actual issue, not left as hidden policy.
 
-### A: External Work Drivers (New Functional Issue, Unregistered)
+### #105: External Work Drivers (Registered Prepared Alias A)
 
 Title: **Deliver independent work, SCM, CI and knowledge drivers with a heterogeneous project path**
 
@@ -176,7 +205,7 @@ provider interface/rights checks are required evidence, not speculative cross-pr
 
 Links: #9/#49 current source, #61 source ownership, #103 and merged ADR/migration.
 
-### B: Ordinary Work Engine (New Functional Issue, Unregistered)
+### #106: Ordinary Work Engine (Registered Prepared Alias B)
 
 Title: **Deliver ordinary Program execution with shared pull and managed push handoffs**
 
@@ -195,7 +224,7 @@ acceptance and driver synchronization; reuse existing domain/intake/journal/revi
 
 Acceptance Criteria:
 
-1. Discover through A, validate complete explicit dependencies/current source/check/relevance evidence,
+1. Discover through #105, validate complete explicit dependencies/current source/check/relevance evidence,
    refuse cycles/missing/unsupported/unknown required facts, approve exact ordinary meaning and activate
    legal Program commands. No L0 fallback, issue-text authority or hidden second lifecycle.
 2. Shared #59/#56 claims/reservations prepare one immutable Attempt/Operation before a pull handoff or
@@ -212,10 +241,10 @@ Acceptance Criteria:
 6. Installed local CLI works without Console or #57 network deployment; shared handlers are reusable by
    #57. Preserve trusted/cooperative limitations, scope/refusal/migration evidence and full negative tests.
 
-Dependencies: A, #59, #56; accepted #49/#51/#54 foundations verified, not reopened. No #52/#55/#57
+Dependencies: #105, #59, #56, #49 and #54; accepted #49/#51/#54 foundations verified, not reopened. No #52/#55/#57
 transport, all-provider catalogue, mandatory cloud or strict isolation dependency for the basic profile.
 
-Links: #49/#51/#54/#90 source/receipts, A, #56/#59, #103 and merged ADR.
+Links: #49/#51/#54/#90 source/receipts, #105, #56/#59, #103 and merged ADR.
 
 ### #52: Strict Executable Resource Profile
 
@@ -238,7 +267,7 @@ Acceptance Criteria:
 4. Lost receipts, unavailable admission, identity mismatch, unknown usage, hidden calls or unsupported
    cancellation retain uncertainty/refuse the strict profile; no fresh Attempt, silent reroute or replay.
 5. Basic coordinated work may use an existing explicitly acknowledged harness configuration and reports
-   unavailable model control honestly. No #52 gate on unrelated #56/#57/#59 or B basic profile.
+   unavailable model control honestly. No #52 gate on unrelated #56/#57/#59 or #106 basic profile.
 6. Ship installed compatibility/negative receipts for the exact selected versions and preserve Codex;
    live inference and producer semantic changes remain separately authorized, never implied by this issue.
 
@@ -256,7 +285,7 @@ attributed context without duplicating catalogue/ranking or creating authority. 
 delivers utilized-reference provenance and must not be redelivered as missing work.
 
 Scope: preserve codec-v3 utilized reference and local-only labels; optional direct content/sidecar/
-cut interpretation and harness-interface evidence through A's knowledge seam, only for supported
+cut interpretation and harness-interface evidence through #105's knowledge seam, only for supported
 producer semantics. MI #19 / SR #176 remain accepted explanation-only installed work.
 
 Acceptance Criteria:
@@ -273,8 +302,8 @@ Acceptance Criteria:
 5. Installed optional-consumer tests and migration docs distinguish retained reference, retrieved content,
    synthetic producer fixtures and separately authorized live reception. No mandatory MI service.
 
-Dependencies: A for new generic reader composition; exact existing MI publication/utilization contract
-and SR utilization only when that lane is used. No #52/B/basic-coordination prerequisite in either
+Dependencies: #105 for new generic reader composition; exact existing MI publication/utilization contract
+and SR utilization only when that lane is used. No #52/#106/basic-coordination prerequisite in either
 direction. Owner-controlled expansion of sharing/active adoption remains a separate decision.
 
 Links: PR #101, MI #13/#19, SR #176 and #103.
@@ -339,12 +368,12 @@ Acceptance Criteria:
 6. Provide a consumable versioned producer contract and executable installed conformance client; actual
    Console/IDE UI implementation remains downstream. Decision alerts are useful but never sole truth.
 
-Dependencies: #59 claim semantics and B for complete ordinary command composition. #59/B local work
+Dependencies: #59 claim semantics and #106 for complete ordinary command composition. #59/#106 local work
 does not depend on this transport, eliminating the old #57/#59 cycle. Router #183/MI #16/Console
 availability are NOT Kernel producer prerequisites. Unselected remote security commitments are scoped
 decisions, not permission to invent auth or block the trusted local application core.
 
-Links: #59/B, Console #2/#3/#4/#7/#12, prior G08 specification, #103.
+Links: #59/#106, Console #2/#3/#4/#7/#12, prior G08 specification, #103.
 
 ### #58: Private Complete Outcome Export
 
@@ -368,7 +397,7 @@ Acceptance Criteria:
 5. Installed schema/version/old-record/unsupported/corrupt/privacy/correction/crash tests prove the
    actual composed pipeline. PASS/APPROVE is conditional exact-subject evidence, not causal model quality.
 
-Dependencies: #56, B and accepted #54 lineage; #52 enriches strict-profile facts only. SR #177 is an
+Dependencies: #56, #106 and accepted #54 lineage; #52 enriches strict-profile facts only. SR #177 is an
 optional downstream local consumer. MI #17 is closed with rejected operational sharing; it is neither
 an export prerequisite nor implicit publication permission.
 
@@ -402,7 +431,7 @@ Acceptance Criteria:
 
 Dependencies: accepted #48/#50/#61/#90 exact source/receipt evidence, not closed states alone. Remove
 all #57 prerequisites for claims/local ownership. Router parallel admission is a strict-resource lane
-concern, not a global work-claim blocker. Current ordinary dispatcher consumes this result in B.
+concern, not a global work-claim blocker. The ordinary dispatcher delivery consumes this result in #106.
 
 Links: #48/#50/#61/#90, existing journal/source leases, #103 and ADR 0011.
 
@@ -436,7 +465,7 @@ Acceptance Criteria:
    network/privacy scope and finite numeric time/attempt/money envelope, including STOP/unknown rules.
    Without it record the cell unreceived, not an offline pass as live or product GO.
 
-Dependencies: A, B, #52/#56/#57/#58/#59/#62. Optional #55 direct-MI expansion is not a mandatory
+Dependencies: #105, #106, #52/#56/#57/#58/#59/#62. Optional #55 direct-MI expansion is not a mandatory
 component; the already delivered utilized-reference path remains covered. No component depends on
 #60, no mandatory Console/IDE, no every-future-provider/version promise, no automatic merge/deploy.
 
@@ -471,35 +500,36 @@ Acceptance Criteria:
 
 Dependencies: no whole-issue upstream gate. Receive each affected producer version when that cell is
 implemented; SR #185 / MI #18 accepted obligations do not become unfinished global gates, and SR
-#186 release/platform scope does not block CK's independent installed compatibility work. Accompany A/B
+#186 release/platform scope does not block CK's independent installed compatibility work. Accompany #105/#106
 and interface changes rather than form a cycle with final #60 reception.
 
 Links: PR #102, existing migration/source/storage docs, SR #185/#186, MI #18, #103.
 
 ## Native Edge Plan And Execution Order
 
-All current open native edges are empty. After creating real A/B IDs, add exactly these candidate
-dependencies with MCP and verify them; remove no existing edge unless a fresh read proves it conflicts
-with the integrated alignment. Existing new concurrent edges need explicit reconciliation first.
+At the prepublication cut all open native edges were empty. The parent published the following
+28 edges through supported MCP operations using actual #105/#106 IDs. Confirm current state against
+canonical read-back receipts in #103; preserve/reconcile legitimate concurrent edges rather than
+blindly replaying writes. The table is the expected graph, not a substitute for those reads.
 
 | Issue | Required native predecessors to publish | Not a native hard prerequisite |
 | --- | --- | --- |
-| A | None | #52/#55/#57/Console |
-| #59 | #48, #50, #61, #90 (accepted bounded results; retain their remaining limits) | #57, B, Router generic parallelism |
+| #105 | None | #52/#55/#57/Console |
+| #59 | #48, #50, #61, #90 (accepted bounded results; retain their remaining limits) | #57, #106, Router generic parallelism |
 | #56 | #48, #49, #54 (accepted foundations) | #52, numeric real owner budget before coding |
-| B | A, #59, #56, #49, #54 | #57 network transport, #52, #55 |
-| #57 | #59, B | SR #183, Console readiness |
+| #106 | #105, #59, #56, #49, #54 | #57 network transport, #52, #55 |
+| #57 | #59, #106 | SR #183, Console readiness |
 | #52 | #47, #51 | #53, all basic coordination |
-| #55 | A | #52, B, MI sharing |
-| #58 | #56, B, #54 | MI #17, SR #177, #52 for basic export |
+| #55 | #105 | #52, #106, MI sharing |
+| #58 | #56, #106, #54 | MI #17, SR #177, #52 for basic export |
 | #62 | None (cell-specific accepted producers recorded in body) | Whole #52/#57/#60, SR #186 release |
-| #60 | A, B, #52, #56, #57, #58, #59, #62 | Every optional #55 direct source, Console/IDE |
+| #60 | #105, #106, #52, #56, #57, #58, #59, #62 | Every optional #55 direct source, Console/IDE |
 | #103 | None; explicit owner integration/publication gate in body | Functional implementation or /loop |
 
 This graph has no #57/#59 or #60/component cycle. Earliest engineering work **after** integrated
 architecture/publication/acceptance is #56 and #59 (P1, their accepted predecessors must be refreshed),
-plus newly registered A; existing #56 precedes #59 on equal rank/eligibility by oldest registration.
-B follows A/#56/#59. #57 receives full ordinary commands after B. #62 compatibility can accompany
+plus #105; existing #56 precedes #59 on equal rank/eligibility by oldest registration.
+#106 follows #105/#56/#59. #57 receives full ordinary commands after #106. #62 compatibility can accompany
 all lanes, #52 can proceed independently when its exact integration/owner gates permit, #58 follows
 actual work facts, and #60 receives the installed composition. P3 optional MI is useful but not a
 reason to delay the core path. This is a complete functional program, not invocation authority or a
@@ -507,20 +537,23 @@ new QUEUE_EMPTY finding. Fresh producer unknowns are UNVERIFIED and must be insp
 
 ## Cross-Project Impact
 
-Read-only canonical refs matched clean local `develop` objects at inspection:
+Read-only canonical refs matched clean local `develop` objects at refreshed inspection on 2026-10-27.
+SR advanced after preparation; MI and Console did not. No external mutation was made.
 
 | Project | Exact inspected revision |
 | --- | --- |
-| Scarcity Router | `4162f6fa9f774beaf6e92d86b7ebc92f306da4bd` |
+| Scarcity Router | `4a182affa4775a4a38b47860ad7622a099c56c4a` |
 | Model Intelligence | `8f572c332db8290b5dad9e03f5b0f960271a8349` |
 | Creatidy Console | `417372f189874a01dc0cd0ea9d494f18f4c180a4` |
 
-Paths below are pinned to these revisions unless specified. No external source, issue, label,
+Paths below are pinned to these revisions unless specified. The initial SR cut was
+`4162f6fa9f774beaf6e92d86b7ebc92f306da4bd`; #222/PR #223 is the material new contract evidence.
+No external source, issue, label,
 dependency or runtime was changed; no collectors, model calls, owner data or private source read.
 
 | Project | Impact / classification | Existing contract / issue | Required change | Owner | Dependency level | Priority |
 | --- | --- | --- | --- | --- | --- | --- |
-| SR | Basic coordination/pull/push/work budgets: CK only | CK domain/ports; SR `routing_core.py` rate ceilings and `execution_assurance.py` call facts | No SR change needed; CK composes work capacity without model inventory/ranking | CK #56/#59/B | No SR prerequisite for basic work | P1 CK |
+| SR | Basic coordination/pull/push/work budgets: CK only | CK domain/ports; SR `routing_core.py` rate ceilings and `execution_assurance.py` call facts | No SR change needed; CK composes work capacity without model inventory/ranking | CK #105/#106/#56/#59 | No SR prerequisite for basic implementation | P1 CK |
 | SR | Executable route: already satisfied bounded producer, downstream CK reception | #174/D-079 `/v1/route`, `executable_contract.py`; #179 identity/effort, #181/D-080 Responses subset | Consume exact supported contracts in #52; no new route API or relaxed pin semantics | CK #52 | Strict profile only | P2 CK |
 | SR | Exact Kilo multipart: conditional producer/adapter decision | CK #100; Kilo 7.8.18 `0bc1c373a9d9c5abd2a1a941f2bcebb321f467f1`; SR `gateway_openai.py` content-array refusal and `gateway_responses.py` multi-part refusal | Separate accepted multipart semantics or proved supported lossless alternative; no blind flatten/drop/proxy. No current SR issue verified to own this exact extension; do not claim #181 covers it | SR if producer extension selected; CK if adapter selected | Only exact unadapted Kilo/Router combination; not core | P2 conditional decision |
 | SR | Work budget/call-fact exchange: downstream acceptance, partially UNVERIFIED transport | #184 accepted `source_call_facts`, schema1 local trusted seam | Check exact eventual CK transport can receive attributable receipt/corrections; no public remote receipt endpoint assumed | CK #56; SR only if a missing producer seam is proved | Strict metered cell, not all budgets | P1 CK policy; P2 metering |
@@ -528,10 +561,10 @@ dependency or runtime was changed; no collectors, model calls, owner data or pri
 | SR | Owner observation: required external producer, existing work | #183 open; admin/client/worker credentials are not Console observer grants | SR observer authorization/freshness/events/reconnect remains SR-owned; not Kernel's API | SR #183, CC consumers | SR Console view only, not CK #57 | Existing SR scope; no rank mutation |
 | SR | Optional outcomes: optional/unaffected | #177 local explicit outcome consumer | No mandatory producer change or upload; CK #58 exports origin-local facts | SR #177 / CK #58 | Optional downstream | P2 CK export |
 | MI | Utilization/publication: already satisfied bounded producer/installed path | #13 publication; #19/PR42; SR #176/PR221; `mi.utilization-working/1` | No MI change needed for reference retention or basic work; preserve explanation-only scope and #101 consumer | CK #55 optional remainder | No MI live service needed | P3 optional |
-| MI | Active knowledge adoption: optional, broader mapping UNVERIFIED | `INSTALLED_ACCEPTANCE.md`, SR D-082: active calibration/admission not accepted | Check exact scope/channel/effort/freshness associations before broader activation; do not invent new MI /1 or /2 work for coordination | MI curation / SR policy if later selected | Optional selected source only | No new rank |
+| MI / SR | Active knowledge adoption: optional, policy integrated but real-source positive adoption UNVERIFIED | SR #222 CLOSED / PR #223 MERGED, D-082; `mi_consumer.py`, `selection_app.py`, `routing_core.py`, `docs/machine-interfaces.md`; MI `INSTALLED_ACCEPTANCE.md` | Default-off opt-in selection/admission is implemented. Receive complete exact channel/configuration/effort/applicability/freshness evidence before positive real-source adoption; no new MI version or endpoint assumed | MI curator / SR policy owner; optional CK #55 or selected #52 profile | Optional source-adoption acceptance only, not #105/#106 implementation | P3 CK optional; external rank unchanged |
 | MI | Direct knowledge/privacy exchange: optional/unaffected | Publication frame1, `mi.public-evidence-working/1` and /2; #17 rejected operational sharing | No MI redesign, work tracker or private usage DB. No CK upload or sharing authority | CK #55/#58, owner if new sharing | Not basic-work or export prerequisite | P3 direct context |
 | MI | Operator view: already satisfied offline producer | #16 `mi.operator-working/1`, `OPERATOR_CONTRACT.md`: commands=[], replay=false | No live MI endpoint required; CC #6 adopts offline full snapshots/gap limitations | CC #6 | Downstream UI only | Existing consumer work |
-| CC | Shared CK status/commands/modes: CK producer then downstream consumer | CK #57; CC #2 contract-gap inventory, #3/#4/#7/#12 open; `src/App.tsx` scaffold | CK publishes versioned owner/worker/observer interface; CC displays mode/capability/unknown/decision consistently and forwards scoped commands | CK #57, CC named consumers | No CC prerequisite for CK correctness | P1 CK; consumer rank unchanged |
+| CC | Shared CK status/commands/modes: CK producer then downstream consumer | CK #57; CC #2 CLOSED contract-gap inventory, #3/#4/#7/#12 OPEN; `docs/contracts.md`, `src/App.tsx` no-connections scaffold | CK publishes versioned owner/worker/observer interface; CC displays mode/capability/unknown/decision consistently and forwards scoped commands | CK #57, CC named consumers | CC integration/acceptance downstream; no CC prerequisite for CK correctness | P1 CK; CC #3/#7/#12 P1, #4 P2, unchanged |
 | CC | Auth/reconnect/correlation: downstream integration/acceptance | CC #2/#3/#4/#7/#12; no accepted shared cross-product wire schema | Consume each owner's authentication/scope, snapshot positions and gap/resync; do not copy scheduler, policy, Router ranking or open SQLite | CC; CK producer for its scope | Relevant view only | Existing consumer work |
 | CC | Web versus CLI/IDE: optional/unaffected authority | ADR0007 and CC product boundaries | No mandatory plugin/web migration. UI extension separate from Kilo work integration; same Kernel authority | CK client integration / CC UI | Presentation optional | No new external feature gate |
 
@@ -539,13 +572,29 @@ The installed MI/SR receipt uses MI producer `d65891668b7e79f7b666c021f02a1b4bf8
 consumer `4162f6fa9f774beaf6e92d86b7ebc92f306da4bd`; SR still pins that MI producer in its optional
 dependency. MI's newer current HEAD includes acceptance machinery, not a silent replacement of the
 tested producer. MI #19/SR #176 do not prove active calibration, live collection, all-scope source
-adoption or CK/Console acceptance. Contract versions are not package versions.
+adoption or CK/Console acceptance. The later SR #222/PR #223 opt-in policy does not upgrade that
+frozen receipt or establish real-source positive adoption. Its conservative ceiling intersection
+does not establish billing, entitlement, physical identity or production activation. Contract versions
+are not package versions.
 
-## Remaining Owner Authority
+Refreshed issue states: SR #174/#179/#180/#181/#184/#185 and MI #13/#16/#18/#19 are closed with
+bounded producer receipts; SR #177/#183/#186/#199 and CC #3/#4/#6/#7/#12 remain open. SR #199 is
+legacy-lane retirement only after accepted replacement/equivalence and explicit migration; MI #17
+remains closed with rejected current operational sharing. MI #16's `OPERATOR_CONTRACT.md` is offline
+full snapshots, `commands=[]`, `replay=false`; it is not a missing mandatory live endpoint. SR #184's
+`source_call_facts` is a trusted local callback in `gateway_coordinator.py`, not a public endpoint;
+eventual remote CK receipt/correction transport remains unverified and lane-local. The refreshed
+current multipart refusals in `gateway_openai.py` and `gateway_responses.py` are unchanged by #223.
+No exact Kilo multipart extension issue was established among these named contracts.
 
-Immediate integration action is owner merge of the exact reviewed/current #103 documentation PR,
-followed by verified canonical publication/acceptance. The primary cannot solve this by another
-branch, `/loop`, tool workaround or direct push. The owner need not relay reviewer prompts/results.
+## Delegated Acceptance And Remaining Authority
+
+PR #104 was merged by the owner. The 2026-10-27 instruction explicitly delegates objective
+postpublication consistency acceptance on the previously approved criteria, then invokes the normal
+repository `/loop` after those gates pass. #103 records exact publication, independent verdict,
+delegated acceptance and actual transition evidence. No redundant owner confirmation is required.
+Documentation-status corrections still use an ordinary reviewed PR; an unmerged correction is not
+canonical publication or evidence of a completed transition. No direct develop push is permitted.
 
 No fundamental architecture choice is left open by this revision. Real live budgets/accounts/effects,
 new producer multipart semantics versus an adapted supported route, remote security exposure beyond

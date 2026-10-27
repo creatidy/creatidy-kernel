@@ -1,9 +1,9 @@
 # Unified Work Coordination Target
 
 The owner-authorized revision is recorded in [ADR 0012](../adr/0012-unified-work-coordination-and-drivers.md).
-While its PR is unmerged, this is the proposed recording of that direction, not integrated product
-authority or an implemented capability. After integration it is the single current target; older
-push/gateway-only diagrams are historical, not alternate architectures. See the
+PR #104 integrated it at `ace7175e087cd70e207594f5631c8f4f70fabfd4` on 2026-10-27.
+It is the single current target, not an implemented capability; older push/gateway-only diagrams
+are historical, not alternate architectures. Canonical publication/acceptance evidence is in #103. See the
 [publication plan and current evidence](backlog-alignment.md) and [roadmap](successor.md).
 
 ## One Core, Two Modes
