@@ -919,6 +919,8 @@ class SQLiteProgramStore:
     def _reserve_work(
         self, program_id: str, attempt_id: str, operation_id: str, category: WorkKind, retained_bytes: int = 0
     ) -> None:
+        if type(category) is not WorkKind or type(retained_bytes) is not int or retained_bytes < 0:
+            raise ValueError("invalid work reservation")
         binding = self._work_binding(program_id)
         if binding is None:
             raise BudgetRefused("configured original work envelope required")
@@ -973,8 +975,6 @@ class SQLiteProgramStore:
         self, program_id: str, attempt_id: str, operation_id: str, category: WorkKind, *, retained_bytes: int = 0
     ) -> None:
         self._assert_writer_thread()
-        if type(category) is not WorkKind or type(retained_bytes) is not int or retained_bytes < 0:
-            raise ValueError("invalid work reservation")
         with self._gate, self._transaction():
             self._reserve_work(program_id, attempt_id, operation_id, category, retained_bytes)
 

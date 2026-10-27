@@ -9,13 +9,14 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from test_sqlite_store import spec
+from test_sqlite_store import OWNER, WORKER, spec
 from test_task_execution import FixtureConnection, deflake_edit, fixture_task, fixture_verification, make_source, run
-from test_work_budget import Clock, policy
+from test_work_budget import Clock, policy, prepare
 
 from creatidy_kernel.adapters import task_execution
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.task_execution import TaskInterrupted, VerificationCommand
+from creatidy_kernel.core.domain import ActivateProgram, FinishAttempt, StartAttempt
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.work_budget import BudgetRefused, ResourceCeiling, WorkKind
 
@@ -159,3 +160,57 @@ def test_uncapped_basic_profile_keeps_unknown_usage_without_blocking_all_work(sq
         )
         store.reserve_work("program-1", "a1", "b", WorkKind.REVIEW)
         assert store.work_budget_status("program-1")["hard_inference_cap"] is False
+
+
+@pytest.mark.parametrize("entrypoint", ["reserve_work", "budgeted_intent"])
+@pytest.mark.parametrize(
+    ("category", "quantity"),
+    [(WorkKind.TOOL, -4096), (WorkKind.TOOL, True), (WorkKind.TOOL, 1.5), (WorkKind.TOOL, "4096"), ("tool", 0)],
+)
+def test_every_reservation_entry_validates_before_replay_and_preserves_capacity(
+    sqlite_tmp_path: Path, entrypoint: str, category: object, quantity: object
+) -> None:
+    path = sqlite_tmp_path / "validated-reservations.sqlite3"
+    base = policy()
+    configured = replace(
+        base, counts=tuple((kind, 2 if kind is WorkKind.TOOL else count) for kind, count in base.counts)
+    )
+    with SQLiteProgramStore(path, boot_clock=Clock()) as store:
+        program = store.create(spec(), "create")
+        store.bind_work_budget(program.program_id, "project", configured, configured, 110)
+        program = store.admit(program.program_id, "activate", ActivateProgram(0, OWNER))
+        program = prepare(store, program, "a1")
+        program = store.admit(program.program_id, "start", StartAttempt(program.revision, WORKER, "a1"))
+        store.admit(program.program_id, "finish", FinishAttempt(program.revision, WORKER, "a1"))
+        before = store.work_budget_status(program.program_id)
+        operations = store.operations()
+        if entrypoint == "reserve_work":
+            with pytest.raises(ValueError, match="invalid work reservation"):
+                store.reserve_work(
+                    program.program_id, "a1", "invalid", cast(WorkKind, category), retained_bytes=cast(int, quantity)
+                )
+        else:
+            with pytest.raises(ValueError, match="invalid work reservation"):
+                store.budgeted_intent(
+                    program.program_id,
+                    "a1",
+                    cast(WorkKind, category),
+                    "invalid",
+                    "invalid",
+                    {},
+                    retained_bytes=cast(int, quantity),
+                )
+        assert store.work_budget_status(program.program_id) == before and store.operations() == operations
+    with SQLiteProgramStore(path, boot_clock=Clock()) as store:
+        assert store.work_budget_status("program-1") == before and store.available_retained_bytes("program-1") == 4096
+        store.budgeted_intent("program-1", "a1", WorkKind.TOOL, "valid", "valid", {}, retained_bytes=4096)
+        retained = store.work_budget_status("program-1")
+        with pytest.raises(ValueError, match="invalid work reservation"):
+            store.budgeted_intent(
+                "program-1", "a1", cast(WorkKind, category), "valid", "valid", {}, retained_bytes=cast(int, quantity)
+            )
+        with pytest.raises(BudgetRefused, match="retained streaming byte capacity"):
+            store.budgeted_intent("program-1", "a1", WorkKind.TOOL, "excess", "excess", {}, retained_bytes=8192)
+        assert store.work_budget_status("program-1") == retained and store.available_retained_bytes("program-1") == 0
+    with SQLiteProgramStore(path, boot_clock=Clock()) as store:
+        assert store.work_budget_status("program-1") == retained and store.available_retained_bytes("program-1") == 0
