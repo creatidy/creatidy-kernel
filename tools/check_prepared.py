@@ -16,6 +16,7 @@ from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.scarcity_router import RuntimeSupport, ScarcityRouterAllocator, requirement_markers
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.authority import Principal
+from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import AuthorityEnvelope, BudgetPolicy, PolicyReference, ProgramStatus
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.intake import (
@@ -28,6 +29,7 @@ from creatidy_kernel.core.intake import (
     encode,
 )
 from creatidy_kernel.core.resources import Allocation, ResourceRequest
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy
 from creatidy_kernel.ports.allocation import decode_allocation, encode_allocation
 from creatidy_kernel.ports.intake import OrdinaryIntake
 
@@ -109,13 +111,21 @@ policy = OwnerPolicy(
     frozenset({"fixture:recipe:v1"}),
     frozenset({"smoke-baseline", "smoke-content"}),
     10,
+    work_budget=WorkBudgetPolicy.basic(1, 1, verifications=1, retained_bytes=1024),
+    project_budget=WorkBudgetPolicy.basic(1, 1, verifications=1, retained_bytes=1024),
+    project_id="installed-prepared-synthetic-project",
 )
 # This Principal is ONLY the deliberate synthetic fixture; production callers authenticate externally.
 principal = Principal("synthetic-owner", "owner")
-with SQLiteProgramStore(state / "prepared.db") as store:
+with SQLiteProgramStore(
+    state / "prepared.db", boot_clock=lambda: BootClockReading(100, 1_000_000_000, "prepared-synthetic-boot")
+) as store:
     intake = OrdinaryIntake(store, reader, lambda: 100)
     draft = intake.prepare("installed-smoke", subject, meaning, expected_parent=None)
     approved = intake.approve(principal, draft, policy, decision_id="smoke-decision", expires_at=110)
+    original_budget = store.work_budget_status(approved.program.program_id)
+    if original_budget["binding"] is None or original_budget["reservations"] != []:
+        raise SystemExit("Installed ordinary policy binding is missing or minted execution usage")
     refusal = intake.handoff(principal, approved, policy, ScarcityRouterAllocator)
     if (
         not isinstance(refusal, TranslationRefusal)
@@ -125,11 +135,15 @@ with SQLiteProgramStore(state / "prepared.db") as store:
         or refusal.reason != "ordinary_requirement_mapping_unavailable"
     ):
         raise SystemExit("Installed ordinary intake contract failed")
-with SQLiteProgramStore(state / "prepared.db") as store:
+with SQLiteProgramStore(
+    state / "prepared.db", boot_clock=lambda: BootClockReading(100, 1_000_000_000, "prepared-synthetic-boot")
+) as store:
     intake = OrdinaryIntake(store, reader, lambda: 100)
     recovered = intake.approve(principal, draft, policy, decision_id="smoke-decision", expires_at=110)
     if recovered.program != approved.program or recovered.decision_bytes != approved.decision_bytes:
         raise SystemExit("Installed ordinary approval recovery differs")
+    if store.work_budget_status(recovered.program.program_id) != original_budget:
+        raise SystemExit("Installed ordinary policy recovery reset its envelope")
 
 requirement: dict[str, object] = {
     "task_level": "L2",
@@ -190,7 +204,9 @@ try:
         (Allocation("fixture-harness", "openai", "synthetic-model", frozenset(), 2048, "synthetic binding"),),
         runtime_support=(RuntimeSupport("fixture-harness", "synthetic-v1", frozenset(), 0, "fixture:harness-proof"),),
     )
-    with SQLiteProgramStore(state / "prepared.db") as store:
+    with SQLiteProgramStore(
+        state / "prepared.db", boot_clock=lambda: BootClockReading(100, 1_000_000_000, "prepared-synthetic-boot")
+    ) as store:
         intake = OrdinaryIntake(store, reader, lambda: 100)
         positive = intake.prepare("installed-smoke", subject, typed, expected_parent=draft.digest)
         approved_positive = intake.approve(principal, positive, policy, decision_id="typed-decision", expires_at=110)

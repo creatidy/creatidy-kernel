@@ -99,4 +99,8 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
         )
     with tempfile.TemporaryDirectory(prefix="source-", dir=storage_root) as source_directory:
         subprocess.run([str(python), "-I", str(ROOT / "tools/check_source.py"), source_directory], cwd=work, check=True)
+    with tempfile.TemporaryDirectory(prefix="work-budget-", dir=storage_root) as budget_directory:
+        subprocess.run(
+            [str(python), "-I", str(ROOT / "tools/check_work_budget.py"), budget_directory], cwd=work, check=True
+        )
 print("Package check: wheel metadata/license, sdist rebuild, isolated install and CLI replay/export passed.")

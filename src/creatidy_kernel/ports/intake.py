@@ -37,6 +37,7 @@ from creatidy_kernel.core.intake import (
     strings,
 )
 from creatidy_kernel.core.resources import Allocation, ResourceRequest
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy
 from creatidy_kernel.ports.program_store import ApplicationStore, OperationRecord, ProgramReadChanged
 from creatidy_kernel.ports.resources import ResourceAllocator
 
@@ -71,6 +72,9 @@ class RequirementsAllocator(RequirementsTranslator, ResourceAllocator, Protocol)
 
 
 class IntakeStore(ApplicationStore, Protocol):
+    def bind_work_budget(
+        self, program_id: str, project_id: str, project: WorkBudgetPolicy, task: WorkBudgetPolicy, deadline: int
+    ) -> None: ...
     def operations(self, prefix: str = "") -> tuple[OperationRecord, ...]: ...
     def find_program(self, program_id: str) -> Program | None: ...
     def program_read_cut[T](
@@ -623,6 +627,14 @@ class OrdinaryIntake:
                 current_program = self._final_program(
                     program_id, current_program.spec.digest, principal, draft, policy, current, expires_at
                 )
+                if (
+                    policy.work_budget is not None
+                    and policy.project_budget is not None
+                    and policy.project_id is not None
+                ):
+                    self.store.bind_work_budget(
+                        program_id, policy.project_id, policy.project_budget, policy.work_budget, expires_at
+                    )
                 return ApprovedMeaning(draft, decision_id, decision, current_program)
             if consumed.get("expected_revision") != current_program.revision:
                 raise IntakeRefused("approval recovery no longer matches Program")
@@ -689,6 +701,10 @@ class OrdinaryIntake:
                 AmendProgramSpec(program.revision, principal.actor_id, amendment),
             )
         program = self._final_program(program_id, program.spec.digest, principal, draft, policy, current, expires_at)
+        if policy.work_budget is not None and policy.project_budget is not None and policy.project_id is not None:
+            self.store.bind_work_budget(
+                program_id, policy.project_id, policy.project_budget, policy.work_budget, expires_at
+            )
         return ApprovedMeaning(draft, decision_id, decision, program)
 
     def handoff(

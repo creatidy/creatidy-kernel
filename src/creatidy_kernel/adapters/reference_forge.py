@@ -14,6 +14,7 @@ from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.sqlite_store import OperationConflict, SQLiteProgramStore
 from creatidy_kernel.core.execution import OperationKey
 from creatidy_kernel.core.forge import Effect, EffectStatus, ForgeConflict, Receipt, Reference
+from creatidy_kernel.core.work_budget import BudgetRefused, WorkKind
 from creatidy_kernel.ports.forge import Forge
 
 PR_OPERATION = "reference:pr"
@@ -68,6 +69,7 @@ def deliver_reference_pr(
     title: str = "Bounded two-node reference result",
     body: str | None = None,
     authorize_dispatch: Callable[[], bool] = lambda: True,
+    budget_subject: tuple[str, str] | None = None,
 ) -> dict[str, object]:
     """Called by the trusted application only after exact-head acceptance.
 
@@ -100,7 +102,22 @@ def deliver_reference_pr(
             "acceptance_reference": acceptance_reference,
             "topic": fresh_agit_topic(),
         }
-        operation = store.intent(operation_id, operation_id, request)
+        if budget_subject is None:
+            operation = store.intent(operation_id, operation_id, request)
+        else:
+            try:
+                operation = store.budgeted_intent(
+                    *budget_subject, WorkKind.AUXILIARY, operation_id, operation_id, request
+                )
+            except BudgetRefused as refused:
+                return {
+                    "mode": mode,
+                    "operation_id": operation_id,
+                    "head": head,
+                    "status": "budget_exhausted",
+                    "reference": None,
+                    "reason": str(refused),
+                }
     expected = (mode, repository.value, head, base_branch, acceptance_reference)
     if (
         tuple(request.get(key) for key in ("mode", "repository", "head", "base_branch", "acceptance_reference"))
@@ -123,6 +140,8 @@ def deliver_reference_pr(
     if first_delivery:
         if not authorize_dispatch():
             return result
+        if budget_subject is not None:
+            store.budgeted_intent(*budget_subject, WorkKind.AUXILIARY, operation_id, operation_id, request)
         store.claim(operation_id, now=now, lease_seconds=1)
         operation = store.operation(operation_id)
     effect = Effect(
@@ -179,6 +198,15 @@ def deliver_reference_pr(
                     reference=receipt.reference.value if recovered and receipt.reference is not None else None,
                     matched_digest=operation.request_digest if recovered else None,
                 )
+        if budget_subject is not None and receipt.status in {
+            EffectStatus.ACCEPTED,
+            EffectStatus.REJECTED,
+            EffectStatus.STALE,
+        }:
+            store.record_work_settlement(
+                operation_id,
+                receipt.reference.value if receipt.reference is not None else f"publication:{receipt.status.value}",
+            )
         return _result(result, receipt, fault, store.operation(operation_id).status)
 
 

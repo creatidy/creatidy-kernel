@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from creatidy_kernel.core.domain import AuthorityEnvelope, BudgetPolicy, PolicyReference
 from creatidy_kernel.core.forge import Observation, Presence
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy
 
 
 class IntakeRefused(ValueError):
@@ -249,6 +250,9 @@ class OwnerPolicy:
     evidence_producers: frozenset[str]
     freshness_seconds: int
     repair_baseline_reference: str | None = None
+    work_budget: WorkBudgetPolicy | None = None
+    project_budget: WorkBudgetPolicy | None = None
+    project_id: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -264,6 +268,13 @@ class OwnerPolicy:
             raise IntakeRefused("explicit recipe and producer policy required")
         if type(self.freshness_seconds) is not int or self.freshness_seconds <= 0:
             raise IntakeRefused("explicit positive evidence freshness required")
+        if any(value is not None for value in (self.work_budget, self.project_budget, self.project_id)) and (
+            type(self.work_budget) is not WorkBudgetPolicy
+            or type(self.project_budget) is not WorkBudgetPolicy
+            or type(self.project_id) is not str
+            or not self.project_id.strip()
+        ):
+            raise IntakeRefused("work and project budget policy require one explicit capacity authority")
 
     def payload(self) -> dict[str, object]:
         return {
@@ -280,6 +291,15 @@ class OwnerPolicy:
             "evidence_producers": sorted(self.evidence_producers),
             "freshness_seconds": self.freshness_seconds,
             "repair_baseline_reference": self.repair_baseline_reference,
+            **(
+                {
+                    "work_budget": self.work_budget.payload(),
+                    "project_budget": self.project_budget.payload(),
+                    "project_id": self.project_id,
+                }
+                if self.work_budget is not None and self.project_budget is not None
+                else {}
+            ),
         }
 
     @property

@@ -46,6 +46,7 @@ from creatidy_kernel.core.execution import (
 )
 from creatidy_kernel.core.forge import Presence, Reference
 from creatidy_kernel.core.resources import Allocation
+from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy
 from creatidy_kernel.ports.allocation import load_allocation
 from creatidy_kernel.ports.application import advance_work_unit, manifest_bytes
 from creatidy_kernel.ports.forge import Forge
@@ -127,6 +128,14 @@ def run_live_reference(
             program = store.load("reference")
         except ProgramNotFound:
             program = store.create(reference_spec(), "create")
+        budget = WorkBudgetPolicy.basic(
+            program.spec.budget.max_attempts,
+            program.spec.budget.max_active_attempts,
+            verifications=program.spec.budget.max_attempts * len(POLICY.checks),
+            retained_bytes=64 * 1024,
+            auxiliary=1,
+        )
+        store.bind_work_budget("reference", repository.value, budget, budget, deadline)
         if now < deadline and program.status is not ProgramStatus.COMPLETED:
             remote_base = forge.branch(repository, "develop")
             if remote_base.presence is not Presence.FOUND or remote_base.revision != Reference(f"forgejo:{base}"):
@@ -161,10 +170,17 @@ def run_live_reference(
                 reasoning_effort=selected.reasoning_effort,
             )
 
+        def work_authorized() -> bool:
+            try:
+                store.check_work_authority("reference")
+            except BudgetRefused:
+                return False
+            return True
+
         def authorize(request: ExecutionRequest) -> bool:
             operation = store.operation(request.operation.operation_id)
             return (
-                int(time.time()) < deadline
+                work_authorized()
                 and operation.status == "dispatched"
                 and operation.fence == request.fence
                 and operation.request_digest == request.operation.request_digest
@@ -206,7 +222,7 @@ def run_live_reference(
         status = "budget_exhausted"
         used = len(store.operations("reference:live-poll:"))
         for index in range(used, max_observations + 1):
-            if int(time.time()) >= deadline:
+            if not work_authorized():
                 break
             program = store.load("reference")
             pending = [
@@ -230,6 +246,8 @@ def run_live_reference(
                     acceptance_reference=str(accepted["manifest"]),
                     forge=forge,
                     repository=repository,
+                    authorize_dispatch=work_authorized,
+                    budget_subject=("reference", "reference:second"),
                 )
                 if receipt.get("status") == "accepted":
                     try:

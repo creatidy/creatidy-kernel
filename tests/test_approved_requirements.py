@@ -99,8 +99,19 @@ def test_intake_http_original_subject_and_durable_unknown_recovery(
     sqlite_tmp_path: Path, requirement: dict[str, object]
 ) -> None:
     scenario = Scenario()
+    from creatidy_kernel.core.deadlines import BootClockReading
+    from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+
+    budget = WorkBudgetPolicy.basic(1, 1, verifications=1, retained_bytes=65536)
+
+    def budget_clock() -> BootClockReading:
+        return BootClockReading(100, 1_000_000_000, "synthetic-approved-requirements")
+
     trusted_policy = replace(
         policy(),
+        work_budget=budget,
+        project_budget=budget,
+        project_id="synthetic-requirements-project",
         authority=AuthorityEnvelope(
             "owner", trusted_satisfaction_issuers=frozenset({"verifier"}), delegated_actor_ids=frozenset({"worker"})
         ),
@@ -108,7 +119,7 @@ def test_intake_http_original_subject_and_durable_unknown_recovery(
     meaning = declaration(**requirement_markers(requirement), context=[])
     path = sqlite_tmp_path / "ordinary.db"
     document = response(requirement)
-    with server(encode(document)) as (origin, requests), SQLiteProgramStore(path) as store:
+    with server(encode(document)) as (origin, requests), SQLiteProgramStore(path, boot_clock=budget_clock) as store:
         allocator = ScarcityRouterAllocator(origin, (BINDING,), runtime_support=(SUPPORT,))
         intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
         draft = intake.prepare("issue51", SUBJECT, meaning, expected_parent=None)
@@ -177,7 +188,7 @@ def test_intake_http_original_subject_and_durable_unknown_recovery(
         def select(self, request: ResourceRequest) -> Allocation:
             pytest.fail("existing Attempt must never select again")
 
-    with SQLiteProgramStore(path) as store:
+    with SQLiteProgramStore(path, boot_clock=budget_clock) as store:
         assert OrdinaryIntake(store, scenario.reader, lambda: 100).history("issue51") == (draft,)
 
         def lost_receipt(point: str) -> None:

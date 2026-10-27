@@ -795,14 +795,19 @@ def test_cancellation_during_verification_stops_further_commands(
     requested = [False]
     calls: list[tuple[str, ...]] = []
     original = cast(
-        "Callable[[Path, VerificationCommand, int, Mapping[str, str]], dict[str, object]]",
+        "Callable[[Path, VerificationCommand, int, Mapping[str, str], Callable[[], bool], int], dict[str, object]]",
         inspect.getattr_static(task_execution, "_run_command"),
     )
 
     def interrupt_after_command(
-        workspace: Path, command: VerificationCommand, repeat: int, supplied: Mapping[str, str]
+        workspace: Path,
+        command: VerificationCommand,
+        repeat: int,
+        supplied: Mapping[str, str],
+        authorized: Callable[[], bool],
+        max_bytes: int,
     ) -> dict[str, object]:
-        result = original(workspace, command, repeat, supplied)
+        result = original(workspace, command, repeat, supplied, authorized, max_bytes)
         calls.append(command.argv)
         requested[0] = True
         return result

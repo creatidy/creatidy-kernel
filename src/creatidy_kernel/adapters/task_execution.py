@@ -18,7 +18,9 @@ import json
 import math
 import os
 import re
+import selectors
 import shutil
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -26,11 +28,13 @@ import time
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, closing
 from dataclasses import asdict, dataclass, field, replace
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
 
+from creatidy_kernel.adapters.boot_clock import read_boot_clock
 from creatidy_kernel.adapters.codex_discovery import (
     CODEX_VERSION_PATTERN,
     CodexDiscoveryFailure,
@@ -62,6 +66,7 @@ from creatidy_kernel.adapters.sqlite_store import (
     SQLiteProgramStore,
     validate_local_storage,
 )
+from creatidy_kernel.core.deadlines import BootClockReading, DeadlineProjection
 from creatidy_kernel.core.domain import (
     ActivateProgram,
     Attempt,
@@ -96,8 +101,10 @@ from creatidy_kernel.core.execution import (
 )
 from creatidy_kernel.core.forge import EffectStatus, Presence, Reference, UnsupportedForge
 from creatidy_kernel.core.knowledge import export_document
+from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
+from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.allocation import (
     decode_runtime_receipt_with_group,
     encode_allocation,
@@ -852,27 +859,82 @@ def _run_command(
     command: VerificationCommand,
     repeat: int,
     supplied: Mapping[str, str],
+    authorized: Callable[[], bool] = lambda: True,
+    max_bytes: int = MAX_CAPTURE_BYTES,
 ) -> dict[str, object]:
     environment = {"HOME": str(workspace), "PATH": os.defpath, "LANG": "C.UTF-8"}
     for key in COMMAND_ENV_KEYS:
         if supplied.get(key):
             environment[key] = supplied[key]
     started = time.monotonic()
+    output = [bytearray(), bytearray()]
+    timed_out = False
+    output_exhausted = False
+    authority_lost = False
+    settled = False
+    if not authorized():
+        return {
+            "argv": list(command.argv),
+            "repeat": repeat,
+            "exit_code": None,
+            "timed_out": False,
+            "duration_ms": 0,
+            "observed_at": int(time.time()),
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "retained_bytes": 0,
+            "output_exhausted": False,
+            "authority_lost": True,
+            "owned_group_settled": True,
+            "dispatch": "not_started",
+        }
+    process = subprocess.Popen(  # noqa: S603 - trusted task-spec argv, no shell, pinned cwd.
+        list(command.argv),
+        cwd=workspace,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
     try:
-        completed = subprocess.run(  # noqa: S603 - trusted task-spec argv, no shell, pinned cwd.
-            list(command.argv),
-            cwd=workspace,
-            env=environment,
-            capture_output=True,  # noqa: S603
-            timeout=command.timeout_seconds,
-        )
-        exit_code: int | None = completed.returncode
-        timed_out = False
-        stdout, stderr = completed.stdout, completed.stderr
-    except subprocess.TimeoutExpired as expired:
-        exit_code, timed_out = None, True
-        stdout = expired.stdout or b""
-        stderr = expired.stderr or b""
+        with selectors.DefaultSelector() as selector:
+            for index, pipe in enumerate((process.stdout, process.stderr)):
+                if pipe is not None:
+                    selector.register(pipe, selectors.EVENT_READ, index)
+            while selector.get_map() or process.poll() is None:
+                timed_out = time.monotonic() - started >= command.timeout_seconds
+                authority_lost = not authorized()
+                if timed_out or authority_lost or output_exhausted:
+                    break
+                for key, _ in selector.select(0.05):
+                    chunk = os.read(key.fd, min(8192, max_bytes + 1))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    remaining = max_bytes - sum(len(part) for part in output)
+                    output[int(key.data)].extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        output_exhausted = True
+                        break
+    finally:
+        # The original group is owned for this invocation only. Never recover a PID.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            settled = True
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+    exit_code = process.returncode
     duration_ms = int((time.monotonic() - started) * 1000)
     return {
         "argv": list(command.argv),
@@ -880,8 +942,14 @@ def _run_command(
         "exit_code": exit_code,
         "timed_out": timed_out,
         "duration_ms": duration_ms,
-        "stdout_tail": stdout[-MAX_CAPTURE_BYTES:].decode("utf-8", "replace"),
-        "stderr_tail": stderr[-MAX_CAPTURE_BYTES:].decode("utf-8", "replace"),
+        "observed_at": int(time.time()),
+        "stdout_tail": output[0].decode("utf-8", "replace"),
+        "stderr_tail": output[1].decode("utf-8", "replace"),
+        "retained_bytes": sum(len(part) for part in output),
+        "output_exhausted": output_exhausted,
+        "authority_lost": authority_lost,
+        "owned_group_settled": settled,
+        "escaped_descendants": "unverified; trusted-development is not containment",
     }
 
 
@@ -993,11 +1061,55 @@ class TaskChecks:
                 f"{len(self.task.verification)} trusted command(s)"
             )
             runs: list[dict[str, object]] = []
-            for command in self.task.verification:
+            for command_index, command in enumerate(self.task.verification):
                 for repeat in range(1, command.repeats + 1):
                     if not self.authorized():
                         return self._evidence(name, subject, False, {"runs": runs, "reason": "authority unavailable"})
-                    runs.append(_run_command(self.workspace, command, repeat, self.command_environment))
+                    key = f"command:{ATTEMPT_ID}:{self.head}:{command_index}:{repeat}"
+                    result_data = self.store.find_artifact(OPERATION_ID, key)
+                    if result_data is not None:
+                        run = cast(dict[str, object], json.loads(result_data))
+                    else:
+                        # A crash after reservation but before the durable result is
+                        # uncertain work, not permission to execute the command twice.
+                        prior = self.store.work_budget_status(PROGRAM_ID)["reservations"]
+                        if any(item["operation"] == key for item in cast(list[dict[str, object]], prior)):
+                            return self._evidence(
+                                name, subject, False, {"runs": runs, "reason": "prior command result unknown"}
+                            )
+                        allowance = min(MAX_CAPTURE_BYTES, self.store.available_retained_bytes(PROGRAM_ID))
+                        if allowance <= 0:
+                            return self._evidence(
+                                name, subject, False, {"runs": runs, "reason": "retained byte budget exhausted"}
+                            )
+                        self.store.reserve_work(PROGRAM_ID, ATTEMPT_ID, key, WorkKind.TOOL, retained_bytes=allowance)
+                        run = _run_command(
+                            self.workspace, command, repeat, self.command_environment, self.authorized, allowance
+                        )
+                    reference = self.store.finalize_artifact(OPERATION_ID, key, manifest_bytes(run))
+                    self.store.record_retained_bytes(key, cast(int, run["retained_bytes"]))
+                    self.store.record_usage(
+                        key,
+                        UsageObservation(
+                            f"{key}:elapsed",
+                            ATTEMPT_ID,
+                            key,
+                            "elapsed",
+                            "milliseconds",
+                            Decimal(cast(int, run["duration_ms"])),
+                            Provenance.MEASUREMENT,
+                            "kernel:verification-clock",
+                            cast(int, run["observed_at"]),
+                        ),
+                    )
+                    if run["owned_group_settled"] is True:
+                        self.store.record_work_settlement(key, reference)
+                    runs.append(run)
+                    if (
+                        any(runs[-1].get(key) is True for key in ("timed_out", "authority_lost", "output_exhausted"))
+                        or runs[-1].get("owned_group_settled") is not True
+                    ):
+                        return self._evidence(name, subject, False, {"runs": runs, "reason": "bounded command stopped"})
                     if self.fault is not None:
                         self.fault("verification")
             entries = _porcelain(self.workspace)
@@ -1283,6 +1395,8 @@ def export_task_store(store: SQLiteProgramStore) -> dict[str, object]:
         "mode": mode.get("mode"),
         "task": mode.get("task"),
         "deadline": mode.get("deadline"),
+        "deadline_projection": mode.get("deadline_projection"),
+        "work_budget": store.work_budget_status(PROGRAM_ID),
         "base": base,
         "attempts": attempts,
         "trust_mode": "trusted_development",
@@ -1466,6 +1580,8 @@ def run_task(
     fault: str | None = None,
     cancel_requested: bool = False,
     cancellation_requested: Callable[[], bool] | None = None,
+    boot_clock: Callable[[], BootClockReading | None] = read_boot_clock,
+    work_policy: WorkBudgetPolicy | None = None,
 ) -> dict[str, object]:
     """Run or recover one frozen task through the bounded K1-K8 composition.
 
@@ -1508,7 +1624,7 @@ def run_task(
             lifecycle.append(f"interrupted after {boundary}; rerun to reconcile")
             raise TaskInterrupted(f"interrupted after {boundary}; rerun to reconcile")
 
-    with SQLiteProgramStore(directory / "kernel.sqlite3") as store, ExitStack() as cleanup:
+    with SQLiteProgramStore(directory / "kernel.sqlite3", boot_clock=boot_clock) as store, ExitStack() as cleanup:
         cancellation_lease = _owned_group_lease_seconds(connection)
         cancellation_latched = False
         close_owned_group, observe_owned_group, observe_owned_group_reference = owned_group_callbacks(connection)
@@ -1519,6 +1635,7 @@ def run_task(
             nonlocal cancellation_latched
             cancellation_latched = True
             key = f"cancel:{attempt_id}"
+            store.revoke_work_budget(PROGRAM_ID, key)
             try:
                 recorded = store.operation(key)
             except OperationConflict as error:
@@ -1897,6 +2014,8 @@ def run_task(
                     reference=handle,
                 )
             finish_cancelled_attempt(attempt.attempt_id)
+            if store.has_work_budget(PROGRAM_ID):
+                store.record_work_settlement(operation.operation_id, settlement_reference)
 
         def mark_cancellation_uncertain(cancellation_id: str, cancellation: OperationRecord) -> None:
             if cancellation.status == "dispatched":
@@ -1925,10 +2044,15 @@ def run_task(
             if str(error) != "unknown operation":
                 raise
             mode_recorded = None
+        projection: DeadlineProjection | None = None
         if mode_recorded is None:
             if existing_database:
                 raise ValueError("existing database is not this neutral task")
             deadline = deadline if deadline is not None else now + 3300
+            reading = boot_clock()
+            if reading is None:
+                raise UnsupportedExecution("verified suspend-inclusive boot clock unavailable")
+            projection = DeadlineProjection.bind(deadline, reading)
             store.intent(
                 "task_execution:mode",
                 "task_execution:mode",
@@ -1938,6 +2062,7 @@ def run_task(
                     "task_digest": task.digest,
                     "expected_base_sha": task.expected_base_sha,
                     "deadline": deadline,
+                    "deadline_projection": asdict(projection),
                     "version": version,
                     "repository": task.forge_repository,
                     "source": str(source_repository),
@@ -1992,13 +2117,36 @@ def run_task(
                 raise UnsupportedExecution("recovery requires original trusted support evidence")
             deadline = recorded_deadline
         assert deadline is not None  # noqa: S101 - established by durable envelope validation.
+        if mode_recorded is not None:
+            raw_projection = mode_recorded.get("deadline_projection")
+            projection = None
+            if type(raw_projection) is dict:
+                try:
+                    projection = DeadlineProjection.decode(cast(dict[str, object], raw_projection))
+                except (TypeError, ValueError):
+                    pass
+            if projection is not None and projection.wall_deadline != deadline:
+                raise ValueError("original deadline projection differs from wall envelope")
+
+        def decision_time() -> int:
+            return deadline if projection is None else projection.decision_time(boot_clock())
+
+        def authority_current() -> bool:
+            if cancellation_requested_now() or decision_time() >= deadline:
+                return False
+            try:
+                store.check_work_authority(PROGRAM_ID)
+            except BudgetRefused:
+                return False
+            return True
+
         if isinstance(connection, CodexStdio):
             previous_before_close = connection.before_close
             previous_after_close = connection.after_close
 
             def before_owned_close() -> None:
                 nonlocal retirement_context
-                if cancellation_requested_now() or int(time.time()) >= deadline:
+                if cancellation_requested_now() or decision_time() >= deadline:
                     cancel_record = record_cancellation(ATTEMPT_ID, OPERATION_ID)
                     if (
                         retirement_context is None
@@ -2121,6 +2269,23 @@ def run_task(
             program = store.create(task_program_spec(task), "create")
         if program.spec != task_program_spec(task):
             raise ValueError("durable task intent differs from the frozen task specification")
+        counts = WorkBudgetPolicy.basic(
+            program.spec.budget.max_attempts,
+            program.spec.budget.max_active_attempts,
+            verifications=program.spec.budget.max_attempts * len(POLICY.checks),
+            retained_bytes=MAX_CAPTURE_BYTES,
+            auxiliary=1,
+        )
+        counts = replace(
+            counts,
+            counts=tuple(
+                (kind, sum(command.repeats for command in task.verification) if kind is WorkKind.TOOL else count)
+                for kind, count in counts.counts
+            ),
+        )
+        configured = work_policy if work_policy is not None else counts
+        if projection is not None:
+            store.configure_work_budget(PROGRAM_ID, task.forge_repository, configured, configured, projection)
         if program.status is ProgramStatus.DRAFT:
             program = store.admit(PROGRAM_ID, "activate", ActivateProgram(program.revision, "owner"))
             lifecycle.append("task admitted: owner-approved frozen task")
@@ -2196,7 +2361,7 @@ def run_task(
                 fault=crash,
                 captured=captured,
                 command_environment=command_environment,
-                authorized=lambda: not cancellation_requested_now() and int(time.time()) < deadline,
+                authorized=authority_current,
             )
 
             def resolve(request: ExecutionRequest) -> CodexInputs:
@@ -2225,8 +2390,8 @@ def run_task(
                 def current() -> bool:
                     operation = store.operation(request.operation.operation_id)
                     return (
-                        not cancellation_requested_now()
-                        and int(time.time()) < deadline
+                        authority_current()
+                        and decision_time() < deadline
                         and operation.status == "dispatched"
                         and operation.fence == request.fence
                         and operation.request_digest == request.operation.request_digest
@@ -2272,18 +2437,22 @@ def run_task(
                         fault=crash,
                         restore=restore,
                         artifact_path=CANDIDATE_PATH,
-                        clock=lambda: int(time.time()),
+                        clock=decision_time,
                         deadline=deadline,
                         cancel_requested=cancellation_requested_now,
                     )
                 )
+            except BudgetRefused as error:
+                lifecycle.append(f"work admission refused: {error}")
+                status = "budget_exhausted"
+                cancellation_pending = bool(store.load(PROGRAM_ID).attempts)
             except (ExecutionConflict, OSError, RuntimeError, ValueError):
-                if not cancellation_requested_now() and int(time.time()) < deadline:
+                if authority_current():
                     raise
                 status = "cancel_uncertain"
             cancellation_pending = cancellation_pending or cancellation_requested_now()
-            if cancellation_pending or (int(time.time()) >= deadline and status != "accepted"):
-                status = "expired" if int(time.time()) >= deadline else "cancel_uncertain"
+            if cancellation_pending or (decision_time() >= deadline and status != "accepted"):
+                status = "expired" if decision_time() >= deadline else "cancel_uncertain"
                 program = store.load(PROGRAM_ID)
                 for attempt in program.attempts:
                     operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
@@ -2638,7 +2807,7 @@ def run_task(
                 operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
                 record_cancellation(attempt.spec.attempt_id, operation.operation_id)
         if program.state(UNIT_ID).status is WorkUnitStatus.SATISFIED:
-            if cancellation_pending or int(time.time()) >= deadline:
+            if cancellation_pending or decision_time() >= deadline:
                 try:
                     delivery = store.operation(PR_OPERATION)
                 except OperationConflict as error:
@@ -2669,7 +2838,8 @@ def run_task(
                 schema="task-pr-v1",
                 title=task.pr_title,
                 body=f"{task.pr_body}\n\nTask: {task.task_id}. Accepted result: {accepted['manifest']}.",
-                authorize_dispatch=lambda: not cancellation_requested_now() and int(time.time()) < deadline,
+                authorize_dispatch=authority_current,
+                budget_subject=(PROGRAM_ID, ATTEMPT_ID),
             )
             if receipt.get("interrupted"):
                 raise TaskInterrupted(f"interrupted after {receipt['interrupted']}; rerun to reconcile")
@@ -2700,7 +2870,7 @@ def run_task(
             return result
         result = export_task_store(store)
         result.update(
-            condition=status,
+            condition="unknown" if projection is None or not projection.verifiable(boot_clock()) else status,
             verification=captured,
             lifecycle=lifecycle,
             isolation="not attested; trusted development only",

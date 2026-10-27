@@ -43,6 +43,7 @@ from creatidy_kernel.core.execution import (
 from creatidy_kernel.core.knowledge import export_document
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy
 from creatidy_kernel.ports.allocation import decode_identity, identity_matches, is_legacy_allocation, load_allocation
 from creatidy_kernel.ports.application import Collection, advance_work_unit, manifest_bytes
 from creatidy_kernel.ports.resources import ResourceAllocator
@@ -385,6 +386,7 @@ def reference_export(store: SQLiteProgramStore) -> dict[str, object]:
         "mode": mode,
         "program": program.program_id,
         "status": program.status.value,
+        "work_budget": store.work_budget_status(program.program_id),
         "trust_mode": "trusted_development",
         "isolation": "none; deterministic synthetic worker" if mode == "offline" else "not attested",
         "attempts": attempts,
@@ -469,6 +471,20 @@ def run_reference(
             program = store.create(reference_spec(), "create")
         if program.spec != reference_spec():
             raise ValueError("reference intent differs from durable owner-approved spec")
+        budget = WorkBudgetPolicy.basic(
+            program.spec.budget.max_attempts,
+            program.spec.budget.max_active_attempts,
+            verifications=program.spec.budget.max_attempts * len(POLICY.checks),
+            retained_bytes=64 * 1024,
+            auxiliary=1,
+        )
+        store.bind_work_budget(
+            "reference",
+            "synthetic-reference",
+            budget,
+            budget,
+            store.original_work_deadline("reference") or int(time.time()) + 3600,
+        )
         if program.status is ProgramStatus.DRAFT:
             program = store.admit("reference", "activate", ActivateProgram(program.revision, "owner"))
 
@@ -514,6 +530,8 @@ def run_reference(
             head=str(accepted["head"]),
             acceptance_reference=str(accepted["manifest"]),
             fault=fault,
+            authorize_dispatch=lambda: _reference_authorized(store),
+            budget_subject=("reference", "reference:second"),
         )
         if receipt.get("status") == "accepted":
             try:
@@ -525,3 +543,8 @@ def run_reference(
         result["pr_observation"] = "current adapter readback"
         result["head"] = accepted["head"]
         return result
+
+
+def _reference_authorized(store: SQLiteProgramStore) -> bool:
+    store.check_work_authority("reference")
+    return True
