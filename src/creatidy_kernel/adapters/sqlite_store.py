@@ -718,6 +718,12 @@ class SQLiteProgramStore:
         existing = self._work_binding(program_id)
         if existing is None and self._load_head(program_id).attempts:
             raise BudgetRefused("legacy Attempt lacks original work-budget proof; reconciliation required")
+        origin = self._work_record("clock-origin", program_id)
+        if origin is not None:
+            if projection != DeadlineProjection.decode(origin["projection"]):
+                raise BudgetRefused("original work projection cannot be renewed")
+            if existing is None and origin["spec_digest"] != self._load_head(program_id).spec.digest:
+                raise BudgetRefused("prepared clock origin belongs to a different specification")
         self._write_work_record("project", project_id, {"project": project_id, "policy": project.payload()})
         fields: dict[str, object] = {
             "program": program_id,
@@ -763,25 +769,20 @@ class SQLiteProgramStore:
             changes = self._connection.total_changes
             current = self.find_program(spec.program_id)
             existing = self._work_binding(spec.program_id)
-            if existing is not None:
-                projection = DeadlineProjection.decode(existing["projection"])
+            origin = self.pending_work_projection(spec)
+            if existing is not None or origin is not None:
+                projection = DeadlineProjection.decode(existing["projection"]) if existing is not None else origin
+                assert projection is not None  # noqa: S101 - original evidence checked above.
                 if (
                     deadline.wall_deadline if isinstance(deadline, DeadlineProjection) else deadline
                 ) != projection.wall_deadline:
                     raise BudgetRefused("original work expiry cannot be renewed")
                 if isinstance(deadline, DeadlineProjection) and deadline != projection:
                     raise BudgetRefused("original work projection cannot be renewed")
-                if existing["project"] != project_id or existing["policy"] != task.payload():
+                if existing is not None and (existing["project"] != project_id or existing["policy"] != task.payload()):
                     raise BudgetRefused("specification revision cannot reset original work envelope")
-                if validate is not None or amendment is not None:
-                    reading = readings.get(spec.program_id)
-                    if reading is None or not projection.verifiable(reading):
-                        raise BudgetRefused("original work deadline expired or boot clock unverifiable")
-                    previous = self._clock_watermarks[spec.program_id]
-                    if reading.wall < previous.wall or reading.boot_ns < previous.boot_ns:
-                        raise BudgetRefused("observed wall/boot clock rollback; no new work authority")
-                    if projection.decision_time(reading) >= projection.wall_deadline:
-                        raise BudgetRefused("original work deadline expired or boot clock unverifiable")
+                if existing is None or validate is not None or amendment is not None:
+                    self._check_work_projection(spec.program_id, projection, readings.get(spec.program_id))
             else:
                 projection = self._new_work_projection(deadline, readings)
             if project.strict_inference or task.strict_inference:
@@ -791,10 +792,27 @@ class SQLiteProgramStore:
                 raise BudgetRefused("project policy cannot replace original capacity authority")
             if current is not None and existing is None and current.attempts:
                 raise BudgetRefused("legacy Attempt lacks original work-budget proof; reconciliation required")
+            if self._closed or self._connection.total_changes != changes:
+                raise ProgramReadChanged("final store read cut changed during a callback")
+            if existing is None and origin is None:
+                # A prepared clock origin is evidence, not an accepted budget or
+                # Program. Keep it independently so failure/retry cannot renew it.
+                with self._transaction(readings):
+                    self._write_work_record(
+                        "clock-origin",
+                        spec.program_id,
+                        {"program": spec.program_id, "spec_digest": spec.digest, "projection": asdict(projection)},
+                    )
+                changes = self._connection.total_changes
             if validate is not None:
                 validate()
             if self._closed or self._connection.total_changes != changes:
                 raise ProgramReadChanged("final store read cut changed during a callback")
+            # Nothing that can block on caller validation runs after this final
+            # independent capture. Preserve the original anchors, not a new bind.
+            readings = self._prepare_work_clocks()
+            if existing is None or validate is not None or amendment is not None:
+                self._check_work_projection(spec.program_id, projection, readings.get(spec.program_id))
             with self._transaction(readings):
                 if current is None:
                     if amendment is not None:
@@ -819,6 +837,29 @@ class SQLiteProgramStore:
     def has_work_budget(self, program_id: str) -> bool:
         self._assert_writer_thread()
         return self._work_binding(program_id) is not None
+
+    def pending_work_projection(self, spec: ProgramSpec) -> DeadlineProjection | None:
+        """Recover a prepared clock origin, never accepted work/dispatch authority."""
+        self._assert_writer_thread()
+        origin = self._work_record("clock-origin", spec.program_id)
+        if origin is None or self._work_binding(spec.program_id) is not None:
+            return None
+        if origin["spec_digest"] != spec.digest:
+            raise BudgetRefused("prepared clock origin belongs to a different specification")
+        return DeadlineProjection.decode(origin["projection"])
+
+    def _check_work_projection(
+        self, program_id: str, projection: DeadlineProjection, reading: BootClockReading | None
+    ) -> None:
+        if reading is None:
+            raise BudgetRefused("clock observation persistence unverified; no new work authority")
+        if not projection.verifiable(reading):
+            raise BudgetRefused("original work deadline expired or boot clock unverifiable")
+        previous = self._clock_watermarks[program_id]
+        if reading.wall < previous.wall or reading.boot_ns < previous.boot_ns:
+            raise BudgetRefused("observed wall/boot clock rollback; no new work authority")
+        if projection.decision_time(reading) >= projection.wall_deadline:
+            raise BudgetRefused("original work deadline expired or boot clock unverifiable")
 
     def _new_work_projection(
         self, deadline: int | DeadlineProjection, readings: dict[str, BootClockReading | None]
@@ -852,8 +893,9 @@ class SQLiteProgramStore:
         """First binding only; reopening never projects a deadline again."""
         self._assert_writer_thread()
         existing = self._work_binding(program_id)
-        if existing is not None:
-            projection = DeadlineProjection.decode(existing["projection"])
+        origin = existing if existing is not None else self._work_record("clock-origin", program_id)
+        if origin is not None:
+            projection = DeadlineProjection.decode(origin["projection"])
             if projection.wall_deadline != deadline:
                 raise BudgetRefused("original work expiry cannot be renewed")
         else:
@@ -865,7 +907,8 @@ class SQLiteProgramStore:
     def original_work_deadline(self, program_id: str) -> int | None:
         self._assert_writer_thread()
         binding = self._work_binding(program_id)
-        return None if binding is None else DeadlineProjection.decode(binding["projection"]).wall_deadline
+        origin = binding if binding is not None else self._work_record("clock-origin", program_id)
+        return None if origin is None else DeadlineProjection.decode(origin["projection"]).wall_deadline
 
     def check_work_authority(self, program_id: str) -> None:
         self._assert_writer_thread()
@@ -957,6 +1000,8 @@ class SQLiteProgramStore:
         if self._connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             return {}
         bindings = self._work_records("binding")
+        bound = {item["program"] for item in bindings}
+        bindings.extend(item for item in self._work_records("clock-origin") if item["program"] not in bound)
         if not bindings:
             return {}
         result: dict[str, BootClockReading | None] = {cast(str, item["program"]): None for item in bindings}
@@ -992,15 +1037,17 @@ class SQLiteProgramStore:
                 raise
             if not eligible:
                 return result
+            changes = self._connection.total_changes
             try:
                 reading = self._boot_clock()
             except (OSError, ValueError):
                 reading = None
+            callback_changed = self._closed or self._connection.total_changes != changes
             for program_id in eligible:
                 self._clock_uncommitted[program_id] = reading
             self._flush_clock_observations()
             for program_id in eligible:
-                result[program_id] = reading
+                result[program_id] = None if callback_changed else reading
         except (OSError, sqlite3.DatabaseError, BudgetRefused):
             # No authority is derived from an uncommitted sample. The committed
             # pending marker survives failed flush and fresh-process recovery.
@@ -1125,6 +1172,11 @@ class SQLiteProgramStore:
             scoped = [item for item in records if item[scope] == identity]
             effective = self._effective_usage(scoped)
             for ceiling in policy.resources:
+                authoritative = {
+                    Provenance.MEASUREMENT.value,
+                    Provenance.PROVIDER_REPORT.value,
+                    Provenance.OWNER_RECORD.value,
+                }
                 matching = [
                     item for item in effective if (item["metric"], item["unit"]) == (ceiling.metric, ceiling.unit)
                 ]
@@ -1133,8 +1185,7 @@ class SQLiteProgramStore:
                         (
                             Decimal(cast(str, item["quantity"]))
                             for item in matching
-                            if item["quantity"] is not None
-                            and item["provenance"] in {Provenance.MEASUREMENT.value, Provenance.PROVIDER_REPORT.value}
+                            if item["quantity"] is not None and item["provenance"] in authoritative
                         ),
                         Decimal(0),
                     )
@@ -1145,7 +1196,7 @@ class SQLiteProgramStore:
                 # complete hidden-client consumption. No installed profile supplies
                 # a resource-specific conservative final bound to release this hold.
                 if any(item["operation"] != exclude_operation for item in scoped) or any(
-                    item["quantity"] is None for item in matching
+                    item["quantity"] is None or item["provenance"] not in authoritative for item in matching
                 ):
                     raise BudgetRefused(f"{scope} resource headroom unknown")
 

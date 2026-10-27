@@ -23,7 +23,7 @@ from creatidy_kernel.adapters.fake_forge import SyntheticForgeTransport
 from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.reference_live import run_live_reference
 from creatidy_kernel.adapters.sqlite_codec import program_json
-from creatidy_kernel.adapters.sqlite_store import OperationConflict, SQLiteProgramStore
+from creatidy_kernel.adapters.sqlite_store import OperationConflict, OperationRecord, SQLiteProgramStore
 from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import CancelProgram, ProgramStatus
 from creatidy_kernel.core.forge import Reference
@@ -37,6 +37,12 @@ pytest_plugins = ["test_sqlite_store", "test_clock_transaction_boundaries"]
 
 def configured_policy() -> OwnerPolicy:
     return replace(policy(), work_budget=budget(), project_budget=budget(), project_id="project")
+
+
+def business_operations(store: SQLiteProgramStore) -> tuple[OperationRecord, ...]:
+    return tuple(
+        item for item in store.operations() if not item.operation_id.startswith("work-budget:v1:clock-origin:")
+    )
 
 
 @pytest.mark.parametrize("change", ["remove", "expiry", "project", "task-policy", "project-policy"])
@@ -185,20 +191,30 @@ def test_real_acceptance_commit_failure_rolls_back_every_business_fact_and_retri
         if amend:
             intake.approve(OWNER, draft, selected, decision_id="original", expires_at=200)
             draft = intake.prepare("task", SUBJECT, declaration(context=["amendment"]), expected_parent=draft.digest)
-        before = store.find_program("ordinary:task"), store.history("ordinary:task"), store.operations()
+        before = store.find_program("ordinary:task"), store.history("ordinary:task"), business_operations(store)
         clock.reading = BootClockReading(105, 2_000_000_000, "synthetic-boot-a")
-        # Existing-envelope observation commits pending/floor before the business commit.
-        cast(CommitFailure, connection(store)).remaining = 3 if amend else 1
+        # Existing: early pending/floor + final pending/floor, then business.
+        # New: inert original projection + final pending/floor, then business.
+        cast(CommitFailure, connection(store)).remaining = 5 if amend else 4
         with pytest.raises(sqlite3.OperationalError, match="commit failure"):
             intake.approve(OWNER, draft, selected, decision_id="retry", expires_at=200)
-        assert (store.find_program("ordinary:task"), store.history("ordinary:task"), store.operations()) == before
+        assert (
+            store.find_program("ordinary:task"),
+            store.history("ordinary:task"),
+            business_operations(store),
+        ) == before
         assert store.find_artifact("ordinary:decision:retry", "record") is None
         if amend:
             assert tuple(
                 connection(store).execute("SELECT wall, boot_ns, pending FROM work_clock_state").fetchone()
             ) == (105, 2_000_000_000, 0)
         else:
-            assert not cast(dict[str, BootClockReading], inspect.getattr_static(store, "_clock_watermarks"))
+            cached = cast(dict[str, BootClockReading], inspect.getattr_static(store, "_clock_watermarks"))
+            assert cached["ordinary:task"] == BootClockReading(105, 2_000_000_000, "synthetic-boot-a")
+            assert tuple(
+                connection(store).execute("SELECT wall, boot_ns, pending FROM work_clock_state").fetchone()
+            ) == (105, 2_000_000_000, 0)
+            assert not store.has_work_budget("ordinary:task")
     with SQLiteProgramStore(path, boot_clock=clock) as store:
         intake = OrdinaryIntake(store, scenario.reader, lambda: scenario.time)
         accepted = intake.approve(OWNER, draft, selected, decision_id="retry", expires_at=200)
@@ -248,7 +264,7 @@ def test_configured_final_clock_callback_mutation_is_preserved_without_consumpti
 def test_owner_primitive_rolls_back_mode_create_binding_and_artifact_refs_together(sqlite_tmp_path: Path) -> None:
     path = sqlite_tmp_path / "initialize.sqlite3"
     with SQLiteProgramStore(path, boot_clock=Clock()) as store:
-        cast(CommitFailure, connection(store)).remaining = 1
+        cast(CommitFailure, connection(store)).remaining = 4
         with pytest.raises(sqlite3.OperationalError, match="commit failure"):
             store.accept_work_budget(
                 spec(),
@@ -259,7 +275,11 @@ def test_owner_primitive_rolls_back_mode_create_binding_and_artifact_refs_togeth
                 200,
                 records=(("mode", {"mode": "fixture"}, b"synthetic bytes"),),
             )
-        assert store.find_program("program-1") is None and store.operations() == () and store.history("program-1") == ()
+        assert (
+            store.find_program("program-1") is None
+            and business_operations(store) == ()
+            and store.history("program-1") == ()
+        )
         assert store.find_artifact("mode", "record") is None
     with SQLiteProgramStore(path, boot_clock=Clock()) as store:
         store.accept_work_budget(
@@ -275,8 +295,9 @@ def test_owner_primitive_rolls_back_mode_create_binding_and_artifact_refs_togeth
 
 
 @pytest.mark.usefixtures("failing_connection")
+@pytest.mark.parametrize("retry_clock", ["valid", "expiry", "reboot"])
 def test_task_atomic_commit_failure_allows_corrected_initialization(
-    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retry_clock: str
 ) -> None:
     monkeypatch.setattr(task_execution.time, "time", lambda: 100)
     source = make_source(sqlite_tmp_path)
@@ -298,8 +319,32 @@ def test_task_atomic_commit_failure_allows_corrected_initialization(
         fault.setattr(CommitFailure, "execute", fail_initial)
         with pytest.raises(sqlite3.OperationalError, match="commit failure"):
             execute(control, source, client, clock)
-    assert calls == 1 and client.starts == 0 and not (control / "kernel.sqlite3").exists()
+    assert calls == 1 and client.starts == 0
+    with SQLiteProgramStore(control / "kernel.sqlite3", boot_clock=clock) as store:
+        assert store.find_program(task_execution.PROGRAM_ID) is None and business_operations(store) == ()
+        projection = store.pending_work_projection(task_execution.task_program_spec(fixture_task(repeats=1)))
+        assert projection is not None and projection.wall_deadline == 110
+    if retry_clock != "valid":
+        clock.reading = BootClockReading(
+            100, 12_000_000_000, "synthetic-boot-a" if retry_clock == "expiry" else "synthetic-boot-b"
+        )
+        with pytest.raises(BudgetRefused):
+            execute(control, source, client, clock)
+        with SQLiteProgramStore(control / "kernel.sqlite3", boot_clock=clock) as store:
+            assert store.find_program(task_execution.PROGRAM_ID) is None and business_operations(store) == ()
+            assert (
+                store.pending_work_projection(task_execution.task_program_spec(fixture_task(repeats=1))) == projection
+            )
+        assert client.starts == 0
+        return
     assert execute(control, source, client, clock)["condition"] == "running" and client.starts == 1
+    with SQLiteProgramStore(control / "kernel.sqlite3", boot_clock=clock) as store:
+        assert cast(dict[str, object], store.work_budget_status(task_execution.PROGRAM_ID)["binding"])[
+            "projection"
+        ] == {
+            name: getattr(projection, name)
+            for name in ("wall_deadline", "wall_anchor", "boot_anchor_ns", "boot_deadline_ns", "boot_id", "clock")
+        }
 
 
 def test_task_strict_policy_refuses_before_initialization(
@@ -410,6 +455,6 @@ def test_reference_refused_clock_leaves_no_mode_or_program_then_corrected_retry(
     if composition == "offline":
         monkeypatch.setattr(SQLiteProgramStore, "__init__", original_init)
     with SQLiteProgramStore(control / "kernel.sqlite3") as store:
-        assert store.find_program("reference") is None and not store.operations()
+        assert store.find_program("reference") is None and not business_operations(store)
     available = True
     assert run()["status"] == "completed"

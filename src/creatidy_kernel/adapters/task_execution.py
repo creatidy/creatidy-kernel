@@ -2391,9 +2391,15 @@ def run_task(
         projection: DeadlineProjection | None = None
         if mode_recorded is None:
             if existing_database:
-                raise ValueError("existing database is not this neutral task")
-            assert initial_projection is not None  # noqa: S101 - validated before fresh store initialization.
-            projection = initial_projection
+                projection = store.pending_work_projection(approved_spec)
+                if projection is None or store.find_program(PROGRAM_ID) is not None or len(store.operations()) != 1:
+                    raise ValueError("existing database is not this neutral task")
+                if deadline is not None and deadline != projection.wall_deadline:
+                    raise BudgetRefused("original work expiry cannot be renewed")
+                deadline = projection.wall_deadline
+            else:
+                assert initial_projection is not None  # noqa: S101 - validated before fresh store initialization.
+                projection = initial_projection
             mode_request: dict[str, object] = {
                 "mode": "live" if forge_factory is not None else "synthetic",
                 "task": task.task_id,
