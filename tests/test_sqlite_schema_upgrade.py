@@ -31,33 +31,34 @@ def legacy_database(sqlite_tmp_path: Path, pinned_reader: Path) -> Path:
     return path
 
 
+@pytest.mark.parametrize("migration_step", ["_migrate_2_to_3", "_migrate_3_to_4"])
 def test_migration_interruption_rolls_back_then_reuses_atomic_original_backup(
-    legacy_database: Path, monkeypatch: pytest.MonkeyPatch
+    legacy_database: Path, monkeypatch: pytest.MonkeyPatch, migration_step: str
 ) -> None:
     path = legacy_database
     with closing(sqlite3.connect(path)) as raw:
         original = tuple(raw.iterdump())
-    migrate = cast(Callable[[SQLiteProgramStore], None], inspect.getattr_static(SQLiteProgramStore, "_migrate_2_to_3"))
+    migrate = cast(Callable[[SQLiteProgramStore], None], inspect.getattr_static(SQLiteProgramStore, migration_step))
 
     def interrupted(store: SQLiteProgramStore) -> None:
         migrate(store)
         raise RuntimeError("synthetic interruption before schema transaction commit")
 
     with monkeypatch.context() as failure:
-        failure.setattr(SQLiteProgramStore, "_migrate_2_to_3", interrupted)
+        failure.setattr(SQLiteProgramStore, migration_step, interrupted)
         with pytest.raises(RuntimeError, match="interruption"):
             SQLiteProgramStore(path)
     with closing(sqlite3.connect(path)) as raw:
         assert raw.execute("PRAGMA user_version").fetchone()[0] == 2
         assert tuple(raw.iterdump()) == original
-    backups = list(path.parent.glob(path.name + ".pre-schema-3-*"))
+    backups = list(path.parent.glob(path.name + ".pre-schema-4-*"))
     assert len(backups) == 1
     manifest = json.loads((backups[0] / "manifest.json").read_text())
     assert manifest["schema_version"] == 2 and manifest["artifacts"]
     with SQLiteProgramStore(path) as upgraded:
-        assert upgraded.startup_evidence.schema_version == 3
+        assert upgraded.startup_evidence.schema_version == 4
         assert upgraded.artifact("legacy-evidence", "original") == b"synthetic retained original bytes"
-    assert list(path.parent.glob(path.name + ".pre-schema-3-*")) == backups
+    assert list(path.parent.glob(path.name + ".pre-schema-4-*")) == backups
 
 
 def test_actual_old_reader_refuses_new_schema_without_dispatch_or_record_mutation(
@@ -82,7 +83,7 @@ def test_failed_backup_never_installs_the_new_authority_contract(
     sync = cast(Callable[[Path], None], inspect.getattr_static(sqlite_store, "_fsync_directory"))
 
     def fail_publication(directory: Path) -> None:
-        if ".pre-schema-3-" in directory.name:
+        if ".pre-schema-4-" in directory.name:
             raise OSError("synthetic backup publication failure")
         sync(directory)
 
@@ -94,14 +95,14 @@ def test_failed_backup_never_installs_the_new_authority_contract(
         assert raw.execute("PRAGMA user_version").fetchone()[0] == 2
         assert raw.execute("SELECT name FROM sqlite_master WHERE name = 'store_contract'").fetchone() is None
         assert raw.execute("SELECT COUNT(*) FROM history").fetchone()[0] == 1
-    assert not list(path.parent.glob(path.name + ".pre-schema-3-*"))
-    assert not list(path.parent.glob("." + path.name + ".pre-schema-3-*"))
+    assert not list(path.parent.glob(path.name + ".pre-schema-4-*"))
+    assert not list(path.parent.glob("." + path.name + ".pre-schema-4-*"))
     with SQLiteProgramStore(path) as recovered:
-        assert recovered.startup_evidence.schema_version == 3
+        assert recovered.startup_evidence.schema_version == 4
 
 
 @pytest.mark.parametrize("corruption", ["schema", "omitted-artifact", "artifact-bytes"])
-def test_schema_three_backup_validates_version_and_complete_artifact_inventory(
+def test_current_schema_backup_validates_version_and_complete_artifact_inventory(
     legacy_database: Path, corruption: str
 ) -> None:
     path = legacy_database

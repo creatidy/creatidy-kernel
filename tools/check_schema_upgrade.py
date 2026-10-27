@@ -11,19 +11,18 @@ from contextlib import closing
 from pathlib import Path
 
 PINNED_BASE_ID = "e2348656238a2ff9a3244868e2beb543d86f15a5"  # Exact public Git object ID, not a credential.
+PINNED_PRECLOCK_ID = "23a28e31c17018acb9900efeed2da1b9b03330cf"  # Published schema-3 public Git object ID.
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def install_pinned_reader(directory: Path) -> Path:
+def install_pinned_reader(directory: Path, *, commit_id: str = PINNED_BASE_ID) -> Path:
     """Build the actual public base, never a simulated legacy validator or another checkout."""
     resolved = subprocess.run(
-        ["git", "rev-parse", f"{PINNED_BASE_ID}^{{commit}}"], cwd=ROOT, check=True, capture_output=True, text=True
+        ["git", "rev-parse", f"{commit_id}^{{commit}}"], cwd=ROOT, check=True, capture_output=True, text=True
     )
-    if resolved.stdout.strip() != PINNED_BASE_ID:
+    if resolved.stdout.strip() != commit_id:
         raise RuntimeError("pinned public base object unavailable")
-    archive = subprocess.run(
-        ["git", "archive", "--format=tar", PINNED_BASE_ID], cwd=ROOT, check=True, capture_output=True
-    )
+    archive = subprocess.run(["git", "archive", "--format=tar", commit_id], cwd=ROOT, check=True, capture_output=True)
     source = directory / "source"
     source.mkdir()
     with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as contents:
@@ -58,7 +57,7 @@ from pathlib import Path
 from creatidy_kernel.adapters.reference import reference_spec
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 with SQLiteProgramStore(Path(sys.argv[1])) as store:
-    assert store.startup_evidence.schema_version == 2
+    assert store.startup_evidence.schema_version == (int(sys.argv[2]) if len(sys.argv) > 2 else 2)
     store.create(reference_spec(), 'create')
     store.intent('legacy-evidence', 'legacy-evidence', {'synthetic': True})
     store.finalize_artifact('legacy-evidence', 'original', b'synthetic retained original bytes')
@@ -70,11 +69,11 @@ from pathlib import Path
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore, BackupBundle, UnsupportedSQLiteConfiguration
 from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import ActivateProgram, AttemptSpec, PrepareAttempt
-from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy
 clock = lambda: BootClockReading(100, 1000000000, 'installed-synthetic-boot')
 path = Path(sys.argv[1])
 with SQLiteProgramStore(path, boot_clock=clock) as store:
-    assert store.startup_evidence.schema_version == 3
+    assert store.startup_evidence.schema_version == 4
     program = store.load('reference')
     assert store.artifact('legacy-evidence', 'original') == b'synthetic retained original bytes'
     policy = WorkBudgetPolicy.basic(1, 1, verifications=1, retained_bytes=1024)
@@ -86,22 +85,30 @@ with SQLiteProgramStore(path, boot_clock=clock) as store:
                            'runtime:installed-attempt', 'runtime:installed-attempt', {'attempt': attempt.digest})
     store.revoke_work_budget('reference', 'synthetic owner stop')
     before = store.work_budget_status('reference')
-    bundle = store.backup(path.parent / 'schema-three-backup')
-    assert bundle.schema_version == 3
-restored = SQLiteProgramStore.restore_backup(bundle, path.parent / 'restored-three.sqlite3')
+    bundle = store.backup(path.parent / 'schema-four-backup')
+    assert bundle.schema_version == 4
+restored = SQLiteProgramStore.restore_backup(bundle, path.parent / 'restored-four.sqlite3')
 with SQLiteProgramStore(restored, boot_clock=clock) as store:
     assert store.work_budget_status('reference') == before
     assert store.artifact('legacy-evidence', 'original') == b'synthetic retained original bytes'
-backups = list(path.parent.glob(path.name + '.pre-schema-3-*'))
+    try:
+        store.claim('runtime:installed-attempt', now=100, lease_seconds=1)
+    except BudgetRefused:
+        pass
+    else:
+        raise AssertionError('restored revocation lost its dispatch fence')
+    assert store.operation('runtime:installed-attempt').attempts == 0
+backups = list(path.parent.glob(path.name + '.pre-schema-4-*'))
 assert len(backups) == 1
 import json
 manifest = json.loads((backups[0] / 'manifest.json').read_text())
-assert manifest['schema_version'] == 2
+old_schema = int(sys.argv[2]) if len(sys.argv) > 2 else 2
+assert manifest['schema_version'] == old_schema
 old_bundle = BackupBundle(backups[0], backups[0] / 'kernel.sqlite3', backups[0] / 'manifest.json',
-                          manifest['database_sha256'], manifest['history_record_count'], 2)
-restored = SQLiteProgramStore.restore_backup(old_bundle, path.parent / 'restored-two.sqlite3')
+                          manifest['database_sha256'], manifest['history_record_count'], old_schema)
+restored = SQLiteProgramStore.restore_backup(old_bundle, path.parent / 'restored-original.sqlite3')
 with SQLiteProgramStore(restored, boot_clock=clock) as store:
-    assert store.startup_evidence.schema_version == 3
+    assert store.startup_evidence.schema_version == 4
     assert not store.has_work_budget('reference')
     assert store.artifact('legacy-evidence', 'original') == b'synthetic retained original bytes'
 """
@@ -124,37 +131,44 @@ else:
 def main(new_python: Path, storage_root: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="installed-schema-upgrade-", dir=storage_root) as value:
         directory = Path(value)
-        old_python = install_pinned_reader(directory)
-        path = directory / "synthetic.sqlite3"
-        subprocess.run([str(old_python), "-I", "-c", CREATE_LEGACY, str(path)], cwd=directory, check=True)
-        with closing(sqlite3.connect(path)) as original:
-            history = original.execute("SELECT * FROM history").fetchall()
-            admissions = original.execute("SELECT * FROM command_admissions").fetchall()
-        subprocess.run([str(new_python), "-I", "-c", UPGRADE_AND_REVOKE, str(path)], cwd=directory, check=True)
-        with closing(sqlite3.connect(path)) as current:
-            before = tuple(current.iterdump())
-            if (
-                current.execute("SELECT * FROM history ORDER BY sequence LIMIT 1").fetchall() != history
-                or current.execute("SELECT * FROM command_admissions WHERE command_key = 'create'").fetchall()
-                != admissions
-            ):
-                raise RuntimeError("migration rewrote original history/admission bytes")
-        marker = directory / "forbidden-effect"
-        subprocess.run(
-            [str(old_python), "-I", "-c", REFUSE_DOWNGRADE, str(path), str(marker)], cwd=directory, check=True
-        )
-        with closing(sqlite3.connect(path)) as current:
-            if (
-                tuple(current.iterdump()) != before
-                or current.execute("PRAGMA user_version").fetchone()[0] != 3
-                or current.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] != 0
-            ):
-                raise RuntimeError("downgraded reader changed protected records or dispatched")
-        if marker.exists():
-            raise RuntimeError("downgraded reader performed an effect")
+        for schema, commit_id in ((2, PINNED_BASE_ID), (3, PINNED_PRECLOCK_ID)):
+            fixture = directory / f"schema-{schema}"
+            fixture.mkdir()
+            old_python = install_pinned_reader(fixture, commit_id=commit_id)
+            path = fixture / "synthetic.sqlite3"
+            subprocess.run(
+                [str(old_python), "-I", "-c", CREATE_LEGACY, str(path), str(schema)], cwd=fixture, check=True
+            )
+            with closing(sqlite3.connect(path)) as original:
+                history = original.execute("SELECT * FROM history").fetchall()
+                admissions = original.execute("SELECT * FROM command_admissions").fetchall()
+            subprocess.run(
+                [str(new_python), "-I", "-c", UPGRADE_AND_REVOKE, str(path), str(schema)], cwd=fixture, check=True
+            )
+            with closing(sqlite3.connect(path)) as current:
+                before = tuple(current.iterdump())
+                if (
+                    current.execute("SELECT * FROM history ORDER BY sequence LIMIT 1").fetchall() != history
+                    or current.execute("SELECT * FROM command_admissions WHERE command_key = 'create'").fetchall()
+                    != admissions
+                ):
+                    raise RuntimeError("migration rewrote original history/admission bytes")
+            marker = fixture / "forbidden-effect"
+            subprocess.run(
+                [str(old_python), "-I", "-c", REFUSE_DOWNGRADE, str(path), str(marker)], cwd=fixture, check=True
+            )
+            with closing(sqlite3.connect(path)) as current:
+                if (
+                    tuple(current.iterdump()) != before
+                    or current.execute("PRAGMA user_version").fetchone()[0] != 4
+                    or current.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] != 0
+                ):
+                    raise RuntimeError("downgraded reader changed protected records or dispatched")
+            if marker.exists():
+                raise RuntimeError("downgraded reader performed an effect")
         print(
-            f"Installed schema upgrade: actual base {PINNED_BASE_ID} reader refuses schema 3; "
-            "original bytes, v2/v3 backups and artifacts preserved."
+            f"Installed schema upgrade: actual readers {PINNED_BASE_ID} and {PINNED_PRECLOCK_ID} refuse schema 4; "
+            "original bytes, v2/v3/v4 backups and artifacts preserved."
         )
 
 

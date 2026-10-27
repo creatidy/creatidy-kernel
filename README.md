@@ -433,14 +433,27 @@ An estimate or partial numeric receipt is not complete resource coverage, includ
 settlement. No installed producer supplies the final conservative bound needed to release that
 unknown headroom; further resource-constrained admissions refuse rather than infer zero hidden work.
 
-Work-budget authority uses SQLite schema 3. Opening an existing schema-1/2 store first publishes a
-verified online backup named `<database>.pre-schema-3-<logical-digest>`, then atomically installs the
-schema-3 compatibility marker without rewriting historical records. Backup failure prevents migration;
+Work-budget authority uses SQLite schema 4. Its bounded per-Program clock row commits a pending-read
+marker before acquiring a clock sample and commits guard floors before the capacity/outbox transaction.
+Admission rollback cannot erase observed high-water evidence, and caches contain committed floors
+only. A failed clock flush leaves durable uncertainty: the same live owner may flush its exact captured
+sample, but a fresh process cannot invent that sample from its recovery wall clock. Historical reads
+and cancellation journaling remain available; new authority refuses while evidence is incomplete.
+
+Opening an existing schema-1/2/3 store first publishes a verified online backup named
+`<database>.pre-schema-4-<logical-digest>`, then atomically installs the clock-state compatibility
+boundary without rewriting historical records or the original schema-3 contract marker. Backup failure prevents migration;
 transaction interruption retains the original schema and published recovery image. After commit,
-reopen retains schema 3 rather than replaying effects. The actual installed reader from public base
-`e2348656238a2ff9a3244868e2beb543d86f15a5` is tested to refuse schema 3 before claims/effects. Schema-2
-and schema-3 bundles retain their own versioned manifests and complete artifact inventory; restore is
+reopen retains schema 4 rather than replaying effects. Actual installed readers from public base
+`e2348656238a2ff9a3244868e2beb543d86f15a5` and schema-3 revision
+`23a28e31c17018acb9900efeed2da1b9b03330cf` refuse schema 4 before claims/effects. Schema-2/3/4
+bundles retain their own versioned manifests and complete artifact inventory; restore is
 to a new offline path using the current reader, not downgrade permission or a live migration command.
+
+The finite live reference also routes authority/capacity refusal inside observation or collection
+through its durable STOP journal and bounded original-owned-group cleanup, even after a terminal
+turn receipt. Terminality alone does not prove group settlement. Missing, failed or mismatched
+settlement evidence remains `cancel_uncertain`; accepted receipts cannot publish after refusal.
 
 `task export` is a thin persisted task/Allocation/candidate/acceptance/PR summary, not the richer
 reference export or a task-integrated `core.outcomes` pipeline. It lacks full requested/resolved/observed

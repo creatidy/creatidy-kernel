@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 from collections.abc import Callable, Generator
-from contextlib import closing, contextmanager, nullcontext
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -49,7 +49,7 @@ from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _APPLICATION_ID = 0x43544B31
 _DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _LOCAL_FILESYSTEMS = {
@@ -222,6 +222,8 @@ class SQLiteProgramStore:
         self._busy_timeout_ms = busy_timeout_ms
         self._boot_clock = boot_clock
         self._clock_watermarks: dict[str, BootClockReading] = {}
+        self._clock_uncommitted: dict[str, BootClockReading | None] = {}
+        self._transaction_clock_readings: dict[str, BootClockReading | None] | None = None
         self._cache_mode = "private"
         self._closed = False
         try:
@@ -741,38 +743,121 @@ class SQLiteProgramStore:
         if binding["spec_digest"] != self._load_head(program_id).spec.digest:
             raise BudgetRefused("work envelope belongs to a different current specification")
         projection = DeadlineProjection.decode(binding["projection"])
-        reading = self._boot_clock()
+        readings = self._transaction_clock_readings if self._connection.in_transaction else self._prepare_work_clocks()
+        state = self._connection.execute(
+            "SELECT * FROM work_clock_state WHERE program_id = ?", (program_id,)
+        ).fetchone()
+        if state is None or state["pending"] or readings is None or program_id not in readings:
+            raise BudgetRefused("clock observation persistence unverified; no new work authority")
+        reading = readings[program_id]
         if projection.decision_time(reading) >= projection.wall_deadline:
             raise BudgetRefused("original work deadline expired or boot clock unverifiable")
         assert reading is not None  # noqa: S101 - projection verification established reading.
-        clock_type = f"clock-{hashlib.sha256(program_id.encode()).hexdigest()}"
-        previous = self._clock_watermarks.get(program_id)
-        if previous is None:
-            records = self._work_records(clock_type)
-            if records:
-                latest = max(records, key=lambda item: cast(int, item["wall"]))
-                previous = BootClockReading(
-                    cast(int, latest["wall"]),
-                    cast(int, latest["boot_ns"]),
-                    cast(str, latest["boot_id"]),
-                    cast(str, latest["clock"]),
-                )
-            else:
-                previous = BootClockReading(
-                    projection.wall_anchor, projection.boot_anchor_ns, projection.boot_id, projection.clock
-                )
+        previous = self._clock_watermarks[program_id]
         if reading.wall < previous.wall or reading.boot_ns < previous.boot_ns:
             raise BudgetRefused("observed wall/boot clock rollback; no new work authority")
-        if reading.wall > previous.wall:
-            # At most one append per original envelope wall second, not per poll.
-            with self._gate, nullcontext() if self._connection.in_transaction else self._transaction():
-                self._write_work_record(clock_type, str(reading.wall), dict(asdict(reading)))
-        self._clock_watermarks[program_id] = reading
         if (
             self._work_record("revoked", program_id) is not None
             or self._load_head(program_id).status is ProgramStatus.CANCELLED
         ):
             raise BudgetRefused("work authority revoked")
+
+    def _flush_clock_observations(self) -> None:
+        """Commit only captured clock evidence, never capacity/outbox/domain rows."""
+        if not self._clock_uncommitted:
+            return
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            for program_id, reading in self._clock_uncommitted.items():
+                row = self._connection.execute(
+                    "SELECT * FROM work_clock_state WHERE program_id = ?", (program_id,)
+                ).fetchone()
+                if row is None:
+                    raise BudgetRefused("original pending clock observation is missing")
+                wall, boot_ns = cast(int, row["wall"]), cast(int, row["boot_ns"])
+                if reading is not None and (reading.boot_id, reading.clock) == (row["boot_id"], row["clock"]):
+                    wall, boot_ns = max(wall, reading.wall), max(boot_ns, reading.boot_ns)
+                self._connection.execute(
+                    "UPDATE work_clock_state SET wall = ?, boot_ns = ?, pending = 0 WHERE program_id = ?",
+                    (wall, boot_ns, program_id),
+                )
+            self._connection.execute("COMMIT")
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+        # Cache only committed guard floors. These maxima never reproject expiry.
+        for program_id in self._clock_uncommitted:
+            row = self._connection.execute(
+                "SELECT * FROM work_clock_state WHERE program_id = ?", (program_id,)
+            ).fetchone()
+            assert row is not None  # noqa: S101 - transaction retained the existing row.
+            self._clock_watermarks[program_id] = BootClockReading(
+                row["wall"], row["boot_ns"], row["boot_id"], row["clock"]
+            )
+        self._clock_uncommitted.clear()
+
+    def _prepare_work_clocks(self) -> dict[str, BootClockReading | None]:
+        """Durable pending marker BEFORE acquisition; durable floors BEFORE admission.
+
+        A lost pending read cannot be reconstructed from a recovery wall clock.
+        The same live owner may retry flushing the exact captured sample. Historical
+        reads and cancellation journaling remain possible when authority is unknown.
+        """
+        if self._connection.in_transaction:
+            return {}  # Never roll back or join an outer admission transaction.
+        if self._connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            return {}
+        bindings = self._work_records("binding")
+        if not bindings:
+            return {}
+        result: dict[str, BootClockReading | None] = {cast(str, item["program"]): None for item in bindings}
+        try:
+            self._flush_clock_observations()
+            self._connection.execute("BEGIN IMMEDIATE")
+            eligible: list[str] = []
+            try:
+                for binding in bindings:
+                    program_id = cast(str, binding["program"])
+                    row = self._connection.execute(
+                        "SELECT * FROM work_clock_state WHERE program_id = ?", (program_id,)
+                    ).fetchone()
+                    if row is None:
+                        projection = DeadlineProjection.decode(binding["projection"])
+                        legacy = self._work_records(f"clock-{hashlib.sha256(program_id.encode()).hexdigest()}")
+                        wall = max([projection.wall_anchor, *(cast(int, item["wall"]) for item in legacy)])
+                        boot_ns = max([projection.boot_anchor_ns, *(cast(int, item["boot_ns"]) for item in legacy)])
+                        self._connection.execute(
+                            "INSERT INTO work_clock_state VALUES (?, ?, ?, ?, ?, 0)",
+                            (program_id, wall, boot_ns, projection.boot_id, projection.clock),
+                        )
+                    elif row["pending"]:
+                        continue
+                    self._connection.execute(
+                        "UPDATE work_clock_state SET pending = 1 WHERE program_id = ?", (program_id,)
+                    )
+                    eligible.append(program_id)
+                self._connection.execute("COMMIT")
+            except BaseException:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+            if not eligible:
+                return result
+            try:
+                reading = self._boot_clock()
+            except (OSError, ValueError):
+                reading = None
+            for program_id in eligible:
+                self._clock_uncommitted[program_id] = reading
+            self._flush_clock_observations()
+            for program_id in eligible:
+                result[program_id] = reading
+        except (OSError, sqlite3.DatabaseError, BudgetRefused):
+            # No authority is derived from an uncommitted sample. The committed
+            # pending marker survives failed flush and fresh-process recovery.
+            return result
+        return result
 
     def revoke_work_budget(self, program_id: str, evidence: str) -> None:
         self._assert_writer_thread()
@@ -1441,7 +1526,7 @@ class SQLiteProgramStore:
             if (
                 manifest["format"] != "creatidy-kernel-sqlite-backup"
                 or type(manifest["schema_version"]) is not int
-                or manifest["schema_version"] not in (1, 2, 3)
+                or manifest["schema_version"] not in (1, 2, 3, 4)
             ):
                 raise ValueError("unsupported backup manifest")
             with (directory / "kernel.sqlite3").open("rb") as stream:
@@ -1798,8 +1883,8 @@ class SQLiteProgramStore:
 
     def _migrate(self) -> None:
         original_version = cast(int, self._connection.execute("PRAGMA user_version").fetchone()[0])
-        if original_version in (1, 2):
-            self._backup_before_schema_three()
+        if original_version in (1, 2, 3):
+            self._backup_before_schema_four()
         with self._transaction():
             version = cast(int, self._connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SCHEMA_VERSION:
@@ -1813,19 +1898,22 @@ class SQLiteProgramStore:
             if version == 2:
                 self._migrate_2_to_3()
                 version = 3
+            if version == 3:
+                self._migrate_3_to_4()
+                version = 4
             if version != SCHEMA_VERSION:
                 raise UnsupportedSQLiteConfiguration(f"no migration path from schema version {version}")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._validate_schema()
 
-    def _backup_before_schema_three(self) -> None:
+    def _backup_before_schema_four(self) -> None:
         # A content-qualified name reuses the same complete backup after an
         # interrupted upgrade, never overwriting an earlier recovery image.
         digest = hashlib.sha256()
         for statement in self._connection.iterdump():
             digest.update(statement.encode("utf-8"))
             digest.update(b"\n")
-        target = self._path.parent / f"{self._path.name}.pre-schema-3-{digest.hexdigest()}"
+        target = self._path.parent / f"{self._path.name}.pre-schema-4-{digest.hexdigest()}"
         if target.exists():
             self._verify_backup_manifest(target)
             original = hashlib.sha256()
@@ -2000,6 +2088,14 @@ class SQLiteProgramStore:
                 "BEGIN SELECT RAISE(ABORT, 'store contract is immutable'); END"
             )
 
+    def _migrate_3_to_4(self) -> None:
+        self._connection.execute(
+            "CREATE TABLE work_clock_state (program_id TEXT PRIMARY KEY, wall INTEGER NOT NULL CHECK(wall >= 0), "
+            "boot_ns INTEGER NOT NULL CHECK(boot_ns >= 0), boot_id TEXT NOT NULL, "
+            "clock TEXT NOT NULL CHECK(clock = 'linux:CLOCK_BOOTTIME'), "
+            "pending INTEGER NOT NULL CHECK(pending IN (0,1))) WITHOUT ROWID"
+        )
+
     def _validate_schema(self) -> None:
         tables = {
             cast(str, row[0])
@@ -2019,6 +2115,7 @@ class SQLiteProgramStore:
             "operation_reconciliations",
             "artifact_references",
             "store_contract",
+            "work_clock_state",
         }
         if not required <= tables:
             raise UnsupportedSQLiteConfiguration("database schema is missing required K2 tables")
@@ -2050,6 +2147,7 @@ class SQLiteProgramStore:
             },
             "artifact_references": {"operation_id", "name", "digest", "size"},
             "store_contract": {"schema_version", "authority_contract"},
+            "work_clock_state": {"program_id", "wall", "boot_ns", "boot_id", "clock", "pending"},
         }
         for table, expected in columns.items():
             actual = {cast(str, row["name"]) for row in self._connection.execute(f"PRAGMA table_info({table})")}
@@ -2086,7 +2184,9 @@ class SQLiteProgramStore:
     @contextmanager
     def _transaction(self) -> Generator[None, None, None]:
         self._assert_writer_thread()
+        readings = self._prepare_work_clocks()
         self._connection.execute("BEGIN IMMEDIATE")
+        self._transaction_clock_readings = readings
         try:
             yield
             self._connection.execute("COMMIT")
@@ -2094,6 +2194,8 @@ class SQLiteProgramStore:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
             raise
+        finally:
+            self._transaction_clock_readings = None
 
     def _duplicate_result(self, command_key: str, input_digest: str) -> Program | None:
         row = self._connection.execute(

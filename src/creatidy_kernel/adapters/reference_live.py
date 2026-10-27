@@ -7,10 +7,14 @@ not hostile-worker isolation. A connection's RPC timeout must be finite as well.
 """
 
 import hashlib
+import json
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
+from typing import cast
 
+from creatidy_kernel.adapters.boot_clock import read_boot_clock
 from creatidy_kernel.adapters.codex_runtime import (
     CodexConnection,
     CodexInputs,
@@ -31,6 +35,7 @@ from creatidy_kernel.adapters.reference import (
 )
 from creatidy_kernel.adapters.reference_forge import deliver_reference_pr
 from creatidy_kernel.adapters.sqlite_store import OperationConflict, ProgramNotFound, SQLiteProgramStore
+from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import ActivateProgram, ProgramStatus, WorkUnitStatus
 from creatidy_kernel.core.execution import (
     Activity,
@@ -47,7 +52,7 @@ from creatidy_kernel.core.execution import (
 from creatidy_kernel.core.forge import Presence, Reference
 from creatidy_kernel.core.resources import Allocation
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy
-from creatidy_kernel.ports.allocation import load_allocation
+from creatidy_kernel.ports.allocation import decode_identity, load_allocation
 from creatidy_kernel.ports.application import advance_work_unit, manifest_bytes
 from creatidy_kernel.ports.forge import Forge
 from creatidy_kernel.ports.resources import ResourceAllocator
@@ -68,6 +73,7 @@ def run_live_reference(
     max_observations: int,
     allocator: ResourceAllocator | None = None,
     supported_efforts: frozenset[tuple[str, str, str]] = frozenset(),
+    boot_clock: Callable[[], BootClockReading | None] = read_boot_clock,
 ) -> dict[str, object]:
     """Run at most two native turns and bounded observations, interrupt on budget exit.
 
@@ -103,7 +109,7 @@ def run_live_reference(
         raise ValueError("controller object source must be outside the worker workspace")
     base = reference_commit(workspace_path, b"")
     with (
-        SQLiteProgramStore(directory / "kernel.sqlite3") as store,
+        SQLiteProgramStore(directory / "kernel.sqlite3", boot_clock=boot_clock) as store,
         SQLiteProgramStore(directory / "runtime.sqlite3") as artifacts,
     ):
         store.intent(
@@ -208,6 +214,14 @@ def run_live_reference(
             )
 
         retire_owned_group, observe_owned_group, observe_owned_group_reference = owned_group_callbacks(connection)
+        retirement_attempted = False
+
+        def retire_once() -> None:
+            nonlocal retirement_attempted
+            if not retirement_attempted and retire_owned_group is not None:
+                retirement_attempted = True
+                retire_owned_group()
+
         runtime = CodexRuntime(
             connection,
             version=version,
@@ -215,15 +229,28 @@ def run_live_reference(
             authorize=authorize,
             collect=collect,
             supported_efforts=supported_efforts,
-            retire=retire_owned_group,
+            retire=retire_once if retire_owned_group is not None else None,
             settled=observe_owned_group,
             group_reference=observe_owned_group_reference,
+            clock=lambda: int(time.time()),
         )
 
         def restore(request: ExecutionRequest, handle: str) -> None:
-            runtime.restore(request, handle)
+            data = store.find_artifact(request.operation.operation_id, "runtime-receipt")
+            receipt: dict[str, object] = {} if data is None else cast(dict[str, object], json.loads(data))
+            original_group = receipt.get("owned_group_reference")
+            original_identity = receipt.get("identity")
+            runtime.restore(
+                request,
+                handle,
+                owned_group_reference=original_group if type(original_group) is str else None,
+                receipt_identity=decode_identity(manifest_bytes(cast(dict[str, object], original_identity)))
+                if type(original_identity) is dict
+                else None,
+            )
 
         status = "budget_exhausted"
+        authority_refused = bool(store.operations("interruption:live-authority"))
         used = len(store.operations("reference:live-poll:"))
         for index in range(used, max_observations + 1):
             if not work_authorized():
@@ -276,25 +303,38 @@ def run_live_reference(
                     TrustMode.TRUSTED_DEVELOPMENT,
                 ),
             )
-            status = advance_work_unit(
-                store,
-                program,
-                unit,
-                allocator=resource_allocator,
-                runtime=runtime,
-                workspace=workspace,
-                collector=ReferenceCollector(artifacts, store, workspace_path, base),
-                policy=POLICY,
-                now=int(time.time()),
-                restore=restore,
-            )
+            try:
+                status = advance_work_unit(
+                    store,
+                    program,
+                    unit,
+                    allocator=resource_allocator,
+                    runtime=runtime,
+                    workspace=workspace,
+                    collector=ReferenceCollector(artifacts, store, workspace_path, base),
+                    policy=POLICY,
+                    now=int(time.time()),
+                    restore=restore,
+                    clock=lambda: int(time.time()),
+                )
+            except BudgetRefused:
+                authority_refused = True
+                status = "budget_exhausted"
+                store.intent(
+                    "interruption:live-authority",
+                    "interruption:live-authority",
+                    {"reason": "new work authority refused inside admission"},
+                )
+                break
             if status in {"unknown", "rejected", "identity_unavailable"}:
                 break
         if status not in {"unknown", "rejected", "identity_unavailable"}:
             status = "budget_exhausted"
+        store.revoke_work_budget("reference", "interruption:live-budget")
+        owned_cleanup: list[dict[str, object]] = []
         for attempt in store.load("reference").attempts:
             operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
-            if operation.accepted_reference is not None and operation.status != "terminal":
+            if operation.accepted_reference is not None:
                 selected = load_allocation(store, attempt.spec)
                 request = ExecutionRequest(
                     OperationKey(operation.operation_id, operation.effect_key, operation.request_digest),
@@ -324,18 +364,67 @@ def run_live_reference(
                     operation.fence,
                     allocation=selected,
                 )
-                runtime.restore(request, operation.accepted_reference)
+                receipt_data = store.find_artifact(operation.operation_id, "runtime-receipt")
+                original: dict[str, object] = (
+                    {} if receipt_data is None else cast(dict[str, object], json.loads(receipt_data))
+                )
+                expected_group = original.get("owned_group_reference")
+                expected_group = expected_group if type(expected_group) is str and expected_group.strip() else None
                 cancellation_id = f"cancel:{attempt.spec.attempt_id}"
                 cancellation = store.intent(
                     cancellation_id,
                     cancellation_id,
                     {"operation": operation.operation_id, "handle": operation.accepted_reference},
                 )
+                cached = store.find_artifact(cancellation_id, "owned-group-settlement")
+                if cached is not None:
+                    proof = cast(dict[str, object], json.loads(cached))
+                    if (
+                        proof.get("operation") == operation.operation_id
+                        and proof.get("effect_key") == operation.effect_key
+                        and proof.get("request_digest") == operation.request_digest
+                        and proof.get("runtime_fence") == operation.fence
+                        and proof.get("cancellation_fence") == cancellation.fence
+                        and proof.get("handle") == operation.accepted_reference
+                        and proof.get("attempt") == attempt.spec.digest
+                        and expected_group is not None
+                        and proof.get("owned_group_reference") == expected_group
+                        and proof.get("owned_group_settled") is True
+                        and proof.get("result_reconciled") is True
+                    ):
+                        owned_cleanup.append(proof)
+                        continue
+                try:
+                    current_group = (
+                        observe_owned_group_reference() if observe_owned_group_reference is not None else None
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    current_group = None
+                group_matches = expected_group is not None and current_group == expected_group
+                if retire_owned_group is not None and not group_matches:
+                    owned_cleanup.append(
+                        {
+                            "operation": operation.operation_id,
+                            "owned_group_settled": None,
+                            "reason": "original owned group unavailable; no adoption",
+                        }
+                    )
+                    continue
+                restore(request, operation.accepted_reference)
                 if cancellation.attempts == 0:
                     fence = store.claim(cancellation_id, now=int(time.time()), lease_seconds=1)
                     # The adapter cannot prove interrupt delivery, even when the RPC returns.
                     store.observe(cancellation_id, fence, f"uncertain:{cancellation_id}", "unknown")
-                    runtime.cancel(operation.accepted_reference)
+                    try:
+                        runtime.cancel(operation.accepted_reference)
+                    except (OSError, RuntimeError):
+                        pass
+                    finally:
+                        if group_matches:
+                            try:
+                                retire_once()
+                            except (OSError, RuntimeError):
+                                pass
                 observation = runtime.observe(operation.accepted_reference, now=int(time.time()))
                 observation_data = manifest_bytes(asdict(observation))
                 store.finalize_artifact(
@@ -352,6 +441,41 @@ def run_live_reference(
                         "terminal",
                         reference=operation.accepted_reference,
                     )
+                try:
+                    settled = observe_owned_group() if group_matches and observe_owned_group is not None else None
+                except (OSError, RuntimeError, ValueError):
+                    settled = None
+                reconciled = (
+                    observation.activity is Activity.TERMINAL
+                    and observation.handle == operation.accepted_reference
+                    and group_matches
+                    and manifest_bytes(asdict(observation.identity)) == manifest_bytes(original.get("identity"))
+                )
+                proof = cast(
+                    dict[str, object],
+                    {
+                        "version": 1,
+                        "operation": operation.operation_id,
+                        "effect_key": operation.effect_key,
+                        "request_digest": operation.request_digest,
+                        "runtime_fence": operation.fence,
+                        "cancellation_fence": store.operation(cancellation_id).fence,
+                        "attempt": attempt.spec.digest,
+                        "handle": operation.accepted_reference,
+                        "owned_group_reference": expected_group,
+                        "owned_group_settled": settled,
+                        "result_reconciled": reconciled,
+                        "descendants": "unproven",
+                    },
+                )
+                proof_data = manifest_bytes(proof)
+                store.finalize_artifact(
+                    cancellation_id, f"owned-observation:{hashlib.sha256(proof_data).hexdigest()}", proof_data
+                )
+                if group_matches and settled is True and reconciled:
+                    reference = store.finalize_artifact(cancellation_id, "owned-group-settlement", proof_data)
+                    store.record_work_settlement(operation.operation_id, reference)
+                owned_cleanup.append(proof)
         store.intent(
             "interruption:live-budget",
             "interruption:live-budget",
@@ -359,9 +483,16 @@ def run_live_reference(
         )
         result = reference_export(store)
         result.update(
-            condition=status,
+            condition="cancel_uncertain"
+            if authority_refused
+            and any(
+                item.get("owned_group_settled") is not True or item.get("result_reconciled") is not True
+                for item in owned_cleanup
+            )
+            else status,
             mode="live",
             isolation="not attested",
             interruption="finite observation/deadline exit; cancellation requested, settlement not assumed",
+            owned_cleanup=owned_cleanup,
         )
         return result
