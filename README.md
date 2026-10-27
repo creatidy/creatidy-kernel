@@ -412,6 +412,11 @@ durable settlement, conflicting reuse remains blocked. A lost result is never fa
 retirement permits only the existing exact runtime cancellation path, not ordinary acceptance or
 rejection. This adds no daemon or stronger native isolation claim.
 
+Successful command reuse also requires its original bounded workspace-integrity receipt, bound to
+the exact command result and candidate head. Recovery uses the recorded tracked/untracked outcome,
+not the clean workspace produced by restoration. Missing integrity proof stays uncertain before any
+reset/clean; an incomplete bounded integrity capture cannot become a pass.
+
 Ordinary `OwnerPolicy` can carry `work_budget`, `project_budget` and `project_id`. Approval binds those
 policies without dispatching or reporting usage. Authorized meaning amendments keep the original
 envelope and accumulated usage; old policies and Program bytes are not rewritten. Legacy preparation
@@ -424,6 +429,18 @@ routes or quotas are reconstructed. Resource ceilings are stop-on-observed limit
 observations prevent further headroom claims. Installed external-client profiles do not prove a hard
 inference cap: `strict_inference=True` is refused, not fulfilled by a synthetic receipt or a future
 Router endpoint. Basic external-client work may retain unknown inference usage without a strict claim.
+An estimate or partial numeric receipt is not complete resource coverage, including after physical
+settlement. No installed producer supplies the final conservative bound needed to release that
+unknown headroom; further resource-constrained admissions refuse rather than infer zero hidden work.
+
+Work-budget authority uses SQLite schema 3. Opening an existing schema-1/2 store first publishes a
+verified online backup named `<database>.pre-schema-3-<logical-digest>`, then atomically installs the
+schema-3 compatibility marker without rewriting historical records. Backup failure prevents migration;
+transaction interruption retains the original schema and published recovery image. After commit,
+reopen retains schema 3 rather than replaying effects. The actual installed reader from public base
+`e2348656238a2ff9a3244868e2beb543d86f15a5` is tested to refuse schema 3 before claims/effects. Schema-2
+and schema-3 bundles retain their own versioned manifests and complete artifact inventory; restore is
+to a new offline path using the current reader, not downgrade permission or a live migration command.
 
 `task export` is a thin persisted task/Allocation/candidate/acceptance/PR summary, not the richer
 reference export or a task-integrated `core.outcomes` pipeline. It lacks full requested/resolved/observed

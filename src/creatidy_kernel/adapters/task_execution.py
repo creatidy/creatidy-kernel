@@ -46,7 +46,7 @@ from creatidy_kernel.adapters.codex_stdio import CodexStdio
 from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
 from creatidy_kernel.adapters.forge_refs import AGitPush, ForgeBinding, https_origin, oid, repository_path, valid_branch
 from creatidy_kernel.adapters.forgejo import ForgejoForge
-from creatidy_kernel.adapters.forgejo_transport import ConditionalGitTransport, HTTPSForgejoTransport
+from creatidy_kernel.adapters.forgejo_transport import ConditionalGitTransport, HTTPSForgejoTransport, run_git_bounded
 from creatidy_kernel.adapters.reference import reference_git, reference_git_bytes
 from creatidy_kernel.adapters.reference_forge import deliver_reference_pr
 from creatidy_kernel.adapters.scarcity_router import ScarcityRouterAllocator, ScarcityRouterUnavailable
@@ -983,7 +983,10 @@ def _command_recovery(
                 data = store.find_artifact(OPERATION_ID, key)
                 result = None if data is None else cast(dict[str, object], json.loads(data))
                 settled = _command_settled(store, key, result)
-        if result is None or not settled:
+        integrity_unknown = (
+            result is not None and _command_succeeded(result) and _command_integrity(store, key, result) is None
+        )
+        if result is None or not settled or integrity_unknown:
             pending.append(key)
             all_settled = all_settled and settled
             if record:
@@ -997,6 +1000,92 @@ def _command_recovery(
                     },
                 )
     return tuple(pending), all_settled
+
+
+def _command_succeeded(result: dict[str, object]) -> bool:
+    return (
+        type(result.get("exit_code")) is int
+        and result["exit_code"] == 0
+        and all(result.get(name) is False for name in ("timed_out", "output_exhausted", "authority_lost"))
+    )
+
+
+def _command_integrity(store: SQLiteProgramStore, key: str, result: dict[str, object]) -> dict[str, object] | None:
+    data = store.find_artifact(OPERATION_ID, f"command-integrity:{key}")
+    if data is None:
+        return None
+    raw: object = json.loads(data)
+    if type(raw) is not dict:
+        return None
+    value = cast(dict[str, object], raw)
+    request = cast(dict[str, object], json.loads(store.operation(key).request_json)["request"])
+    subject = cast(dict[str, object], request["subject"])
+    if (
+        value.get("version") != 1
+        or value.get("operation") != key
+        or value.get("head") != subject.get("head_revision")
+        or value.get("result_digest") != "sha256:" + hashlib.sha256(manifest_bytes(result)).hexdigest()
+        or type(value.get("complete")) is not bool
+        or type(value.get("clean")) is not bool
+        or len(data) > MAX_CAPTURE_BYTES
+    ):
+        return None
+    return value
+
+
+def _capture_command_integrity(
+    store: SQLiteProgramStore, workspace: Path, head: str, key: str, result: dict[str, object]
+) -> None:
+    raw: str | None = None
+    executable = shutil.which("git", path=os.defpath)
+    if executable is not None:
+        try:
+            completed = run_git_bounded(
+                [executable, "status", "--porcelain", "-z"],
+                workspace,
+                {
+                    "HOME": str(workspace),
+                    "PATH": os.defpath,
+                    "LANG": "C.UTF-8",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_TERMINAL_PROMPT": "0",
+                },
+                GIT_TIMEOUT_SECONDS,
+                MAX_CAPTURE_BYTES,
+            )
+            if completed.returncode == 0:
+                raw = completed.stdout
+        except (OSError, OverflowError, ValueError, subprocess.SubprocessError):
+            pass
+    observed_head = git_text(workspace, "rev-parse", "HEAD")
+    entries: list[dict[str, str]] = []
+    if raw is not None:
+        fields = raw.split("\0")
+        index = 0
+        while index < len(fields):
+            field = fields[index]
+            index += 1
+            if not field:
+                continue
+            text = field
+            entries.append({"status": text[:2], "path": text[3:]})
+            if text[0] in "RC":
+                index += 1
+    payload: dict[str, object] = {
+        "version": 1,
+        "operation": key,
+        "head": head,
+        "observed_head": observed_head,
+        "result_digest": "sha256:" + hashlib.sha256(manifest_bytes(result)).hexdigest(),
+        "complete": raw is not None,
+        "clean": raw is not None and not entries and observed_head == head,
+        "entries": entries,
+    }
+    while len(manifest_bytes(payload)) > MAX_CAPTURE_BYTES:
+        entries = entries[: len(entries) // 2]
+        payload.update(entries=entries, complete=False, clean=False)
+    store.finalize_artifact(OPERATION_ID, f"command-integrity:{key}", manifest_bytes(payload))
 
 
 def _require_command_results(store: SQLiteProgramStore) -> None:
@@ -1222,6 +1311,7 @@ class TaskChecks:
                 f"{len(self.task.verification)} trusted command(s)"
             )
             runs: list[dict[str, object]] = []
+            integrities: list[dict[str, object]] = []
             for command_index, command in enumerate(self.task.verification):
                 for repeat in range(1, command.repeats + 1):
                     if not self.authorized():
@@ -1284,6 +1374,8 @@ class TaskChecks:
                             owner.result = run
                         finally:
                             owner.persist(self.store)
+                        if _command_settled(self.store, key, run):
+                            _capture_command_integrity(self.store, self.workspace, self.head, key, run)
                     reference = self.store.finalize_artifact(OPERATION_ID, key, manifest_bytes(run))
                     self.store.record_retained_bytes(key, cast(int, run["retained_bytes"]))
                     self.store.record_usage(
@@ -1305,6 +1397,11 @@ class TaskChecks:
                     else:
                         raise WorkUncertain("verification command group settlement unknown")
                     runs.append(run)
+                    integrity = _command_integrity(self.store, key, run)
+                    if integrity is None and _command_succeeded(run):
+                        raise WorkUncertain("successful command lacks original workspace-integrity result")
+                    if integrity is not None:
+                        integrities.append(integrity)
                     if (
                         any(runs[-1].get(key) is True for key in ("timed_out", "authority_lost", "output_exhausted"))
                         or runs[-1].get("owned_group_settled") is not True
@@ -1312,9 +1409,14 @@ class TaskChecks:
                         return self._evidence(name, subject, False, {"runs": runs, "reason": "bounded command stopped"})
                     if self.fault is not None:
                         self.fault("verification")
-            entries = _porcelain(self.workspace)
-            mutations = [{"status": status, "path": path} for status, path in entries if status != "??"]
-            untracked = sorted(path for status, path in entries if status == "??")
+            entries = [entry for integrity in integrities for entry in cast(list[dict[str, str]], integrity["entries"])]
+            mutations = [
+                dict(status=status, path=path)
+                for status, path in sorted(
+                    {(entry["status"], entry["path"]) for entry in entries if entry["status"] != "??"}
+                )
+            ]
+            untracked = sorted({entry["path"] for entry in entries if entry["status"] == "??"})
             # Every non-ignored Git-visible change after verification fails: the
             # workspace must be Git-clean with respect to all non-ignored state, so
             # the recorded evidence depends on the candidate subject alone. Ignored
@@ -1324,7 +1426,8 @@ class TaskChecks:
                     isinstance(run["exit_code"], int) and run["exit_code"] == 0 and run["timed_out"] is False
                     for run in runs
                 )
-                and not entries
+                and len(integrities) == len(runs)
+                and all(integrity["complete"] is True and integrity["clean"] is True for integrity in integrities)
             )
             self.lifecycle.append("verification passed" if passed else "verification failed")
             return self._evidence(

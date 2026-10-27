@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 from collections.abc import Callable, Generator
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -45,11 +45,11 @@ from creatidy_kernel.core.domain import (
     SatisfyWorkUnit,
     WorkUnitStatus,
 )
-from creatidy_kernel.core.outcomes import UsageObservation
+from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _APPLICATION_ID = 0x43544B31
 _DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _LOCAL_FILESYSTEMS = {
@@ -243,6 +243,7 @@ class SQLiteProgramStore:
                 if _is_sqlite_lock_contention(error):
                     raise ConcurrentWriter("another controller owns SQLite EXCLUSIVE locking mode") from error
                 raise
+            self._startup_evidence = self._read_startup_evidence()
             self._migrate()
             self.rebuild_projections()
             self._validate_operation_records()
@@ -896,16 +897,23 @@ class SQLiteProgramStore:
                 ]
                 if (
                     sum(
-                        (Decimal(cast(str, item["quantity"])) for item in matching if item["quantity"] is not None),
+                        (
+                            Decimal(cast(str, item["quantity"]))
+                            for item in matching
+                            if item["quantity"] is not None
+                            and item["provenance"] in {Provenance.MEASUREMENT.value, Provenance.PROVIDER_REPORT.value}
+                        ),
                         Decimal(0),
                     )
                     >= ceiling.quantity
                 ):
                     raise BudgetRefused(f"{scope} observed resource ceiling exhausted")
-                covered = {item["operation"] for item in matching if item["quantity"] is not None}
-                if any(
-                    item["operation"] != exclude_operation and item["operation"] not in covered for item in scoped
-                ) or any(item["quantity"] is None for item in matching):
+                # A numeric receipt, even after physical settlement, does not prove
+                # complete hidden-client consumption. No installed profile supplies
+                # a resource-specific conservative final bound to release this hold.
+                if any(item["operation"] != exclude_operation for item in scoped) or any(
+                    item["quantity"] is None for item in matching
+                ):
                     raise BudgetRefused(f"{scope} resource headroom unknown")
 
     def _reserve_work(
@@ -1430,18 +1438,44 @@ class SQLiteProgramStore:
     def _verify_backup_manifest(directory: Path) -> None:
         try:
             manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-            if manifest["format"] != "creatidy-kernel-sqlite-backup" or manifest["schema_version"] not in (1, 2):
+            if (
+                manifest["format"] != "creatidy-kernel-sqlite-backup"
+                or type(manifest["schema_version"]) is not int
+                or manifest["schema_version"] not in (1, 2, 3)
+            ):
                 raise ValueError("unsupported backup manifest")
             with (directory / "kernel.sqlite3").open("rb") as stream:
                 if hashlib.file_digest(stream, "sha256").hexdigest() != manifest["database_sha256"]:
                     raise ValueError("backup database digest mismatch")
-            entries = cast(list[dict[str, object]], manifest["artifacts"]) if manifest["schema_version"] == 2 else []
+            entries = cast(list[dict[str, object]], manifest["artifacts"]) if manifest["schema_version"] >= 2 else []
+            if type(entries) is not list:
+                raise ValueError("invalid artifact manifest")
+            with closing(
+                sqlite3.connect(f"{(directory / 'kernel.sqlite3').as_uri()}?mode=ro&immutable=1", uri=True)
+            ) as image:
+                if image.execute("PRAGMA user_version").fetchone()[0] != manifest["schema_version"]:
+                    raise ValueError("backup manifest/database schema mismatch")
+                expected = (
+                    sorted(image.execute("SELECT DISTINCT digest, size FROM artifact_references").fetchall())
+                    if manifest["schema_version"] >= 2
+                    else []
+                )
+            listed: list[tuple[str, int]] = []
             for entry in entries:
                 digest, size = entry["digest"], entry["size"]
-                if type(digest) is not str or len(digest) != 64 or type(size) is not int:
+                if (
+                    type(digest) is not str
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                    or type(size) is not int
+                    or size < 0
+                ):
                     raise ValueError("invalid artifact manifest entry")
+                listed.append((digest, size))
                 SQLiteProgramStore._verify_blob(directory / "kernel.sqlite3.artifacts" / digest, digest, size)
-        except (OSError, ValueError, KeyError, TypeError) as error:
+            if sorted(listed) != expected:
+                raise ValueError("artifact manifest does not cover database references exactly")
+        except (OSError, ValueError, KeyError, TypeError, sqlite3.DatabaseError) as error:
             raise CorruptHistory("backup bundle manifest verification failed") from error
 
     @classmethod
@@ -1619,12 +1653,16 @@ class SQLiteProgramStore:
                 _fsync_file(database)
                 with database.open("rb") as stream:
                     file_digest = hashlib.file_digest(stream, "sha256").hexdigest()
-                artifacts = [
-                    (cast(str, row["digest"]), cast(int, row["size"]))
-                    for row in self._connection.execute(
-                        "SELECT DISTINCT digest, size FROM artifact_references ORDER BY digest"
-                    )
-                ]
+                artifacts = (
+                    []
+                    if schema_version == 1
+                    else [
+                        (cast(str, row["digest"]), cast(int, row["size"]))
+                        for row in self._connection.execute(
+                            "SELECT DISTINCT digest, size FROM artifact_references ORDER BY digest"
+                        )
+                    ]
+                )
                 if artifacts:
                     artifact_target = temporary / "kernel.sqlite3.artifacts"
                     artifact_target.mkdir()
@@ -1759,6 +1797,9 @@ class SQLiteProgramStore:
             )
 
     def _migrate(self) -> None:
+        original_version = cast(int, self._connection.execute("PRAGMA user_version").fetchone()[0])
+        if original_version in (1, 2):
+            self._backup_before_schema_three()
         with self._transaction():
             version = cast(int, self._connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SCHEMA_VERSION:
@@ -1769,10 +1810,35 @@ class SQLiteProgramStore:
             if version == 1:
                 self._migrate_1_to_2()
                 version = 2
+            if version == 2:
+                self._migrate_2_to_3()
+                version = 3
             if version != SCHEMA_VERSION:
                 raise UnsupportedSQLiteConfiguration(f"no migration path from schema version {version}")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        self._validate_schema()
+            self._validate_schema()
+
+    def _backup_before_schema_three(self) -> None:
+        # A content-qualified name reuses the same complete backup after an
+        # interrupted upgrade, never overwriting an earlier recovery image.
+        digest = hashlib.sha256()
+        for statement in self._connection.iterdump():
+            digest.update(statement.encode("utf-8"))
+            digest.update(b"\n")
+        target = self._path.parent / f"{self._path.name}.pre-schema-3-{digest.hexdigest()}"
+        if target.exists():
+            self._verify_backup_manifest(target)
+            original = hashlib.sha256()
+            with closing(
+                sqlite3.connect(f"{(target / 'kernel.sqlite3').as_uri()}?mode=ro&immutable=1", uri=True)
+            ) as backup:
+                for statement in backup.iterdump():
+                    original.update(statement.encode("utf-8"))
+                    original.update(b"\n")
+            if original.digest() != digest.digest():
+                raise CorruptHistory("pre-upgrade backup differs from current original records")
+        else:
+            self.backup(target)
 
     def _migrate_0_to_1(self) -> None:
         statements = (
@@ -1920,6 +1986,20 @@ class SQLiteProgramStore:
                     f"BEGIN SELECT RAISE(ABORT, '{table} is immutable'); END"
                 )
 
+    def _migrate_2_to_3(self) -> None:
+        # This is an authority compatibility boundary, not a data rewrite. Older
+        # readers reject user_version=3 before they can ignore work-budget facts.
+        self._connection.execute(
+            "CREATE TABLE store_contract (schema_version INTEGER PRIMARY KEY CHECK(schema_version = 3), "
+            "authority_contract TEXT NOT NULL CHECK(authority_contract = 'work-budget:v1')) WITHOUT ROWID"
+        )
+        self._connection.execute("INSERT INTO store_contract VALUES (3, 'work-budget:v1')")
+        for action in ("UPDATE", "DELETE"):
+            self._connection.execute(
+                f"CREATE TRIGGER store_contract_no_{action.lower()} BEFORE {action} ON store_contract "
+                "BEGIN SELECT RAISE(ABORT, 'store contract is immutable'); END"
+            )
+
     def _validate_schema(self) -> None:
         tables = {
             cast(str, row[0])
@@ -1938,6 +2018,7 @@ class SQLiteProgramStore:
             "operation_transports",
             "operation_reconciliations",
             "artifact_references",
+            "store_contract",
         }
         if not required <= tables:
             raise UnsupportedSQLiteConfiguration("database schema is missing required K2 tables")
@@ -1968,6 +2049,7 @@ class SQLiteProgramStore:
                 "authoritative_absence",
             },
             "artifact_references": {"operation_id", "name", "digest", "size"},
+            "store_contract": {"schema_version", "authority_contract"},
         }
         for table, expected in columns.items():
             actual = {cast(str, row["name"]) for row in self._connection.execute(f"PRAGMA table_info({table})")}
@@ -1979,6 +2061,7 @@ class SQLiteProgramStore:
         }
         required_triggers = {"history_no_update", "history_no_delete", "admissions_no_update", "admissions_no_delete"}
         required_triggers |= {"operations_no_delete", "outbox_no_update", "outbox_no_delete"}
+        required_triggers |= {"store_contract_no_update", "store_contract_no_delete"}
         required_triggers |= {
             f"{table}_no_{action}"
             for table in (
@@ -1992,6 +2075,11 @@ class SQLiteProgramStore:
         }
         if not required_triggers <= triggers:
             raise UnsupportedSQLiteConfiguration("database schema is missing append-only history constraints")
+        if [
+            tuple(row)
+            for row in self._connection.execute("SELECT schema_version, authority_contract FROM store_contract")
+        ] != [(3, "work-budget:v1")]:
+            raise UnsupportedSQLiteConfiguration("database authority compatibility contract is invalid")
         if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise CorruptHistory("database contains a foreign-key violation")
 

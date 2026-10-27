@@ -54,6 +54,10 @@ def test_ci_is_canonical_with_pinned_actions_and_no_configured_secrets() -> None
         uses = step.get("uses")
         if isinstance(uses, str):
             assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", uses)
+            if uses.startswith("actions/checkout@"):
+                options = cast(dict[str, object], step["with"])
+                assert options["fetch-depth"] == 0
+                assert options["persist-credentials"] is False
             if uses.startswith("astral-sh/setup-uv@"):
                 options = cast(dict[str, object], step["with"])
                 assert options["github-token"] == ""

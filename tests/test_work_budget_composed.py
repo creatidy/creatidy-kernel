@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Composed command-integrity crashes and conservative resource headroom."""
+
+import json
+import subprocess
+from dataclasses import replace
+from decimal import Decimal
+from pathlib import Path
+from typing import cast
+
+import pytest
+from test_sqlite_store import spec
+from test_task_execution import FixtureConnection, deflake_edit, fixture_task, fixture_verification, make_source, run
+from test_work_budget import Clock, policy
+
+from creatidy_kernel.adapters import task_execution
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.adapters.task_execution import TaskInterrupted, VerificationCommand
+from creatidy_kernel.core.outcomes import Provenance, UsageObservation
+from creatidy_kernel.core.work_budget import BudgetRefused, ResourceCeiling, WorkKind
+
+pytest_plugins = ["test_sqlite_store"]
+
+
+@pytest.mark.parametrize("effect", ["tracked", "untracked"])
+def test_dirty_zero_exit_command_cannot_be_cleaned_into_a_pass_after_verification_crash(
+    sqlite_tmp_path: Path, effect: str
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    script = (
+        "p=pathlib.Path('tests/test_e2e_execution.py'); p.write_text(p.read_text()+'# touched\\n')"
+        if effect == "tracked"
+        else "pathlib.Path('leftover-artifact.txt').write_text('verification residue')"
+    )
+    command = fixture_verification(source, script)
+    task = replace(fixture_task(repeats=1), verification=(VerificationCommand(command, 30),))
+    control = sqlite_tmp_path / "control"
+    connection = FixtureConnection(deflake_edit)
+    with pytest.raises(TaskInterrupted):
+        run(control, source, connection, task=task, fault="verification")
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        results = [
+            item
+            for item in cast(
+                list[dict[str, object]], store.work_budget_status(task_execution.PROGRAM_ID)["reservations"]
+            )
+            if item["category"] == "tool"
+        ]
+        key = cast(str, results[0]["operation"])
+        receipt = json.loads(store.artifact(task_execution.OPERATION_ID, key))
+        integrity = json.loads(store.artifact(task_execution.OPERATION_ID, f"command-integrity:{key}"))
+        assert receipt["exit_code"] == 0 and integrity["clean"] is False and integrity["complete"] is True
+    # Fresh controller, existing durable result, no re-execution of the command.
+    recovered = run(control, source, FixtureConnection(deflake_edit), task=task)
+    assert recovered["condition"] == "rejected" and "acceptance" not in recovered and "pr" not in recovered
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        assert store.operation(key).attempts == 1
+        assert len(cast(list[object], store.work_budget_status(task_execution.PROGRAM_ID)["usage_history"])) == 1
+
+
+def test_success_result_without_integrity_stays_unknown_before_restore(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    command = fixture_verification(source, "pathlib.Path('protected-unchecked-effect').write_text('retain')")
+    task = replace(fixture_task(repeats=1), verification=(VerificationCommand(command, 30),))
+    control = sqlite_tmp_path / "control"
+    original = SQLiteProgramStore.finalize_artifact
+
+    def missing_integrity(store: SQLiteProgramStore, operation_id: str, name: str, data: bytes) -> str:
+        if name.startswith("command-integrity:"):
+            raise TaskInterrupted("synthetic loss before original integrity result")
+        return original(store, operation_id, name, data)
+
+    with monkeypatch.context() as crash:
+        crash.setattr(SQLiteProgramStore, "finalize_artifact", missing_integrity)
+        with pytest.raises(TaskInterrupted):
+            run(control, source, FixtureConnection(deflake_edit), task=task)
+    marker = control / "workspace/protected-unchecked-effect"
+    assert marker.read_text() == "retain"
+
+    def forbidden_restore(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("unchecked command effects must not be erased")
+
+    monkeypatch.setattr(task_execution, "_install_candidate", forbidden_restore)
+    recovered = run(control, source, FixtureConnection(deflake_edit), task=task)
+    assert recovered["condition"] in {"cancel_uncertain", "cancelled"} and "acceptance" not in recovered
+    assert marker.read_text() == "retain"
+
+
+def test_bounded_incomplete_integrity_is_never_a_cached_pass(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    task = fixture_task(repeats=1)
+
+    def exhausted(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise OverflowError("synthetic integrity output exceeds bounded capture")
+
+    monkeypatch.setattr(task_execution, "run_git_bounded", exhausted)
+    with pytest.raises(TaskInterrupted):
+        run(control, source, FixtureConnection(deflake_edit), task=task, fault="verification")
+    recovered = run(control, source, FixtureConnection(deflake_edit), task=task)
+    assert recovered["condition"] == "rejected" and "acceptance" not in recovered
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        records = cast(list[dict[str, object]], store.work_budget_status(task_execution.PROGRAM_ID)["reservations"])
+        for record in records:
+            if record["category"] == "tool":
+                data = store.artifact(task_execution.OPERATION_ID, f"command-integrity:{record['operation']}")
+                assert len(data) <= task_execution.MAX_CAPTURE_BYTES
+                integrity = json.loads(data)
+                assert integrity["complete"] is False and integrity["clean"] is False
+
+
+@pytest.mark.parametrize("scope", ["program", "project"])
+@pytest.mark.parametrize("provenance", [Provenance.ESTIMATE, Provenance.PROVIDER_REPORT])
+def test_zero_or_partial_receipt_never_releases_unknown_headroom(
+    sqlite_tmp_path: Path, scope: str, provenance: Provenance
+) -> None:
+    path = sqlite_tmp_path / "resource.sqlite3"
+    basic = policy()
+    limited = replace(basic, resources=(ResourceCeiling("money", "USD", Decimal(10)),))
+    project, task = (basic, limited) if scope == "program" else (limited, basic)
+    with SQLiteProgramStore(path, boot_clock=Clock()) as store:
+        store.create(spec(), "create")
+        store.bind_work_budget("program-1", "project", project, task, 110)
+        store.reserve_work("program-1", "a1", "running-a", WorkKind.ATTEMPT)
+        first = UsageObservation(
+            "o1", "a1", "partial-r", "money", "USD", Decimal(0), provenance, "synthetic-provider", 100
+        )
+        store.record_usage("running-a", first)
+        with pytest.raises(BudgetRefused, match=f"{scope} resource headroom unknown"):
+            store.reserve_work("program-1", "a1", "b", WorkKind.REVIEW)
+        # Physical completion is not a producer guarantee of complete billing.
+        store.record_work_settlement("running-a", "synthetic:exact-physical-completion")
+    with SQLiteProgramStore(path, boot_clock=Clock()) as store:
+        store.record_usage("running-a", replace(first, observation_id="o2", quantity=None, supersedes_id="o1"))
+        with pytest.raises(BudgetRefused, match="unknown"):
+            store.reserve_work("program-1", "a1", "b", WorkKind.REVIEW)
+        store.record_usage("running-a", replace(first, observation_id="o3", quantity=Decimal(2), supersedes_id="o2"))
+        with pytest.raises(BudgetRefused, match="unknown"):
+            store.reserve_work("program-1", "a1", "b", WorkKind.REVIEW)
+        final = store.work_budget_status("program-1")
+        assert len(cast(list[object], final["reservations"])) == 1 and final["hard_inference_cap"] is False
+        assert len(cast(list[object], final["usage_history"])) == 3
+
+
+def test_uncapped_basic_profile_keeps_unknown_usage_without_blocking_all_work(sqlite_tmp_path: Path) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / "basic.sqlite3", boot_clock=Clock()) as store:
+        store.create(spec(), "create")
+        store.bind_work_budget("program-1", "project", policy(), policy(), 110)
+        store.reserve_work("program-1", "a1", "a", WorkKind.ATTEMPT)
+        store.record_usage(
+            "a",
+            UsageObservation(
+                "o1", "a1", "r", "money", "USD", None, Provenance.PROVIDER_REPORT, "synthetic-client", 100
+            ),
+        )
+        store.reserve_work("program-1", "a1", "b", WorkKind.REVIEW)
+        assert store.work_budget_status("program-1")["hard_inference_cap"] is False

@@ -169,7 +169,7 @@ def test_source_receipt_identity_cannot_move_between_operations(sqlite_tmp_path:
 @pytest.mark.parametrize("scope", ["program", "project"])
 @pytest.mark.parametrize("correction", [Decimal(20), None])
 def test_existing_reservation_cannot_bypass_corrected_ceiling(
-    sqlite_tmp_path: Path, scope: str, correction: Decimal | None
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str, correction: Decimal | None
 ) -> None:
     base = policy()
     limited = replace(base, resources=(ResourceCeiling("money", "USD", Decimal(10)),))
@@ -191,7 +191,18 @@ def test_existing_reservation_cannot_bypass_corrected_ceiling(
         program = store.admit(program.program_id, "start", StartAttempt(program.revision, WORKER, "a1"))
         store.admit(program.program_id, "finish", FinishAttempt(program.revision, WORKER, "a1"))
         request: dict[str, object] = {"subject": "synthetic candidate"}
-        store.budgeted_intent(program.program_id, "a1", WorkKind.REVIEW, "review-b", "review-b", request)
+
+        # Preserve the earlier-contract counterexample with an already-reserved B.
+        # New production admissions now refuse this partial-coverage setup, tested
+        # separately; an imported historical reservation must still fail at claim.
+        def prior_headroom(
+            _store: SQLiteProgramStore, _program_id: str, *, exclude_operation: str | None = None
+        ) -> None:
+            return None
+
+        with monkeypatch.context() as legacy:
+            legacy.setattr(SQLiteProgramStore, "_check_resource_headroom", prior_headroom)
+            store.budgeted_intent(program.program_id, "a1", WorkKind.REVIEW, "review-b", "review-b", request)
         before = store.work_budget_status(program.program_id)["reservations"]
         store.record_usage("runtime:a1", replace(fact, observation_id="o2", quantity=correction, supersedes_id="o1"))
         # Historical intent replay remains possible but is not a new dispatch permit.
