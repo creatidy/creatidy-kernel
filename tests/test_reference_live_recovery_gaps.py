@@ -16,6 +16,7 @@ from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.reference import reference_commit, reference_git
 from creatidy_kernel.adapters.reference_live import run_live_reference
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.execution import RuntimeObservation
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.resources import Allocation
@@ -137,6 +138,43 @@ def scenario(sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator
     finally:
         for connection in result.connections:
             connection.retire_fixture()
+
+
+def test_reference_application_clock_rollback_enters_stop_without_escaped_refusal(
+    scenario: Scenario, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RollbackClock(Clock):
+        armed = False
+        seen_high = False
+
+        def __call__(self) -> BootClockReading:
+            if self.armed:
+                self.armed = False
+                self.seen_high = True
+                self.reading = BootClockReading(103, 3_000_000_000, "synthetic-live-boot")
+                return BootClockReading(105, 2_000_000_000, "synthetic-live-boot")
+            return self.reading
+
+    clock = RollbackClock()
+    scenario.clock = clock
+    connection = scenario.connection()
+    request = connection.request
+
+    def arm(method: str, params: dict[str, object]) -> dict[str, object]:
+        result = request(method, params)
+        if method == "turn/start":
+            clock.armed = True
+        return result
+
+    monkeypatch.setattr(connection, "request", arm)
+    result = scenario.run(connection)
+    assert clock.seen_high and result["condition"] == "cancel_uncertain"
+    assert result["accepted"] == [] and scenario.transport.pulls == []
+    assert connection.starts == 1 and connection.calls.count("turn/start") == 1
+    assert (scenario.directory / "repository/protected-worker-output").read_text() == "retain"
+    with SQLiteProgramStore(scenario.directory / "kernel.sqlite3", boot_clock=clock) as store:
+        assert store.operations("interruption:live-authority") and not store.operations("acceptance:")
+        assert store.operation("runtime:reference:first").attempts == 1
 
 
 @pytest.mark.parametrize("status", ["completed", "inProgress"])

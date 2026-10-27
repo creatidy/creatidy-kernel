@@ -42,6 +42,7 @@ from creatidy_kernel.adapters.task_execution import (
     compose_task_live as _compose_task_live,
 )
 from creatidy_kernel.adapters.task_execution import git_text as task_git
+from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import DomainCommandType, FinishAttempt, Program
 from creatidy_kernel.core.execution import UnsupportedExecution
 from creatidy_kernel.core.forge import Reference
@@ -352,7 +353,8 @@ def test_invalid_fresh_deadline_does_not_poison_corrected_same_directory_run(
     control = sqlite_tmp_path / "control"
     connection = FixtureConnection(lambda _path: None)
     connection.status = "inProgress"
-    monkeypatch.setattr(time, "time", lambda: 1000)
+    reading = BootClockReading(1000, 1_000_000_000, "synthetic-fresh-deadline-boot")
+    monkeypatch.setattr(time, "time", lambda: reading.wall)
 
     def advance(deadline: int | None) -> dict[str, object]:
         return run_task(
@@ -365,6 +367,7 @@ def test_invalid_fresh_deadline_does_not_poison_corrected_same_directory_run(
             version="1.2.3",
             deadline=deadline,
             allocation=ALLOCATION,
+            boot_clock=lambda: reading,
         )
 
     with pytest.raises(ValueError, match="owner deadline"):

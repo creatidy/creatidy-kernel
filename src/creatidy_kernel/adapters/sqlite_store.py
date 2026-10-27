@@ -724,7 +724,20 @@ class SQLiteProgramStore:
             if projection.wall_deadline != deadline:
                 raise BudgetRefused("original work expiry cannot be renewed")
         else:
-            reading = self._boot_clock()
+            if self._work_records("binding"):
+                readings = self._prepare_work_clocks()
+                if not readings or any(item is None for item in readings.values()):
+                    raise BudgetRefused("clock observation persistence unverified; no new work envelope")
+                reading = next(iter(readings.values()))
+                assert reading is not None  # noqa: S101 - checked all captured readings above.
+                for program in readings:
+                    previous = self._clock_watermarks[program]
+                    if previous.boot_id == reading.boot_id and (
+                        reading.wall < previous.wall or reading.boot_ns < previous.boot_ns
+                    ):
+                        raise BudgetRefused("observed wall/boot clock rollback; no new work envelope")
+            else:
+                reading = self._boot_clock()
             if reading is None:
                 raise BudgetRefused("verified suspend-inclusive clock unavailable")
             projection = DeadlineProjection.bind(deadline, reading)
@@ -743,6 +756,26 @@ class SQLiteProgramStore:
         if binding["spec_digest"] != self._load_head(program_id).spec.digest:
             raise BudgetRefused("work envelope belongs to a different current specification")
         projection = DeadlineProjection.decode(binding["projection"])
+        if self.work_decision_time(program_id) >= projection.wall_deadline:
+            raise BudgetRefused("original work deadline expired or boot clock unverifiable")
+        if (
+            self._work_record("revoked", program_id) is not None
+            or self._load_head(program_id).status is ProgramStatus.CANCELLED
+        ):
+            raise BudgetRefused("work authority revoked")
+
+    def work_decision_time(self, program_id: str) -> int:
+        """Use the same durably captured reading for application authority clocks.
+
+        This proves time only, not dispatch permission. Expired/revoked work may
+        still reconcile receipts; unverifiable time or rollback never becomes a
+        fresh projection or a new authority grant.
+        """
+        self._assert_writer_thread()
+        binding = self._work_binding(program_id)
+        if binding is None:
+            raise BudgetRefused("configured original work envelope required")
+        projection = DeadlineProjection.decode(binding["projection"])
         readings = self._transaction_clock_readings if self._connection.in_transaction else self._prepare_work_clocks()
         state = self._connection.execute(
             "SELECT * FROM work_clock_state WHERE program_id = ?", (program_id,)
@@ -750,17 +783,13 @@ class SQLiteProgramStore:
         if state is None or state["pending"] or readings is None or program_id not in readings:
             raise BudgetRefused("clock observation persistence unverified; no new work authority")
         reading = readings[program_id]
-        if projection.decision_time(reading) >= projection.wall_deadline:
+        if not projection.verifiable(reading):
             raise BudgetRefused("original work deadline expired or boot clock unverifiable")
         assert reading is not None  # noqa: S101 - projection verification established reading.
         previous = self._clock_watermarks[program_id]
         if reading.wall < previous.wall or reading.boot_ns < previous.boot_ns:
             raise BudgetRefused("observed wall/boot clock rollback; no new work authority")
-        if (
-            self._work_record("revoked", program_id) is not None
-            or self._load_head(program_id).status is ProgramStatus.CANCELLED
-        ):
-            raise BudgetRefused("work authority revoked")
+        return projection.decision_time(reading)
 
     def _flush_clock_observations(self) -> None:
         """Commit only captured clock evidence, never capacity/outbox/domain rows."""

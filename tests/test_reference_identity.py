@@ -7,7 +7,7 @@ from typing import cast
 from unittest.mock import patch
 
 import pytest
-from test_reference_live import Connection
+from test_reference_live import Connection, controlled_reference_clock
 
 from creatidy_kernel.adapters.codex_runtime import CodexRuntime
 from creatidy_kernel.adapters.fake_forge import SyntheticForgeTransport
@@ -52,6 +52,7 @@ def live_scenario(directory: Path) -> tuple[Connection, Callable[[], dict[str, o
             object_source=objects,
             deadline=100,
             max_observations=4,
+            boot_clock=controlled_reference_clock,
         )
 
     return connection, run

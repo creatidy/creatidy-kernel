@@ -1935,6 +1935,13 @@ def run_task(
         raise ValueError("owner deadline must be within one hour ahead")
     if directory.exists() and not existing_database and any(directory.iterdir()):
         raise ValueError("unjournaled task control directory must be empty")
+    initial_projection: DeadlineProjection | None = None
+    if not existing_database:
+        deadline = deadline if deadline is not None else now + 3300
+        reading = boot_clock()
+        if reading is None:
+            raise UnsupportedExecution("verified suspend-inclusive boot clock unavailable")
+        initial_projection = DeadlineProjection.bind(deadline, reading)
     directory.mkdir(parents=True, exist_ok=True)
     lifecycle: list[str] = []
     captured: dict[str, dict[str, object]] = {}
@@ -2368,11 +2375,8 @@ def run_task(
         if mode_recorded is None:
             if existing_database:
                 raise ValueError("existing database is not this neutral task")
-            deadline = deadline if deadline is not None else now + 3300
-            reading = boot_clock()
-            if reading is None:
-                raise UnsupportedExecution("verified suspend-inclusive boot clock unavailable")
-            projection = DeadlineProjection.bind(deadline, reading)
+            assert initial_projection is not None  # noqa: S101 - validated before fresh store initialization.
+            projection = initial_projection
             store.intent(
                 "task_execution:mode",
                 "task_execution:mode",
@@ -2448,15 +2452,25 @@ def run_task(
             if projection is not None and projection.wall_deadline != deadline:
                 raise ValueError("original deadline projection differs from wall envelope")
 
+        clock_unverified = projection is None
+
         def decision_time() -> int:
-            return deadline if projection is None else projection.decision_time(boot_clock())
+            nonlocal clock_unverified
+            if clock_unverified:
+                return deadline
+            try:
+                return store.work_decision_time(PROGRAM_ID)
+            except BudgetRefused:
+                clock_unverified = True
+                return deadline  # Original expiry is a refusal sentinel, never a renewed allowance.
 
         def authority_current() -> bool:
-            if cancellation_requested_now() or decision_time() >= deadline:
+            if cancellation_requested_now() or clock_unverified:
                 return False
             try:
                 store.check_work_authority(PROGRAM_ID)
             except BudgetRefused:
+                record_cancellation(ATTEMPT_ID, OPERATION_ID)
                 return False
             return True
 
@@ -2729,10 +2743,10 @@ def run_task(
                     try:
                         store.check_work_dispatch(request.operation.operation_id)
                     except BudgetRefused:
+                        record_cancellation(ATTEMPT_ID, OPERATION_ID)
                         return False
                     return (
                         authority_current()
-                        and decision_time() < deadline
                         and operation.status == "dispatched"
                         and operation.fence == request.fence
                         and operation.request_digest == request.operation.request_digest
@@ -2752,7 +2766,7 @@ def run_task(
                 authorize=authorize,
                 collect=collector.runtime_candidate,
                 supported_efforts=supported_efforts,
-                clock=lambda: int(time.time()),
+                clock=decision_time,
                 retire=retire_owned_group if close_owned_group is not None else None,
                 settled=observe_owned_group,
                 group_reference=observe_owned_group_reference,
@@ -3222,7 +3236,7 @@ def run_task(
             return result
         result = export_task_store(store)
         result.update(
-            condition="unknown" if projection is None or not projection.verifiable(boot_clock()) else status,
+            condition="unknown" if clock_unverified else status,
             verification=captured,
             lifecycle=lifecycle,
             isolation="not attested; trusted development only",

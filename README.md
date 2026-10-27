@@ -439,6 +439,10 @@ Admission rollback cannot erase observed high-water evidence, and caches contain
 only. A failed clock flush leaves durable uncertainty: the same live owner may flush its exact captured
 sample, but a fresh process cannot invent that sample from its recovery wall clock. Historical reads
 and cancellation journaling remain available; new authority refuses while evidence is incomplete.
+Application decision-time callbacks consume the same durably observed store reading, not a separate
+boot-clock sample. A fresh task validates its initial boot proof and projection before creating its
+neutral store; failed initial proof leaves no task state to poison a corrected invocation. Existing
+stores and recorded expiries are never silently adopted or refreshed.
 
 Opening an existing schema-1/2/3 store first publishes a verified online backup named
 `<database>.pre-schema-4-<logical-digest>`, then atomically installs the clock-state compatibility

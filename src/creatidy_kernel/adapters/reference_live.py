@@ -188,7 +188,24 @@ def run_live_reference(
                 reasoning_effort=selected.reasoning_effort,
             )
 
+        stopping = False
+        clock_refused = False
+
+        def decision_time() -> int:
+            nonlocal clock_refused
+            if clock_refused and not stopping:
+                raise BudgetRefused("original work clock refused authority")
+            try:
+                return store.work_decision_time("reference")
+            except BudgetRefused:
+                clock_refused = True
+                if not stopping:
+                    raise
+                return deadline  # Refusal sentinel permits STOP, never new dispatch/acceptance.
+
         def work_authorized() -> bool:
+            if clock_refused:
+                return False
             try:
                 store.check_work_authority("reference")
             except BudgetRefused:
@@ -196,14 +213,12 @@ def run_live_reference(
             return True
 
         def authorize(request: ExecutionRequest) -> bool:
-            try:
-                store.check_work_dispatch(request.operation.operation_id)
-            except BudgetRefused:
-                return False
+            if clock_refused:
+                raise BudgetRefused("original work clock refused authority")
+            store.check_work_dispatch(request.operation.operation_id)
             operation = store.operation(request.operation.operation_id)
             return (
-                work_authorized()
-                and operation.status == "dispatched"
+                operation.status == "dispatched"
                 and operation.fence == request.fence
                 and operation.request_digest == request.operation.request_digest
             )
@@ -245,7 +260,7 @@ def run_live_reference(
             retire=retire_once if retire_owned_group is not None else None,
             settled=observe_owned_group,
             group_reference=observe_owned_group_reference,
-            clock=lambda: int(time.time()),
+            clock=decision_time,
         )
 
         def original_receipt(
@@ -396,7 +411,7 @@ def run_live_reference(
                     policy=POLICY,
                     now=int(time.time()),
                     restore=restore,
-                    clock=lambda: int(time.time()),
+                    clock=decision_time,
                 )
             except BudgetRefused:
                 authority_refused = True
@@ -418,6 +433,7 @@ def run_live_reference(
                 break
             if status in {"unknown", "rejected", "identity_unavailable"}:
                 break
+        stopping = True
         if status not in {"unknown", "rejected", "identity_unavailable"}:
             status = "budget_exhausted"
         store.revoke_work_budget("reference", "interruption:live-budget")
