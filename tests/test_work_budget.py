@@ -20,14 +20,22 @@ from creatidy_kernel.adapters.sqlite_codec import program_json
 from creatidy_kernel.adapters.sqlite_store import ConcurrentWriter, OperationConflict, SQLiteProgramStore
 from creatidy_kernel.adapters.task_execution import VerificationCommand
 from creatidy_kernel.core.deadlines import BootClockReading, DeadlineProjection
-from creatidy_kernel.core.domain import ActivateProgram, AttemptSpec, PrepareAttempt, Program, ProgramSpec
+from creatidy_kernel.core.domain import (
+    ActivateProgram,
+    AttemptSpec,
+    FinishAttempt,
+    PrepareAttempt,
+    Program,
+    ProgramSpec,
+    StartAttempt,
+)
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.work_budget import BudgetRefused, ResourceCeiling, WorkBudgetPolicy, WorkKind
 
 pytest_plugins = ["test_sqlite_store"]
 
 run_command = cast(
-    Callable[[Path, VerificationCommand, int, Mapping[str, str], Callable[[], bool], int], dict[str, object]],
+    Callable[..., dict[str, object]],
     inspect.getattr_static(task_execution, "_run_command"),
 )
 
@@ -274,9 +282,11 @@ def test_durable_command_result_recovers_accounting_without_reexecution(
         supplied: Mapping[str, str],
         authorized: Callable[[], bool],
         max_bytes: int,
+        *,
+        owner: task_execution.OwnedVerificationCommand | None = None,
     ) -> dict[str, object]:
         calls.append(command.argv)
-        return run_command(workspace, command, repeat, supplied, authorized, max_bytes)
+        return run_command(workspace, command, repeat, supplied, authorized, max_bytes, owner=owner)
 
     def crash_accounting(_store: SQLiteProgramStore, _key: str, _bytes: int) -> None:
         raise task_execution.TaskInterrupted("synthetic crash after durable command result")
@@ -296,6 +306,8 @@ def test_durable_command_result_recovers_accounting_without_reexecution(
 def test_review_retries_tools_and_auxiliary_share_finite_capacity(sqlite_tmp_path: Path) -> None:
     with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3", boot_clock=Clock()) as store:
         program = prepare(store, initialize(store, project=policy(attempts=1)), "a1")
+        program = store.admit(program.program_id, "start:a1", StartAttempt(program.revision, WORKER, "a1"))
+        program = store.admit(program.program_id, "finish:a1", FinishAttempt(program.revision, WORKER, "a1"))
         store.budgeted_intent(
             program.program_id, "a1", WorkKind.REVIEW, "review:a1", "review:a1", {"subject": "candidate-a1"}
         )

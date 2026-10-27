@@ -11,6 +11,10 @@ class BudgetRefused(ValueError):
     """Capacity or evidence does not permit another admission."""
 
 
+class WorkUncertain(RuntimeError):
+    """Unresolved ownership/result is not ordinary failed verification evidence."""
+
+
 class WorkKind(StrEnum):
     ATTEMPT = "attempt"
     REVIEW = "review"

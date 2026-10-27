@@ -227,6 +227,7 @@ class BudgetedChecks:
         return self._run(name, subject, key)
 
     def _run(self, name: str, subject: EvidenceSubject, key: str) -> Evidence | None:
+        self.store.check_work_dispatch(key)
         result = self.checks.check(name, subject)
         data = manifest_bytes(None if result is None else asdict(result))
         self.store.finalize_artifact(key, "result", data)
@@ -483,6 +484,7 @@ def advance_work_unit(
             fence,
             allocation,
         )
+        store.check_work_dispatch(operation_id)
         handle = runtime.start(request)
         if cancel_requested is not None:
             cancel_requested()

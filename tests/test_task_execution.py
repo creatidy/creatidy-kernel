@@ -27,6 +27,7 @@ from creatidy_kernel.adapters.task_execution import (
     CODEX_METHODS,
     TASKS,
     LiveTaskComponents,
+    OwnedVerificationCommand,
     TaskChecks,
     TaskInterrupted,
     TaskRuntimeConfig,
@@ -252,6 +253,7 @@ def run(
     fault: str | None = None,
     cancel_requested: bool = False,
     cancellation_requested: Callable[[], bool] | None = None,
+    command_owners: dict[str, OwnedVerificationCommand] | None = None,
 ) -> dict[str, object]:
     if forge is None:
         forge, _transport = make_forge(base or "0" * 40)
@@ -271,6 +273,7 @@ def run(
         fault=fault,
         cancel_requested=cancel_requested,
         cancellation_requested=cancellation_requested,
+        command_owners=command_owners,
     )
 
 
@@ -795,7 +798,7 @@ def test_cancellation_during_verification_stops_further_commands(
     requested = [False]
     calls: list[tuple[str, ...]] = []
     original = cast(
-        "Callable[[Path, VerificationCommand, int, Mapping[str, str], Callable[[], bool], int], dict[str, object]]",
+        "Callable[..., dict[str, object]]",
         inspect.getattr_static(task_execution, "_run_command"),
     )
 
@@ -806,8 +809,10 @@ def test_cancellation_during_verification_stops_further_commands(
         supplied: Mapping[str, str],
         authorized: Callable[[], bool],
         max_bytes: int,
+        *,
+        owner: OwnedVerificationCommand | None = None,
     ) -> dict[str, object]:
-        result = original(workspace, command, repeat, supplied, authorized, max_bytes)
+        result = original(workspace, command, repeat, supplied, authorized, max_bytes, owner=owner)
         calls.append(command.argv)
         requested[0] = True
         return result

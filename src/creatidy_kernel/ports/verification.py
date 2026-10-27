@@ -343,9 +343,9 @@ def dispatch_product_review(
     program = store.load(program_id)
     if (
         request.subject.attempt_digest != program.attempt(request.author_attempt_id).spec.digest
-        or request.subject.spec_digest != program.spec.digest
+        or request.subject.spec_digest != program.attempt(request.author_attempt_id).spec.spec_digest
     ):
-        raise ValueError("product review differs from current exact Attempt/specification")
+        raise ValueError("product review differs from original exact Attempt/specification")
     operation = store.budgeted_intent(
         program_id,
         request.author_attempt_id,
@@ -425,6 +425,7 @@ def dispatch_product_review(
     fence = store.claim(operation_id, now=now, lease_seconds=lease_seconds)
     operation = store.operation(operation_id)
     key = OperationKey(operation_id, operation.effect_key, operation.request_digest)
+    store.check_work_dispatch(operation_id)
     try:
         receipt = dispatcher.dispatch(key, request, fence=fence)
     except Exception:

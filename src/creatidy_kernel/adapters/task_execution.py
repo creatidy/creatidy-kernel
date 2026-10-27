@@ -25,6 +25,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, closing
 from dataclasses import asdict, dataclass, field, replace
@@ -104,7 +105,7 @@ from creatidy_kernel.core.knowledge import export_document
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
-from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
+from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind, WorkUncertain
 from creatidy_kernel.ports.allocation import (
     decode_runtime_receipt_with_group,
     encode_allocation,
@@ -854,6 +855,156 @@ def _install_candidate(workspace: Path, objects: Path, head: str) -> None:
     git_text(objects, "fetch", "--no-tags", str(workspace), "HEAD", timeout=GIT_TIMEOUT_SECONDS)
 
 
+class OwnedVerificationCommand:
+    """Only this live Popen owner may retire its original group; never restore a PID."""
+
+    def __init__(self, operation: OperationRecord, started: Callable[[], None] = lambda: None) -> None:
+        self.binding: dict[str, object] = {
+            "version": 1,
+            "operation": operation.operation_id,
+            "effect_key": operation.effect_key,
+            "request_digest": operation.request_digest,
+            "fence": operation.fence,
+            "group_reference": uuid.uuid4().hex,
+            "profile": "trusted-development:owned-verification-group",
+        }
+        self.process: subprocess.Popen[bytes] | None = None
+        self.result: dict[str, object] | None = None
+        self.started = started
+        self.retirement_attempted = False
+
+    def attach(self, process: subprocess.Popen[bytes]) -> None:
+        if self.process is not None:
+            raise WorkUncertain("command owner already has an original process")
+        self.process = process
+        self.started()
+
+    def settled(self) -> bool | None:
+        if self.result is not None and self.result.get("dispatch") == "not_started":
+            return True
+        if self.process is None:
+            return None
+        self.process.poll()
+        try:
+            os.killpg(self.process.pid, 0)
+        except ProcessLookupError:
+            return self.process.returncode is not None
+        except OSError:
+            return None
+        return False
+
+    def retire(self) -> bool | None:
+        process = self.process
+        if process is None or self.retirement_attempted:
+            return self.settled()
+        self.retirement_attempted = True
+        if process.poll() is None:
+            try:
+                if os.getpgid(process.pid) != process.pid:
+                    return False
+            except ProcessLookupError:
+                pass
+            except OSError:
+                return None
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return None
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return self.settled()
+
+    def persist(self, store: SQLiteProgramStore) -> None:
+        key = cast(str, self.binding["operation"])
+        if self.result is not None:
+            store.finalize_artifact(OPERATION_ID, key, manifest_bytes(self.result))
+        data = manifest_bytes(
+            {
+                **self.binding,
+                "owned_group_settled": self.settled(),
+                "result_reconciled": self.result is not None,
+                "result_digest": None
+                if self.result is None
+                else "sha256:" + hashlib.sha256(manifest_bytes(self.result)).hexdigest(),
+                "descendants": "unproven; trusted-development is not containment",
+            }
+        )
+        identity = f"command-settlement:{key}:{hashlib.sha256(data).hexdigest()}"
+        store.intent(identity, identity, {"kind": "work-budget-record", "witness": json.loads(data)})
+
+
+def _command_settled(store: SQLiteProgramStore, key: str, result: dict[str, object] | None) -> bool:
+    binding_data = store.find_artifact(OPERATION_ID, f"command-owner:{key}")
+    if binding_data is None:
+        # Historical completed receipts remain readable; missing/failed proof does not improve.
+        return result is not None and result.get("owned_group_settled") is True
+    binding = cast(dict[str, object], json.loads(binding_data))
+    operation = store.operation(key)
+    if (
+        binding.get("operation") != key
+        or binding.get("request_digest") != operation.request_digest
+        or binding.get("fence") != operation.fence
+    ):
+        return False
+    for fact in store.operations(f"command-settlement:{key}:"):
+        witness = cast(dict[str, object], json.loads(fact.request_json)["request"]["witness"])
+        if (
+            all(witness.get(name) == value for name, value in binding.items())
+            and witness.get("owned_group_settled") is True
+        ):
+            return True
+    return False
+
+
+def _command_recovery(
+    store: SQLiteProgramStore, owners: Mapping[str, OwnedVerificationCommand] | None = None, *, record: bool = True
+) -> tuple[tuple[str, ...], bool]:
+    """Return unresolved commands and whether every original owned group is settled."""
+    pending: list[str] = []
+    all_settled = True
+    reservations = cast(list[dict[str, object]], store.work_budget_status(PROGRAM_ID)["reservations"])
+    for reservation in reservations:
+        if reservation["category"] != WorkKind.TOOL.value:
+            continue
+        key = cast(str, reservation["operation"])
+        data = store.find_artifact(OPERATION_ID, key)
+        result = None if data is None else cast(dict[str, object], json.loads(data))
+        settled = _command_settled(store, key, result)
+        if (result is None or not settled) and owners is not None and key in owners:
+            owner = owners[key]
+            original = store.find_artifact(OPERATION_ID, f"command-owner:{key}")
+            if original is not None and manifest_bytes(owner.binding) == original:
+                owner.retire()
+                owner.persist(store)
+                data = store.find_artifact(OPERATION_ID, key)
+                result = None if data is None else cast(dict[str, object], json.loads(data))
+                settled = _command_settled(store, key, result)
+        if result is None or not settled:
+            pending.append(key)
+            all_settled = all_settled and settled
+            if record:
+                store.intent(
+                    f"command-unknown:{key}",
+                    f"command-unknown:{key}",
+                    {
+                        "kind": "work-budget-record",
+                        "operation": key,
+                        "reason": "original command result or qualified ownership settlement unresolved",
+                    },
+                )
+    return tuple(pending), all_settled
+
+
+def _require_command_results(store: SQLiteProgramStore) -> None:
+    pending, _ = _command_recovery(store)
+    if pending:
+        raise WorkUncertain("verification command ownership/result unresolved; workspace reuse refused")
+
+
 def _run_command(
     workspace: Path,
     command: VerificationCommand,
@@ -861,6 +1012,8 @@ def _run_command(
     supplied: Mapping[str, str],
     authorized: Callable[[], bool] = lambda: True,
     max_bytes: int = MAX_CAPTURE_BYTES,
+    *,
+    owner: OwnedVerificationCommand | None = None,
 ) -> dict[str, object]:
     environment = {"HOME": str(workspace), "PATH": os.defpath, "LANG": "C.UTF-8"}
     for key in COMMAND_ENV_KEYS:
@@ -897,6 +1050,8 @@ def _run_command(
         start_new_session=True,
     )
     try:
+        if owner is not None:
+            owner.attach(process)
         with selectors.DefaultSelector() as selector:
             for index, pipe in enumerate((process.stdout, process.stderr)):
                 if pipe is not None:
@@ -918,18 +1073,21 @@ def _run_command(
                         break
     finally:
         # The original group is owned for this invocation only. Never recover a PID.
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            settled = True
+        if owner is not None:
+            settled = owner.retire() is True
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                settled = True
         if process.stdout is not None:
             process.stdout.close()
         if process.stderr is not None:
@@ -969,6 +1127,7 @@ class TaskChecks:
         captured: dict[str, dict[str, object]] | None = None,
         command_environment: Mapping[str, str] | None = None,
         authorized: Callable[[], bool] = lambda: True,
+        command_owners: dict[str, OwnedVerificationCommand] | None = None,
     ) -> None:
         self.store = store
         self.task = task
@@ -981,6 +1140,7 @@ class TaskChecks:
         self.captured = captured if captured is not None else {}
         self.command_environment = dict(command_environment or {})
         self.authorized = authorized
+        self.command_owners = command_owners if command_owners is not None else {}
         self._last_payload: dict[str, object] = {}
 
     def _evidence(self, name: str, subject: EvidenceSubject, passed: bool, payload: dict[str, object]) -> Evidence:
@@ -1041,6 +1201,7 @@ class TaskChecks:
                 name, subject, passed, {"changed_paths": list(self.paths), "allowed_paths": sorted(allowed)}
             )
         if name == "verification-commands":
+            _require_command_results(self.store)
             # POLICY's shipped order/digest is durable. Enforce the structural
             # prerequisite here as well, including direct producer calls.
             actual_paths = _changed_paths(self.workspace, self.base, self.head)
@@ -1074,18 +1235,55 @@ class TaskChecks:
                         # uncertain work, not permission to execute the command twice.
                         prior = self.store.work_budget_status(PROGRAM_ID)["reservations"]
                         if any(item["operation"] == key for item in cast(list[dict[str, object]], prior)):
-                            return self._evidence(
-                                name, subject, False, {"runs": runs, "reason": "prior command result unknown"}
-                            )
+                            raise WorkUncertain("prior verification command result unknown")
                         allowance = min(MAX_CAPTURE_BYTES, self.store.available_retained_bytes(PROGRAM_ID))
                         if allowance <= 0:
                             return self._evidence(
                                 name, subject, False, {"runs": runs, "reason": "retained byte budget exhausted"}
                             )
-                        self.store.reserve_work(PROGRAM_ID, ATTEMPT_ID, key, WorkKind.TOOL, retained_bytes=allowance)
-                        run = _run_command(
-                            self.workspace, command, repeat, self.command_environment, self.authorized, allowance
+                        self.store.budgeted_intent(
+                            PROGRAM_ID,
+                            ATTEMPT_ID,
+                            WorkKind.TOOL,
+                            key,
+                            key,
+                            {
+                                "subject": asdict(subject),
+                                "argv": list(command.argv),
+                                "repeat": repeat,
+                                "command_index": command_index,
+                            },
+                            retained_bytes=allowance,
                         )
+                        self.store.claim(key, now=int(time.time()), lease_seconds=command.timeout_seconds)
+                        owner = OwnedVerificationCommand(
+                            self.store.operation(key),
+                            lambda: self.fault("command-dispatched") if self.fault is not None else None,
+                        )
+                        self.command_owners[key] = owner
+                        self.store.finalize_artifact(
+                            OPERATION_ID, f"command-owner:{key}", manifest_bytes(owner.binding)
+                        )
+
+                        def authorized(operation_id: str = key) -> bool:
+                            if not self.authorized():
+                                return False
+                            self.store.check_work_dispatch(operation_id)
+                            return True
+
+                        try:
+                            run = _run_command(
+                                self.workspace,
+                                command,
+                                repeat,
+                                self.command_environment,
+                                authorized,
+                                allowance,
+                                owner=owner,
+                            )
+                            owner.result = run
+                        finally:
+                            owner.persist(self.store)
                     reference = self.store.finalize_artifact(OPERATION_ID, key, manifest_bytes(run))
                     self.store.record_retained_bytes(key, cast(int, run["retained_bytes"]))
                     self.store.record_usage(
@@ -1102,8 +1300,10 @@ class TaskChecks:
                             cast(int, run["observed_at"]),
                         ),
                     )
-                    if run["owned_group_settled"] is True:
+                    if _command_settled(self.store, key, run):
                         self.store.record_work_settlement(key, reference)
+                    else:
+                        raise WorkUncertain("verification command group settlement unknown")
                     runs.append(run)
                     if (
                         any(runs[-1].get(key) is True for key in ("timed_out", "authority_lost", "output_exhausted"))
@@ -1207,6 +1407,7 @@ class TaskCollector:
         captured: dict[str, dict[str, object]] | None = None,
         command_environment: Mapping[str, str] | None = None,
         authorized: Callable[[], bool] = lambda: True,
+        command_owners: dict[str, OwnedVerificationCommand] | None = None,
     ) -> None:
         self.store = store
         self.task = task
@@ -1218,8 +1419,10 @@ class TaskCollector:
         self.captured = captured if captured is not None else {}
         self.command_environment = dict(command_environment or {})
         self.authorized = authorized
+        self.command_owners = command_owners if command_owners is not None else {}
 
     def runtime_candidate(self, request: ExecutionRequest) -> Candidate | None:
+        _require_command_results(self.store)
         try:
             recorded = _request(self.store, CANDIDATE_OPERATION)
         except OperationConflict as error:
@@ -1242,6 +1445,7 @@ class TaskCollector:
         )
 
     def collect(self, request: ExecutionRequest, candidate: Candidate, *, now: int) -> Collection:
+        _require_command_results(self.store)
         try:
             recorded = _request(self.store, CANDIDATE_OPERATION)
         except OperationConflict as error:
@@ -1292,6 +1496,7 @@ class TaskCollector:
                 captured=self.captured,
                 command_environment=self.command_environment,
                 authorized=self.authorized,
+                command_owners=self.command_owners,
             ),
         )
 
@@ -1404,6 +1609,8 @@ def export_task_store(store: SQLiteProgramStore) -> dict[str, object]:
         "automatic_merge": False,
         "automatic_deploy": False,
     }
+    unresolved_commands, command_groups_settled = _command_recovery(store, record=False)
+    result.update(unresolved_commands=list(unresolved_commands), command_groups_settled=command_groups_settled)
     try:
         store.operation(OPERATION_ID)
     except OperationConflict as error:
@@ -1493,8 +1700,13 @@ def task_status(directory: Path) -> dict[str, object]:
     cancellation_state = cancellation.get("settlement_state") if cancellation is not None else None
     expired = type(result["deadline"]) is int and int(time.time()) >= result["deadline"]
     terminal = bool(operations) and all(item["status"] == "terminal" for item in operations)
+    command_uncertain = bool(result["unresolved_commands"]) and not (
+        result["command_groups_settled"] is True and cancellation_state == "settled"
+    )
     condition = (
-        "accepted"
+        "cancel_uncertain"
+        if command_uncertain
+        else "accepted"
         if acceptance is not None
         else "cancelled_no_dispatch"
         if cancellation is not None
@@ -1534,7 +1746,9 @@ def task_status(directory: Path) -> dict[str, object]:
         "expired": expired,
         "condition": condition,
         "next_action": (
-            "Cancelled before dispatch; new execution requires separate approval."
+            "Retain workspace; reconcile original command ownership/result. Never adopt a stored PID or blindly retry."
+            if command_uncertain
+            else "Cancelled before dispatch; new execution requires separate approval."
             if condition == "cancelled_no_dispatch"
             else "Cancellation is recorded and waiting at the existing bounded owner-thread cleanup boundary."
             if condition == "cancel_requested"
@@ -1551,6 +1765,8 @@ def task_status(directory: Path) -> dict[str, object]:
         ),
         "runtime_state": "status is recorded evidence, not a fresh native observation",
         "cancellation": result.get("cancellation"),
+        "unresolved_commands": result["unresolved_commands"],
+        "command_groups_settled": result["command_groups_settled"],
         "attempts": result["attempts"],
         "workspace_state": "candidate collected" if candidate else "prepared or untouched",
         "candidate_head": candidate.get("head") if candidate else None,
@@ -1582,6 +1798,7 @@ def run_task(
     cancellation_requested: Callable[[], bool] | None = None,
     boot_clock: Callable[[], BootClockReading | None] = read_boot_clock,
     work_policy: WorkBudgetPolicy | None = None,
+    command_owners: dict[str, OwnedVerificationCommand] | None = None,
 ) -> dict[str, object]:
     """Run or recover one frozen task through the bounded K1-K8 composition.
 
@@ -2290,6 +2507,22 @@ def run_task(
             program = store.admit(PROGRAM_ID, "activate", ActivateProgram(program.revision, "owner"))
             lifecycle.append("task admitted: owner-approved frozen task")
             crash("task-admitted")
+        pending_commands, commands_settled = _command_recovery(store, command_owners)
+        if pending_commands and not commands_settled:
+            result = export_task_store(store)
+            result.update(
+                condition="cancel_uncertain",
+                unresolved_commands=list(pending_commands),
+                workspace_reuse="refused before restoration; qualified command owner/result unavailable",
+                lifecycle=lifecycle,
+                automatic_merge=False,
+            )
+            return result
+        if pending_commands:
+            # A qualified command owner can prove retirement, not invent a lost
+            # result. Only the existing exact runtime cancellation path may finish.
+            cancellation_pending = True
+            cancellation_latched = True
         attempt_exists = any(item.spec.attempt_id == ATTEMPT_ID for item in program.attempts)
         if cancellation_pending and not attempt_exists:
             return cancelled_without_attempt()
@@ -2362,6 +2595,7 @@ def run_task(
                 captured=captured,
                 command_environment=command_environment,
                 authorized=authority_current,
+                command_owners=command_owners,
             )
 
             def resolve(request: ExecutionRequest) -> CodexInputs:
@@ -2389,6 +2623,10 @@ def run_task(
             def authorize(request: ExecutionRequest) -> bool:
                 def current() -> bool:
                     operation = store.operation(request.operation.operation_id)
+                    try:
+                        store.check_work_dispatch(request.operation.operation_id)
+                    except BudgetRefused:
+                        return False
                     return (
                         authority_current()
                         and decision_time() < deadline
@@ -2442,6 +2680,17 @@ def run_task(
                         cancel_requested=cancellation_requested_now,
                     )
                 )
+            except WorkUncertain as error:
+                result = export_task_store(store)
+                pending, _ = _command_recovery(store)
+                result.update(
+                    condition="cancel_uncertain",
+                    unresolved_commands=list(pending),
+                    workspace_reuse=str(error),
+                    lifecycle=lifecycle,
+                    automatic_merge=False,
+                )
+                return result
             except BudgetRefused as error:
                 lifecycle.append(f"work admission refused: {error}")
                 status = "budget_exhausted"

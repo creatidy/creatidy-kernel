@@ -166,6 +166,8 @@ def deliver_reference_pr(
         if first_delivery:
             if not authorize_dispatch():
                 return {**result, "status": "unknown"}
+            if budget_subject is not None:
+                store.check_work_dispatch(operation_id)
             receipt = forge.apply(effect)
             if fault == "pr-send":
                 return {**result, "status": "unknown", "interrupted": "pr-send"}

@@ -178,6 +178,10 @@ def run_live_reference(
             return True
 
         def authorize(request: ExecutionRequest) -> bool:
+            try:
+                store.check_work_dispatch(request.operation.operation_id)
+            except BudgetRefused:
+                return False
             operation = store.operation(request.operation.operation_id)
             return (
                 work_authorized()

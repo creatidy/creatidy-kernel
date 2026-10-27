@@ -36,12 +36,14 @@ from creatidy_kernel.adapters.sqlite_codec import (
 )
 from creatidy_kernel.core.deadlines import BootClockReading, DeadlineProjection
 from creatidy_kernel.core.domain import (
+    AttemptStatus,
     DomainCommandType,
     PrepareAttempt,
     Program,
     ProgramSpec,
     ProgramStatus,
     SatisfyWorkUnit,
+    WorkUnitStatus,
 )
 from creatidy_kernel.core.outcomes import UsageObservation
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
@@ -492,6 +494,8 @@ class SQLiteProgramStore:
             )
             if intent is not None:
                 self._insert_intent(*intent, allow_existing=False)
+                if isinstance(command, PrepareAttempt) and self._work_binding(program_id) is not None:
+                    self._bind_work_dispatch(program_id, command.attempt.attempt_id, intent[0])
         return next_program
 
     def history(self, program_id: str) -> tuple[HistoryRecord, ...]:
@@ -607,7 +611,7 @@ class SQLiteProgramStore:
             ):
                 raise BudgetRefused("runtime dispatch lacks original work-budget/clock proof")
             if reservation is not None:
-                self.check_work_authority(cast(str, reservation["program"]))
+                self.check_work_dispatch(operation_id)
                 if op.attempts:
                     self._reserve_work(
                         cast(str, reservation["program"]),
@@ -776,6 +780,134 @@ class SQLiteProgramStore:
             if self._work_record("revoked", program_id) is None:
                 self._write_work_record("revoked", program_id, {"program": program_id, "evidence": evidence})
 
+    def _bind_work_dispatch(self, program_id: str, attempt_id: str, operation_id: str) -> None:
+        attempt = self._load_head(program_id).attempt(attempt_id).spec
+        operation = self.operation(operation_id)
+        self._write_work_record(
+            "dispatch-binding",
+            operation_id,
+            {
+                "program": program_id,
+                "attempt": attempt_id,
+                "attempt_digest": attempt.digest,
+                "spec_digest": attempt.spec_digest,
+                "spec_revision": attempt.spec_revision,
+                "operation": operation_id,
+                "effect_key": operation.effect_key,
+                "request_digest": operation.request_digest,
+            },
+        )
+
+    def check_work_dispatch(self, operation_id: str) -> None:
+        """Revalidate NEW dispatch, not historical receipt or reservation replay."""
+        self._assert_writer_thread()
+        reservation = self._work_record("reservation", operation_id)
+        if reservation is None:
+            raise BudgetRefused("dispatch lacks original work reservation")
+        program_id, attempt_id = cast(str, reservation["program"]), cast(str, reservation["attempt"])
+        self.check_work_authority(program_id)
+        program = self._load_head(program_id)
+        try:
+            attempt = program.attempt(attempt_id)
+        except ValueError as error:
+            raise BudgetRefused("dispatch lacks its originating Attempt") from error
+        if (attempt.spec.spec_revision, attempt.spec.spec_digest) != (program.spec.revision, program.spec.digest):
+            raise BudgetRefused("reserved Attempt belongs to a superseded specification")
+        operation = self.operation(operation_id)
+        binding = self._work_record("dispatch-binding", operation_id)
+        expected = {
+            "program": program_id,
+            "attempt": attempt_id,
+            "attempt_digest": attempt.spec.digest,
+            "spec_digest": attempt.spec.spec_digest,
+            "spec_revision": attempt.spec.spec_revision,
+            "operation": operation_id,
+            "effect_key": operation.effect_key,
+            "request_digest": operation.request_digest,
+        }
+        if binding is None:
+            # Existing original typed requests remain evidence, never a new projection.
+            request = cast(dict[str, object], json.loads(operation.request_json)["request"])
+            subject = request.get("subject")
+            subject_fields = cast(dict[str, object], subject) if type(subject) is dict else {}
+            if not (
+                reservation["category"] == WorkKind.ATTEMPT.value and request.get("attempt") == attempt.spec.digest
+            ) and not (
+                subject_fields.get("attempt_digest") == attempt.spec.digest
+                and subject_fields.get("spec_digest") == program.spec.digest
+            ):
+                raise BudgetRefused("original exact dispatch binding unavailable")
+        elif binding != {"kind": "work-budget-record", "type": "dispatch-binding", **expected}:
+            raise BudgetRefused("Operation differs from original Attempt dispatch binding")
+        state = program.state(attempt.spec.work_unit_id)
+        category = WorkKind(cast(str, reservation["category"]))
+        if category is WorkKind.ATTEMPT:
+            if json.loads(operation.request_json)["request"].get("attempt") != attempt.spec.digest:
+                raise BudgetRefused("runtime Operation request differs from originating Attempt")
+            permitted = (
+                program.status is ProgramStatus.ACTIVE
+                and attempt.status in {AttemptStatus.PREPARED, AttemptStatus.EXECUTING}
+                and state.status is WorkUnitStatus.ACTIVE
+                and state.active_attempt_id == attempt_id
+            )
+        elif category is WorkKind.AUXILIARY:
+            permitted = (
+                program.status in {ProgramStatus.ACTIVE, ProgramStatus.COMPLETED}
+                and attempt.status is AttemptStatus.FINISHED
+                and state.status is WorkUnitStatus.SATISFIED
+                and any(
+                    item.reference_id == state.satisfaction_id and item.source_attempt_id == attempt_id
+                    for item in program.satisfactions
+                )
+            )
+        else:
+            latest = next(
+                (item for item in reversed(program.attempts) if item.spec.work_unit_id == attempt.spec.work_unit_id),
+                None,
+            )
+            permitted = (
+                program.status is ProgramStatus.ACTIVE
+                and attempt.status is AttemptStatus.FINISHED
+                and state.status is WorkUnitStatus.READY
+                and latest is not None
+                and latest.attempt_id == attempt_id
+            )
+        if not permitted:
+            raise BudgetRefused("Attempt/WorkUnit state no longer permits this dispatch")
+        self._check_resource_headroom(program_id, exclude_operation=operation_id)
+
+    def _check_resource_headroom(self, program_id: str, *, exclude_operation: str | None = None) -> None:
+        binding = self._work_binding(program_id)
+        if binding is None:
+            raise BudgetRefused("configured original work envelope required")
+        project = self._work_record("project", cast(str, binding["project"]))
+        if project is None:
+            raise BudgetRefused("project capacity authority unavailable")
+        records = self._work_records("reservation")
+        for scope, identity, policy in (
+            ("program", program_id, WorkBudgetPolicy.decode(binding["policy"])),
+            ("project", binding["project"], WorkBudgetPolicy.decode(project["policy"])),
+        ):
+            scoped = [item for item in records if item[scope] == identity]
+            effective = self._effective_usage(scoped)
+            for ceiling in policy.resources:
+                matching = [
+                    item for item in effective if (item["metric"], item["unit"]) == (ceiling.metric, ceiling.unit)
+                ]
+                if (
+                    sum(
+                        (Decimal(cast(str, item["quantity"])) for item in matching if item["quantity"] is not None),
+                        Decimal(0),
+                    )
+                    >= ceiling.quantity
+                ):
+                    raise BudgetRefused(f"{scope} observed resource ceiling exhausted")
+                covered = {item["operation"] for item in matching if item["quantity"] is not None}
+                if any(
+                    item["operation"] != exclude_operation and item["operation"] not in covered for item in scoped
+                ) or any(item["quantity"] is None for item in matching):
+                    raise BudgetRefused(f"{scope} resource headroom unknown")
+
     def _reserve_work(
         self, program_id: str, attempt_id: str, operation_id: str, category: WorkKind, retained_bytes: int = 0
     ) -> None:
@@ -826,19 +958,7 @@ class SQLiteProgramStore:
                 retained += cast(int, result["bytes"] if result is not None else item["retained_bytes"])
             if retained + retained_bytes > policy.retained_bytes:
                 raise BudgetRefused(f"{scope} retained streaming byte capacity exhausted")
-            for ceiling in policy.resources:
-                effective = self._effective_usage(scoped)
-                matching = [
-                    item for item in effective if (item["metric"], item["unit"]) == (ceiling.metric, ceiling.unit)
-                ]
-                # Every prior reservation needs an attributed, known final quantity.
-                covered = {item["operation"] for item in matching if item["quantity"] is not None}
-                if any(item["operation"] not in covered for item in scoped) or any(
-                    item["quantity"] is None for item in matching
-                ):
-                    raise BudgetRefused(f"{scope} resource headroom unknown")
-                if sum((Decimal(cast(str, item["quantity"])) for item in matching), Decimal(0)) >= ceiling.quantity:
-                    raise BudgetRefused(f"{scope} observed resource ceiling exhausted")
+        self._check_resource_headroom(program_id)
         self._write_work_record("reservation", operation_id, reservation)
 
     def reserve_work(
@@ -858,11 +978,16 @@ class SQLiteProgramStore:
         operation_id: str,
         effect_key: str,
         request: dict[str, object],
+        *,
+        retained_bytes: int = 0,
     ) -> OperationRecord:
         self._assert_writer_thread()
         with self._gate, self._transaction():
-            self._reserve_work(program_id, attempt_id, operation_id, category)
+            existed = self._work_record("reservation", operation_id) is not None
+            self._reserve_work(program_id, attempt_id, operation_id, category, retained_bytes)
             self._insert_intent(operation_id, effect_key, request)
+            if not existed:
+                self._bind_work_dispatch(program_id, attempt_id, operation_id)
         return self.operation(operation_id)
 
     def work_program_for_attempt(self, attempt_id: str) -> str:
@@ -951,11 +1076,13 @@ class SQLiteProgramStore:
             if existing is not None:
                 self._write_work_record("usage", observation_key, fields)
                 return
-            facts = self._effective_usage([reservation])
+            facts = self._effective_usage(self._work_records("reservation"))
             identity = (observation.source, observation.receipt_id, observation.metric, observation.unit)
             prior = [
                 item for item in facts if (item["source"], item["receipt_id"], item["metric"], item["unit"]) == identity
             ]
+            if any(item["operation"] != operation_id or item["attempt_id"] != observation.attempt_id for item in prior):
+                raise BudgetRefused("source receipt retains its original Attempt/Operation attribution")
             if (not prior and observation.supersedes_id is not None) or (
                 prior and (len(prior) != 1 or observation.supersedes_id != prior[0]["observation_id"])
             ):

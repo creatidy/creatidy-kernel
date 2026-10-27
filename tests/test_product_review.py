@@ -17,10 +17,12 @@ from creatidy_kernel.core.domain import (
     AttemptSpec,
     AuthorityEnvelope,
     BudgetPolicy,
+    FinishAttempt,
     PolicyReference,
     PrepareAttempt,
     Program,
     ProgramSpec,
+    StartAttempt,
 )
 from creatidy_kernel.core.execution import (
     Activity,
@@ -108,6 +110,9 @@ def dispatch_product_review(
             "runtime:a1",
             {"attempt": attempt.digest},
         )
+        program = store.load(program.program_id)
+        program = store.admit(program.program_id, "start:a1", StartAttempt(program.revision, "worker", "a1"))
+        store.admit(program.program_id, "finish:a1", FinishAttempt(program.revision, "worker", "a1"))
     return _dispatch_product_review(store, review, dispatcher, now=now, lease_seconds=lease_seconds)
 
 

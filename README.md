@@ -399,6 +399,19 @@ counts and unknown work. Successful acceptance releases its logical work slot in
 STOP/expiry still requires the bounded cancellation path's exact witness, not a lease or turn status.
 This is not the general resource/workspace fencing or ordinary dispatcher planned in #59/#105/#106.
 
+New delivery rechecks the original Attempt, applicable specification, WorkUnit state, immutable
+Operation binding and current observed resource headroom. Historical reservation/receipt replay is
+not fresh dispatch authority. Source-qualified receipt identities retain their original
+Attempt/Operation attribution across the whole capacity authority, including corrections.
+
+An unresolved verification command result or owned-group settlement is `cancel_uncertain`, not a
+failed check. Recovery checks this before restoring/resetting/cleaning the candidate workspace. A
+retained original `OwnedVerificationCommand` can retire its live `Popen` group and journal an exact
+operation/fence/opaque-group witness; no PID is restored from disk. Without that owner or qualified
+durable settlement, conflicting reuse remains blocked. A lost result is never fabricated: physical
+retirement permits only the existing exact runtime cancellation path, not ordinary acceptance or
+rejection. This adds no daemon or stronger native isolation claim.
+
 Ordinary `OwnerPolicy` can carry `work_budget`, `project_budget` and `project_id`. Approval binds those
 policies without dispatching or reporting usage. Authorized meaning amendments keep the original
 envelope and accumulated usage; old policies and Program bytes are not rewritten. Legacy preparation
