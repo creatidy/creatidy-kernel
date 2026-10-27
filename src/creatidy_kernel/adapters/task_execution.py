@@ -2640,17 +2640,8 @@ def run_task(
             lifecycle.append("task admitted: owner-approved frozen task")
             crash("task-admitted")
         pending_commands, commands_settled = _command_recovery(store, command_owners)
-        if pending_commands and not commands_settled:
-            result = export_task_store(store)
-            result.update(
-                condition="cancel_uncertain",
-                unresolved_commands=list(pending_commands),
-                workspace_reuse="refused before restoration; qualified command owner/result unavailable",
-                lifecycle=lifecycle,
-                automatic_merge=False,
-            )
-            return result
-        if pending_commands:
+        workspace_refusal = "refused before restoration; qualified command owner/result unavailable"
+        if pending_commands and commands_settled:
             # A qualified command owner can prove retirement, not invent a lost
             # result. Only the existing exact runtime cancellation path may finish.
             cancellation_pending = True
@@ -2658,7 +2649,15 @@ def run_task(
         attempt_exists = any(item.spec.attempt_id == ATTEMPT_ID for item in program.attempts)
         if cancellation_pending and not attempt_exists:
             return cancelled_without_attempt()
-        if not attempt_exists:
+        if pending_commands:
+            # Recover inert request bindings only. Unresolved TOOL ownership must
+            # not prevent STOP, or permit preparing/restoring the workspace.
+            recorded_base = _request(store, "task_execution:base")
+            base = oid(str(recorded_base["base"]))
+            if recorded_base["task"] != task.task_id:
+                raise ValueError("durable base belongs to a different task")
+            objects, workspace = directory / "objects.git", directory / "workspace"
+        elif not attempt_exists:
             with source_use(source_repository, task.repository_url):
                 frozen_base = (
                     _request(store, "task_execution:base")["base"] if (directory / "objects.git").exists() else None
@@ -2693,7 +2692,8 @@ def run_task(
             base, objects, workspace = prepare_workspace(
                 store, directory, source_repository, task, lifecycle, attempt_exists=True
             )
-        crash("workspace-prepared")
+        if not pending_commands:
+            crash("workspace-prepared")
         if cancellation_requested_now():
             cancellation_pending = True
         if cancellation_pending:
@@ -2703,7 +2703,7 @@ def run_task(
                 operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
                 record_cancellation(attempt.spec.attempt_id, operation.operation_id)
         status = "accepted"
-        if program.state(UNIT_ID).status is not WorkUnitStatus.SATISFIED:
+        if pending_commands or program.state(UNIT_ID).status is not WorkUnitStatus.SATISFIED:
             lifecycle.append("allocation recovered from durable Attempt" if attempt_exists else "allocation selected")
             workspace_handle = WorkspaceHandle(
                 WORKSPACE_KEY,
@@ -2793,7 +2793,7 @@ def run_task(
             try:
                 status = (
                     "cancel_uncertain"
-                    if cancellation_pending
+                    if cancellation_pending or pending_commands
                     else advance_work_unit(
                         store,
                         program,
@@ -2813,16 +2813,9 @@ def run_task(
                     )
                 )
             except WorkUncertain as error:
-                result = export_task_store(store)
-                pending, _ = _command_recovery(store)
-                result.update(
-                    condition="cancel_uncertain",
-                    unresolved_commands=list(pending),
-                    workspace_reuse=str(error),
-                    lifecycle=lifecycle,
-                    automatic_merge=False,
-                )
-                return result
+                pending_commands, _ = _command_recovery(store)
+                workspace_refusal = str(error)
+                status = "cancel_uncertain"
             except BudgetRefused as error:
                 lifecycle.append(f"work admission refused: {error}")
                 status = "budget_exhausted"
@@ -3182,6 +3175,17 @@ def run_task(
             program = store.load(PROGRAM_ID)
             if cancellation_pending and not program.attempts:
                 return cancelled_without_attempt()
+        if pending_commands:
+            # Runtime settlement is not TOOL settlement or a reusable workspace.
+            result = export_task_store(store)
+            result.update(
+                condition="cancel_uncertain",
+                unresolved_commands=list(pending_commands),
+                workspace_reuse=workspace_refusal,
+                lifecycle=lifecycle,
+                automatic_merge=False,
+            )
+            return result
         if cancellation_requested_now() and not cancellation_pending:
             cancellation_pending = True
             for attempt in program.attempts:
