@@ -36,16 +36,18 @@ from creatidy_kernel.adapters.reference import (
 from creatidy_kernel.adapters.reference_forge import deliver_reference_pr
 from creatidy_kernel.adapters.sqlite_store import OperationConflict, ProgramNotFound, SQLiteProgramStore
 from creatidy_kernel.core.deadlines import BootClockReading
-from creatidy_kernel.core.domain import ActivateProgram, ProgramStatus, WorkUnitStatus
+from creatidy_kernel.core.domain import ActivateProgram, AttemptSpec, ProgramStatus, WorkUnitStatus
 from creatidy_kernel.core.execution import (
     Activity,
     Artifact,
     ArtifactManifest,
     Candidate,
+    ExecutionConflict,
     ExecutionRequest,
     OperationKey,
     RuntimeIdentity,
     TrustMode,
+    UnsupportedExecution,
     WorkspaceHandle,
     WorkspaceSpec,
 )
@@ -55,9 +57,16 @@ from creatidy_kernel.core.execution import (
 from creatidy_kernel.core.forge import Presence, Reference
 from creatidy_kernel.core.resources import Allocation
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkUncertain
-from creatidy_kernel.ports.allocation import decode_identity, load_allocation
+from creatidy_kernel.ports.allocation import (
+    decode_allocation,
+    decode_runtime_receipt_with_group,
+    identity_matches,
+    is_legacy_allocation,
+    load_attempt_inputs,
+)
 from creatidy_kernel.ports.application import advance_work_unit, manifest_bytes
 from creatidy_kernel.ports.forge import Forge
+from creatidy_kernel.ports.program_store import OperationRecord
 from creatidy_kernel.ports.resources import ResourceAllocator
 
 
@@ -239,19 +248,72 @@ def run_live_reference(
             clock=lambda: int(time.time()),
         )
 
+        def original_receipt(
+            attempt: AttemptSpec, operation: OperationRecord, data: bytes | None
+        ) -> tuple[Allocation, str, RuntimeIdentity, str | None]:
+            if data is None:
+                raise WorkUncertain("original runtime receipt is unavailable")
+            if (
+                operation.operation_id != f"runtime:{attempt.attempt_id}"
+                or store.load("reference").attempt(attempt.attempt_id).spec != attempt
+            ):
+                raise WorkUncertain("runtime Operation differs from originating Attempt")
+            allocation_data, _ = load_attempt_inputs(store, attempt)
+            selected = decode_allocation(allocation_data)
+            handle, fence, identity, group = decode_runtime_receipt_with_group(data)
+            parts = handle.removeprefix("codex:").split(":") if handle.startswith("codex:") else []
+            if (
+                selected.runtime_id != "codex"
+                or fence != operation.fence
+                or operation.attempts == 0
+                or operation.retry_proof is not None
+                or operation.status not in {"dispatched", "unknown", "accepted", "terminal"}
+                or operation.accepted_reference not in (None, handle)
+                or len(parts) != 2
+                or not all(parts)
+                or attempt.agent_definition_reference is None
+                or not identity_matches(
+                    identity,
+                    selected,
+                    attempt.agent_definition_reference,
+                    require_resolved=False,
+                    legacy=is_legacy_allocation(allocation_data),
+                )
+            ):
+                raise WorkUncertain("runtime receipt differs from original Operation/fence/Attempt bindings")
+            return selected, handle, identity, group
+
         def restore(request: ExecutionRequest, handle: str) -> None:
-            data = store.find_artifact(request.operation.operation_id, "runtime-receipt")
-            receipt: dict[str, object] = {} if data is None else cast(dict[str, object], json.loads(data))
-            original_group = receipt.get("owned_group_reference")
-            original_identity = receipt.get("identity")
-            lookup = runtime.restore(
-                request,
-                handle,
-                owned_group_reference=original_group if type(original_group) is str else None,
-                receipt_identity=decode_identity(manifest_bytes(cast(dict[str, object], original_identity)))
-                if type(original_identity) is dict
-                else None,
-            )
+            operation = store.operation(request.operation.operation_id)
+            try:
+                selected, original_handle, original_identity, original_group = original_receipt(
+                    request.attempt, operation, store.find_artifact(operation.operation_id, "runtime-receipt")
+                )
+            except (ValueError, OperationConflict) as error:
+                raise WorkUncertain("original runtime receipt cannot be verified") from error
+            if (
+                request.operation
+                != OperationKey(operation.operation_id, operation.effect_key, operation.request_digest)
+                or request.fence != operation.fence
+                or handle != original_handle
+                or request.allocation != selected
+            ):
+                raise WorkUncertain("restoration differs from original runtime receipt")
+            if (
+                original_group is None
+                and observe_owned_group_reference is not None
+                and observe_owned_group_reference() is not None
+            ):
+                # Missing historical group proof cannot bind a newly supplied owner.
+                existing = runtime.reconcile(request.operation, handle)
+                if existing.presence is not RuntimePresence.FOUND:
+                    raise WorkUncertain("original owned-group binding is unavailable")
+            try:
+                lookup = runtime.restore(
+                    request, handle, owned_group_reference=original_group, receipt_identity=original_identity
+                )
+            except (ExecutionConflict, UnsupportedExecution) as error:
+                raise WorkUncertain("original runtime restoration cannot be verified") from error
             if lookup.presence is not RuntimePresence.FOUND or lookup.handle != handle:
                 raise WorkUncertain("original runtime restoration is unverified; no replacement-group adoption")
 
@@ -311,6 +373,18 @@ def run_live_reference(
                 ),
             )
             try:
+                existing_attempt = next(
+                    (item for item in program.attempts if item.attempt_id == f"reference:{unit}"), None
+                )
+                if existing_attempt is not None:
+                    prior = store.operation(f"runtime:{existing_attempt.attempt_id}")
+                    if prior.attempts or prior.accepted_reference is not None:
+                        try:
+                            original_receipt(
+                                existing_attempt.spec, prior, store.find_artifact(prior.operation_id, "runtime-receipt")
+                            )
+                        except ValueError as error:
+                            raise WorkUncertain("original runtime receipt cannot be verified") from error
                 status = advance_work_unit(
                     store,
                     program,
@@ -350,8 +424,54 @@ def run_live_reference(
         owned_cleanup: list[dict[str, object]] = []
         for attempt in store.load("reference").attempts:
             operation = store.operation(f"runtime:{attempt.spec.attempt_id}")
+            receipt_data: bytes | None = None
+            try:
+                receipt_data = store.find_artifact(operation.operation_id, "runtime-receipt")
+                if (
+                    operation.attempts == 0
+                    and operation.status == "intent"
+                    and operation.accepted_reference is None
+                    and receipt_data is None
+                ):
+                    continue  # Original admission was never dispatched.
+                selected, handle, receipt_identity, expected_group = original_receipt(
+                    attempt.spec, operation, receipt_data
+                )
+                if operation.accepted_reference is None:
+                    # Exactly the causal receipt replay used by ordinary admission:
+                    # record a native return, never a candidate acceptance or dispatch.
+                    store.record_transport(operation.operation_id, operation.fence, True)
+                    operation = store.observe(
+                        operation.operation_id, operation.fence, f"accepted:{handle}", "accepted", reference=handle
+                    )
+            except (ValueError, WorkUncertain):
+                restoration_uncertain = True
+                store.intent(
+                    "interruption:live-restoration",
+                    "interruption:live-restoration",
+                    {"reason": "original runtime restoration unverified"},
+                )
+                unknown: dict[str, object] = {
+                    "version": 1,
+                    "operation": operation.operation_id,
+                    "request_digest": operation.request_digest,
+                    "runtime_fence": operation.fence,
+                    "attempt": attempt.spec.digest,
+                    "handle": operation.accepted_reference,
+                    "receipt_digest": None
+                    if receipt_data is None
+                    else "sha256:" + hashlib.sha256(receipt_data).hexdigest(),
+                    "owned_group_settled": None,
+                    "result_reconciled": False,
+                    "reason": "original runtime receipt/bindings unavailable or invalid",
+                }
+                data = manifest_bytes(unknown)
+                store.finalize_artifact(
+                    operation.operation_id, f"stop-uncertain:{hashlib.sha256(data).hexdigest()}", data
+                )
+                owned_cleanup.append(unknown)
+                continue
             if operation.accepted_reference is not None:
-                selected = load_allocation(store, attempt.spec)
                 request = ExecutionRequest(
                     OperationKey(operation.operation_id, operation.effect_key, operation.request_digest),
                     attempt.spec,
@@ -380,12 +500,6 @@ def run_live_reference(
                     operation.fence,
                     allocation=selected,
                 )
-                receipt_data = store.find_artifact(operation.operation_id, "runtime-receipt")
-                original: dict[str, object] = (
-                    {} if receipt_data is None else cast(dict[str, object], json.loads(receipt_data))
-                )
-                expected_group = original.get("owned_group_reference")
-                expected_group = expected_group if type(expected_group) is str and expected_group.strip() else None
                 cancellation_id = f"cancel:{attempt.spec.attempt_id}"
                 cancellation = store.intent(
                     cancellation_id,
@@ -418,6 +532,12 @@ def run_live_reference(
                     current_group = None
                 group_matches = expected_group is not None and current_group == expected_group
                 if not group_matches and (expected_group is not None or retire_owned_group is not None):
+                    restoration_uncertain = True
+                    store.intent(
+                        "interruption:live-restoration",
+                        "interruption:live-restoration",
+                        {"reason": "original runtime restoration unverified"},
+                    )
                     owned_cleanup.append(
                         {
                             "operation": operation.operation_id,
@@ -479,7 +599,7 @@ def run_live_reference(
                     and observation.activity is Activity.TERMINAL
                     and observation.handle == operation.accepted_reference
                     and group_matches
-                    and manifest_bytes(asdict(observation.identity)) == manifest_bytes(original.get("identity"))
+                    and observation.identity == receipt_identity
                 )
                 proof = cast(
                     dict[str, object],
