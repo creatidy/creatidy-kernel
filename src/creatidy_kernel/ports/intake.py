@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
 from creatidy_kernel.core.authority import Principal
+from creatidy_kernel.core.deadlines import DeadlineProjection
 from creatidy_kernel.core.domain import (
     AmendProgramSpec,
     InputBinding,
@@ -37,7 +38,7 @@ from creatidy_kernel.core.intake import (
     strings,
 )
 from creatidy_kernel.core.resources import Allocation, ResourceRequest
-from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy
 from creatidy_kernel.ports.program_store import ApplicationStore, OperationRecord, ProgramReadChanged
 from creatidy_kernel.ports.resources import ResourceAllocator
 
@@ -72,9 +73,19 @@ class RequirementsAllocator(RequirementsTranslator, ResourceAllocator, Protocol)
 
 
 class IntakeStore(ApplicationStore, Protocol):
-    def bind_work_budget(
-        self, program_id: str, project_id: str, project: WorkBudgetPolicy, task: WorkBudgetPolicy, deadline: int
-    ) -> None: ...
+    def accept_work_budget(
+        self,
+        spec: ProgramSpec,
+        command_key: str,
+        project_id: str,
+        project: WorkBudgetPolicy,
+        task: WorkBudgetPolicy,
+        deadline: int | DeadlineProjection,
+        *,
+        amendment: AmendProgramSpec | None = None,
+        records: tuple[tuple[str, dict[str, object], bytes | None], ...] = (),
+        validate: Callable[[], None] | None = None,
+    ) -> Program: ...
     def operations(self, prefix: str = "") -> tuple[OperationRecord, ...]: ...
     def find_program(self, program_id: str) -> Program | None: ...
     def program_read_cut[T](
@@ -618,23 +629,57 @@ class OrdinaryIntake:
         if matching and len(matching) != 1:
             raise IntakeRefused("ambiguous decision consumption")
         current_program = self.store.find_program(program_id)
+        configured = policy.work_budget is not None
+        if not configured and self.store.has_work_budget(program_id):
+            raise BudgetRefused("configured work envelope cannot be removed")
+
+        def accept_budget(
+            spec: ProgramSpec,
+            records: tuple[tuple[str, bytes], ...],
+            amendment: AmendProgramSpec | None = None,
+        ) -> ApprovedMeaning:
+            assert (  # noqa: S101 - OwnerPolicy validates the complete configured tuple.
+                policy.project_id is not None and policy.project_budget is not None and policy.work_budget is not None
+            )
+
+            def validate() -> None:
+                if current_program is None:
+                    self._validate(principal, draft, policy, current, expires_at)
+                else:
+                    self._final_program(
+                        program_id, current_program.spec.digest, principal, draft, policy, current, expires_at
+                    )
+
+            try:
+                program = self.store.accept_work_budget(
+                    spec,
+                    f"ordinary:approve:{decision_id}",
+                    policy.project_id,
+                    policy.project_budget,
+                    policy.work_budget,
+                    expires_at,
+                    amendment=amendment,
+                    records=tuple(
+                        (identity, {"kind": "ordinary-intake-record", "version": 1, "bytes": raw.decode()}, raw)
+                        for identity, raw in records
+                    ),
+                    validate=validate,
+                )
+            except ProgramReadChanged as error:
+                raise IntakeRefused(str(error)) from None
+            return ApprovedMeaning(draft, decision_id, decision, program)
+
         if matching and current_program is not None:
             consumed = object_from(self._recover(matching[0]))
             if consumed.get("program") == current_program.spec.digest:
+                if configured:
+                    return accept_budget(current_program.spec, ((key, decision),))
                 self._validate(principal, draft, policy, current, expires_at)
                 self._record(key, decision)
                 self._validate(principal, draft, policy, current, expires_at)
                 current_program = self._final_program(
                     program_id, current_program.spec.digest, principal, draft, policy, current, expires_at
                 )
-                if (
-                    policy.work_budget is not None
-                    and policy.project_budget is not None
-                    and policy.project_id is not None
-                ):
-                    self.store.bind_work_budget(
-                        program_id, policy.project_id, policy.project_budget, policy.work_budget, expires_at
-                    )
                 return ApprovedMeaning(draft, decision_id, decision, current_program)
             if consumed.get("expected_revision") != current_program.revision:
                 raise IntakeRefused("approval recovery no longer matches Program")
@@ -662,6 +707,8 @@ class OrdinaryIntake:
                     "program": spec.digest,
                 }
             )
+            if configured:
+                return accept_budget(spec, ((key, decision), (consumption_key, consumption)))
             self._validate(principal, draft, policy, current, expires_at)
             self._record(key, decision)
             self._record(consumption_key, consumption)
@@ -690,6 +737,12 @@ class OrdinaryIntake:
                     "expected_revision": program.revision,
                 }
             )
+            if configured:
+                return accept_budget(
+                    spec,
+                    ((key, decision), (consumption_key, consumption)),
+                    AmendProgramSpec(program.revision, principal.actor_id, amendment),
+                )
             self._validate(principal, draft, policy, current, expires_at)
             self._record(key, decision)
             self._record(consumption_key, consumption)
@@ -701,10 +754,6 @@ class OrdinaryIntake:
                 AmendProgramSpec(program.revision, principal.actor_id, amendment),
             )
         program = self._final_program(program_id, program.spec.digest, principal, draft, policy, current, expires_at)
-        if policy.work_budget is not None and policy.project_budget is not None and policy.project_id is not None:
-            self.store.bind_work_budget(
-                program_id, policy.project_id, policy.project_budget, policy.work_budget, expires_at
-            )
         return ApprovedMeaning(draft, decision_id, decision, program)
 
     def handoff(

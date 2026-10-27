@@ -63,7 +63,6 @@ from creatidy_kernel.adapters.source_cache import (
 )
 from creatidy_kernel.adapters.sqlite_store import (
     OperationConflict,
-    ProgramNotFound,
     SQLiteProgramStore,
     validate_local_storage,
 )
@@ -1919,6 +1918,8 @@ def run_task(
     assert resource_allocator is not None  # noqa: S101 - established by the exclusive input check.
     if owner_approved is not True or trusted_development_acknowledged is not True:
         raise ValueError("explicit owner approval and trusted-development acknowledgment required")
+    if work_policy is not None and work_policy.strict_inference:
+        raise BudgetRefused("strict inference bounds unavailable for the installed profiles")
     if deadline is not None and (type(deadline) is not int or deadline > now + 3600):
         raise ValueError("owner deadline must be within one hour ahead")
     _suitable_path(directory)
@@ -2365,6 +2366,22 @@ def run_task(
             )
             return result
 
+        approved_spec = task_program_spec(task)
+        counts = WorkBudgetPolicy.basic(
+            approved_spec.budget.max_attempts,
+            approved_spec.budget.max_active_attempts,
+            verifications=approved_spec.budget.max_attempts * len(POLICY.checks),
+            retained_bytes=MAX_CAPTURE_BYTES,
+            auxiliary=1,
+        )
+        counts = replace(
+            counts,
+            counts=tuple(
+                (kind, sum(command.repeats for command in task.verification) if kind is WorkKind.TOOL else count)
+                for kind, count in counts.counts
+            ),
+        )
+        configured = work_policy if work_policy is not None else counts
         try:
             mode_recorded = _request(store, "task_execution:mode")
         except OperationConflict as error:
@@ -2377,31 +2394,44 @@ def run_task(
                 raise ValueError("existing database is not this neutral task")
             assert initial_projection is not None  # noqa: S101 - validated before fresh store initialization.
             projection = initial_projection
-            store.intent(
-                "task_execution:mode",
-                "task_execution:mode",
-                {
-                    "mode": "live" if forge_factory is not None else "synthetic",
-                    "task": task.task_id,
-                    "task_digest": task.digest,
-                    "expected_base_sha": task.expected_base_sha,
-                    "deadline": deadline,
-                    "deadline_projection": asdict(projection),
-                    "version": version,
-                    "repository": task.forge_repository,
-                    "source": str(source_repository),
-                    **(
-                        {
-                            "model": allocation.model_id,
-                            "provider": allocation.provider_id,
-                            "fixed_allocation": encode_allocation(allocation).decode(),
-                        }
-                        if allocation is not None
-                        else {"allocator": "external"}
-                    ),
-                    **({"supported_efforts": sorted(supported_efforts)} if supported_efforts else {}),
-                },
-            )
+            mode_request: dict[str, object] = {
+                "mode": "live" if forge_factory is not None else "synthetic",
+                "task": task.task_id,
+                "task_digest": task.digest,
+                "expected_base_sha": task.expected_base_sha,
+                "deadline": deadline,
+                "deadline_projection": asdict(projection),
+                "version": version,
+                "repository": task.forge_repository,
+                "source": str(source_repository),
+                **(
+                    {
+                        "model": allocation.model_id,
+                        "provider": allocation.provider_id,
+                        "fixed_allocation": encode_allocation(allocation).decode(),
+                    }
+                    if allocation is not None
+                    else {"allocator": "external"}
+                ),
+                **({"supported_efforts": sorted(supported_efforts)} if supported_efforts else {}),
+            }
+            try:
+                store.accept_work_budget(
+                    approved_spec,
+                    "create",
+                    task.forge_repository,
+                    configured,
+                    configured,
+                    projection,
+                    records=(("task_execution:mode", mode_request, None),),
+                )
+            except BaseException:
+                # This invocation created the database. A fully rolled-back
+                # initialization has no identity to recover or adopt on retry.
+                if store.find_program(PROGRAM_ID) is None and not store.operations():
+                    store.close()
+                    (directory / "kernel.sqlite3").unlink()
+                raise
         elif str(mode_recorded["task_digest"]) != task.digest:
             raise ValueError("durable task mode belongs to a different frozen task")
         else:
@@ -2597,29 +2627,14 @@ def run_task(
         except OperationConflict as error:
             if str(error) != "unknown operation":
                 raise
-        try:
+        if projection is not None and mode_recorded is not None:
+            program = store.accept_work_budget(
+                task_program_spec(task), "create", task.forge_repository, configured, configured, projection
+            )
+        else:
             program = store.load(PROGRAM_ID)
-        except ProgramNotFound:
-            program = store.create(task_program_spec(task), "create")
         if program.spec != task_program_spec(task):
             raise ValueError("durable task intent differs from the frozen task specification")
-        counts = WorkBudgetPolicy.basic(
-            program.spec.budget.max_attempts,
-            program.spec.budget.max_active_attempts,
-            verifications=program.spec.budget.max_attempts * len(POLICY.checks),
-            retained_bytes=MAX_CAPTURE_BYTES,
-            auxiliary=1,
-        )
-        counts = replace(
-            counts,
-            counts=tuple(
-                (kind, sum(command.repeats for command in task.verification) if kind is WorkKind.TOOL else count)
-                for kind, count in counts.counts
-            ),
-        )
-        configured = work_policy if work_policy is not None else counts
-        if projection is not None:
-            store.configure_work_budget(PROGRAM_ID, task.forge_repository, configured, configured, projection)
         if program.status is ProgramStatus.DRAFT:
             program = store.admit(PROGRAM_ID, "activate", ActivateProgram(program.revision, "owner"))
             lifecycle.append("task admitted: owner-approved frozen task")

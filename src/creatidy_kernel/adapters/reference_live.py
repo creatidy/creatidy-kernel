@@ -34,7 +34,7 @@ from creatidy_kernel.adapters.reference import (
     reference_spec,
 )
 from creatidy_kernel.adapters.reference_forge import deliver_reference_pr
-from creatidy_kernel.adapters.sqlite_store import OperationConflict, ProgramNotFound, SQLiteProgramStore
+from creatidy_kernel.adapters.sqlite_store import OperationConflict, SQLiteProgramStore
 from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import ActivateProgram, AttemptSpec, ProgramStatus, WorkUnitStatus
 from creatidy_kernel.core.execution import (
@@ -124,36 +124,37 @@ def run_live_reference(
         SQLiteProgramStore(directory / "kernel.sqlite3", boot_clock=boot_clock) as store,
         SQLiteProgramStore(directory / "runtime.sqlite3") as artifacts,
     ):
-        store.intent(
-            "reference:mode",
-            "reference:mode",
-            {
-                "mode": "live",
-                "deadline": deadline,
-                "max_observations": max_observations,
-                "version": version,
-                "repository": repository.value,
-                **(
-                    {"model": allocation.model_id, "provider": allocation.provider_id}
-                    if allocation is not None
-                    else {"allocator": "external"}
-                ),
-                "object_source": str(object_source),
-                **({"supported_efforts": sorted(supported_efforts)} if supported_efforts else {}),
-            },
-        )
-        try:
-            program = store.load("reference")
-        except ProgramNotFound:
-            program = store.create(reference_spec(), "create")
+        mode_request: dict[str, object] = {
+            "mode": "live",
+            "deadline": deadline,
+            "max_observations": max_observations,
+            "version": version,
+            "repository": repository.value,
+            **(
+                {"model": allocation.model_id, "provider": allocation.provider_id}
+                if allocation is not None
+                else {"allocator": "external"}
+            ),
+            "object_source": str(object_source),
+            **({"supported_efforts": sorted(supported_efforts)} if supported_efforts else {}),
+        }
+        spec = reference_spec()
         budget = WorkBudgetPolicy.basic(
-            program.spec.budget.max_attempts,
-            program.spec.budget.max_active_attempts,
-            verifications=program.spec.budget.max_attempts * len(POLICY.checks),
+            spec.budget.max_attempts,
+            spec.budget.max_active_attempts,
+            verifications=spec.budget.max_attempts * len(POLICY.checks),
             retained_bytes=64 * 1024,
             auxiliary=1,
         )
-        store.bind_work_budget("reference", repository.value, budget, budget, deadline)
+        program = store.accept_work_budget(
+            spec,
+            "create",
+            repository.value,
+            budget,
+            budget,
+            deadline,
+            records=(("reference:mode", mode_request, None),),
+        )
         if now < deadline and program.status is not ProgramStatus.COMPLETED:
             remote_base = forge.branch(repository, "develop")
             if remote_base.presence is not Presence.FOUND or remote_base.revision != Reference(f"forgejo:{base}"):

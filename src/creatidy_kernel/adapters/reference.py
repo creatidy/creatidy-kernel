@@ -13,7 +13,7 @@ from typing import cast
 
 from creatidy_kernel.adapters.fixed_allocator import FixedAllocator
 from creatidy_kernel.adapters.reference_forge import deliver_reference_pr
-from creatidy_kernel.adapters.sqlite_store import OperationConflict, ProgramNotFound, SQLiteProgramStore
+from creatidy_kernel.adapters.sqlite_store import OperationConflict, SQLiteProgramStore
 from creatidy_kernel.core.domain import (
     ActivateProgram,
     AuthorityEnvelope,
@@ -464,26 +464,22 @@ def run_reference(
         SQLiteProgramStore(directory / "kernel.sqlite3") as store,
         SQLiteProgramStore(directory / "runtime.sqlite3") as external,
     ):
-        store.intent("reference:mode", "reference:mode", {"mode": "offline"})
-        try:
-            program = store.load("reference")
-        except ProgramNotFound:
-            program = store.create(reference_spec(), "create")
-        if program.spec != reference_spec():
-            raise ValueError("reference intent differs from durable owner-approved spec")
+        spec = reference_spec()
         budget = WorkBudgetPolicy.basic(
-            program.spec.budget.max_attempts,
-            program.spec.budget.max_active_attempts,
-            verifications=program.spec.budget.max_attempts * len(POLICY.checks),
+            spec.budget.max_attempts,
+            spec.budget.max_active_attempts,
+            verifications=spec.budget.max_attempts * len(POLICY.checks),
             retained_bytes=64 * 1024,
             auxiliary=1,
         )
-        store.bind_work_budget(
-            "reference",
+        program = store.accept_work_budget(
+            spec,
+            "create",
             "synthetic-reference",
             budget,
             budget,
             store.original_work_deadline("reference") or int(time.time()) + 3600,
+            records=(("reference:mode", {"mode": "offline"}, None),),
         )
         if program.status is ProgramStatus.DRAFT:
             program = store.admit("reference", "activate", ActivateProgram(program.revision, "owner"))
