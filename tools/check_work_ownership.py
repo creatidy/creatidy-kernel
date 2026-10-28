@@ -311,6 +311,132 @@ def publication_replay_conformance(directory: Path, binary: Path) -> None:
                 connection.close()
 
 
+def live_alias_conformance(directory: Path) -> None:
+    """Actual shared pull entrance while another generic task retains its original inode."""
+    parent = directory / "live-alias-workspaces"
+    parent.mkdir(mode=0o700)
+    old = LocalOwnedWorkspace(parent, "old", create=True)
+    independent = LocalOwnedWorkspace(parent, "independent", create=True)
+    (old.path / "manual").write_bytes(b"installed original manual bytes")
+    path = directory / "live-alias.sqlite3"
+    clock = lambda: BootClockReading(100, 1_000_000_000, "installed-alias-boot")  # noqa: E731
+    with SQLiteProgramStore(path, boot_clock=clock) as store:
+        base = reference_spec()
+        budget = WorkBudgetPolicy.basic(3, 3, verifications=3, retained_bytes=16384, auxiliary=2)
+        for name in ("live-generic", "independent"):
+            spec = ProgramSpec(
+                name,
+                base.objective,
+                base.work_units,
+                base.initial_inputs,
+                base.budget,
+                base.authority,
+                acceptance_criteria=base.acceptance_criteria,
+                policy_references=base.policy_references,
+            )
+            program = store.create(spec, f"create:{name}")
+            store.bind_work_budget(name, "alias-project", budget, budget, 110)
+            store.admit(name, f"activate:{name}", ActivateProgram(program.revision, "owner"))
+        program = store.load("live-generic")
+        original = AttemptSpec(
+            "live-generic",
+            program.program_id,
+            "first",
+            program.spec.revision,
+            program.spec.digest,
+            program.resolved_inputs("first"),
+            workspace_reference=str(old.path),
+        )
+        store.admit_with_intent(
+            program.program_id,
+            "prepare:old",
+            PrepareAttempt(program.revision, "worker", original),
+            "runtime:live-generic",
+            "runtime:live-generic",
+            {"attempt": original.digest},
+        )
+        retained = old.path.with_name("retained-old")
+        old.path.rename(retained)
+        old.path.symlink_to(retained, target_is_directory=True)
+        held = (
+            store.load("live-generic"),
+            store.work_budget_status("live-generic"),
+            store.operation("runtime:live-generic"),
+        )
+    with SQLiteProgramStore(path, boot_clock=clock) as store:
+        worker = WorkOwnership(
+            store, Principal("worker", "worker"), independent, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
+        )
+        program = store.load("independent")
+        attempt = AttemptSpec(
+            "independent",
+            program.program_id,
+            "first",
+            program.spec.revision,
+            program.spec.digest,
+            program.resolved_inputs("first"),
+            workspace_reference=str(independent.path),
+        )
+        claimed = worker.claim("claim:independent", program.revision, attempt, lease_seconds=5)
+        require(worker.renew("renew:independent", claimed, lease_seconds=7) == 107)
+        program = store.load("independent")
+        program = store.admit(
+            "independent", "start:independent", StartAttempt(program.revision, "worker", attempt.attempt_id)
+        )
+        worker.quiesce(claimed, "client:independent-task-quiescent")
+        worker.submit(claimed)
+        program = store.admit(
+            "independent", "finish:independent", FinishAttempt(program.revision, "worker", attempt.attempt_id)
+        )
+        accepted = TrustedSatisfaction(
+            "accepted:independent",
+            program.program_id,
+            "first",
+            program.spec.revision,
+            program.spec.digest,
+            program.spec.work_unit_applicability_fingerprint("first"),
+            "verifier",
+            attempt.attempt_id,
+            tuple(InputBinding(name, "artifact:" + name) for name in sorted(program.spec.work_unit("first").outputs)),
+        )
+        store.admit("independent", "accept:independent", SatisfyWorkUnit(program.revision, "verifier", accepted))
+        owner = WorkOwnership(
+            store, Principal("owner", "owner"), independent, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
+        )
+        owner.authorize_publication(
+            claimed, "independent-publication", "independent-publication", {"accepted": "independent"}
+        )
+        require(owner.dispatch(claimed, "independent-publication", lease_seconds=1) == 1)
+        require(
+            (
+                store.load("live-generic"),
+                store.work_budget_status("live-generic"),
+                store.operation("runtime:live-generic"),
+            )
+            == held
+        )
+        for target in (old.path, retained, retained / "child", parent):
+            program = store.load("live-generic")
+            competing = AttemptSpec(
+                "unsafe",
+                program.program_id,
+                "first",
+                program.spec.revision,
+                program.spec.digest,
+                program.resolved_inputs("first"),
+                workspace_reference=str(target),
+            )
+            before = store.operations()
+            try:
+                store.admit(program.program_id, "prepare:unsafe", PrepareAttempt(program.revision, "worker", competing))
+            except OwnershipConflict:
+                pass
+            else:
+                raise AssertionError("installed live original/alias/ancestor/descendant hold was bypassed")
+            require(store.operations() == before)
+        require(old.path.is_symlink() and (retained / "manual").read_bytes() == b"installed original manual bytes")
+
+
 def main(directory: Path) -> None:
     parent = directory / "workspaces"
     parent.mkdir(mode=0o700)
@@ -619,13 +745,15 @@ for line in sys.stdin:
         require(store.startup_evidence.schema_version == 5)
     settlement_conformance(directory, fixture)
     publication_replay_conformance(directory, fixture)
+    live_alias_conformance(directory)
     print(
         "Installed ownership: atomic pull claims, conflicts, independent work, original renewal, quiescence, "
         "immutable capture, manual preservation, empty cleanup, explicit-request replay after edit/retirement/reopen, "
         "global generic preparation fencing, cold managed history, fresh post-filesystem boot expiry, "
         "fresh task-proof acceptance/publication, settled historical alias independence, "
         "logical/profile proof separation, counter-only retry/remediation completion, "
-        "and exact original publication authorization replay across retirement/reopen in both modes passed."
+        "exact original publication authorization replay across retirement/reopen in both modes, "
+        "and live original-inode alias independence with unchanged unknown work passed."
     )
 
 

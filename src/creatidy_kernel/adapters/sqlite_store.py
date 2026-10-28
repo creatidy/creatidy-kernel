@@ -198,6 +198,17 @@ class _StorageTopology:
     super_options: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkspaceFootprint:
+    scope: ResourceScope | None
+    resolved: str | None
+    root: tuple[int, int, int, int] | None
+    parent: tuple[int, int, int, int] | None
+    ancestors: tuple[tuple[int, int, int, int], ...]
+    stamps: tuple[tuple[int, ...], ...]
+    complete: bool
+
+
 class SQLiteProgramStore:
     """A file-backed K1 store with one SQLite-exclusive connection and one owner process/thread."""
 
@@ -237,6 +248,7 @@ class SQLiteProgramStore:
         self._clock_uncommitted: dict[str, BootClockReading | None] = {}
         self._transaction_clock_readings: dict[str, BootClockReading | None] | None = None
         self._workspace_scopes: dict[str, ResourceScope | None] | None = None
+        self._workspace_footprints: dict[str, _WorkspaceFootprint] | None = None
         self._workspace_artifacts: dict[tuple[str, str], str] | None = None
         self._cache_mode = "private"
         self._closed = False
@@ -534,6 +546,31 @@ class SQLiteProgramStore:
             self._insert_intent(*intent, allow_existing=False)
             if isinstance(command, PrepareAttempt) and self._work_binding(program_id) is not None:
                 self._bind_work_dispatch(program_id, command.attempt.attempt_id, intent[0])
+        if isinstance(command, PrepareAttempt) and self._physical_workspace_scope(command.attempt.workspace_reference):
+            # Observation binds the first admission, not ownership or cleanup
+            # permission. Never backfill this record on recovery/reservation.
+            attempt = command.attempt
+            assert self._workspace_footprints is not None  # noqa: S101 - physical preflight checked above.
+            footprint = self._workspace_footprints[cast(str, attempt.workspace_reference)]
+            self._write_work_record(
+                "ownership-workspace",
+                canonical_json([program_id, attempt.attempt_id]),
+                {
+                    "program": program_id,
+                    "attempt": attempt.attempt_id,
+                    "attempt_digest": attempt.digest,
+                    "workspace_reference": attempt.workspace_reference,
+                    "command": command_key,
+                    "operation": None if intent is None else intent[0],
+                    "effect_key": None if intent is None else intent[1],
+                    "request_digest": None if intent is None else self.operation(intent[0]).request_digest,
+                    "reservation": None
+                    if self._work_binding(program_id) is None
+                    else (intent[0] if intent is not None else f"runtime:{attempt.attempt_id}"),
+                    "root": None if footprint.root is None else list(footprint.root),
+                    "parent": None if footprint.parent is None else list(footprint.parent),
+                },
+            )
         return next_program
 
     def history(self, program_id: str) -> tuple[HistoryRecord, ...]:
@@ -782,6 +819,19 @@ class SQLiteProgramStore:
             "ownership-candidate": {"claim", "subject"},
             "ownership-release": {"claim", "evidence"},
             "ownership-unknown": {"claim", "evidence"},
+            "ownership-workspace": {
+                "program",
+                "attempt",
+                "attempt_digest",
+                "workspace_reference",
+                "command",
+                "operation",
+                "effect_key",
+                "request_digest",
+                "reservation",
+                "root",
+                "parent",
+            },
             "ownership-publication": {
                 "claim",
                 "claim_digest",
@@ -826,6 +876,8 @@ class SQLiteProgramStore:
                         raise OwnershipConflict("claim namespace differs from command identity")
                 elif kind == "ownership-settlement":
                     self._validate_resource_settlement(record, operation.operation_id)
+                elif kind == "ownership-workspace":
+                    self._validate_workspace_identity(record, operation.operation_id)
                 else:
                     claim_record = self._work_record("ownership-claim", cast(str, record["claim"]))
                     if claim_record is None:
@@ -866,7 +918,7 @@ class SQLiteProgramStore:
                         or record["expires_at"] > cast(int, self.original_work_deadline(claim.attempt.program_id))
                     ):
                         raise OwnershipConflict("renewal differs from original authority horizon")
-            except (ValueError, TypeError, KeyError, AttributeError) as error:
+            except (ValueError, TypeError, KeyError, AttributeError, OperationConflict, ProgramNotFound) as error:
                 raise CorruptHistory("invalid exact ownership subject/receipt") from error
 
     @property
@@ -1585,6 +1637,132 @@ class SQLiteProgramStore:
         except (OwnershipConflict, OSError, RuntimeError):
             return None
 
+    @staticmethod
+    def _capture_workspace_footprint(reference: str) -> _WorkspaceFootprint:
+        """Probe only this name and its bounded ancestor chains, never search for a lost inode."""
+        scope = SQLiteProgramStore._resolve_workspace_scope(reference)
+        resolved: str | None = None
+        stamps: list[tuple[int, ...]] = []
+        ancestors: list[tuple[int, int, int, int]] = []
+        root = parent = None
+        fd: int | None = None
+        try:
+            resolved = str(Path(reference).resolve(strict=False))
+            parts = Path(resolved).parts
+            if len(parts) > 256 or len(Path(reference).parts) > 256:
+                raise OwnershipConflict("workspace ancestor probe bound exceeded")
+            # Retain alias/root change stamps for preflight ABA detection. Parent
+            # identity/custody, not timestamps of unrelated sibling activity, is relevant.
+            for path in (Path(reference), *Path(reference).parents):
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    continue
+                if str(path) == reference or stat.S_ISLNK(info.st_mode):
+                    stamps.append((info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_ctime_ns))
+            fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            info = os.fstat(fd)
+            ancestors.append((info.st_dev, info.st_ino, info.st_uid, info.st_mode))
+            for index, part in enumerate(parts[1:], 1):
+                try:
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except FileNotFoundError:
+                    if index == len(parts) - 1:
+                        parent = ancestors[-1]
+                    break
+                os.close(fd)
+                fd = child
+                info = os.fstat(fd)
+                ancestors.append((info.st_dev, info.st_ino, info.st_uid, info.st_mode))
+            else:
+                root = ancestors[-1]
+                parent = ancestors[-2] if len(ancestors) > 1 else None
+                stamps.append((info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_ctime_ns))
+            return _WorkspaceFootprint(scope, resolved, root, parent, tuple(reversed(ancestors)), tuple(stamps), True)
+        except (OwnershipConflict, OSError, RuntimeError):
+            return _WorkspaceFootprint(scope, resolved, None, None, (), tuple(stamps), False)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _validate_workspace_identity(self, record: dict[str, object], operation_id: str) -> None:
+        for name in ("program", "attempt", "attempt_digest", "workspace_reference", "command"):
+            if type(record[name]) is not str or not cast(str, record[name]).strip():
+                raise OwnershipConflict("invalid original workspace admission identity")
+        for name in ("operation", "effect_key", "request_digest", "reservation"):
+            if record[name] is not None and (type(record[name]) is not str or not cast(str, record[name]).strip()):
+                raise OwnershipConflict("invalid original workspace intent/reservation identity")
+        program_id, attempt_id = cast(str, record["program"]), cast(str, record["attempt"])
+        attempt = self._load_head(program_id).attempt(attempt_id).spec
+        if self._work_key("ownership-workspace", canonical_json([program_id, attempt_id])) != operation_id or (
+            record["attempt_digest"],
+            record["workspace_reference"],
+        ) != (attempt.digest, attempt.workspace_reference):
+            raise OwnershipConflict("workspace identity differs from its exact original Attempt")
+        ResourceScope("workspace", cast(str, record["workspace_reference"]))
+        for name in ("root", "parent"):
+            value = record[name]
+            if value is not None and (
+                type(value) is not list
+                or len(cast(list[object], value)) != 4
+                or any(type(item) is not int or item < 0 for item in cast(list[int], value))
+                or not stat.S_ISDIR(cast(list[int], value)[3])
+            ):
+                raise OwnershipConflict("invalid original workspace inode/custody facts")
+        if record["root"] is not None and record["parent"] is None:
+            raise OwnershipConflict("original workspace root lacks parent custody facts")
+        admission = self._connection.execute(
+            "SELECT 1 FROM command_admissions WHERE command_key = ? AND program_id = ?", (record["command"], program_id)
+        ).fetchone()
+        # Admissions retain the exact PrepareAttempt input in history, not a new pathname adoption.
+        history = self._connection.execute(
+            "SELECT input_json FROM history WHERE command_key = ? AND program_id = ? "
+            "AND command_type = 'prepare_attempt'",
+            (record["command"], program_id),
+        ).fetchone()
+        if admission is None or history is None:
+            raise OwnershipConflict("workspace identity lacks its original atomic preparation")
+        prepared = cast(dict[str, object], json.loads(history["input_json"]))
+        if prepared != json.loads(
+            command_input_json(
+                program_id,
+                PrepareAttempt(cast(int, prepared["expected_revision"]), cast(str, prepared["actor_id"]), attempt),
+            )
+        ):
+            raise OwnershipConflict("workspace identity differs from original preparation input")
+        if record["operation"] is None:
+            if record["effect_key"] is not None or record["request_digest"] is not None:
+                raise OwnershipConflict("workspace identity invented an original runtime intent")
+        else:
+            intent = self.operation(cast(str, record["operation"]))
+            if (record["effect_key"], record["request_digest"]) != (intent.effect_key, intent.request_digest):
+                raise OwnershipConflict("workspace identity differs from original runtime intent")
+        if record["reservation"] is not None:
+            reservation = self._work_record("reservation", cast(str, record["reservation"]))
+            if reservation is None or (reservation["program"], reservation["attempt"], reservation["category"]) != (
+                program_id,
+                attempt_id,
+                WorkKind.ATTEMPT.value,
+            ):
+                raise OwnershipConflict("workspace identity lacks its original reservation")
+        reservations = [
+            item["operation"]
+            for item in self._work_records("reservation")
+            if (item["program"], item["attempt"], item["category"]) == (program_id, attempt_id, WorkKind.ATTEMPT.value)
+        ]
+        if reservations != ([] if record["reservation"] is None else [record["reservation"]]):
+            raise OwnershipConflict("workspace identity differs from its exact original reservation")
+        if record["operation"] is not None and record["reservation"] is not None:
+            binding = self._work_record("dispatch-binding", cast(str, record["operation"]))
+            if binding is None or (
+                binding["program"],
+                binding["attempt"],
+                binding["attempt_digest"],
+                binding["effect_key"],
+                binding["request_digest"],
+            ) != (program_id, attempt_id, attempt.digest, record["effect_key"], record["request_digest"]):
+                raise OwnershipConflict("workspace identity differs from its original dispatch binding")
+
     def _attempt_workspace_references(self, program_id: str, attempt_id: str) -> tuple[str | None, ...]:
         attempt = next(
             (item.spec for item in self._load_head(program_id).attempts if item.attempt_id == attempt_id), None
@@ -1627,7 +1805,8 @@ class SQLiteProgramStore:
             raise ProgramReadChanged("physical workspace preflight cannot join business SQL")
         changes = self._connection.total_changes
         references = self._workspace_references(additional)
-        scopes = {reference: self._resolve_workspace_scope(reference) for reference in sorted(references)}
+        footprints = {reference: self._capture_workspace_footprint(reference) for reference in sorted(references)}
+        scopes = {reference: footprint.scope for reference, footprint in footprints.items()}
         prepared: dict[tuple[str, str], str] = {}
         for operation_id, name, data in artifacts:
             self._validate_command_key(operation_id)
@@ -1638,8 +1817,8 @@ class SQLiteProgramStore:
             self._check_owned_artifact_budget(operation_id, digest, len(data))
             self._stage_blob(digest, data)
             prepared[(operation_id, name)] = digest
-        verified = {reference: self._resolve_workspace_scope(reference) for reference in sorted(references)}
-        stable = not self._closed and changes == self._connection.total_changes and scopes == verified
+        verified = {reference: self._capture_workspace_footprint(reference) for reference in sorted(references)}
+        stable = not self._closed and changes == self._connection.total_changes and footprints == verified
         if self._closed:
             raise ProgramReadChanged("owner closed during physical workspace preflight")
         # Potentially blocking validation precedes the independently durable
@@ -1649,12 +1828,15 @@ class SQLiteProgramStore:
             raise ProgramReadChanged("physical workspace/store read cut changed during preflight")
         previous = self._workspace_scopes
         previous_artifacts = self._workspace_artifacts
+        previous_footprints = self._workspace_footprints
         self._workspace_scopes = scopes
+        self._workspace_footprints = footprints
         self._workspace_artifacts = prepared
         try:
             yield readings
         finally:
             self._workspace_scopes = previous
+            self._workspace_footprints = previous_footprints
             self._workspace_artifacts = previous_artifacts
 
     def _physical_workspace_scope(self, reference: str | None) -> ResourceScope | None:
@@ -1667,12 +1849,27 @@ class SQLiteProgramStore:
         scope = self._workspace_scopes[reference]
         if scope is None:
             raise OwnershipConflict("physical workspace must already be canonical; aliases require reconciliation")
+        if self._workspace_footprints is None or not self._workspace_footprints[reference].complete:
+            raise OwnershipConflict("physical workspace identity/ancestor observation unavailable")
         return scope
 
     def _check_workspace_claims(self, attempt: AttemptSpec) -> None:
         workspace = self._physical_workspace_scope(attempt.workspace_reference)
         if workspace is None:
             return
+        if self._attempt_work_claim(attempt.program_id, attempt.attempt_id) is None:
+            original = self._work_record(
+                "ownership-workspace", canonical_json([attempt.program_id, attempt.attempt_id])
+            )
+            if original is not None and original["root"] is not None:
+                assert self._workspace_footprints is not None  # noqa: S101 - physical preflight checked above.
+                observed = self._workspace_footprints[workspace.key]
+                if observed.root != tuple(cast(list[int], original["root"])) or observed.parent != (
+                    None if original["parent"] is None else tuple(cast(list[int], original["parent"]))
+                ):
+                    raise OwnershipConflict(
+                        "original generic workspace identity/custody changed; reconciliation required"
+                    )
         for item in self._work_records("ownership-claim"):
             if self._work_record("ownership-release", cast(str, item["command"])) is not None:
                 continue
@@ -1698,12 +1895,60 @@ class SQLiteProgramStore:
                     continue  # Owned generations are governed by their durable release, not Attempt status.
                 if self._generic_resource_settled(attempt.spec):
                     continue  # A closed historical subject cannot make independent work depend on its current pathname.
-                other_workspace = self._physical_workspace_scope(attempt.spec.workspace_reference)
-                if other_workspace is None or not workspace.conflicts(other_workspace):
+                reference = attempt.spec.workspace_reference
+                if reference is None or not reference.startswith("/"):
                     continue
-                raise OwnershipConflict(
-                    "generic workspace work lacks applicable exact settlement; cannot adopt its resource"
+                other_workspace = ResourceScope("workspace", reference)
+                if workspace.conflicts(other_workspace):
+                    raise OwnershipConflict("generic workspace lacks exact settlement proof; retains original pathname")
+                if self._workspace_footprints is None:
+                    raise ProgramReadChanged("workspace identity lacks this decision's preflight")
+                observed = self._workspace_footprints[reference]
+                candidate = self._workspace_footprints[workspace.key]
+                original = self._work_record(
+                    "ownership-workspace", canonical_json([program.program_id, attempt.attempt_id])
                 )
+                # A reserved, still-absent future name is not an inode binding.
+                # Only the original undispatched preparation can prove that no
+                # task capability has yet materialized it. Never adopt a later root.
+                absent_unstarted = (
+                    original is not None
+                    and original["root"] is None
+                    and observed.root is None
+                    and observed.scope is not None
+                    and attempt.status is AttemptStatus.PREPARED
+                    and original["operation"] is not None
+                    and self.operation(cast(str, original["operation"])).attempts == 0
+                    and all(
+                        item["category"] == WorkKind.ATTEMPT.value
+                        or WorkKind(cast(str, item["category"])) in COUNT_ONLY_WORK
+                        for item in self._work_records("reservation")
+                        if (item["program"], item["attempt"]) == (program.program_id, attempt.attempt_id)
+                    )
+                )
+                if (
+                    original is None
+                    or original["parent"] is None
+                    or not observed.complete
+                    or not candidate.complete
+                    or observed.parent != tuple(cast(list[int], original["parent"]))
+                    or (
+                        observed.root
+                        != (None if original["root"] is None else tuple(cast(list[int], original["root"])))
+                    )
+                    or (original["root"] is None and not absent_unstarted)
+                ):
+                    raise OwnershipConflict(
+                        "generic workspace canonical identity/custody unknown; reconciliation required"
+                    )
+                if observed.resolved is not None and workspace.conflicts(ResourceScope("workspace", observed.resolved)):
+                    raise OwnershipConflict("generic workspace retains its observed original-inode alias footprint")
+                if (
+                    observed.root is not None and any(item[:2] == observed.root[:2] for item in candidate.ancestors)
+                ) or (
+                    candidate.root is not None and any(item[:2] == candidate.root[:2] for item in observed.ancestors)
+                ):
+                    raise OwnershipConflict("generic workspace inode/ancestor conflict retains the original resource")
 
     def _generic_resource_settled(self, attempt: AttemptSpec, *, exclude_operation: str | None = None) -> bool:
         effects = [

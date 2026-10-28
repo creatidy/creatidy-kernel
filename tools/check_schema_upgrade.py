@@ -17,6 +17,7 @@ PINNED_INITIAL_OWNERSHIP_ID = "b9aae79d36e1a1ece046dd565a07be028c8f865a"  # Orig
 PINNED_PREQUALIFICATION_ID = "3aa2b8f0232892ddfc61545bff7c646176253628"  # Exact schema-5 prequalification producer.
 PINNED_PRE_ACCEPTANCE_ID = "88d59fcd594cbf7fd529971a12139628bef9b6a5"  # Exact public Git object ID.
 PINNED_PRE_PUBLICATION_ID = "3ebd84a28c6c3bfcf6ed7f4b1937fc425ae05b13"  # Exact public Git object ID.
+PINNED_PRE_WORKSPACE_ID = "397ee0cb6a11f0638b9b19f48076f34d1d1c69b1"  # Exact public schema-5 pathname-only producer.
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -357,6 +358,34 @@ with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
 """
 
 
+REFUSE_UNBOUND_WORKSPACE = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
+from creatidy_kernel.core.authority import Principal
+from creatidy_kernel.core.deadlines import BootClockReading
+from creatidy_kernel.core.domain import AttemptSpec
+from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE,HandoffMode,OwnershipConflict
+from creatidy_kernel.ports.ownership import WorkOwnership
+directory = Path(sys.argv[1])
+clock = lambda: BootClockReading(100,1000000000,'synthetic-boot-a')
+with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
+    tree = LocalOwnedWorkspace(directory / 'workspaces','independent',create=True)
+    app = WorkOwnership(store,Principal('worker','worker'),tree,mode=HandoffMode.PULL,profile=COOPERATIVE_PROFILE)
+    program = store.load('successor')
+    attempt = AttemptSpec('independent','successor','first',program.spec.revision,program.spec.digest,
+                          program.resolved_inputs('first'),workspace_reference=str(tree.path))
+    try:
+        app.claim('claim:independent',program.revision,attempt,lease_seconds=5)
+    except OwnershipConflict as error:
+        assert 'identity/custody unknown' in str(error)
+    else:
+        raise AssertionError('old generic history was retrospectively bound to a current inode')
+    assert not store.operations('work-budget:v1:ownership-workspace:')
+"""
+
+
 def main(new_python: Path, storage_root: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="installed-schema-upgrade-", dir=storage_root) as value:
         directory = Path(value)
@@ -481,6 +510,45 @@ def main(new_python: Path, storage_root: Path) -> None:
         with closing(sqlite3.connect(path)) as current:
             if tuple(current.iterdump()) != before:
                 raise RuntimeError("old reader changed typed original owner authorization")
+        workspace = directory / "workspace-identity"
+        workspace.mkdir()
+        pathname_python = install_pinned_reader(workspace, commit_id=PINNED_PRE_WORKSPACE_ID)
+        for bound in (False, True):
+            fixture = workspace / ("bound" if bound else "unbound")
+            fixture.mkdir()
+            subprocess.run(
+                [
+                    str(new_python if bound else pathname_python),
+                    "-I",
+                    "-c",
+                    CREATE_LOGICAL_GENERIC,
+                    str(fixture),
+                    "logical-only",
+                ],
+                cwd=fixture,
+                check=True,
+            )
+            path = fixture / "kernel.sqlite3"
+            old = fixture / "workspaces" / "one"
+            retained = old.with_name("retained")
+            old.rename(retained)
+            old.symlink_to(retained, target_is_directory=True)
+            with closing(sqlite3.connect(path)) as current:
+                before = tuple(current.iterdump())
+            subprocess.run(
+                [
+                    str(pathname_python if bound else new_python),
+                    "-I",
+                    "-c",
+                    REFUSE_QUALIFICATION_DOWNGRADE if bound else REFUSE_UNBOUND_WORKSPACE,
+                    str(path if bound else fixture),
+                ],
+                cwd=fixture,
+                check=True,
+            )
+            with closing(sqlite3.connect(path)) as current:
+                if tuple(current.iterdump()) != before:
+                    raise RuntimeError("workspace compatibility rewrote original history or identity records")
         print(
             f"Installed schema upgrade: actual readers {PINNED_BASE_ID}, {PINNED_PRECLOCK_ID}, "
             f"{PINNED_PREOWNERSHIP_ID} refuse schema 5; original bytes, v2/v3/v4/v5 backups and artifacts preserved; "
@@ -494,6 +562,10 @@ def main(new_python: Path, storage_root: Path) -> None:
         print(
             "Installed publication authorization: original owner receipts required, old unproven operations unchanged, "
             "unsafe older reader refused."
+        )
+        print(
+            "Installed workspace identity: unbound original bytes remain unknown/unchanged; actual prior reader "
+            f"{PINNED_PRE_WORKSPACE_ID} refuses the new identity category without writes."
         )
 
 
