@@ -782,6 +782,19 @@ class SQLiteProgramStore:
             "ownership-candidate": {"claim", "subject"},
             "ownership-release": {"claim", "evidence"},
             "ownership-unknown": {"claim", "evidence"},
+            "ownership-publication": {
+                "claim",
+                "claim_digest",
+                "claimant",
+                "generation",
+                "attempt_digest",
+                "owner",
+                "subject",
+                "acceptance",
+                "operation",
+                "effect_key",
+                "request_digest",
+            },
             "ownership-settlement": {
                 "operation",
                 "program",
@@ -818,6 +831,10 @@ class SQLiteProgramStore:
                     if claim_record is None:
                         raise OwnershipConflict("ownership record has no original claim")
                     claim = self._decode_work_claim(claim_record)
+                    if kind == "ownership-publication":
+                        self._validate_claim_publication(record)
+                        if self._work_key(kind, cast(str, record["operation"])) != operation.operation_id:
+                            raise OwnershipConflict("publication authorization identity differs")
                     if kind == "ownership-proof":
                         proof = cast(dict[str, object], record["proof"])
                         if set(proof) != {
@@ -1358,6 +1375,109 @@ class SQLiteProgramStore:
                 "ownership-release", claim.command_key, {"claim": claim.command_key, "evidence": evidence}
             )
 
+    def _validate_claim_publication(self, record: dict[str, object]) -> OperationRecord:
+        if type(record["generation"]) is not int:
+            raise OwnershipConflict("publication generation must be an exact integer")
+        original = self._work_record("ownership-claim", cast(str, record["claim"]))
+        if original is None:
+            raise OwnershipConflict("publication authorization has no original claim")
+        claim = self._decode_work_claim(original)
+        claim_digest = self.operation(self._work_key("ownership-claim", claim.command_key)).request_digest
+        if (
+            record["claim_digest"],
+            record["claimant"],
+            record["generation"],
+            record["attempt_digest"],
+            record["owner"],
+        ) != (
+            claim_digest,
+            claim.claimant,
+            claim.generation,
+            claim.attempt.digest,
+            self._claim_owner(claim),
+        ):
+            raise OwnershipConflict("publication authorization differs from original owner/claim identity")
+        candidate = self._work_record("ownership-candidate", claim.command_key)
+        if candidate is None or candidate["subject"] != record["subject"]:
+            raise OwnershipConflict("publication authorization lacks its original exact candidate")
+        program = self._load_head(claim.attempt.program_id)
+        if not any(
+            item.reference_id == record["acceptance"]
+            and item.source_attempt_id == claim.attempt.attempt_id
+            and item.spec_digest == claim.attempt.spec_digest
+            for item in program.satisfactions
+        ):
+            raise OwnershipConflict("publication authorization lacks its original accepted fact")
+        operation = self.operation(cast(str, record["operation"]))
+        if (operation.effect_key, operation.request_digest) != (record["effect_key"], record["request_digest"]):
+            raise OwnershipConflict("publication authorization differs from immutable Operation input")
+        reservation = self._work_record("reservation", operation.operation_id)
+        if reservation is None or (reservation["program"], reservation["attempt"], reservation["category"]) != (
+            claim.attempt.program_id,
+            claim.attempt.attempt_id,
+            WorkKind.AUXILIARY.value,
+        ):
+            raise OwnershipConflict("publication authorization lacks its original AUX reservation")
+        binding = self._work_record("dispatch-binding", operation.operation_id)
+        if binding != {
+            "kind": "work-budget-record",
+            "type": "dispatch-binding",
+            **{
+                "program": claim.attempt.program_id,
+                "attempt": claim.attempt.attempt_id,
+                "attempt_digest": claim.attempt.digest,
+                "effect_key": operation.effect_key,
+                "request_digest": operation.request_digest,
+                "operation": operation.operation_id,
+                "spec_digest": claim.attempt.spec_digest,
+                "spec_revision": claim.attempt.spec_revision,
+            },
+        }:
+            raise OwnershipConflict("publication authorization lacks its original dispatch binding")
+        return operation
+
+    def find_claim_publication(
+        self,
+        claim: WorkClaim,
+        owner: str,
+        operation_id: str,
+        effect_key: str,
+        request: dict[str, object],
+    ) -> OperationRecord | None:
+        """Read only an explicit committed owner authorization, never infer one from an AUX intent."""
+        self._assert_writer_thread()
+        self._validate_command_key(operation_id)
+        self._validate_command_key(effect_key)
+        if type(request) is not dict:
+            raise TypeError("request must be a JSON object")
+        with self._gate:
+            original = self._work_record("ownership-claim", claim.command_key)
+            if original is None or self._decode_work_claim(original) != claim or self._claim_owner(claim) != owner:
+                raise IdempotencyConflict("publication caller differs from original claim/owner")
+            record = self._work_record("ownership-publication", operation_id)
+            if record is None:
+                if self._connection.execute(
+                    "SELECT 1 FROM operations WHERE operation_id = ? OR effect_key = ?", (operation_id, effect_key)
+                ).fetchone():
+                    raise IdempotencyConflict("existing effect lacks an original matching owner authorization")
+                return None
+            digest = hashlib.sha256(canonical_json({"version": 1, "request": request}).encode("utf-8")).hexdigest()
+            if (
+                record["claim"],
+                record["owner"],
+                record["generation"],
+                record["effect_key"],
+                record["request_digest"],
+            ) != (
+                claim.command_key,
+                owner,
+                claim.generation,
+                effect_key,
+                digest,
+            ):
+                raise IdempotencyConflict("publication authorization input differs from its recorded decision")
+            return self._validate_claim_publication(record)
+
     def authorize_claim_publication(
         self,
         claim: WorkClaim,
@@ -1368,11 +1488,17 @@ class SQLiteProgramStore:
         request: dict[str, object],
     ) -> OperationRecord:
         self._assert_writer_thread()
+        historical = self.find_claim_publication(claim, owner, operation_id, effect_key, request)
+        if historical is not None:
+            return historical
         with (
             self._gate,
             self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
             self._transaction(readings),
         ):
+            historical = self.find_claim_publication(claim, owner, operation_id, effect_key, request)
+            if historical is not None:
+                return historical
             self._check_work_claim(claim, settled=True, publication=True)
             if self._claim_owner(claim) != owner:
                 raise OwnershipConflict("only original owner authorizes protected effects")
@@ -1381,6 +1507,26 @@ class SQLiteProgramStore:
             self._insert_intent(operation_id, effect_key, request)
             self._bind_work_dispatch(claim.attempt.program_id, claim.attempt.attempt_id, operation_id)
             self.check_work_dispatch(operation_id)
+            operation = self.operation(operation_id)
+            self._write_work_record(
+                "ownership-publication",
+                operation_id,
+                {
+                    "claim": claim.command_key,
+                    "claim_digest": self.operation(self._work_key("ownership-claim", claim.command_key)).request_digest,
+                    "claimant": claim.claimant,
+                    "generation": claim.generation,
+                    "attempt_digest": claim.attempt.digest,
+                    "owner": owner,
+                    "subject": subject,
+                    "acceptance": self._load_head(claim.attempt.program_id)
+                    .state(claim.attempt.work_unit_id)
+                    .satisfaction_id,
+                    "operation": operation_id,
+                    "effect_key": operation.effect_key,
+                    "request_digest": operation.request_digest,
+                },
+            )
         return self.operation(operation_id)
 
     def release_claim_resources(

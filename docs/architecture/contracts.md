@@ -79,6 +79,13 @@ does not authorize fresh acceptance or publication. Publication intent/dispatch 
 actual current AUXILIARY operation, with other real effects still required. Old accepted facts remain
 historical evidence, not automatic new publication authority.
 
+An owned publication's original owner decision is a separate typed receipt, atomically committed
+with the exact AUX reservation/Operation/binding. Historical lookup validates the full original
+claim and owner, accepted candidate and immutable op/effect/request before any capture/live checks;
+it returns current Operation status without renewing authority or consuming capacity. No untyped AUX
+state implies that receipt. Changed input refuses; fresh authorization and delivery still require
+current accepted subject, original clock authority and all applicable other effect settlements.
+
 Qualified closed generic subjects are omitted before historical path dereference and preflight work;
 their changed old names cannot globally gate independent resources. Current decision targets remain
 explicit and must pass canonical physical preflight even when already closed. Live/unknown effects

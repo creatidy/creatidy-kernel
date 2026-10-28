@@ -16,6 +16,7 @@ PINNED_PREOWNERSHIP_ID = "b11aae420517b14bbb4d85c84f9a0d82c14446c6"  # Published
 PINNED_INITIAL_OWNERSHIP_ID = "b9aae79d36e1a1ece046dd565a07be028c8f865a"  # Original PR110 schema-5 record producer.
 PINNED_PREQUALIFICATION_ID = "3aa2b8f0232892ddfc61545bff7c646176253628"  # Exact schema-5 prequalification producer.
 PINNED_PRE_ACCEPTANCE_ID = "88d59fcd594cbf7fd529971a12139628bef9b6a5"  # Exact public Git object ID.
+PINNED_PRE_PUBLICATION_ID = "3ebd84a28c6c3bfcf6ed7f4b1937fc425ae05b13"  # Exact public Git object ID.
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -288,6 +289,74 @@ except CorruptHistory:
 """
 
 
+CREATE_OWNED_PUBLICATION = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.reference import reference_spec
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
+from creatidy_kernel.core.authority import Principal
+from creatidy_kernel.core.deadlines import BootClockReading
+from creatidy_kernel.core.domain import (ActivateProgram,AttemptSpec,StartAttempt,FinishAttempt,
+                                        SatisfyWorkUnit,TrustedSatisfaction,InputBinding)
+from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE,HandoffMode
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+from creatidy_kernel.ports.ownership import WorkOwnership
+directory = Path(sys.argv[1])
+parent = directory / 'workspaces'
+parent.mkdir(mode=0o700)
+tree = LocalOwnedWorkspace(parent,'one',create=True)
+clock = lambda: BootClockReading(100,1000000000,'synthetic-boot-a')
+with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
+    program = store.create(reference_spec(),'create')
+    budget = WorkBudgetPolicy.basic(3,3,verifications=3,retained_bytes=16384,auxiliary=3)
+    store.bind_work_budget('reference','project',budget,budget,110)
+    program = store.admit('reference','activate',ActivateProgram(program.revision,'owner'))
+    worker = WorkOwnership(store,Principal('worker','worker'),tree,mode=HandoffMode.PULL,profile=COOPERATIVE_PROFILE)
+    owner = WorkOwnership(store,Principal('owner','owner'),tree,mode=HandoffMode.PULL,profile=COOPERATIVE_PROFILE)
+    attempt = AttemptSpec('publication-task','reference','first',program.spec.revision,program.spec.digest,
+                          program.resolved_inputs('first'),workspace_reference=str(tree.path))
+    claim = worker.claim('claim:publication-task',program.revision,attempt,lease_seconds=5)
+    program = store.load('reference')
+    program = store.admit('reference','start',StartAttempt(program.revision,'worker',attempt.attempt_id))
+    worker.quiesce(claim,'client:exact-task-quiescent')
+    worker.submit(claim)
+    program = store.admit('reference','finish',FinishAttempt(program.revision,'worker',attempt.attempt_id))
+    accepted = TrustedSatisfaction('accepted:publication','reference','first',program.spec.revision,program.spec.digest,
+        program.spec.work_unit_applicability_fingerprint('first'),'verifier',attempt.attempt_id,
+        tuple(InputBinding(name,'artifact:'+name) for name in sorted(program.spec.work_unit('first').outputs)))
+    store.admit('reference','accept',SatisfyWorkUnit(program.revision,'verifier',accepted))
+    owner.authorize_publication(claim,'owner-publication','owner-publication',{'accepted':'publication-task'})
+"""
+
+REFUSE_UNPROVEN_OWNER_AUTHORIZATION = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore,IdempotencyConflict
+from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
+from creatidy_kernel.core.authority import Principal
+from creatidy_kernel.core.deadlines import BootClockReading
+from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE,HandoffMode
+from creatidy_kernel.ports.ownership import WorkOwnership
+directory = Path(sys.argv[1])
+clock = lambda: BootClockReading(100,1000000000,'synthetic-boot-a')
+with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
+    tree = LocalOwnedWorkspace(directory / 'workspaces','one')
+    owner = WorkOwnership(store,Principal('owner','owner'),tree,mode=HandoffMode.PULL,profile=COOPERATIVE_PROFILE)
+    attempt = store.load('reference').attempt('publication-task').spec
+    claim = store.find_work_claim('claim:publication-task','worker',1,attempt,HandoffMode.PULL,
+                                  COOPERATIVE_PROFILE,(tree.resource,),5)
+    assert claim is not None
+    try:
+        owner.authorize_publication(claim,'owner-publication','owner-publication',{'accepted':'publication-task'})
+    except IdempotencyConflict:
+        pass
+    else:
+        raise AssertionError('old AUX state was invented into an original owner authorization')
+    assert not store.operations('work-budget:v1:ownership-publication:')
+"""
+
+
 def main(new_python: Path, storage_root: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="installed-schema-upgrade-", dir=storage_root) as value:
         directory = Path(value)
@@ -373,6 +442,45 @@ def main(new_python: Path, storage_root: Path) -> None:
         with closing(sqlite3.connect(path)) as current:
             if tuple(current.iterdump()) != before:
                 raise RuntimeError("old schema5 reader changed typed settlement records")
+        publication = directory / "publication"
+        publication.mkdir()
+        previous_python = install_pinned_reader(publication, commit_id=PINNED_PRE_PUBLICATION_ID)
+        old_publication = publication / "unproven"
+        old_publication.mkdir()
+        subprocess.run(
+            [str(previous_python), "-I", "-c", CREATE_OWNED_PUBLICATION, str(old_publication)],
+            cwd=old_publication,
+            check=True,
+        )
+        path = old_publication / "kernel.sqlite3"
+        with closing(sqlite3.connect(path)) as current:
+            before = tuple(current.iterdump())
+        subprocess.run(
+            [str(new_python), "-I", "-c", REFUSE_UNPROVEN_OWNER_AUTHORIZATION, str(old_publication)],
+            cwd=old_publication,
+            check=True,
+        )
+        with closing(sqlite3.connect(path)) as current:
+            if tuple(current.iterdump()) != before:
+                raise RuntimeError("original unproven publication history was rewritten or authorized")
+        new_publication = publication / "typed"
+        new_publication.mkdir()
+        subprocess.run(
+            [str(new_python), "-I", "-c", CREATE_OWNED_PUBLICATION, str(new_publication)],
+            cwd=new_publication,
+            check=True,
+        )
+        path = new_publication / "kernel.sqlite3"
+        with closing(sqlite3.connect(path)) as current:
+            before = tuple(current.iterdump())
+        subprocess.run(
+            [str(previous_python), "-I", "-c", REFUSE_QUALIFICATION_DOWNGRADE, str(path)],
+            cwd=new_publication,
+            check=True,
+        )
+        with closing(sqlite3.connect(path)) as current:
+            if tuple(current.iterdump()) != before:
+                raise RuntimeError("old reader changed typed original owner authorization")
         print(
             f"Installed schema upgrade: actual readers {PINNED_BASE_ID}, {PINNED_PRECLOCK_ID}, "
             f"{PINNED_PREOWNERSHIP_ID} refuse schema 5; original bytes, v2/v3/v4/v5 backups and artifacts preserved; "
@@ -382,6 +490,10 @@ def main(new_python: Path, storage_root: Path) -> None:
         print(
             "Installed settlement qualification: untyped logical history stays unknown; "
             "old schema5 readers refuse new proof categories."
+        )
+        print(
+            "Installed publication authorization: original owner receipts required, old unproven operations unchanged, "
+            "unsafe older reader refused."
         )
 
 

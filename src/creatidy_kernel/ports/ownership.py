@@ -95,6 +95,15 @@ class OwnershipStore(Protocol):
         request: dict[str, object],
     ) -> OperationRecord: ...
 
+    def find_claim_publication(
+        self,
+        claim: WorkClaim,
+        owner: str,
+        operation_id: str,
+        effect_key: str,
+        request: dict[str, object],
+    ) -> OperationRecord | None: ...
+
     def release_claim_resources(
         self,
         claim: WorkClaim,
@@ -156,13 +165,16 @@ class WorkOwnership:
         self._resources = (workspace.resource, *resources)
         workspace.bind_authority(store.ownership_authority)
 
-    def _caller(self, claim: WorkClaim) -> None:
+    def _bound_caller(self, claim: WorkClaim) -> None:
         if (claim.mode, claim.profile, claim.resources) != (
             self._mode,
             self._profile,
             self._resources,
         ) or (self._principal.role == "worker" and claim.claimant != self._principal.actor_id):
             raise OwnershipConflict("claim does not belong to authenticated client/configuration")
+
+    def _caller(self, claim: WorkClaim) -> None:
+        self._bound_caller(claim)
         if self._witness is not None and self._witness.scope_unknown:
             self._store.quarantine_work_claim(claim, None, "configured profile producer reports unknown/escaped scope")
             raise OwnershipConflict("configured profile scope unknown; retained durable quarantine")
@@ -277,8 +289,12 @@ class WorkOwnership:
         effect_key: str,
         request: dict[str, object],
     ) -> OperationRecord:
-        self._caller(claim)
         owner = self._owner()
+        self._bound_caller(claim)
+        historical = self._store.find_claim_publication(claim, owner, operation_id, effect_key, request)
+        if historical is not None:
+            return historical  # Original authorization outcome, not current delivery authority.
+        self._caller(claim)
         subject = self.observe(claim)
         return self._store.authorize_claim_publication(
             claim,

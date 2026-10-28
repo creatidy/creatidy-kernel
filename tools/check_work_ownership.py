@@ -191,6 +191,126 @@ def settlement_conformance(directory: Path, binary: Path) -> None:
             connection.close()
 
 
+def publication_replay_conformance(directory: Path, binary: Path) -> None:
+    for mode in (HandoffMode.PULL, HandoffMode.MANAGED):
+        parent = directory / f"publication-{mode.value}"
+        parent.mkdir(mode=0o700)
+        tree = LocalOwnedWorkspace(parent, "one", create=True)
+        path = directory / f"publication-{mode.value}.sqlite3"
+        clock = lambda: BootClockReading(100, 1_000_000_000, "installed-publication-boot")  # noqa: E731
+        connection = None
+        witness = None
+        resources = ()
+        profile = COOPERATIVE_PROFILE
+        if mode is HandoffMode.MANAGED:
+            connection = CodexStdio(
+                (str(binary), "app-server"), "0.99.1", environment={"HOME": str(directory), "PATH": os.defpath}
+            )
+            witness = CodexOwnedSessionWitness(connection)
+            resources = (witness.resource,)
+            profile = witness.profile
+        try:
+            with SQLiteProgramStore(path, boot_clock=clock) as store:
+                base = reference_spec()
+                program = store.create(base, "create")
+                budget = WorkBudgetPolicy.basic(3, 3, verifications=3, retained_bytes=16384, auxiliary=3)
+                store.bind_work_budget(program.program_id, "publication-project", budget, budget, 110)
+                program = store.admit(program.program_id, "activate", ActivateProgram(program.revision, "owner"))
+                worker = WorkOwnership(
+                    store,
+                    Principal("worker", "worker"),
+                    tree,
+                    mode=mode,
+                    profile=profile,
+                    resources=resources,
+                    witness=witness,
+                )
+                owner = WorkOwnership(
+                    store,
+                    Principal("owner", "owner"),
+                    tree,
+                    mode=mode,
+                    profile=profile,
+                    resources=resources,
+                    witness=witness,
+                )
+                attempt = AttemptSpec(
+                    "publication",
+                    program.program_id,
+                    "first",
+                    program.spec.revision,
+                    program.spec.digest,
+                    program.resolved_inputs("first"),
+                    workspace_reference=str(tree.path),
+                )
+                claimed = worker.claim("claim:publication", program.revision, attempt, lease_seconds=5)
+                if mode is HandoffMode.MANAGED:
+                    worker.witness(claimed, "start")
+                program = store.load(program.program_id)
+                store.admit(program.program_id, "start", StartAttempt(program.revision, "worker", attempt.attempt_id))
+                if connection is not None:
+                    connection.close()
+                    worker.witness(claimed, "complete")
+                else:
+                    worker.quiesce(claimed, "client:publication-task-quiescent")
+                worker.submit(claimed)
+                program = store.load(program.program_id)
+                program = store.admit(
+                    program.program_id, "finish", FinishAttempt(program.revision, "worker", attempt.attempt_id)
+                )
+                fact = TrustedSatisfaction(
+                    "accepted:publication",
+                    program.program_id,
+                    "first",
+                    program.spec.revision,
+                    program.spec.digest,
+                    program.spec.work_unit_applicability_fingerprint("first"),
+                    "verifier",
+                    attempt.attempt_id,
+                    tuple(
+                        InputBinding(name, f"artifact:{name}")
+                        for name in sorted(program.spec.work_unit("first").outputs)
+                    ),
+                )
+                store.admit(program.program_id, "accept", SatisfyWorkUnit(program.revision, "verifier", fact))
+                request: dict[str, object] = {"accepted": fact.reference_id}
+                authorized = owner.authorize_publication(claimed, "publication", "publication-effect", request)
+                before = store.operations(), store.work_budget_status(program.program_id)
+                require(
+                    owner.authorize_publication(claimed, "publication", "publication-effect", request) == authorized
+                )
+                require((store.operations(), store.work_budget_status(program.program_id)) == before)
+                fence = owner.dispatch(claimed, "publication", lease_seconds=1)
+                store.record_transport("publication", fence, True)
+                store.observe(
+                    "publication", fence, "accepted:publication", "accepted", reference="synthetic:publication"
+                )
+                store.record_work_settlement("publication", "trusted:synthetic-effect-closed", expected_fence=fence)
+                owner.cleanup(claimed, evidence="owner:exact-empty-retirement")
+                require(
+                    owner.authorize_publication(claimed, "publication", "publication-effect", request)
+                    == store.operation("publication")
+                )
+            with SQLiteProgramStore(path, boot_clock=clock) as store:
+                cold = WorkOwnership(
+                    store,
+                    Principal("owner", "owner"),
+                    LocalOwnedWorkspace(parent, "one"),
+                    mode=mode,
+                    profile=profile,
+                    resources=resources,
+                )
+                before = store.operations(), store.work_budget_status(program.program_id)
+                require(
+                    cold.authorize_publication(claimed, "publication", "publication-effect", request)
+                    == store.operation("publication")
+                )
+                require((store.operations(), store.work_budget_status(program.program_id)) == before)
+        finally:
+            if connection is not None:
+                connection.close()
+
+
 def main(directory: Path) -> None:
     parent = directory / "workspaces"
     parent.mkdir(mode=0o700)
@@ -498,12 +618,14 @@ for line in sys.stdin:
         require((one.path / "unknown-user-data").read_bytes() == b"synthetic manual bytes must survive")
         require(store.startup_evidence.schema_version == 5)
     settlement_conformance(directory, fixture)
+    publication_replay_conformance(directory, fixture)
     print(
         "Installed ownership: atomic pull claims, conflicts, independent work, original renewal, quiescence, "
         "immutable capture, manual preservation, empty cleanup, explicit-request replay after edit/retirement/reopen, "
         "global generic preparation fencing, cold managed history, fresh post-filesystem boot expiry, "
         "fresh task-proof acceptance/publication, settled historical alias independence, "
-        "logical/profile proof separation and counter-only retry/remediation completion passed."
+        "logical/profile proof separation, counter-only retry/remediation completion, "
+        "and exact original publication authorization replay across retirement/reopen in both modes passed."
     )
 
 

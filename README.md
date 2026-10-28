@@ -592,6 +592,14 @@ publication. Fresh publication intent and delivery require the same proof, exclu
 current publication operation, never arbitrary other effects. Existing accepted history remains readable
 and replayable without being upgraded into physical or new publication authority.
 
+Owned publication authorization commits a typed `ownership-publication` receipt with its AUX
+reservation, Operation and dispatch binding. It records the original owner, exact claim/generation,
+accepted candidate and immutable effect/request identity. Exact retries look up that receipt before
+capture, profile or clock checks and return the Operation's current status only as history, including
+after release/retirement or a lost reply. They never renew delivery authority or ignore other pending
+effects. Changed identity/input refuses; an old untyped AUX intent is not invented into original owner
+approval. Fresh authorization and every delivery retain the current proof/subject/clock gates.
+
 Fully qualified closed generic history is filtered before filesystem probing or conflict search.
 A changed old pathname therefore cannot block confirmed independent work. An explicit current target
 is still preflighted and validated even when its previous work was closed: aliases refuse rather than

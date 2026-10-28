@@ -166,6 +166,14 @@ Installed fixtures seed historical acceptance with that pinned producer, never b
 current acceptance gate. Fully qualified closed history is filtered before probing changed old paths;
 explicit unsafe alias targets and live/unqualified scopes still refuse.
 
+Typed `ownership-publication` records add the original owner/claim/generation/accepted-candidate and
+exact Operation effect/request decision without rewriting prior operations. Exact historical lookup
+requires this receipt; an AUX intent created by the actual prior
+`3ebd84a28c6c3bfcf6ed7f4b1937fc425ae05b13` producer remains readable but unproven as an original owner
+authorization. Installed tests preserve that database unchanged on refusal and verify that the same
+older reader refuses new typed authorization records. The schema number remains 5 and unsupported
+ownership record types continue to fail closed.
+
 ## Verification Compatibility
 
 Verification changes under #50 preserve the original Task #143/#166 payloads, policy references,
