@@ -85,7 +85,15 @@ class DriverSubject:
     @classmethod
     def parse(cls, reference: str) -> "DriverSubject":
         prefix = "kernel-driver-subject:v1:"
-        if not reference.startswith(prefix) or len(reference) > 150_000:
+        # Eight opaque fields can each expand to 12 ASCII JSON bytes per codepoint;
+        # the canonical HTTPS origin is ASCII, and knowledge is the longest family.
+        envelope = (
+            b'{"binding":{"api_version":"","family":"knowledge","implementation":"",'
+            b'"namespace":"","origin":"","rights":"","tenant":"","version":"1"},'
+            b'"key":"","kind":"","revision":""}'
+        )
+        max_length = len(prefix) + 2 * (len(envelope) + 4096 + 8 * 4096 * 12)
+        if not reference.startswith(prefix) or len(reference) > max_length:
             raise ValueError("unsupported external subject codec")
         try:
             raw: object = json.loads(bytes.fromhex(reference[len(prefix) :]))

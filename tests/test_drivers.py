@@ -93,6 +93,24 @@ def test_subject_identity_qualifies_every_binding_dimension(field: str, value: s
         DriverSubject.parse("forgejo:acme/service#42")
 
 
+def test_subject_reference_maximum_unicode_roundtrip_and_excess_refusal() -> None:
+    value = "\U0001f600" * 4096
+    original = binding("knowledge", "x", "x", "x")
+    maximum = replace(
+        original,
+        implementation=value,
+        origin="https://" + "a" * (4096 - len("https://")),
+        tenant=value,
+        namespace=value,
+        api_version=value,
+        rights=value,
+    )
+    subject = DriverSubject(maximum, value, value, value)
+    assert DriverSubject.parse(subject.reference) == subject
+    with pytest.raises(ValueError, match="unsupported external subject codec"):
+        DriverSubject.parse(subject.reference + "00")
+
+
 @pytest.mark.parametrize(
     "change", [{"version": "2"}, {"grant": "owner"}, {"trust": "sandbox"}, {"mutation_token": "forbidden"}]
 )
