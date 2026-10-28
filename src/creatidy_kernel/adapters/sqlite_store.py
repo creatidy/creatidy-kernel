@@ -258,6 +258,7 @@ class SQLiteProgramStore:
         self._workspace_footprints: dict[str, _WorkspaceFootprint] | None = None
         self._workspace_identities: dict[tuple[str, str], _WorkspaceIdentity | None] | None = None
         self._workspace_retirements: frozenset[tuple[str, str]] = frozenset()
+        self._workspace_subjects: dict[str, str | None] | None = None
         self._workspace_artifacts: dict[tuple[str, str], str] | None = None
         self._cache_mode = "private"
         self._closed = False
@@ -445,6 +446,7 @@ class SQLiteProgramStore:
     ) -> Program:
         self._assert_writer_thread()
         references: tuple[str | None, ...] | None = None
+        subjects: tuple[WorkClaim | None, ...] = ()
         if isinstance(command, PrepareAttempt):
             references = (command.attempt.workspace_reference,)
         elif isinstance(command, (StartAttempt, FinishAttempt, SatisfyWorkUnit)):
@@ -452,7 +454,15 @@ class SQLiteProgramStore:
                 command.satisfaction.source_attempt_id if isinstance(command, SatisfyWorkUnit) else command.attempt_id
             )
             references = self._attempt_workspace_references(program_id, attempt_id)
-        with self._gate, self._workspace_cut(references) as readings, self._transaction(readings):
+            if (
+                isinstance(command, SatisfyWorkUnit)
+                and self._connection.execute(
+                    "SELECT 1 FROM command_admissions WHERE command_key = ?", (command_key,)
+                ).fetchone()
+                is None
+            ):
+                subjects = (self._attempt_work_claim(program_id, attempt_id),)
+        with self._gate, self._workspace_cut(references, subjects=subjects) as readings, self._transaction(readings):
             return self._admit_decision(program_id, command_key, command, intent)
 
     def _admit_decision(
@@ -702,7 +712,9 @@ class SQLiteProgramStore:
             raise ValueError("now must be an integer and lease_seconds positive")
         with (
             self._gate,
-            self._workspace_cut(self._operation_workspace_references(operation_id)) as readings,
+            self._workspace_cut(
+                self._operation_workspace_references(operation_id), subjects=(self._operation_work_claim(operation_id),)
+            ) as readings,
             self._transaction(readings),
         ):
             op = self.operation(operation_id)
@@ -724,7 +736,7 @@ class SQLiteProgramStore:
                     current_claim, subject = ownership
                     now = self.work_decision_time(current_claim.attempt.program_id)
                     if operation_id == current_claim.operation_id:
-                        self._check_workspace_subject(current_claim, subject)
+                        self._check_workspace_subject(current_claim, subject, fresh=True)
                     else:
                         self._check_claim_candidate(current_claim, subject)
             if reservation is None and (
@@ -1341,12 +1353,13 @@ class SQLiteProgramStore:
             raise OwnershipConflict("explicit reconciliation evidence required")
         with (
             self._gate,
-            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._workspace_cut((claim.attempt.workspace_reference,), subjects=(claim,)) as readings,
             self._transaction(readings),
         ):
             self._check_work_claim(claim, authority=False, settled=True)
             if self._claim_owner(claim) != owner:
                 raise OwnershipConflict("only original owner can reconcile workspace changes")
+            self._check_current_workspace_subject(claim, subject)
             if self._work_record("ownership-observation", f"{claim.command_key}:{subject}") is None:
                 raise OwnershipConflict("reconciliation needs an exact retained observation")
             self._write_work_record(
@@ -1360,7 +1373,9 @@ class SQLiteProgramStore:
                 },
             )
 
-    def _check_workspace_subject(self, claim: WorkClaim, subject: str) -> None:
+    def _check_workspace_subject(self, claim: WorkClaim, subject: str, *, fresh: bool = False) -> None:
+        if fresh:
+            self._check_current_workspace_subject(claim, subject)
         if (
             subject != claim.workspace_subject
             and self._work_record(
@@ -1372,6 +1387,7 @@ class SQLiteProgramStore:
             raise OwnershipConflict("changed/manual workspace bytes require explicit exact-subject reconciliation")
 
     def _check_claim_candidate(self, claim: WorkClaim, subject: str) -> None:
+        self._check_current_workspace_subject(claim, subject)
         candidate = self._work_record("ownership-candidate", claim.command_key)
         observations = [
             item for item in self._work_records("ownership-observation") if item["claim"] == claim.command_key
@@ -1387,7 +1403,7 @@ class SQLiteProgramStore:
         self._assert_writer_thread()
         with (
             self._gate,
-            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._workspace_cut((claim.attempt.workspace_reference,), subjects=(claim,)) as readings,
             self._transaction(readings),
         ):
             self._check_work_claim(claim, settled=True)
@@ -1400,12 +1416,14 @@ class SQLiteProgramStore:
         with (
             self._gate,
             self._workspace_cut(
-                (claim.attempt.workspace_reference,), ((claim.operation_id, "ownership-candidate", snapshot),)
+                (claim.attempt.workspace_reference,),
+                ((claim.operation_id, "ownership-candidate", snapshot),),
+                subjects=(claim,),
             ) as readings,
             self._transaction(readings),
         ):
             self._check_work_claim(claim, settled=True)
-            self._check_workspace_subject(claim, subject)
+            self._check_workspace_subject(claim, subject, fresh=True)
             self._write_work_record(
                 "ownership-candidate", claim.command_key, {"claim": claim.command_key, "subject": subject}
             )
@@ -1562,7 +1580,7 @@ class SQLiteProgramStore:
             return historical
         with (
             self._gate,
-            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._workspace_cut((claim.attempt.workspace_reference,), subjects=(claim,)) as readings,
             self._transaction(readings),
         ):
             historical = self.find_claim_publication(claim, owner, operation_id, effect_key, request)
@@ -1612,14 +1630,16 @@ class SQLiteProgramStore:
         with (
             self._gate,
             self._workspace_cut(
-                (claim.attempt.workspace_reference,), ((claim.operation_id, "ownership-release", snapshot),)
+                (claim.attempt.workspace_reference,),
+                ((claim.operation_id, "ownership-release", snapshot),),
+                subjects=(claim,),
             ) as readings,
             self._transaction(readings),
         ):
             self._check_work_claim(claim, authority=False, settled=True)
             if self._claim_owner(claim) != owner:
                 raise OwnershipConflict("only original owner can release settled resources")
-            self._check_workspace_subject(claim, subject)
+            self._check_workspace_subject(claim, subject, fresh=True)
             self._finalize_artifact(claim.operation_id, "ownership-release", snapshot)
             self._write_work_record(
                 "ownership-release",
@@ -1898,11 +1918,61 @@ class SQLiteProgramStore:
         references = {*additional, *(attempt.workspace_reference for attempt, _ in self._retained_workspaces())}
         return frozenset(reference for reference in references if reference is not None and reference.startswith("/"))
 
+    def _operation_work_claim(self, operation_id: str) -> WorkClaim | None:
+        reservation = self._work_record("reservation", operation_id)
+        return (
+            None
+            if reservation is None
+            else self._attempt_work_claim(cast(str, reservation["program"]), cast(str, reservation["attempt"]))
+        )
+
+    def _capture_claim_subject(self, claim: WorkClaim) -> str | None:
+        """Current bytes from the original controller producer, never a caller's old digest."""
+        try:
+            original = self._work_record("ownership-claim", claim.command_key)
+            if original is None or self._decode_work_claim(original) != claim:
+                return None
+            baseline = self.find_artifact(claim.operation_id, "ownership-baseline")
+            if baseline is None or hashlib.sha256(baseline).hexdigest() != claim.workspace_subject:
+                return None
+            binding = self._work_binding(claim.attempt.program_id)
+            if binding is None:
+                return None
+            project = self._work_record("project", cast(str, binding["project"]))
+            if project is None:
+                return None
+            # This is a finite verification I/O bound, not recovery of an
+            # unstored adapter max_bytes. Encoded captures exceed their raw
+            # file bytes; existing retention/dedup/headroom gates still apply.
+            limit = min(
+                WorkBudgetPolicy.decode(binding["policy"]).retained_bytes,
+                WorkBudgetPolicy.decode(project["policy"]).retained_bytes,
+            )
+            reference = Path(cast(str, claim.attempt.workspace_reference))
+            subject, snapshot = LocalOwnedWorkspace(reference.parent, reference.name, max_bytes=limit).capture()
+            captured = cast(dict[str, object], json.loads(snapshot))
+            bound = cast(dict[str, object], json.loads(baseline))
+            if hashlib.sha256(snapshot).hexdigest() != subject or captured["owner"] != bound["owner"]:
+                return None
+            return subject
+        except (ValueError, TypeError, KeyError, AttributeError, OSError):
+            return None
+
+    def _check_current_workspace_subject(self, claim: WorkClaim, subject: str) -> None:
+        if (
+            type(subject) is not str
+            or self._workspace_subjects is None
+            or self._workspace_subjects.get(claim.command_key) != subject
+        ):
+            raise OwnershipConflict("fresh candidate/current workspace subject unavailable or changed after capture")
+
     @contextmanager
     def _workspace_cut(
         self,
         additional: tuple[str | None, ...] | None,
         artifacts: tuple[tuple[str, str, bytes], ...] = (),
+        *,
+        subjects: tuple[WorkClaim | None, ...] = (),
     ) -> Generator[dict[str, BootClockReading | None] | None, None, None]:
         if additional is None:
             yield None
@@ -1926,6 +1996,8 @@ class SQLiteProgramStore:
             and self._original_workspace_retired(claim)
         )
         scopes = {reference: footprint.scope for reference, footprint in footprints.items()}
+        requested = tuple(claim for claim in subjects if claim is not None)
+        captured_subjects = {claim.command_key: self._capture_claim_subject(claim) for claim in requested}
         prepared: dict[tuple[str, str], str] = {}
         for operation_id, name, data in artifacts:
             self._validate_command_key(operation_id)
@@ -1936,8 +2008,14 @@ class SQLiteProgramStore:
             self._check_owned_artifact_budget(operation_id, digest, len(data))
             self._stage_blob(digest, data)
             prepared[(operation_id, name)] = digest
+        verified_subjects = {claim.command_key: self._capture_claim_subject(claim) for claim in requested}
         verified = {reference: self._capture_workspace_footprint(reference) for reference in sorted(references)}
-        stable = not self._closed and changes == self._connection.total_changes and footprints == verified
+        stable = (
+            not self._closed
+            and changes == self._connection.total_changes
+            and footprints == verified
+            and captured_subjects == verified_subjects
+        )
         if self._closed:
             raise ProgramReadChanged("owner closed during physical workspace preflight")
         # Potentially blocking validation precedes the independently durable
@@ -1950,11 +2028,13 @@ class SQLiteProgramStore:
         previous_footprints = self._workspace_footprints
         previous_identities = self._workspace_identities
         previous_retirements = self._workspace_retirements
+        previous_subjects = self._workspace_subjects
         self._workspace_scopes = scopes
         self._workspace_footprints = footprints
         self._workspace_identities = identities
         self._workspace_retirements = retirements
         self._workspace_artifacts = prepared
+        self._workspace_subjects = captured_subjects
         try:
             yield readings
         finally:
@@ -1963,6 +2043,7 @@ class SQLiteProgramStore:
             self._workspace_identities = previous_identities
             self._workspace_retirements = previous_retirements
             self._workspace_artifacts = previous_artifacts
+            self._workspace_subjects = previous_subjects
 
     def _physical_workspace_scope(self, reference: str | None) -> ResourceScope | None:
         # Legacy keys are opaque, not paths to resolve or silently rewrite.
@@ -2536,7 +2617,9 @@ class SQLiteProgramStore:
             return
         with (
             self._gate,
-            self._workspace_cut(self._operation_workspace_references(operation_id)) as readings,
+            self._workspace_cut(
+                self._operation_workspace_references(operation_id), subjects=(self._operation_work_claim(operation_id),)
+            ) as readings,
             self._transaction(readings),
         ):
             self._check_work_dispatch(operation_id)
@@ -2607,6 +2690,12 @@ class SQLiteProgramStore:
                     raise OwnershipConflict("publication lacks exact candidate handoff")
                 self._check_claim_candidate(claim, cast(str, candidate["subject"]))
             if operation_id == claim.operation_id:
+                current_subject = (
+                    None if self._workspace_subjects is None else self._workspace_subjects.get(claim.command_key)
+                )
+                if current_subject is None:
+                    raise OwnershipConflict("current runtime workspace subject unavailable")
+                self._check_workspace_subject(claim, current_subject, fresh=True)
                 if claim.mode is HandoffMode.PULL:
                     raise OwnershipConflict("pull handoff is not managed Runtime dispatch authority")
                 if self._work_record("ownership-proof", f"{claim.command_key}:start") is None:
@@ -2779,9 +2868,17 @@ class SQLiteProgramStore:
         retained_bytes: int = 0,
     ) -> OperationRecord:
         self._assert_writer_thread()
+        fresh_subject = category is WorkKind.AUXILIARY and (
+            self._work_record("reservation", operation_id) is None
+            or self._connection.execute("SELECT 1 FROM operations WHERE operation_id = ?", (operation_id,)).fetchone()
+            is None
+        )
         with (
             self._gate,
-            self._workspace_cut(self._attempt_workspace_references(program_id, attempt_id)) as readings,
+            self._workspace_cut(
+                self._attempt_workspace_references(program_id, attempt_id),
+                subjects=(self._attempt_work_claim(program_id, attempt_id),) if fresh_subject else (),
+            ) as readings,
             self._transaction(readings),
         ):
             existed = self._work_record("reservation", operation_id) is not None

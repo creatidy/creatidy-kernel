@@ -444,6 +444,146 @@ def live_alias_conformance(directory: Path, *, owned: bool = False) -> None:
         require(old.path.is_symlink() and (retained / "manual").read_bytes() == b"installed original manual bytes")
 
 
+def fresh_subject_conformance(directory: Path, binary: Path) -> None:
+    """Installed store acceptance/effect entrances use actual post-verifier bytes."""
+    for mode in (HandoffMode.PULL, HandoffMode.MANAGED):
+        for sample in ("source.txt", "verification.txt", None, "configured"):
+            configured = sample == "configured"
+            if configured and mode is HandoffMode.MANAGED:
+                continue  # The byte-limit parameter is producer I/O, not a managed-profile contract.
+            filename = None if configured else sample
+            label = f"fresh-{mode.value}-{sample or 'positive'}"
+            parent = directory / f"{label}-workspaces"
+            parent.mkdir(mode=0o700)
+            tree = LocalOwnedWorkspace(parent, "one", create=True, max_bytes=(20 if configured else 16) * 1024 * 1024)
+            (tree.path / "source.txt").write_bytes(
+                b"x" * (17 * 1024 * 1024) if configured else b"installed original source"
+            )
+            (tree.path / "verification.txt").write_bytes(b"installed original verification")
+            native = None
+            clock = lambda: BootClockReading(100, 1_000_000_000, "installed-fresh-subject-boot")  # noqa: E731
+            try:
+                with SQLiteProgramStore(directory / f"{label}.sqlite3", boot_clock=clock) as store:
+                    base = reference_spec()
+                    program = store.create(base, "create")
+                    ceiling = len(tree.capture()[1]) + 4096 if configured else 16384
+                    budget = WorkBudgetPolicy.basic(3, 3, verifications=3, retained_bytes=ceiling, auxiliary=3)
+                    store.bind_work_budget(base.program_id, "project", budget, budget, 110)
+                    program = store.admit(base.program_id, "activate", ActivateProgram(program.revision, "owner"))
+                    resources = ()
+                    witness = None
+                    profile = COOPERATIVE_PROFILE
+                    if mode is HandoffMode.MANAGED:
+                        native = CodexStdio(
+                            (str(binary), "app-server"),
+                            "0.99.1",
+                            environment={"HOME": str(directory), "PATH": os.defpath},
+                        )
+                        witness = CodexOwnedSessionWitness(native)
+                        resources, profile = (witness.resource,), witness.profile
+                    app = WorkOwnership(
+                        store,
+                        Principal("worker", "worker"),
+                        tree,
+                        mode=mode,
+                        profile=profile,
+                        resources=resources,
+                        witness=witness,
+                    )
+                    attempt = AttemptSpec(
+                        "original",
+                        base.program_id,
+                        "first",
+                        base.revision,
+                        base.digest,
+                        program.resolved_inputs("first"),
+                        workspace_reference=str(tree.path),
+                    )
+                    claimed = app.claim("claim:original", program.revision, attempt, lease_seconds=5)
+                    if native is not None:
+                        app.witness(claimed, "start")
+                    program = store.load(base.program_id)
+                    store.admit(base.program_id, "start:original", StartAttempt(program.revision, "worker", "original"))
+                    if native is not None:
+                        native.close()
+                        app.witness(claimed, "complete")
+                    else:
+                        app.quiesce(claimed, "client:installed-original-scope-quiescent")
+                    app.submit(claimed)
+                    subject = app.candidate_subject(claimed)
+                    program = store.load(base.program_id)
+                    program = store.admit(
+                        base.program_id, "finish:original", FinishAttempt(program.revision, "worker", "original")
+                    )
+                    fact = TrustedSatisfaction(
+                        "accepted:original",
+                        base.program_id,
+                        "first",
+                        base.revision,
+                        base.digest,
+                        base.work_unit_applicability_fingerprint("first"),
+                        "verifier",
+                        "original",
+                        tuple(
+                            InputBinding(name, "artifact:" + name) for name in sorted(base.work_unit("first").outputs)
+                        ),
+                    )
+                    command = SatisfyWorkUnit(program.revision, "verifier", fact)
+                    if filename is not None:
+                        (tree.path / filename).write_bytes(b"installed post-verifier manual bytes")
+                        before = (
+                            store.load(base.program_id),
+                            store.operations(),
+                            store.work_budget_status(base.program_id),
+                        )
+                        try:
+                            store.admit(base.program_id, "accept:original", command)
+                        except OwnershipConflict:
+                            pass
+                        else:
+                            raise AssertionError("installed fresh acceptance used a stale verifier subject")
+                        require(
+                            (store.load(base.program_id), store.operations(), store.work_budget_status(base.program_id))
+                            == before
+                        )
+                        require("second" not in store.load(base.program_id).ready_work_unit_ids)
+                        require((tree.path / filename).read_bytes() == b"installed post-verifier manual bytes")
+                    else:
+                        store.admit(base.program_id, "accept:original", command)
+                        require("second" in store.load(base.program_id).ready_work_unit_ids)
+                        original = store.authorize_claim_publication(
+                            claimed, "owner", subject, "publish", "publish", {}
+                        )
+                        (tree.path / "verification.txt").write_bytes(b"installed post-authorization manual bytes")
+                        before = store.operations()
+                        for deliver in (False, True):
+                            try:
+                                if deliver:
+                                    store.claim_owned_operation(claimed, "publish", subject, 1)
+                                else:
+                                    store.check_work_dispatch("publish")
+                            except OwnershipConflict:
+                                pass
+                            else:
+                                raise AssertionError("installed delivery accepted stale authorized workspace bytes")
+                        require(store.operations() == before)
+                        store.record_work_settlement(
+                            "publish", "trusted:installed-undelivered-scope-closed", expected_fence=0
+                        )
+                        before = store.operations()
+                        try:
+                            store.authorize_claim_publication(claimed, "owner", subject, "other", "other", {})
+                        except OwnershipConflict:
+                            pass
+                        else:
+                            raise AssertionError("installed first owner authorization used stale candidate bytes")
+                        require(store.operations() == before)
+                        require(store.find_claim_publication(claimed, "owner", "publish", "publish", {}) == original)
+            finally:
+                if native is not None:
+                    native.close()
+
+
 def main(directory: Path) -> None:
     parent = directory / "workspaces"
     parent.mkdir(mode=0o700)
@@ -754,6 +894,7 @@ for line in sys.stdin:
     publication_replay_conformance(directory, fixture)
     live_alias_conformance(directory)
     live_alias_conformance(directory, owned=True)
+    fresh_subject_conformance(directory, fixture)
     print(
         "Installed ownership: atomic pull claims, conflicts, independent work, original renewal, quiescence, "
         "immutable capture, manual preservation, empty cleanup, explicit-request replay after edit/retirement/reopen, "
@@ -761,7 +902,9 @@ for line in sys.stdin:
         "fresh task-proof acceptance/publication, settled historical alias independence, "
         "logical/profile proof separation, counter-only retry/remediation completion, "
         "exact original publication authorization replay across retirement/reopen in both modes, "
-        "and generic/owned live original-inode alias holds with independent actual-handler work passed."
+        "generic/owned live original-inode alias holds with independent actual-handler work, "
+        "actual current-subject acceptance/publication/delivery guards in both modes, "
+        "and configured capture above the 16 MiB default within original finite capacity passed."
     )
 
 

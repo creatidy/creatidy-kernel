@@ -635,6 +635,10 @@ work/project retained-byte capacity and retain original bytes as immutable artif
 until an authenticated owner explicitly reconciles the exact retained subject. There is no reset,
 stash, auto-adoption or rebase. The default capture bound is 16 MiB/10,000 entries; the trusted host can
 configure the byte bound, and oversized/unstable captures refuse rather than omit files.
+Store-side fresh-subject rechecks use the smaller original task/project retained-byte ceiling as a
+conservative finite raw-read bound, not as recovery of an unstored adapter `max_bytes` setting.
+The app's explicit capture limit and encoded-artifact retention, deduplication and remaining-capacity
+checks remain separate and unchanged; rechecking an already retained subject needs no new byte allocation.
 
 `submit`, `candidate_subject`, protected publication intent and `dispatch` check current generation,
 original authority, exact candidate and applicable task/effect settlement. Verification/acceptance
