@@ -311,19 +311,20 @@ def publication_replay_conformance(directory: Path, binary: Path) -> None:
                 connection.close()
 
 
-def live_alias_conformance(directory: Path) -> None:
-    """Actual shared pull entrance while another generic task retains its original inode."""
-    parent = directory / "live-alias-workspaces"
+def live_alias_conformance(directory: Path, *, owned: bool = False) -> None:
+    """Shared handler preserves generic/owned original-inode holds across aliases."""
+    label = "live-owned-alias" if owned else "live-generic-alias"
+    parent = directory / f"{label}-workspaces"
     parent.mkdir(mode=0o700)
     old = LocalOwnedWorkspace(parent, "old", create=True)
     independent = LocalOwnedWorkspace(parent, "independent", create=True)
     (old.path / "manual").write_bytes(b"installed original manual bytes")
-    path = directory / "live-alias.sqlite3"
+    path = directory / f"{label}.sqlite3"
     clock = lambda: BootClockReading(100, 1_000_000_000, "installed-alias-boot")  # noqa: E731
     with SQLiteProgramStore(path, boot_clock=clock) as store:
         base = reference_spec()
         budget = WorkBudgetPolicy.basic(3, 3, verifications=3, retained_bytes=16384, auxiliary=2)
-        for name in ("live-generic", "independent"):
+        for name in ("live-generic", "independent", "competing"):
             spec = ProgramSpec(
                 name,
                 base.objective,
@@ -347,14 +348,20 @@ def live_alias_conformance(directory: Path) -> None:
             program.resolved_inputs("first"),
             workspace_reference=str(old.path),
         )
-        store.admit_with_intent(
-            program.program_id,
-            "prepare:old",
-            PrepareAttempt(program.revision, "worker", original),
-            "runtime:live-generic",
-            "runtime:live-generic",
-            {"attempt": original.digest},
-        )
+        if owned:
+            app = WorkOwnership(
+                store, Principal("worker", "worker"), old, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
+            )
+            app.claim("claim:old", program.revision, original, lease_seconds=5)
+        else:
+            store.admit_with_intent(
+                program.program_id,
+                "prepare:old",
+                PrepareAttempt(program.revision, "worker", original),
+                "runtime:live-generic",
+                "runtime:live-generic",
+                {"attempt": original.digest},
+            )
         retained = old.path.with_name("retained-old")
         old.path.rename(retained)
         old.path.symlink_to(retained, target_is_directory=True)
@@ -416,7 +423,7 @@ def live_alias_conformance(directory: Path) -> None:
             == held
         )
         for target in (old.path, retained, retained / "child", parent):
-            program = store.load("live-generic")
+            program = store.load("competing")
             competing = AttemptSpec(
                 "unsafe",
                 program.program_id,
@@ -746,6 +753,7 @@ for line in sys.stdin:
     settlement_conformance(directory, fixture)
     publication_replay_conformance(directory, fixture)
     live_alias_conformance(directory)
+    live_alias_conformance(directory, owned=True)
     print(
         "Installed ownership: atomic pull claims, conflicts, independent work, original renewal, quiescence, "
         "immutable capture, manual preservation, empty cleanup, explicit-request replay after edit/retirement/reopen, "
@@ -753,7 +761,7 @@ for line in sys.stdin:
         "fresh task-proof acceptance/publication, settled historical alias independence, "
         "logical/profile proof separation, counter-only retry/remediation completion, "
         "exact original publication authorization replay across retirement/reopen in both modes, "
-        "and live original-inode alias independence with unchanged unknown work passed."
+        "and generic/owned live original-inode alias holds with independent actual-handler work passed."
     )
 
 

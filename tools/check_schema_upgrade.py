@@ -386,6 +386,63 @@ with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
 """
 
 
+VERIFY_ORIGINAL_OWNED_ALIAS = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.reference import reference_spec
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
+from creatidy_kernel.core.authority import Principal
+from creatidy_kernel.core.deadlines import BootClockReading
+from creatidy_kernel.core.domain import ActivateProgram,AttemptSpec,PrepareAttempt,ProgramSpec
+from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE,HandoffMode,OwnershipConflict,ResourceScope
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+from creatidy_kernel.ports.ownership import WorkOwnership
+directory = Path(sys.argv[1])
+old, retained = directory / 'workspaces' / 'one', directory / 'workspaces' / 'retained'
+clock = lambda: BootClockReading(100,1000000000,'synthetic-boot-a')
+with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
+    original = store.load('reference')
+    prior = store.operations()
+    captured = store.artifact('runtime:original','ownership-baseline')
+    recorded = store.find_work_claim('claim:original','worker',1,original.attempt('original').spec,
+        HandoffMode.PULL,COOPERATIVE_PROFILE,(ResourceScope('workspace',str(old)),),5)
+    assert recorded is not None
+    base = reference_spec()
+    policy = WorkBudgetPolicy.basic(3,3,verifications=3,retained_bytes=4096)
+    for name in ('independent','competing'):
+        spec = ProgramSpec(name,base.objective,base.work_units,base.initial_inputs,base.budget,base.authority,
+            acceptance_criteria=base.acceptance_criteria,policy_references=base.policy_references)
+        program = store.create(spec,'create:'+name)
+        store.bind_work_budget(name,'project',policy,policy,110)
+        store.admit(name,'activate:'+name,ActivateProgram(program.revision,'owner'))
+    tree = LocalOwnedWorkspace(directory / 'workspaces','independent',create=True)
+    app = WorkOwnership(store,Principal('worker','worker'),tree,mode=HandoffMode.PULL,profile=COOPERATIVE_PROFILE)
+    program = store.load('independent')
+    attempt = AttemptSpec('independent','independent','first',program.spec.revision,program.spec.digest,
+        program.resolved_inputs('first'),workspace_reference=str(tree.path))
+    claimed = app.claim('claim:independent',program.revision,attempt,lease_seconds=5)
+    assert app.renew('renew:independent',claimed,lease_seconds=7) == 107
+    for target in (old,retained,retained / 'child',old.parent):
+        program = store.load('competing')
+        attempt = AttemptSpec('unsafe','competing','first',program.spec.revision,program.spec.digest,
+            program.resolved_inputs('first'),workspace_reference=str(target))
+        before = store.operations()
+        try:
+            store.admit('competing','prepare:unsafe',PrepareAttempt(program.revision,'worker',attempt))
+        except OwnershipConflict:
+            pass
+        else:
+            raise AssertionError('prior original owned identity was ignored after aliasing')
+        assert store.operations() == before
+    assert store.load('reference') == original
+    assert all(store.operation(item.operation_id) == item for item in prior)
+    assert store.artifact('runtime:original','ownership-baseline') == captured
+    assert len(store.operations('work-budget:v1:ownership-workspace:')) == 1
+    assert (retained / 'manual').read_bytes() == b'synthetic manually retained bytes'
+"""
+
+
 def main(new_python: Path, storage_root: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="installed-schema-upgrade-", dir=storage_root) as value:
         directory = Path(value)
@@ -549,6 +606,22 @@ def main(new_python: Path, storage_root: Path) -> None:
             with closing(sqlite3.connect(path)) as current:
                 if tuple(current.iterdump()) != before:
                     raise RuntimeError("workspace compatibility rewrote original history or identity records")
+        original_owned = workspace / "original-owned-alias"
+        original_owned.mkdir()
+        subprocess.run(
+            [str(pathname_python), "-I", "-c", CREATE_ORIGINAL_CLAIM, str(original_owned), "edited"],
+            cwd=original_owned,
+            check=True,
+        )
+        old = original_owned / "workspaces" / "one"
+        retained = old.with_name("retained")
+        old.rename(retained)
+        old.symlink_to(retained, target_is_directory=True)
+        subprocess.run(
+            [str(new_python), "-I", "-c", VERIFY_ORIGINAL_OWNED_ALIAS, str(original_owned)],
+            cwd=original_owned,
+            check=True,
+        )
         print(
             f"Installed schema upgrade: actual readers {PINNED_BASE_ID}, {PINNED_PRECLOCK_ID}, "
             f"{PINNED_PREOWNERSHIP_ID} refuse schema 5; original bytes, v2/v3/v4/v5 backups and artifacts preserved; "
@@ -565,7 +638,8 @@ def main(new_python: Path, storage_root: Path) -> None:
         )
         print(
             "Installed workspace identity: unbound original bytes remain unknown/unchanged; actual prior reader "
-            f"{PINNED_PRE_WORKSPACE_ID} refuses the new identity category without writes."
+            f"{PINNED_PRE_WORKSPACE_ID} refuses the new identity category without writes; its original owned capture "
+            "retains the aliased inode while the actual shared handler admits independent work without backfill."
         )
 
 

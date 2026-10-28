@@ -47,7 +47,7 @@ def accepted(store: SQLiteProgramStore, tree: LocalOwnedWorkspace) -> tuple[Work
 
 @pytest.mark.parametrize("reopen", [False, True])
 @pytest.mark.parametrize(
-    "state", ["pending", "accepted", "edited", "expired", "revoked", "released", "retired", "other-effect"]
+    "state", ["pending", "accepted", "edited", "alias", "expired", "revoked", "released", "retired", "other-effect"]
 )
 def test_actual_owner_authorization_replay_precedes_capture_and_live_authority(
     sqlite_tmp_path: Path,
@@ -92,6 +92,10 @@ def test_actual_owner_authorization_replay_precedes_capture_and_live_authority(
             store = SQLiteProgramStore(path, boot_clock=read_clock)
             tree = LocalOwnedWorkspace(tree.path.parent, "one")
             owner = client(store, tree, owner=True)
+        if state == "alias":
+            retained = tree.path.with_name("retained-original")
+            tree.path.rename(retained)
+            tree.path.symlink_to(retained, target_is_directory=True)
 
         def no_capture() -> tuple[str, bytes]:
             raise AssertionError("historical publication authorization must not capture current bytes")
@@ -107,7 +111,7 @@ def test_actual_owner_authorization_replay_precedes_capture_and_live_authority(
             store.operations(),
             len(samples),
         ) == before
-        if state in {"expired", "revoked", "released", "retired", "other-effect"}:
+        if state in {"alias", "expired", "revoked", "released", "retired", "other-effect"}:
             with pytest.raises((OwnershipConflict, BudgetRefused)):
                 store.check_work_dispatch("publish")
     finally:
