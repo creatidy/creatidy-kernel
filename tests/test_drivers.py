@@ -21,13 +21,26 @@ from creatidy_kernel.core.drivers import (
     DriverMutation,
     DriverSubject,
     EdgeObligation,
+    driver_bytes,
     driver_digest,
 )
 from creatidy_kernel.core.execution import OperationKey
 from creatidy_kernel.core.forge import EffectStatus, Presence, UnsupportedForge
+from creatidy_kernel.core.ownership import WorkClaim
 from creatidy_kernel.core.work_budget import BudgetRefused
 from creatidy_kernel.ports.drivers import DriverApplication
-from tools.check_drivers import BASE, HEAD, Clock, SyntheticServices, accepted, binding, configured, conformance
+from creatidy_kernel.ports.program_store import OperationRecord
+from tools.check_drivers import (
+    BASE,
+    HEAD,
+    Clock,
+    SyntheticServices,
+    accepted,
+    binding,
+    configured,
+    conformance,
+    settlement_recovery,
+)
 
 
 @pytest.fixture
@@ -612,3 +625,180 @@ def test_original_receipt_replay_is_history_not_fresh_authority(services: Synthe
 def test_installed_recipe_runs_same_real_transports_and_shared_handlers() -> None:
     with state_directory() as directory:
         conformance(Path(directory))
+
+
+@pytest.mark.parametrize("provider", ["github", "confluence"])
+@pytest.mark.parametrize("cut", ["owner-capture", "store-cut"])
+def test_effect_grant_is_rechecked_after_final_workspace_capture(
+    services: SyntheticServices,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    cut: str,
+) -> None:
+    from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
+
+    clock = Clock()
+    project, scm, knowledge, _ = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        owner, claim = accepted(store, Path(directory))
+        mutation = (
+            review_mutation(scm)
+            if provider == "github"
+            else DriverMutation(
+                DriverSubject(knowledge.binding, "page", "900", "19"),
+                "replace_page",
+                (("actor", "synthetic-confluence-writer"), ("body", "<p>new</p>"), ("title", "Guide")),
+                "owner:policy",
+            )
+        )
+        policy = [True]
+        captures: list[int] = []
+        observations = 0
+        observing_final = False
+        capture = LocalOwnedWorkspace.capture
+        observe = owner.observe
+        delivery_cut = store.check_driver_delivery
+
+        def observed(original: WorkClaim) -> str:
+            nonlocal observations, observing_final
+            observations += 1
+            observing_final = observations == 3
+            try:
+                return observe(original)
+            finally:
+                observing_final = False
+
+        def captured(workspace: LocalOwnedWorkspace) -> tuple[str, bytes]:
+            result = capture(workspace)
+            if observing_final and cut == "owner-capture":
+                captures.append(observations)
+                policy[0] = False
+            return result
+
+        def checked(operation_id: str, fence: int, request_digest: str) -> None:
+            delivery_cut(operation_id, fence, request_digest)
+            if cut == "store-cut":
+                policy[0] = False
+
+        monkeypatch.setattr(owner, "observe", observed)
+        monkeypatch.setattr(LocalOwnedWorkspace, "capture", captured)
+        monkeypatch.setattr(store, "check_driver_delivery", checked)
+        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, lambda original, value: policy[0])
+        with pytest.raises(ValueError, match="authority revoked"):
+            app.synchronize(claim, "review", "effect", mutation)
+        assert observations == 3 and (captures or cut == "store-cut")
+        assert not any(method in {"POST", "PUT"} for method, _, _, _ in services.requests)
+        original = store.operation("review")
+        assert original.status == "unknown" and original.attempts == 1
+        assert app.synchronize(claim, "review", "effect", mutation).status is EffectStatus.UNKNOWN
+        assert store.operation("review") == original
+
+
+@pytest.mark.parametrize("rejected", [False, True], ids=["github-accepted", "confluence-409-rejected"])
+def test_terminal_receipt_repairs_exact_settlement_after_crash_reopen(rejected: bool) -> None:
+    with state_directory() as directory:
+        settlement_recovery(Path(directory), rejected=rejected)
+
+
+@pytest.mark.parametrize(
+    "mismatch", ["unknown", "stale", "rejected", "key", "reference", "noncanonical", "extra-field", "cancelled"]
+)
+def test_cached_terminal_receipt_must_match_exact_operation_and_canonical_outcome(
+    services: SyntheticServices,
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    clock = Clock()
+    project, scm, knowledge, _ = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        owner, claim = accepted(store, Path(directory))
+        mutation = review_mutation(scm)
+        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, lambda original, value: True)
+        receipt = app.synchronize(claim, "review", "effect", mutation)
+        value = asdict(receipt)
+        if mismatch in {"unknown", "stale", "rejected"}:
+            value["status"] = mismatch
+        elif mismatch == "key":
+            value["operation"] = {**asdict(receipt.operation), "request_digest": "different-exact-input"}
+        elif mismatch == "reference":
+            value["reference"] = "different-native-review"
+        elif mismatch == "extra-field":
+            value["grant"] = "not-a-receipt-field"
+        cached = json.dumps(value, indent=2).encode() if mismatch == "noncanonical" else driver_bytes(value)
+        calls = len(services.requests)
+        operation = store.operation("review")
+        native_operation = store.operation
+
+        if mismatch == "cancelled":
+
+            def cancelled_operation(operation_id: str) -> OperationRecord:
+                return replace(native_operation(operation_id), status="cancelled")
+
+            monkeypatch.setattr(store, "operation", cancelled_operation)
+
+        def cached_artifact(operation_id: str, name: str) -> bytes:
+            return cached
+
+        def no_settlement(operation_id: str, evidence: str, *, expected_fence: int | None = None) -> None:
+            pytest.fail("mismatched receipt settled")
+
+        monkeypatch.setattr(store, "find_artifact", cached_artifact)
+        monkeypatch.setattr(store, "record_work_settlement", no_settlement)
+        if mismatch == "cancelled":
+            assert app.synchronize(claim, "review", "effect", mutation) == receipt
+        else:
+            with pytest.raises(ValueError, match="receipt"):
+                app.synchronize(claim, "review", "effect", mutation)
+        assert len(services.requests) == calls and native_operation("review") == operation
+
+
+def test_nonterminal_cached_receipt_still_finishes_original_outcome_without_resend(
+    services: SyntheticServices,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = Clock()
+    project, scm, knowledge, transports = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        owner, claim = accepted(store, Path(directory))
+        mutation = review_mutation(scm)
+        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, lambda original, value: True)
+
+        def crash(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("crash after artifact before terminal observation")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "observe", crash)
+            with pytest.raises(RuntimeError, match="before terminal observation"):
+                app.synchronize(claim, "review", "effect", mutation)
+        operation = store.operation("review")
+        cached = store.find_artifact("review", "driver-receipt")
+        assert operation.status == "dispatched" and cached is not None
+        calls = len(services.requests)
+        clock.now = 1001
+        for transport in transports:
+            transport.read_authorization = transport.write_authorization = lambda: pytest.fail(
+                "cache replay contacted provider"
+            )
+
+        def no_new_grant(original: WorkClaim, value: DriverMutation) -> bool:
+            pytest.fail("cache replay requested new grant")
+
+        app.authorize = no_new_grant
+        receipt = app.synchronize(claim, "review", "effect", mutation)
+        assert receipt.status is EffectStatus.ACCEPTED and driver_bytes(asdict(receipt)) == cached
+        recovered = store.operation("review")
+        assert recovered.status == "accepted" and (recovered.fence, recovered.attempts) == (
+            operation.fence,
+            operation.attempts,
+        )
+        owner.release(claim, evidence="original-nonterminal-receipt-recovery")
+        assert len(services.requests) == calls

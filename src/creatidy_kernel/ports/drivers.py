@@ -178,7 +178,27 @@ class DriverApplication:
                 cast(str | None, value["reference"]),
                 cast(str, value["reason"]),
             )
-            if operation.status not in {"accepted", "rejected", "cancelled"}:
+            if cached != driver_bytes(asdict(receipt)):
+                raise ValueError("driver receipt differs from its canonical committed content")
+            if operation.status == "cancelled":
+                return receipt  # Retain the earlier receipt as history; cancellation grants no settlement.
+            if operation.status in {"accepted", "rejected"}:
+                expected = (
+                    "accepted"
+                    if receipt.status is EffectStatus.ACCEPTED
+                    else "rejected"
+                    if receipt.status in {EffectStatus.REJECTED, EffectStatus.STALE}
+                    else None
+                )
+                if operation.status != expected or (
+                    expected == "accepted" and receipt.reference != operation.accepted_reference
+                ):
+                    raise ValueError("driver receipt differs from terminal Operation outcome")
+                # Outcome and settlement are separate commits; replay repairs only this exact witness.
+                self.store.record_work_settlement(
+                    operation_id, "sha256:" + driver_digest(asdict(receipt)), expected_fence=operation.fence
+                )
+            else:
                 self._record(operation_id, operation.fence, receipt)
             return receipt  # Historical receipt is not current remote state or renewed authority.
         if operation.attempts:
@@ -217,10 +237,11 @@ class DriverApplication:
         delivery = DriverDelivery(key, mutation, fence, operation.attempts)
 
         def before_send() -> None:
-            if not self.authorize(claim, mutation):
-                raise ValueError("driver effect authority revoked during observation/credential resolution")
             self.ownership.observe(claim)
             self.store.check_driver_delivery(operation_id, delivery.fence, key.request_digest)
+            # Blocking physical/clock preflight may revoke the separate host effect grant.
+            if not self.authorize(claim, mutation):
+                raise ValueError("driver effect authority revoked during observation/credential resolution")
 
         try:
             receipt = driver.apply(delivery, before_send)

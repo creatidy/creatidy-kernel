@@ -13,6 +13,7 @@ from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import HTTPSHandler, Request, build_opener
 
@@ -43,10 +44,18 @@ from creatidy_kernel.core.domain import (
     StartAttempt,
     TrustedSatisfaction,
 )
-from creatidy_kernel.core.drivers import DriverBinding, DriverMutation, DriverSubject, EdgeObligation, driver_digest
+from creatidy_kernel.core.drivers import (
+    DriverBinding,
+    DriverMutation,
+    DriverSubject,
+    EdgeObligation,
+    driver_bytes,
+    driver_digest,
+)
+from creatidy_kernel.core.execution import OperationKey
 from creatidy_kernel.core.forge import Effect, EffectStatus, Presence, Reference
-from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, WorkClaim
-from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, OwnershipConflict, WorkClaim
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.drivers import DriverApplication, ProjectDrivers
 from creatidy_kernel.ports.ownership import WorkOwnership
 
@@ -462,6 +471,127 @@ def legacy_conformance(services: SyntheticServices, clock: Clock) -> None:
     require(scm.reconcile_legacy(effect, result.reference).status is EffectStatus.ACCEPTED)
 
 
+def settlement_recovery(directory: Path, *, rejected: bool) -> None:
+    """Crash after the real native outcome commit; reopen and repair only its exact settlement."""
+    clock = Clock()
+    services = SyntheticServices()
+    try:
+        project, scm, knowledge, transports = configured(services, clock)
+        mutation = DriverMutation(
+            DriverSubject(knowledge.binding, "page", "900", "19")
+            if rejected
+            else DriverSubject(scm.binding, "change", "7", HEAD),
+            "replace_page" if rejected else "append_review",
+            (("actor", "synthetic-confluence-writer"), ("body", "<p>ours</p>"), ("title", "Guide"))
+            if rejected
+            else (("actor", "synthetic-kernel"), ("body", "Exact settlement recovery")),
+            "owner:exact-effect-policy",
+        )
+        if rejected:
+
+            def competing_update() -> str:
+                services.version = 20
+                services.pages[20] = services.page(20, "Another owner", "<p>theirs</p>", "independent")
+                return "Bearer synthetic-write"
+
+            transports[3].write_authorization = competing_update
+
+        class SettlementCrash(RuntimeError):
+            pass
+
+        with SQLiteProgramStore(directory / "recovery.sqlite3", boot_clock=clock.boot) as store:
+            owner, claim = accepted(store, directory)
+            app = DriverApplication(
+                store,
+                owner,
+                project,
+                (scm, knowledge),
+                clock.wall,
+                lambda original, value: original == claim and value == mutation,
+            )
+            crashed: list[str] = []
+
+            def crash(operation_id: str, evidence: str, *, expected_fence: int | None = None) -> None:
+                operation = store.operation(operation_id)
+                require(operation_id == "sync:crash" and operation.status == ("rejected" if rejected else "accepted"))
+                cached = store.find_artifact(operation_id, "driver-receipt")
+                require(cached is not None and expected_fence == operation.fence and operation.attempts == 1)
+                native = object_value(json.loads(cached or b"null"))
+                require(evidence == "sha256:" + driver_digest(native))
+                require(native["status"] == ("stale" if rejected else "accepted"))
+                crashed.append(evidence)
+                raise SettlementCrash("simulated crash after committed native outcome before resource settlement")
+
+            with patch.object(store, "record_work_settlement", side_effect=crash):
+                try:
+                    app.synchronize(claim, "sync:crash", "effect:crash", mutation)
+                except SettlementCrash:
+                    pass
+                else:
+                    raise AssertionError("original publication did not propagate the settlement crash")
+            original = store.operation("sync:crash")
+            cached = store.find_artifact("sync:crash", "driver-receipt")
+            require(len(crashed) == 1 and cached is not None)
+            require(sum(method in {"POST", "PUT"} for method, _, _, _ in services.requests) == 1)
+            try:
+                owner.release(claim, evidence="must-not-release-missing-settlement")
+            except OwnershipConflict:
+                pass
+            else:
+                raise AssertionError("unsettled native result released resources before recovery")
+            store.reserve_work(
+                claim.attempt.program_id, claim.attempt.attempt_id, "other:unsettled", WorkKind.AUXILIARY
+            )
+
+        with SQLiteProgramStore(directory / "recovery.sqlite3", boot_clock=clock.boot) as store:
+            workspace = LocalOwnedWorkspace(directory / "workspaces", "candidate")
+            owner = WorkOwnership(
+                store, Principal("owner", "owner"), workspace, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
+            )
+            project, scm, knowledge, transports = configured(services, clock)
+
+            def forbidden() -> str:
+                raise AssertionError("cached recovery attempted another provider request")
+
+            def no_new_grant(original: WorkClaim, value: DriverMutation) -> bool:
+                raise AssertionError("cached recovery requested new publication authority")
+
+            for transport in transports:
+                transport.read_authorization = transport.write_authorization = forbidden
+            app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, no_new_grant)
+            calls = len(services.requests)
+            receipt = app.synchronize(claim, "sync:crash", "effect:crash", mutation)
+            require(
+                receipt.operation == OperationKey(original.operation_id, original.effect_key, original.request_digest)
+            )
+            require(receipt.status is (EffectStatus.STALE if rejected else EffectStatus.ACCEPTED))
+            require(
+                driver_bytes(asdict(receipt)) == cached
+                and store.find_artifact("sync:crash", "driver-receipt") == cached
+            )
+            require(store.operation("sync:crash") == original and len(services.requests) == calls)
+            records = store.operations()
+            require(app.synchronize(claim, "sync:crash", "effect:crash", mutation) == receipt)
+            require(store.operations() == records and len(services.requests) == calls)
+            try:
+                store.record_work_settlement("sync:crash", crashed[0], expected_fence=original.fence + 1)
+            except OwnershipConflict:
+                pass
+            else:
+                raise AssertionError("recovered settlement accepted a different fence")
+            try:
+                owner.release(claim, evidence="other-operation-is-still-unsettled")
+            except OwnershipConflict:
+                pass
+            else:
+                raise AssertionError("receipt recovery silently settled another operation")
+            store.record_work_settlement("other:unsettled", "trusted:fixture-other-never-dispatched")
+            owner.release(claim, evidence="exact-native-receipt-recovered-and-other-scope-settled")
+            require(store.operation("sync:crash") == original and len(services.requests) == calls)
+    finally:
+        services.close()
+
+
 def conformance(directory: Path) -> None:
     clock = Clock()
     services = SyntheticServices()
@@ -569,6 +699,10 @@ def conformance(directory: Path) -> None:
             require(reopened.operation("sync:review").request_json == original_request)
             require(reopened.operation("sync:page").status == "accepted")
         legacy_conformance(services, clock)
+        for rejected in (False, True):
+            recovery = directory / ("rejected-settlement" if rejected else "accepted-settlement")
+            recovery.mkdir(mode=0o700)
+            settlement_recovery(recovery, rejected=rejected)
         require(any(item[3] == "Bearer synthetic-write" for item in services.requests))
     finally:
         services.close()
@@ -578,5 +712,5 @@ if __name__ == "__main__":
     conformance(Path(sys.argv[1]))
     print(
         "Installed mixed drivers: native HTTP reads/effects, exact outbox recovery "
-        "and retained Forgejo facade passed (synthetic only)."
+        "retained Forgejo facade and terminal receipt settlement crash/reopen recovery passed (synthetic only)."
     )
