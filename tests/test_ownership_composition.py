@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import subprocess
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
@@ -27,6 +28,7 @@ from creatidy_kernel.core.domain import (
     AttemptSpec,
     FinishAttempt,
     InputBinding,
+    PrepareAttempt,
     SatisfyWorkUnit,
     StartAttempt,
     TrustedSatisfaction,
@@ -36,7 +38,12 @@ from creatidy_kernel.core.verification import Evidence, EvidenceSubject
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkKind
 from creatidy_kernel.ports.application import BudgetedChecks
 from creatidy_kernel.ports.ownership import WorkOwnership
-from tools.check_schema_upgrade import CREATE_LOGICAL_GENERIC, PINNED_PREQUALIFICATION_ID, install_pinned_reader
+from tools.check_schema_upgrade import (
+    CREATE_LOGICAL_GENERIC,
+    PINNED_PRE_ACCEPTANCE_ID,
+    PINNED_PREQUALIFICATION_ID,
+    install_pinned_reader,
+)
 
 pytest_plugins = ["test_sqlite_store"]
 
@@ -65,38 +72,75 @@ def finish_and_accept(store: SQLiteProgramStore, program_id: str, attempt_id: st
 @pytest.mark.parametrize("successor", ["claim", "generic"])
 def test_logically_accepted_generic_does_not_prove_workspace_settlement(
     sqlite_tmp_path: Path,
+    accepted_reader: Path,
     reopen: bool,
     successor: str,
 ) -> None:
     path, clock = sqlite_tmp_path / "kernel.sqlite3", Clock()
-    tree = workspace(sqlite_tmp_path, "one")
+    subprocess.run(  # noqa: S603 - actual prior accepted-history producer; no new unsafe acceptance.
+        [str(accepted_reader), "-I", "-c", CREATE_LOGICAL_GENERIC, str(sqlite_tmp_path)],
+        check=True,
+    )
+    tree = LocalOwnedWorkspace(sqlite_tmp_path / "workspaces", "one")
     store = SQLiteProgramStore(path, boot_clock=clock)
     try:
-        initialize(store, project=policy(active=4))
-        initialize(store, "program-2", project=policy(active=4))
-        prepare_generic(store, "program-1", "generic", str(tree.path))
-        finish_and_accept(store, "program-1", "generic")
         capacity = store.operations("work-budget:v1:settlement:")
         assert len(capacity) == 1
         if reopen:
             store.close()
             store = SQLiteProgramStore(path, boot_clock=clock)
-        before = store.load("program-2"), store.work_budget_status("program-2"), store.operations()
+        program = store.load("successor")
+        attempt = AttemptSpec(
+            "successor",
+            "successor",
+            "first",
+            program.spec.revision,
+            program.spec.digest,
+            program.resolved_inputs("first"),
+            workspace_reference=str(tree.path),
+        )
+        before = store.load("successor"), store.work_budget_status("successor"), store.operations()
         with pytest.raises(OwnershipConflict, match="settlement|proof"):
             if successor == "claim":
-                claim(store, client(store, tree), tree, "program-2", "successor")
+                app = WorkOwnership(
+                    store, Principal("worker", "worker"), tree, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
+                )
+                program = store.load("successor")
+                attempt = AttemptSpec(
+                    "successor",
+                    "successor",
+                    "first",
+                    program.spec.revision,
+                    program.spec.digest,
+                    program.resolved_inputs("first"),
+                    workspace_reference=str(tree.path),
+                )
+                app.claim("claim:successor", program.revision, attempt, lease_seconds=5)
             else:
-                prepare_generic(store, "program-2", "successor", str(tree.path))
-        assert (store.load("program-2"), store.work_budget_status("program-2"), store.operations()) == before
+                program = store.load("successor")
+                attempt = AttemptSpec(
+                    "successor",
+                    "successor",
+                    "first",
+                    program.spec.revision,
+                    program.spec.digest,
+                    program.resolved_inputs("first"),
+                    workspace_reference=str(tree.path),
+                )
+                store.admit("successor", "prepare:successor", PrepareAttempt(program.revision, "worker", attempt))
+        assert (store.load("successor"), store.work_budget_status("successor"), store.operations()) == before
         store.record_work_settlement("runtime:generic", "trusted:exact-task-scope-quiescent")
         assert store.operations("work-budget:v1:settlement:") == capacity
         store.close()
         store = SQLiteProgramStore(path, boot_clock=clock)
         assert store.operations("work-budget:v1:settlement:") == capacity
         if successor == "claim":
-            assert claim(store, client(store, tree), tree, "program-2", "successor").generation == 1
+            app = WorkOwnership(
+                store, Principal("worker", "worker"), tree, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
+            )
+            assert app.claim("claim:successor", program.revision, attempt, lease_seconds=5).generation == 1
         else:
-            prepare_generic(store, "program-2", "successor", str(tree.path))
+            store.admit("successor", "prepare:successor", PrepareAttempt(program.revision, "worker", attempt))
     finally:
         store.close()
 
@@ -312,18 +356,29 @@ def test_logical_effect_completion_cannot_release_unknown_real_effects(sqlite_tm
         store.admit("program-1", "activate", ActivateProgram(program.revision, OWNER))
         app, control = client(store, tree), client(store, tree, owner=True)
         original = claim(store, app, tree)
-        store.budgeted_intent("program-1", "a1", kind, "real-effect", "real-effect", {"kind": kind.value})
+        if kind is WorkKind.TOOL:
+            store.budgeted_intent("program-1", "a1", kind, "real-effect", "real-effect", {"kind": kind.value})
+        else:
+            current = store.load("program-1")
+            store.admit("program-1", "start:a1", StartAttempt(current.revision, WORKER, "a1"))
         app.quiesce(original, "client:task-scope-quiescent")
+        if kind is WorkKind.AUXILIARY:
+            app.submit(original)
+            finish_and_accept(store, "program-1", "a1")
+            control.authorize_publication(original, "real-effect", "real-effect", {"kind": kind.value})
         store.record_work_completion("real-effect", "logical:accepted")
-        for action in (
-            lambda: app.submit(original),
+        actions: list[Callable[[], object]] = [
             lambda: control.release(original, evidence="not-physical-proof"),
             lambda: control.cleanup(original, evidence="not-physical-proof"),
-        ):
+        ]
+        if kind is WorkKind.TOOL:
+            actions.append(lambda: app.submit(original))
+        for action in actions:
             with pytest.raises(OwnershipConflict, match="unreconciled effect"):
                 action()
         store.record_work_settlement("real-effect", "trusted:exact-effect-reconciled", expected_fence=0)
-        assert app.submit(original) == tree.capture()[0]
+        if kind is WorkKind.TOOL:
+            assert app.submit(original) == tree.capture()[0]
         control.release(original, evidence="owner:all-real-effects-reconciled")
 
 
@@ -335,7 +390,10 @@ def test_qualified_settlement_does_not_authorize_different_scope_or_stale_fence(
         initialize(store, "program-3", project=policy(active=4))
         prepare_generic(store, "program-1", "generic", str(tree.path))
         prepare_generic(store, "program-2", "other-generic", str(other.path))
-        finish_and_accept(store, "program-1", "generic")
+        current = store.load("program-1")
+        current = store.admit("program-1", "start:generic", StartAttempt(current.revision, WORKER, "generic"))
+        store.admit("program-1", "finish:generic", FinishAttempt(current.revision, WORKER, "generic"))
+        store.record_work_completion("runtime:generic", "logical:terminal-only")
         store.record_work_settlement("runtime:other-generic", "trusted:other-scope-closed", expected_fence=0)
         with pytest.raises(OwnershipConflict, match="settlement|proof"):
             claim(store, client(store, tree), tree, "program-3", "successor")
@@ -359,6 +417,13 @@ def test_qualified_absence_cannot_be_reused_for_later_dispatch(sqlite_tmp_path: 
         with pytest.raises(OwnershipConflict, match="closes this operation"):
             store.claim("runtime:generic", now=100, lease_seconds=1)
         assert store.operation("runtime:generic").attempts == 0
+
+
+@pytest.fixture(scope="module")
+def accepted_reader(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return install_pinned_reader(
+        tmp_path_factory.mktemp("actual-pre-acceptance-reader"), commit_id=PINNED_PRE_ACCEPTANCE_ID
+    )
 
 
 @pytest.fixture(scope="module")

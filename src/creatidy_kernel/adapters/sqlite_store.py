@@ -427,7 +427,10 @@ class SQLiteProgramStore:
         if isinstance(command, PrepareAttempt):
             references = (command.attempt.workspace_reference,)
         elif isinstance(command, (StartAttempt, FinishAttempt, SatisfyWorkUnit)):
-            references = ()
+            attempt_id = (
+                command.satisfaction.source_attempt_id if isinstance(command, SatisfyWorkUnit) else command.attempt_id
+            )
+            references = self._attempt_workspace_references(program_id, attempt_id)
         with self._gate, self._workspace_cut(references) as readings, self._transaction(readings):
             return self._admit_decision(program_id, command_key, command, intent)
 
@@ -651,7 +654,11 @@ class SQLiteProgramStore:
         self._assert_writer_thread()
         if type(now) is not int or type(lease_seconds) is not int or lease_seconds <= 0:
             raise ValueError("now must be an integer and lease_seconds positive")
-        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
+        with (
+            self._gate,
+            self._workspace_cut(self._operation_workspace_references(operation_id)) as readings,
+            self._transaction(readings),
+        ):
             op = self.operation(operation_id)
             reservation = self._work_record("reservation", operation_id)
             if ownership is not None and (
@@ -1130,14 +1137,22 @@ class SQLiteProgramStore:
 
     def check_work_claim(self, claim: WorkClaim, *, settled: bool = False) -> None:
         self._assert_writer_thread()
-        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._transaction(readings),
+        ):
             self._check_work_claim(claim, settled=settled)
 
     def renew_work_claim(self, command_key: str, claim: WorkClaim, lease_seconds: int) -> int:
         self._assert_writer_thread()
         if type(lease_seconds) is not int or lease_seconds <= 0:
             raise OwnershipConflict("renewal needs a positive bounded duration")
-        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._transaction(readings),
+        ):
             previous = self._work_record("ownership-renew", command_key)
             if previous is not None:
                 if (previous["claim"], previous["claimant"], previous["lease_seconds"]) != (
@@ -1169,7 +1184,11 @@ class SQLiteProgramStore:
     def record_claim_proof(self, claim: WorkClaim, proof: HandoffProof, *, worker_report: bool = False) -> None:
         self._assert_writer_thread()
         proof.check(claim, proof.stage)
-        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._transaction(readings),
+        ):
             # Exact trusted reconciliation is allowed after revoke/expiry, unlike
             # worker renewal, candidate reports, acceptance or publication.
             self._check_work_claim(claim, authority=worker_report or proof.stage == "start")
@@ -1204,7 +1223,9 @@ class SQLiteProgramStore:
             raise OwnershipConflict("workspace snapshot digest differs")
         with (
             self._gate,
-            self._workspace_cut((), ((claim.operation_id, f"workspace:{subject}", snapshot),)) as readings,
+            self._workspace_cut(
+                (claim.attempt.workspace_reference,), ((claim.operation_id, f"workspace:{subject}", snapshot),)
+            ) as readings,
             self._transaction(readings),
         ):
             self._check_work_claim(claim, authority=owner is None)
@@ -1232,7 +1253,11 @@ class SQLiteProgramStore:
         self._assert_writer_thread()
         if not evidence.strip():
             raise OwnershipConflict("explicit reconciliation evidence required")
-        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._transaction(readings),
+        ):
             self._check_work_claim(claim, authority=False, settled=True)
             if self._claim_owner(claim) != owner:
                 raise OwnershipConflict("only original owner can reconcile workspace changes")
@@ -1274,7 +1299,11 @@ class SQLiteProgramStore:
 
     def check_claim_candidate(self, claim: WorkClaim, subject: str) -> None:
         self._assert_writer_thread()
-        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._transaction(readings),
+        ):
             self._check_work_claim(claim, settled=True)
             self._check_claim_candidate(claim, subject)
 
@@ -1284,7 +1313,9 @@ class SQLiteProgramStore:
             raise OwnershipConflict("candidate snapshot digest differs")
         with (
             self._gate,
-            self._workspace_cut((), ((claim.operation_id, "ownership-candidate", snapshot),)) as readings,
+            self._workspace_cut(
+                (claim.attempt.workspace_reference,), ((claim.operation_id, "ownership-candidate", snapshot),)
+            ) as readings,
             self._transaction(readings),
         ):
             self._check_work_claim(claim, settled=True)
@@ -1311,13 +1342,17 @@ class SQLiteProgramStore:
         # No callback/effect executes in the business SQL transaction. A failure
         # or crash retains ownership, including after physical retirement.
         with self._gate:
-            with self._workspace_cut(()) as readings, self._transaction(readings):
+            with self._workspace_cut((claim.attempt.workspace_reference,)) as readings, self._transaction(readings):
                 self._check_work_claim(claim, authority=False, settled=True)
                 if self._claim_owner(claim) != owner:
                     raise OwnershipConflict("only original owner can retire resources")
                 self._check_workspace_subject(claim, subject)
             retire()
-        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._transaction(readings),
+        ):
             self._check_work_claim(claim, authority=False, settled=True)
             self._write_work_record(
                 "ownership-release", claim.command_key, {"claim": claim.command_key, "evidence": evidence}
@@ -1333,7 +1368,11 @@ class SQLiteProgramStore:
         request: dict[str, object],
     ) -> OperationRecord:
         self._assert_writer_thread()
-        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._transaction(readings),
+        ):
             self._check_work_claim(claim, settled=True, publication=True)
             if self._claim_owner(claim) != owner:
                 raise OwnershipConflict("only original owner authorizes protected effects")
@@ -1357,7 +1396,9 @@ class SQLiteProgramStore:
             raise OwnershipConflict("exact owner reconciliation subject required")
         with (
             self._gate,
-            self._workspace_cut((), ((claim.operation_id, "ownership-release", snapshot),)) as readings,
+            self._workspace_cut(
+                (claim.attempt.workspace_reference,), ((claim.operation_id, "ownership-release", snapshot),)
+            ) as readings,
             self._transaction(readings),
         ):
             self._check_work_claim(claim, authority=False, settled=True)
@@ -1398,12 +1439,33 @@ class SQLiteProgramStore:
         except (OwnershipConflict, OSError, RuntimeError):
             return None
 
+    def _attempt_workspace_references(self, program_id: str, attempt_id: str) -> tuple[str | None, ...]:
+        attempt = next(
+            (item.spec for item in self._load_head(program_id).attempts if item.attempt_id == attempt_id), None
+        )
+        return () if attempt is None else (attempt.workspace_reference,)
+
+    def _operation_workspace_references(self, operation_id: str) -> tuple[str | None, ...]:
+        reservation = self._work_record("reservation", operation_id)
+        return (
+            ()
+            if reservation is None
+            else self._attempt_workspace_references(
+                cast(str, reservation["program"]), cast(str, reservation["attempt"])
+            )
+        )
+
     def _workspace_references(self, additional: tuple[str | None, ...]) -> frozenset[str]:
         references = set(additional)
         for row in self._connection.execute("SELECT program_id FROM program_projection").fetchall():
-            references.update(
-                item.spec.workspace_reference for item in self._load_head(cast(str, row["program_id"])).attempts
-            )
+            for item in self._load_head(cast(str, row["program_id"])).attempts:
+                claim = self._attempt_work_claim(item.spec.program_id, item.attempt_id)
+                if claim is not None:
+                    if self._work_record("ownership-release", claim.command_key) is not None:
+                        continue
+                elif self._generic_resource_settled(item.spec):
+                    continue
+                references.add(item.spec.workspace_reference)
         return frozenset(reference for reference in references if reference is not None and reference.startswith("/"))
 
     @contextmanager
@@ -1478,7 +1540,6 @@ class SQLiteProgramStore:
         self._check_generic_workspace_work(workspace, exclude=attempt)
 
     def _check_generic_workspace_work(self, workspace: ResourceScope, *, exclude: AttemptSpec | None = None) -> None:
-        records = self._work_records("reservation")
         for row in self._connection.execute("SELECT program_id FROM program_projection").fetchall():
             program = self._load_head(cast(str, row["program_id"]))
             for attempt in program.attempts:
@@ -1489,23 +1550,25 @@ class SQLiteProgramStore:
                     continue
                 if self._attempt_work_claim(program.program_id, attempt.attempt_id) is not None:
                     continue  # Owned generations are governed by their durable release, not Attempt status.
+                if self._generic_resource_settled(attempt.spec):
+                    continue  # A closed historical subject cannot make independent work depend on its current pathname.
                 other_workspace = self._physical_workspace_scope(attempt.spec.workspace_reference)
                 if other_workspace is None or not workspace.conflicts(other_workspace):
                     continue
-                effects = [
-                    item
-                    for item in records
-                    if (item["program"], item["attempt"])
-                    == (
-                        program.program_id,
-                        attempt.attempt_id,
-                    )
-                    and WorkKind(cast(str, item["category"])) not in COUNT_ONLY_WORK
-                ]
-                if not effects or any(not self._resource_settled(item) for item in effects):
-                    raise OwnershipConflict(
-                        "generic workspace work lacks applicable exact settlement; cannot adopt its resource"
-                    )
+                raise OwnershipConflict(
+                    "generic workspace work lacks applicable exact settlement; cannot adopt its resource"
+                )
+
+    def _generic_resource_settled(self, attempt: AttemptSpec, *, exclude_operation: str | None = None) -> bool:
+        effects = [
+            item
+            for item in self._work_records("reservation")
+            if (item["program"], item["attempt"]) == (attempt.program_id, attempt.attempt_id)
+            and WorkKind(cast(str, item["category"])) not in COUNT_ONLY_WORK
+        ]
+        return any(item["category"] == WorkKind.ATTEMPT.value for item in effects) and all(
+            item["operation"] == exclude_operation or self._resource_settled(item) for item in effects
+        )
 
     def _check_ownership_command(self, program_id: str, command: DomainCommandType) -> None:
         if isinstance(command, PrepareAttempt):
@@ -1526,6 +1589,11 @@ class SQLiteProgramStore:
             if known is not None:
                 self._check_workspace_claims(known)
             claim = self._attempt_work_claim(program_id, attempt_id)
+            if claim is None and known is not None and isinstance(command, SatisfyWorkUnit):
+                if self._physical_workspace_scope(
+                    known.workspace_reference
+                ) is not None and not self._generic_resource_settled(known):
+                    raise OwnershipConflict("fresh acceptance requires exact task and effect settlement proof")
             if claim is not None:
                 self._check_work_claim(claim, settled=not isinstance(command, StartAttempt))
                 if isinstance(command, StartAttempt) and any(
@@ -1944,7 +2012,11 @@ class SQLiteProgramStore:
         if self._connection.in_transaction:
             self._check_work_dispatch(operation_id)
             return
-        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
+        with (
+            self._gate,
+            self._workspace_cut(self._operation_workspace_references(operation_id)) as readings,
+            self._transaction(readings),
+        ):
             self._check_work_dispatch(operation_id)
 
     def _check_work_dispatch(self, operation_id: str) -> None:
@@ -1995,6 +2067,11 @@ class SQLiteProgramStore:
         state = program.state(attempt.spec.work_unit_id)
         category = WorkKind(cast(str, reservation["category"]))
         claim = self._attempt_work_claim(program_id, attempt_id)
+        if claim is None and category is WorkKind.AUXILIARY:
+            if self._physical_workspace_scope(
+                attempt.spec.workspace_reference
+            ) is not None and not self._generic_resource_settled(attempt.spec, exclude_operation=operation_id):
+                raise OwnershipConflict("fresh publication requires exact task and other effect settlement proof")
         if claim is not None:
             self._check_work_claim(
                 claim,
@@ -2161,7 +2238,11 @@ class SQLiteProgramStore:
         self, program_id: str, attempt_id: str, operation_id: str, category: WorkKind, *, retained_bytes: int = 0
     ) -> None:
         self._assert_writer_thread()
-        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
+        with (
+            self._gate,
+            self._workspace_cut(self._attempt_workspace_references(program_id, attempt_id)) as readings,
+            self._transaction(readings),
+        ):
             self._reserve_work(program_id, attempt_id, operation_id, category, retained_bytes)
 
     def budgeted_intent(
@@ -2176,12 +2257,28 @@ class SQLiteProgramStore:
         retained_bytes: int = 0,
     ) -> OperationRecord:
         self._assert_writer_thread()
-        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
+        with (
+            self._gate,
+            self._workspace_cut(self._attempt_workspace_references(program_id, attempt_id)) as readings,
+            self._transaction(readings),
+        ):
             existed = self._work_record("reservation", operation_id) is not None
+            fresh = (
+                not existed
+                or self._connection.execute(
+                    "SELECT 1 FROM operations WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+                is None
+            )
             self._reserve_work(program_id, attempt_id, operation_id, category, retained_bytes)
             self._insert_intent(operation_id, effect_key, request)
-            if not existed:
+            if fresh:
                 self._bind_work_dispatch(program_id, attempt_id, operation_id)
+            if fresh and category is WorkKind.AUXILIARY:
+                attempt = self._load_head(program_id).attempt(attempt_id).spec
+                if self._physical_workspace_scope(attempt.workspace_reference) is not None:
+                    self._check_work_dispatch(operation_id)
         return self.operation(operation_id)
 
     def work_program_for_attempt(self, attempt_id: str) -> str:
@@ -2198,7 +2295,11 @@ class SQLiteProgramStore:
 
     def retry_work(self, operation_id: str) -> None:
         self._assert_writer_thread()
-        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
+        with (
+            self._gate,
+            self._workspace_cut(self._operation_workspace_references(operation_id)) as readings,
+            self._transaction(readings),
+        ):
             original = self._work_record("reservation", operation_id)
             if original is None:
                 raise BudgetRefused("retry lacks original reservation")
@@ -2307,7 +2408,11 @@ class SQLiteProgramStore:
         self._validate_command_key(evidence)
         if expected_fence is not None and (type(expected_fence) is not int or expected_fence < 0):
             raise OwnershipConflict("profile settlement requires an exact nonnegative delivery fence")
-        with self._gate, self._workspace_cut(()) as readings, self._transaction(readings):
+        with (
+            self._gate,
+            self._workspace_cut(self._operation_workspace_references(operation_id)) as readings,
+            self._transaction(readings),
+        ):
             reservation = self._work_record("reservation", operation_id)
             if reservation is None:
                 raise BudgetRefused("settlement has no original reservation")

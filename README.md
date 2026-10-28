@@ -585,6 +585,17 @@ path namespace during an owner decision, not hostile same-UID filesystem isolati
 
 Logical completion and resource settlement are different facts. `SatisfyWorkUnit` and
 `record_work_completion` may settle logical capacity but never prove workspace/session quiescence.
+For a canonical physical subject, fresh `SatisfyWorkUnit` requires qualified runtime and every real
+effect to be settled even without an ownership claim. `FinishAttempt` may remain a logical terminal
+report so verification can run; neither that report nor a historical accepted fact authorizes a new
+publication. Fresh publication intent and delivery require the same proof, excluding only the actual
+current publication operation, never arbitrary other effects. Existing accepted history remains readable
+and replayable without being upgraded into physical or new publication authority.
+
+Fully qualified closed generic history is filtered before filesystem probing or conflict search.
+A changed old pathname therefore cannot block confirmed independent work. An explicit current target
+is still preflighted and validated even when its previous work was closed: aliases refuse rather than
+normalize, while live/unqualified effects continue to retain their applicable resource holds.
 The trusted-profile `record_work_settlement` entry records separate typed qualification bound to the
 original reservation, Attempt digest, workspace, Operation request and delivery fence; producer code
 supplies the original fence when available. It is not a worker boolean or an evidence-string heuristic.

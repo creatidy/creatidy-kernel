@@ -43,7 +43,7 @@ def settlement_conformance(directory: Path, binary: Path) -> None:
     base = reference_spec()
     clock = lambda: BootClockReading(100, 1_000_000_000, "installed-proof-boot")  # noqa: E731
     with SQLiteProgramStore(directory / "proof.sqlite3", boot_clock=clock) as store:
-        budget = WorkBudgetPolicy.basic(3, 3, verifications=3, retained_bytes=16384)
+        budget = WorkBudgetPolicy.basic(3, 3, verifications=3, retained_bytes=16384, auxiliary=2)
         for name in ("logical", "next"):
             spec = ProgramSpec(
                 name,
@@ -80,6 +80,7 @@ def settlement_conformance(directory: Path, binary: Path) -> None:
                 "runtime:logical-generic",
                 {"attempt": attempt.digest},
             )
+            fence = store.claim("runtime:logical-generic", now=100, lease_seconds=1)
             program = store.admit(
                 "logical", "start:logical", StartAttempt(program.revision, "worker", attempt.attempt_id)
             )
@@ -99,7 +100,18 @@ def settlement_conformance(directory: Path, binary: Path) -> None:
                     InputBinding(name, f"artifact:{name}") for name in sorted(program.spec.work_unit("first").outputs)
                 ),
             )
-            store.admit("logical", "accept:logical", SatisfyWorkUnit(program.revision, "verifier", accepted))
+            require(connection.owned_group_active)
+            before_acceptance = store.load("logical"), store.work_budget_status("logical"), store.operations()
+            try:
+                store.admit("logical", "accept:logical", SatisfyWorkUnit(program.revision, "verifier", accepted))
+            except OwnershipConflict:
+                pass
+            else:
+                raise AssertionError("active native task group was freshly accepted from logical terminal state")
+            require(
+                (store.load("logical"), store.work_budget_status("logical"), store.operations()) == before_acceptance
+            )
+            store.record_work_completion("runtime:logical-generic", "logical:terminal-only")
             program = store.load("next")
             successor = AttemptSpec(
                 "next",
@@ -141,7 +153,40 @@ def settlement_conformance(directory: Path, binary: Path) -> None:
             )
             store.record_work_settlement(operation.operation_id, evidence, expected_fence=operation.fence)
             require(store.operations("work-budget:v1:settlement:") == original_capacity)
-            require(app.claim("claim:next", program.revision, successor, lease_seconds=5).generation == 1)
+            current = store.load("logical")
+            store.admit("logical", "accept:logical", SatisfyWorkUnit(current.revision, "verifier", accepted))
+            store.budgeted_intent(
+                "logical",
+                attempt.attempt_id,
+                WorkKind.AUXILIARY,
+                "proof-publication",
+                "proof-publication",
+                {"synthetic": True},
+            )
+            require(store.claim("proof-publication", now=100, lease_seconds=1) == 1)
+            store.record_work_settlement("proof-publication", "trusted:synthetic-no-external-effect", expected_fence=1)
+            require(fence == 1)
+            retained = tree.path.with_name("retained-one")
+            tree.path.rename(retained)
+            tree.path.symlink_to(retained, target_is_directory=True)
+            independent = LocalOwnedWorkspace(parent, "independent", create=True)
+            next_app = WorkOwnership(
+                store, Principal("worker", "worker"), independent, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
+            )
+            successor = AttemptSpec(
+                "next",
+                "next",
+                "first",
+                program.spec.revision,
+                program.spec.digest,
+                program.resolved_inputs("first"),
+                workspace_reference=str(independent.path),
+            )
+            claimed = next_app.claim("claim:next", program.revision, successor, lease_seconds=5)
+            require(claimed.generation == 1)
+            next_app.quiesce(claimed, "client:independent-task-quiescent")
+            require(next_app.submit(claimed) == independent.capture()[0])
+            require(tree.path.is_symlink() and retained.is_dir())
         finally:
             connection.close()
 
@@ -457,6 +502,7 @@ for line in sys.stdin:
         "Installed ownership: atomic pull claims, conflicts, independent work, original renewal, quiescence, "
         "immutable capture, manual preservation, empty cleanup, explicit-request replay after edit/retirement/reopen, "
         "global generic preparation fencing, cold managed history, fresh post-filesystem boot expiry, "
+        "fresh task-proof acceptance/publication, settled historical alias independence, "
         "logical/profile proof separation and counter-only retry/remediation completion passed."
     )
 

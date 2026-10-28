@@ -159,6 +159,13 @@ and prequalification readers reject the new typed category before effects. Insta
 both directions and preserve original rows. Counter-only RETRY/REMEDIATION rows remain counts, not
 effect receipts or refundable capacity.
 
+Accepted generic histories produced by the exact prior `88d59fcd594cbf7fd529971a12139628bef9b6a5`
+reader remain intact and replayable. They are not proof of task-scope settlement: current fresh
+acceptance and new publication for physical subjects require qualified runtime and all real effects.
+Installed fixtures seed historical acceptance with that pinned producer, never by weakening the
+current acceptance gate. Fully qualified closed history is filtered before probing changed old paths;
+explicit unsafe alias targets and live/unqualified scopes still refuse.
+
 ## Verification Compatibility
 
 Verification changes under #50 preserve the original Task #143/#166 payloads, policy references,

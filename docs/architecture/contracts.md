@@ -73,6 +73,17 @@ No operation status, arbitrary evidence-string contents or historical untyped ro
 quiescence. Old untyped records remain intact and require a qualified producer reconciliation. A
 closed operation cannot restart by reusing its old proof, and another effect/fence cannot borrow it.
 
+Fresh acceptance for a generic canonical physical subject requires its exact runtime and all actual
+effect settlements. Logical `FinishAttempt` may precede verification, but terminal/accepted history alone
+does not authorize fresh acceptance or publication. Publication intent/dispatch may exclude only their
+actual current AUXILIARY operation, with other real effects still required. Old accepted facts remain
+historical evidence, not automatic new publication authority.
+
+Qualified closed generic subjects are omitted before historical path dereference and preflight work;
+their changed old names cannot globally gate independent resources. Current decision targets remain
+explicit and must pass canonical physical preflight even when already closed. Live/unknown effects
+are not filtered by capacity rows, terminal status, or pathname changes.
+
 RETRY and REMEDIATION are count-only reservations, not external effects. They remain consumed and
 deduplicated without fabricated receipts; actual runtime/tool/helper/verification/review/publication
 effects retain their separate settlement requirements. All retry reservation paths, including

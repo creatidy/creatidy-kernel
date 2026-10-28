@@ -15,6 +15,7 @@ PINNED_PRECLOCK_ID = "23a28e31c17018acb9900efeed2da1b9b03330cf"  # Published sch
 PINNED_PREOWNERSHIP_ID = "b11aae420517b14bbb4d85c84f9a0d82c14446c6"  # Published schema-4 public Git object ID.
 PINNED_INITIAL_OWNERSHIP_ID = "b9aae79d36e1a1ece046dd565a07be028c8f865a"  # Original PR110 schema-5 record producer.
 PINNED_PREQUALIFICATION_ID = "3aa2b8f0232892ddfc61545bff7c646176253628"  # Exact schema-5 prequalification producer.
+PINNED_PRE_ACCEPTANCE_ID = "88d59fcd594cbf7fd529971a12139628bef9b6a5"  # Exact public Git object ID.
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -216,7 +217,7 @@ from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
 from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import (ActivateProgram, AttemptSpec, PrepareAttempt, StartAttempt, FinishAttempt,
                                         SatisfyWorkUnit, TrustedSatisfaction, InputBinding, ProgramSpec)
-from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 directory = Path(sys.argv[1])
 parent = directory / 'workspaces'
 parent.mkdir(mode=0o700)
@@ -224,7 +225,7 @@ tree = LocalOwnedWorkspace(parent,'one',create=True)
 clock = lambda: BootClockReading(100,1000000000,'synthetic-boot-a')
 with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
     base = reference_spec()
-    budget = WorkBudgetPolicy.basic(3,3,verifications=3,retained_bytes=16384)
+    budget = WorkBudgetPolicy.basic(3,3,verifications=3,retained_bytes=16384,auxiliary=2)
     for name in ('reference','successor'):
         spec = ProgramSpec(name,base.objective,base.work_units,base.initial_inputs,base.budget,base.authority,
                            acceptance_criteria=base.acceptance_criteria,policy_references=base.policy_references)
@@ -241,7 +242,12 @@ with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
     accepted = TrustedSatisfaction('logical:owned-group-stopped','reference','first',program.spec.revision,
         program.spec.digest,program.spec.work_unit_applicability_fingerprint('first'),'verifier','generic',
         tuple(InputBinding(name,'artifact:'+name) for name in sorted(program.spec.work_unit('first').outputs)))
-    store.admit('reference','accept',SatisfyWorkUnit(program.revision,'verifier',accepted))
+    if len(sys.argv) > 2 and sys.argv[2] == 'logical-only':
+        store.record_work_completion('runtime:generic','logical:terminal')
+    else:
+        store.admit('reference','accept',SatisfyWorkUnit(program.revision,'verifier',accepted))
+        if len(sys.argv) > 2 and sys.argv[2] == 'pending-publication':
+            store.budgeted_intent('reference','generic',WorkKind.AUXILIARY,'publish','publish',{'accepted':'logical:owned-group-stopped'})
 """
 
 REFUSE_LOGICAL_REUSE = """
@@ -356,7 +362,9 @@ def main(new_python: Path, storage_root: Path) -> None:
                 raise RuntimeError("old untyped settlement was rewritten/promoted on recovery")
         typed = qualification / "typed"
         typed.mkdir()
-        subprocess.run([str(new_python), "-I", "-c", CREATE_LOGICAL_GENERIC, str(typed)], cwd=typed, check=True)
+        subprocess.run(
+            [str(new_python), "-I", "-c", CREATE_LOGICAL_GENERIC, str(typed), "logical-only"], cwd=typed, check=True
+        )
         path = typed / "kernel.sqlite3"
         with closing(sqlite3.connect(path)) as current:
             before = tuple(current.iterdump())
