@@ -208,6 +208,7 @@ def deliver_reference_pr(
             store.record_work_settlement(
                 operation_id,
                 receipt.reference.value if receipt.reference is not None else f"publication:{receipt.status.value}",
+                expected_fence=operation.fence,
             )
         return _result(result, receipt, fault, store.operation(operation_id).status)
 

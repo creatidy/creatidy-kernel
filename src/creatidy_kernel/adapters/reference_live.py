@@ -641,7 +641,7 @@ def run_live_reference(
                 )
                 if group_matches and settled is True and reconciled:
                     reference = store.finalize_artifact(cancellation_id, "owned-group-settlement", proof_data)
-                    store.record_work_settlement(operation.operation_id, reference)
+                    store.record_work_settlement(operation.operation_id, reference, expected_fence=operation.fence)
                 owned_cleanup.append(proof)
         store.intent(
             "interruption:live-budget",

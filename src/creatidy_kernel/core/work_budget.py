@@ -26,6 +26,9 @@ class WorkKind(StrEnum):
     AUXILIARY = "auxiliary"
 
 
+COUNT_ONLY_WORK = frozenset({WorkKind.RETRY, WorkKind.REMEDIATION})
+
+
 @dataclass(frozen=True, slots=True)
 class ResourceCeiling:
     metric: str

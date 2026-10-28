@@ -33,6 +33,89 @@ bounded mechanisms, not deployment or live reception.
 | State/observation | Dedicated EXCLUSIVE SQLite and offline CLI export/status | [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) owner-served snapshot/events/commands/notifications. Console cannot open active SQLite or weaken durability. |
 | Knowledge/outcomes | Durable context/allocation artifacts, pure unitful `core.outcomes`, richer reference and thin task export | [#55](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/55) utilized MI references, [#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56) full budgets/costs, [#58](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/58) versioned private export. Unknown is not zero or model quality. |
 
+## Local Work And Resource Ownership
+
+The concrete #59 handler is `ports.ownership.WorkOwnership`, composed by the trusted local host with
+an authenticated principal, a `LocalOwnedWorkspace`, explicit scopes/mode/profile and any native witness
+producer. No request-body Principal, independent SQL reader, remote authentication channel or scheduler
+is introduced. The same handler serves cooperative pull and managed handoffs; the ordinary dispatcher
+and remote entrance remain #106/#57.
+
+Claim acceptance atomically combines current domain preparation/eligibility, exact spec and actor,
+original work-clock authority, project/work capacity, Operation intent, claimant, resource conflicts
+and increasing generation. These immutable journal records are not outbox delivery claims. Duplicate
+command/explicit request returns its historical result before filesystem capture or live profile checks;
+the first selected baseline is retained observation, not request input. Changed claimant, revision,
+Attempt, mode, profile, resources or lease refuses even after exact retirement. Reading the original
+result does not renew a lease, allocate a generation or restore authority. Original wall/boot
+projection, pending marker and committed high-water evidence are reused for reports/renewal/delivery,
+never reprojected. Expiry/revoke/heartbeat loss fences authority but does not release unsettled resources.
+
+Common store preparation, known-Attempt reservation, candidate/acceptance and delivery paths enforce
+canonical absolute physical workspace conflicts across all Programs, not only callers with a work claim.
+WorkUnit identity remains Program-scoped; ancestor/descendant workspace scopes remain global. Ambiguous
+absolute paths or symlink aliases refuse without normalization, while legacy opaque workspace keys stay uninterpreted.
+Unsettled generic work with a known physical subject blocks silent resource adoption and competing
+generic work; applicable trusted settlement, not cancellation/expiry alone, permits later ownership.
+
+Potentially blocking physical-path and ownership-artifact preflight completes outside business SQL;
+the existing independent pending/high-water capture then takes a fresh original wall/boot sample.
+Business guards consume only decision-local physical facts and staged digests, never resolving paths
+or validating artifact storage after that cut. Changed preflight paths/store state refuse without
+erasing committed cancellations or clock evidence; staged orphan bytes confer no authority. Controller
+custody and cooperative namespace stability remain required, not a new hostile-filesystem guarantee.
+
+Logical capacity completion is not physical/task-scope resource proof. Acceptance and
+`record_work_completion` record the former; the trusted-profile settlement entry and exact owned
+`HandoffProof` establish only their applicable operation/resource scope. Typed `ownership-settlement`
+records distinguish the basis and bind original reservation/Attempt/workspace/request/fence identity.
+No operation status, arbitrary evidence-string contents or historical untyped row is promoted to
+quiescence. Old untyped records remain intact and require a qualified producer reconciliation. A
+closed operation cannot restart by reusing its old proof, and another effect/fence cannot borrow it.
+
+Fresh acceptance for a generic canonical physical subject requires its exact runtime and all actual
+effect settlements. Logical `FinishAttempt` may precede verification, but terminal/accepted history alone
+does not authorize fresh acceptance or publication. Publication intent/dispatch may exclude only their
+actual current AUXILIARY operation, with other real effects still required. Old accepted facts remain
+historical evidence, not automatic new publication authority.
+
+An owned publication's original owner decision is a separate typed receipt, atomically committed
+with the exact AUX reservation/Operation/binding. Historical lookup validates the full original
+claim and owner, accepted candidate and immutable op/effect/request before any capture/live checks;
+it returns current Operation status without renewing authority or consuming capacity. No untyped AUX
+state implies that receipt. Changed input refuses; fresh authorization and delivery still require
+current accepted subject, original clock authority and all applicable other effect settlements.
+
+Qualified closed generic subjects are omitted before historical path dereference and preflight work;
+their changed old names cannot globally gate independent resources. Current decision targets remain
+explicit and must pass canonical physical preflight even when already closed. Live/unknown effects
+are not filtered by capacity rows, terminal status, or pathname changes.
+
+RETRY and REMEDIATION are count-only reservations, not external effects. They remain consumed and
+deduplicated without fabricated receipts; actual runtime/tool/helper/verification/review/publication
+effects retain their separate settlement requirements. All retry reservation paths, including
+interrupted `BudgetedChecks` recovery, use the same outside-SQL preflight/final durable clock cut.
+
+Pull `kernel:cooperative-task-scope:v1` receipts are authenticated task-scope promises only. Managed
+`CodexOwnedSessionWitness` uses the original dedicated `CodexStdio`, exact opaque group, version-qualified
+profile and exact task resources, with a start witness required before normal/STOP settlement. A missing
+owner, unsupported profile, reported escape or cold PID is unknown, not a completed process. The handler
+never signals an owner Kilo server and does not upgrade ADR 0011 or the test-child profile.
+
+Every candidate/acceptance guard and protected publication compares the claim generation and exact
+captured subject. Filesystem changes retain bounded original bytes and unknown attribution until explicit
+owner reconciliation; no manual change is silently model output. `candidate_subject` is the fresh guard
+for an existing trusted verification/acceptance producer, not a verification verdict. Owned effects use
+`dispatch` for a fresh subject plus the existing outbox fence; receipt/reconciliation is still separate.
+
+Workspace ownership records and capacity-authority binding live in a protected controller parent, outside
+the mutable leaf. Source-cache use leases do not confer mutation ownership. Cleanup requires applicable
+task settlement and reconciliation of every reserved effect; no bare lease or leader PID qualifies.
+Only empty exact owned leaves can be moved into custody and removed nonrecursively. Identity replacement,
+late writes, nonempty/unknown data and artifacts are preserved. An exact durable post-rmdir witness can
+complete an interrupted SQLite release; absence alone cannot. Explicit owner release can instead retain
+settled, reconciled bytes and admit later nonconflicting ownership with a higher generation.
+
 ## Cross-Product Contract Obligations
 
 These are **agreed semantic requirements and to-prove contracts**, not approved new wire shapes,

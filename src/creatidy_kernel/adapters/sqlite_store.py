@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import cast
 
 from creatidy_kernel.adapters.boot_clock import read_boot_clock
+from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
 from creatidy_kernel.adapters.sqlite_codec import (
     CODEC_VERSION,
     RecordCodecError,
@@ -37,20 +38,31 @@ from creatidy_kernel.adapters.sqlite_codec import (
 from creatidy_kernel.core.deadlines import BootClockReading, DeadlineProjection
 from creatidy_kernel.core.domain import (
     AmendProgramSpec,
+    AttemptSpec,
     AttemptStatus,
     DomainCommandType,
+    FinishAttempt,
     PrepareAttempt,
     Program,
     ProgramSpec,
     ProgramStatus,
     SatisfyWorkUnit,
+    StartAttempt,
     WorkUnitStatus,
 )
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
-from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
+from creatidy_kernel.core.ownership import (
+    COOPERATIVE_PROFILE,
+    HandoffMode,
+    HandoffProof,
+    OwnershipConflict,
+    ResourceScope,
+    WorkClaim,
+)
+from creatidy_kernel.core.work_budget import COUNT_ONLY_WORK, BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _APPLICATION_ID = 0x43544B31
 _DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _LOCAL_FILESYSTEMS = {
@@ -187,6 +199,23 @@ class _StorageTopology:
     super_options: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkspaceFootprint:
+    scope: ResourceScope | None
+    resolved: str | None
+    root: tuple[int, int, int, int] | None
+    parent: tuple[int, int, int, int] | None
+    ancestors: tuple[tuple[int, int, int, int], ...]
+    stamps: tuple[tuple[int, ...], ...]
+    complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkspaceIdentity:
+    root: tuple[int, ...] | None
+    parent: tuple[int, ...] | None
+
+
 class SQLiteProgramStore:
     """A file-backed K1 store with one SQLite-exclusive connection and one owner process/thread."""
 
@@ -225,6 +254,12 @@ class SQLiteProgramStore:
         self._clock_watermarks: dict[str, BootClockReading] = {}
         self._clock_uncommitted: dict[str, BootClockReading | None] = {}
         self._transaction_clock_readings: dict[str, BootClockReading | None] | None = None
+        self._workspace_scopes: dict[str, ResourceScope | None] | None = None
+        self._workspace_footprints: dict[str, _WorkspaceFootprint] | None = None
+        self._workspace_identities: dict[tuple[str, str], _WorkspaceIdentity | None] | None = None
+        self._workspace_retirements: frozenset[tuple[str, str]] = frozenset()
+        self._workspace_subjects: dict[str, str | None] | None = None
+        self._workspace_artifacts: dict[tuple[str, str], str] | None = None
         self._cache_mode = "private"
         self._closed = False
         try:
@@ -250,6 +285,7 @@ class SQLiteProgramStore:
             self._migrate()
             self.rebuild_projections()
             self._validate_operation_records()
+            self._validate_ownership_records()
             self._startup_evidence = self._read_startup_evidence()
         except BaseException:
             connection = getattr(self, "_connection", None)
@@ -409,7 +445,24 @@ class SQLiteProgramStore:
         intent: tuple[str, str, dict[str, object]] | None,
     ) -> Program:
         self._assert_writer_thread()
-        with self._gate, self._transaction():
+        references: tuple[str | None, ...] | None = None
+        subjects: tuple[WorkClaim | None, ...] = ()
+        if isinstance(command, PrepareAttempt):
+            references = (command.attempt.workspace_reference,)
+        elif isinstance(command, (StartAttempt, FinishAttempt, SatisfyWorkUnit)):
+            attempt_id = (
+                command.satisfaction.source_attempt_id if isinstance(command, SatisfyWorkUnit) else command.attempt_id
+            )
+            references = self._attempt_workspace_references(program_id, attempt_id)
+            if (
+                isinstance(command, SatisfyWorkUnit)
+                and self._connection.execute(
+                    "SELECT 1 FROM command_admissions WHERE command_key = ?", (command_key,)
+                ).fetchone()
+                is None
+            ):
+                subjects = (self._attempt_work_claim(program_id, attempt_id),)
+        with self._gate, self._workspace_cut(references, subjects=subjects) as readings, self._transaction(readings):
             return self._admit_decision(program_id, command_key, command, intent)
 
     def _admit_decision(
@@ -418,6 +471,8 @@ class SQLiteProgramStore:
         command_key: str,
         command: DomainCommandType,
         intent: tuple[str, str, dict[str, object]] | None,
+        *,
+        retained_bytes: int = 0,
     ) -> Program:
         self._assert_writer_thread()
         self._validate_program_id(program_id)
@@ -437,6 +492,7 @@ class SQLiteProgramStore:
                     raise OperationConflict("duplicate command has no matching atomically admitted intent")
             return duplicate
         current = self._load_head(program_id)
+        self._check_ownership_command(program_id, command)
         next_program = current.apply(command)
         if isinstance(command, SatisfyWorkUnit) and self._work_binding(program_id) is not None:
             self.check_work_authority(program_id)
@@ -449,13 +505,7 @@ class SQLiteProgramStore:
             ]
             if len(completed_reservations) != 1:
                 raise BudgetRefused("acceptance lacks original Attempt capacity reservation")
-            completed_operation = cast(str, completed_reservations[0]["operation"])
-            if self._work_record("settlement", completed_operation) is None:
-                self._write_work_record(
-                    "settlement",
-                    completed_operation,
-                    {"operation": completed_operation, "evidence": command.satisfaction.reference_id},
-                )
+            self._record_work_completion(completed_reservations[0], command.satisfaction.reference_id)
         if isinstance(command, PrepareAttempt):
             # Pure historical domain facts remain writable/readable. They do
             # not authorize a dispatch without original envelope proof.
@@ -471,6 +521,7 @@ class SQLiteProgramStore:
                     attempt.attempt_id,
                     intent[0] if intent is not None else f"runtime:{attempt.attempt_id}",
                     WorkKind.ATTEMPT,
+                    retained_bytes=retained_bytes,
                 )
             elif intent is not None:
                 self._write_work_record(
@@ -514,6 +565,31 @@ class SQLiteProgramStore:
             self._insert_intent(*intent, allow_existing=False)
             if isinstance(command, PrepareAttempt) and self._work_binding(program_id) is not None:
                 self._bind_work_dispatch(program_id, command.attempt.attempt_id, intent[0])
+        if isinstance(command, PrepareAttempt) and self._physical_workspace_scope(command.attempt.workspace_reference):
+            # Observation binds the first admission, not ownership or cleanup
+            # permission. Never backfill this record on recovery/reservation.
+            attempt = command.attempt
+            assert self._workspace_footprints is not None  # noqa: S101 - physical preflight checked above.
+            footprint = self._workspace_footprints[cast(str, attempt.workspace_reference)]
+            self._write_work_record(
+                "ownership-workspace",
+                canonical_json([program_id, attempt.attempt_id]),
+                {
+                    "program": program_id,
+                    "attempt": attempt.attempt_id,
+                    "attempt_digest": attempt.digest,
+                    "workspace_reference": attempt.workspace_reference,
+                    "command": command_key,
+                    "operation": None if intent is None else intent[0],
+                    "effect_key": None if intent is None else intent[1],
+                    "request_digest": None if intent is None else self.operation(intent[0]).request_digest,
+                    "reservation": None
+                    if self._work_binding(program_id) is None
+                    else (intent[0] if intent is not None else f"runtime:{attempt.attempt_id}"),
+                    "root": None if footprint.root is None else list(footprint.root),
+                    "parent": None if footprint.parent is None else list(footprint.parent),
+                },
+            )
         return next_program
 
     def history(self, program_id: str) -> tuple[HistoryRecord, ...]:
@@ -617,13 +693,52 @@ class SQLiteProgramStore:
             return tuple(self.operation(row["operation_id"]) for row in rows if row["operation_id"].startswith(prefix))
 
     def claim(self, operation_id: str, *, now: int, lease_seconds: int) -> int:
+        return self._claim_operation(operation_id, now=now, lease_seconds=lease_seconds)
+
+    def claim_owned_operation(self, claim: WorkClaim, operation_id: str, subject: str, lease_seconds: int) -> int:
+        return self._claim_operation(operation_id, now=0, lease_seconds=lease_seconds, ownership=(claim, subject))
+
+    def _claim_operation(
+        self,
+        operation_id: str,
+        *,
+        now: int,
+        lease_seconds: int,
+        ownership: tuple[WorkClaim, str] | None = None,
+    ) -> int:
         """Durably record the attempt before the caller can invoke the fake effect seam."""
         self._assert_writer_thread()
         if type(now) is not int or type(lease_seconds) is not int or lease_seconds <= 0:
             raise ValueError("now must be an integer and lease_seconds positive")
-        with self._gate, self._transaction():
+        with (
+            self._gate,
+            self._workspace_cut(
+                self._operation_workspace_references(operation_id), subjects=(self._operation_work_claim(operation_id),)
+            ) as readings,
+            self._transaction(readings),
+        ):
             op = self.operation(operation_id)
             reservation = self._work_record("reservation", operation_id)
+            if ownership is not None and (
+                reservation is None
+                or (reservation["program"], reservation["attempt"])
+                != (
+                    ownership[0].attempt.program_id,
+                    ownership[0].attempt.attempt_id,
+                )
+            ):
+                raise OwnershipConflict("delivery target is outside original claim reservation")
+            if reservation is not None:
+                owned = self._attempt_work_claim(cast(str, reservation["program"]), cast(str, reservation["attempt"]))
+                if owned is not None:
+                    if ownership is None or ownership[0] != owned:
+                        raise OwnershipConflict("owned operation requires the shared current-subject handler")
+                    current_claim, subject = ownership
+                    now = self.work_decision_time(current_claim.attempt.program_id)
+                    if operation_id == current_claim.operation_id:
+                        self._check_workspace_subject(current_claim, subject, fresh=True)
+                    else:
+                        self._check_claim_candidate(current_claim, subject)
             if reservation is None and (
                 operation_id.startswith("runtime:") or self._work_record("unbound-attempt", operation_id) is not None
             ):
@@ -685,6 +800,1421 @@ class SQLiteProgramStore:
         current_digest = self._load_head(program_id).spec.digest
         revised = self._work_record("binding-revision", canonical_json([program_id, current_digest]))
         return original if revised is None else revised
+
+    def _decode_work_claim(self, record: dict[str, object]) -> WorkClaim:
+        attempt = self._load_head(cast(str, record["program"])).attempt(cast(str, record["attempt"])).spec
+        if record["attempt_digest"] != attempt.digest:
+            raise OwnershipConflict("original claim Attempt changed")
+        return WorkClaim(
+            cast(str, record["command"]),
+            cast(str, record["claimant"]),
+            attempt,
+            cast(int, record["generation"]),
+            HandoffMode(cast(str, record["mode"])),
+            cast(str, record["profile"]),
+            tuple(ResourceScope(**item) for item in cast(list[dict[str, str]], record["resources"])),
+            cast(str, record["workspace_subject"]),
+            cast(int, record["expires_at"]),
+        )
+
+    def _validate_ownership_records(self) -> None:
+        fields = {
+            "ownership-claim": {
+                "command",
+                "input",
+                "program",
+                "attempt",
+                "attempt_digest",
+                "claimant",
+                "generation",
+                "mode",
+                "profile",
+                "resources",
+                "workspace_subject",
+                "expires_at",
+            },
+            "ownership-renew": {"claim", "claimant", "generation", "lease_seconds", "expires_at"},
+            "ownership-proof": {"claim", "proof"},
+            "ownership-observation": {"claim", "subject", "attribution", "order"},
+            "ownership-reconcile": {"claim", "subject", "owner", "evidence"},
+            "ownership-candidate": {"claim", "subject"},
+            "ownership-release": {"claim", "evidence"},
+            "ownership-unknown": {"claim", "evidence"},
+            "ownership-workspace": {
+                "program",
+                "attempt",
+                "attempt_digest",
+                "workspace_reference",
+                "command",
+                "operation",
+                "effect_key",
+                "request_digest",
+                "reservation",
+                "root",
+                "parent",
+            },
+            "ownership-publication": {
+                "claim",
+                "claim_digest",
+                "claimant",
+                "generation",
+                "attempt_digest",
+                "owner",
+                "subject",
+                "acceptance",
+                "operation",
+                "effect_key",
+                "request_digest",
+            },
+            "ownership-settlement": {
+                "operation",
+                "program",
+                "attempt",
+                "category",
+                "attempt_digest",
+                "workspace_reference",
+                "effect_key",
+                "request_digest",
+                "fence",
+                "basis",
+                "evidence",
+            },
+        }
+        for operation in self.operations("work-budget:v1:ownership-"):
+            record = cast(dict[str, object], json.loads(operation.request_json)["request"])
+            kind = record.get("type")
+            if not isinstance(kind, str) or kind not in fields or record.get("kind") != "work-budget-record":
+                raise CorruptHistory("unsupported ownership record type/version")
+            allowed = fields[kind] | {"kind", "type"}
+            if set(record) != allowed and not (
+                kind == "ownership-release" and set(record) == allowed | {"subject", "owner"}
+            ):
+                raise CorruptHistory("unsupported ownership record fields")
+            try:
+                if kind == "ownership-claim":
+                    claim = self._decode_work_claim(record)
+                    if self._work_key(kind, claim.command_key) != operation.operation_id:
+                        raise OwnershipConflict("claim namespace differs from command identity")
+                elif kind == "ownership-settlement":
+                    self._validate_resource_settlement(record, operation.operation_id)
+                elif kind == "ownership-workspace":
+                    self._validate_workspace_identity(record, operation.operation_id)
+                else:
+                    claim_record = self._work_record("ownership-claim", cast(str, record["claim"]))
+                    if claim_record is None:
+                        raise OwnershipConflict("ownership record has no original claim")
+                    claim = self._decode_work_claim(claim_record)
+                    if kind == "ownership-publication":
+                        self._validate_claim_publication(record)
+                        if self._work_key(kind, cast(str, record["operation"])) != operation.operation_id:
+                            raise OwnershipConflict("publication authorization identity differs")
+                    if kind == "ownership-proof":
+                        proof = cast(dict[str, object], record["proof"])
+                        if set(proof) != {
+                            "source",
+                            "profile",
+                            "mode",
+                            "attempt_digest",
+                            "generation",
+                            "resources",
+                            "stage",
+                            "reference",
+                        }:
+                            raise OwnershipConflict("unsupported ownership proof fields")
+                        HandoffProof(
+                            cast(str, proof["source"]),
+                            cast(str, proof["profile"]),
+                            HandoffMode(cast(str, proof["mode"])),
+                            cast(str, proof["attempt_digest"]),
+                            cast(int, proof["generation"]),
+                            tuple(ResourceScope(**item) for item in cast(list[dict[str, str]], proof["resources"])),
+                            cast(str, proof["stage"]),
+                            cast(str, proof["reference"]),
+                        ).check(claim, cast(str, proof["stage"]))
+                    if kind == "ownership-renew" and (
+                        record["claimant"] != claim.claimant
+                        or record["generation"] != claim.generation
+                        or type(record["expires_at"]) is not int
+                        or type(record["lease_seconds"]) is not int
+                        or record["expires_at"] > cast(int, self.original_work_deadline(claim.attempt.program_id))
+                    ):
+                        raise OwnershipConflict("renewal differs from original authority horizon")
+            except (ValueError, TypeError, KeyError, AttributeError, OperationConflict, ProgramNotFound) as error:
+                raise CorruptHistory("invalid exact ownership subject/receipt") from error
+
+    @property
+    def ownership_authority(self) -> str:
+        self._assert_writer_thread()
+        info = self._path.stat()
+        return hashlib.sha256(canonical_json([str(self._path), info.st_dev, info.st_ino]).encode()).hexdigest()
+
+    def _attempt_work_claim(self, program_id: str, attempt_id: str) -> WorkClaim | None:
+        records = [
+            item
+            for item in self._work_records("ownership-claim")
+            if (item["program"], item["attempt"]) == (program_id, attempt_id)
+        ]
+        if len(records) > 1:
+            raise OwnershipConflict("Attempt has competing work claims")
+        return None if not records else self._decode_work_claim(records[0])
+
+    def _claim_owner(self, claim: WorkClaim) -> str:
+        for spec in self._load_head(claim.attempt.program_id).spec_history:
+            if (spec.revision, spec.digest) == (claim.attempt.spec_revision, claim.attempt.spec_digest):
+                return spec.authority.owner_id
+        raise OwnershipConflict("original work claim owner/specification unavailable")
+
+    @staticmethod
+    def _work_claim_input(
+        command: PrepareAttempt,
+        mode: HandoffMode,
+        profile: str,
+        resources: tuple[ResourceScope, ...],
+        lease_seconds: int,
+    ) -> str:
+        return canonical_json(
+            {
+                "command": command_input_json(command.attempt.program_id, command),
+                "claimant": command.actor_id,
+                "mode": mode.value,
+                "profile": profile,
+                "resources": [asdict(item) for item in resources],
+                "lease_seconds": lease_seconds,
+            }
+        )
+
+    def find_work_claim(
+        self,
+        command_key: str,
+        claimant: str,
+        expected_revision: int,
+        attempt: AttemptSpec,
+        mode: HandoffMode,
+        profile: str,
+        resources: tuple[ResourceScope, ...],
+        lease_seconds: int,
+    ) -> WorkClaim | None:
+        """Read original explicit-request outcome without clocks, filesystem or authority renewal."""
+        self._assert_writer_thread()
+        self._validate_command_key(command_key)
+        with self._gate:
+            previous = self._work_record("ownership-claim", command_key)
+            if previous is None:
+                return None
+            decoded: object = json.loads(cast(str, previous["input"]))
+            if type(decoded) is not dict:
+                raise CorruptHistory("original work claim request must be an object")
+            original = cast(dict[str, object], decoded)
+            # Initial #59 records also retained the first observation in input.
+            # Preserve those bytes and verify it, but do not recapture it on replay.
+            if original.pop("workspace_subject", previous["workspace_subject"]) != previous["workspace_subject"]:
+                raise CorruptHistory("original claim observation differs from its retained baseline")
+            expected = self._work_claim_input(
+                PrepareAttempt(expected_revision, claimant, attempt),
+                mode,
+                profile,
+                resources,
+                lease_seconds,
+            )
+            if canonical_json(original) != expected:
+                raise IdempotencyConflict("work claim command already has different input or claimant")
+            historical = self._decode_work_claim(previous)
+            if (
+                historical.command_key,
+                historical.claimant,
+                historical.attempt,
+                historical.mode,
+                historical.profile,
+                historical.resources,
+            ) != (
+                command_key,
+                claimant,
+                attempt,
+                mode,
+                profile,
+                resources,
+            ):
+                raise CorruptHistory("recorded claim differs from its original explicit request")
+            return historical
+
+    def claim_work(
+        self,
+        command_key: str,
+        claimant: str,
+        expected_revision: int,
+        attempt: AttemptSpec,
+        mode: HandoffMode,
+        profile: str,
+        resources: tuple[ResourceScope, ...],
+        workspace_subject: str,
+        snapshot: bytes,
+        lease_seconds: int,
+    ) -> WorkClaim:
+        """One owner acceptance: resource claim, preparation, budget and outbox.
+
+        Snapshot/producer work is finished before this method. No filesystem,
+        authentication, witness or other business callback runs inside SQL.
+        """
+        self._assert_writer_thread()
+        historical = self.find_work_claim(
+            command_key,
+            claimant,
+            expected_revision,
+            attempt,
+            mode,
+            profile,
+            resources,
+            lease_seconds,
+        )
+        if historical is not None:
+            return historical
+        if (
+            type(mode) is not HandoffMode
+            or not profile.strip()
+            or not claimant.strip()
+            or (mode is HandoffMode.PULL and profile != COOPERATIVE_PROFILE)
+            or type(lease_seconds) is not int
+            or lease_seconds <= 0
+            or type(resources) is not tuple
+            or not resources
+            or sum(item.kind == "workspace" for item in resources) != 1
+            or len(set(resources)) != len(resources)
+            or hashlib.sha256(snapshot).hexdigest() != workspace_subject
+        ):
+            raise OwnershipConflict("invalid exact handoff input")
+        self._validate_command_key(command_key)
+        command = PrepareAttempt(expected_revision, claimant, attempt)
+        data = self._work_claim_input(command, mode, profile, resources, lease_seconds)
+        # Reject ineligible/oversized work before staging orphan-tolerant bytes;
+        # the authoritative checks still repeat after the final clock cut.
+        self.check_work_authority(attempt.program_id)
+        self._load_head(attempt.program_id).apply(command)
+        if len(snapshot) > self.available_retained_bytes(attempt.program_id):
+            raise BudgetRefused("retained workspace artifact byte capacity exhausted; preserve source bytes")
+        with (
+            self._gate,
+            self._workspace_cut(
+                (attempt.workspace_reference,), ((f"runtime:{attempt.attempt_id}", "ownership-baseline", snapshot),)
+            ) as readings,
+            self._transaction(readings),
+        ):
+            historical = self.find_work_claim(
+                command_key,
+                claimant,
+                expected_revision,
+                attempt,
+                mode,
+                profile,
+                resources,
+                lease_seconds,
+            )
+            if historical is not None:
+                return historical
+            if self._connection.execute(
+                "SELECT 1 FROM command_admissions WHERE command_key = ?", (command_key,)
+            ).fetchone():
+                raise OwnershipConflict("work claim cannot adopt a preexisting domain command")
+            self.check_work_authority(attempt.program_id)
+            if attempt.workspace_reference != next(item.key for item in resources if item.kind == "workspace"):
+                raise OwnershipConflict("Attempt workspace differs from exact owned resource")
+            records = self._work_records("ownership-claim")
+            for record in records:
+                if self._work_record("ownership-release", cast(str, record["command"])) is not None:
+                    continue
+                other = self._decode_work_claim(record)
+                if (other.attempt.program_id, other.attempt.work_unit_id) == (attempt.program_id, attempt.work_unit_id):
+                    raise OwnershipConflict("work already claimed; expiry is not settlement")
+                if any(left.conflicts(right) for left in resources for right in other.resources):
+                    raise OwnershipConflict("conflicting workspace/session/effect remains owned")
+            self._check_retained_workspace_work(next(item for item in resources if item.kind == "workspace"))
+            generation = max((cast(int, item["generation"]) for item in records), default=0) + 1
+            now = self.work_decision_time(attempt.program_id)
+            deadline = self.original_work_deadline(attempt.program_id)
+            assert deadline is not None  # noqa: S101 - original authority checked above.
+            expires_at = min(deadline, now + lease_seconds)
+            operation_id = f"runtime:{attempt.attempt_id}"
+            self._admit_decision(
+                attempt.program_id,
+                command_key,
+                command,
+                (operation_id, operation_id, {"attempt": attempt.digest}),
+                retained_bytes=len(snapshot),
+            )
+            self._write_work_record(
+                "ownership-claim",
+                command_key,
+                {
+                    "command": command_key,
+                    "input": data,
+                    "program": attempt.program_id,
+                    "attempt": attempt.attempt_id,
+                    "attempt_digest": attempt.digest,
+                    "claimant": claimant,
+                    "generation": generation,
+                    "mode": mode.value,
+                    "profile": profile,
+                    "resources": [asdict(item) for item in resources],
+                    "workspace_subject": workspace_subject,
+                    "expires_at": expires_at,
+                },
+            )
+            self._finalize_artifact(operation_id, "ownership-baseline", snapshot)
+            return self._decode_work_claim(cast(dict[str, object], self._work_record("ownership-claim", command_key)))
+
+    def _check_work_claim(
+        self,
+        claim: WorkClaim,
+        *,
+        authority: bool = True,
+        settled: bool = False,
+        exclude_operation: str | None = None,
+        publication: bool = False,
+        retirement_receipt: bool = False,
+    ) -> None:
+        original = self._work_record("ownership-claim", claim.command_key)
+        if original is None or self._decode_work_claim(original) != claim:
+            raise OwnershipConflict("claimant, Attempt or original generation differs")
+        if self._work_record("ownership-release", claim.command_key) is not None:
+            raise OwnershipConflict("claim generation released; no further authority")
+        if self._work_record("ownership-unknown", claim.command_key) is not None:
+            raise OwnershipConflict(
+                "task resource scope unknown; quarantine requires explicit isolation/reconciliation"
+            )
+        if authority or settled:
+            # Exact owner retirement/release can reconcile an already removed
+            # leaf. It grants no fresh worker capability and still checks every
+            # competing retained resource and rejects a current alias target.
+            self._check_workspace_claims(
+                claim.attempt,
+                check_owned_identity=authority,
+                retirement_receipt=retirement_receipt,
+            )
+        for item in self._work_records("ownership-claim"):
+            if cast(int, item["generation"]) > claim.generation:
+                newer = self._decode_work_claim(item)
+                if any(left.conflicts(right) for left in claim.resources for right in newer.resources):
+                    raise OwnershipConflict("stale resource generation")
+        if authority:
+            self.check_work_authority(claim.attempt.program_id)
+            program = self._load_head(claim.attempt.program_id)
+            allowed_statuses = (
+                {ProgramStatus.ACTIVE, ProgramStatus.COMPLETED} if publication else {ProgramStatus.ACTIVE}
+            )
+            if program.status not in allowed_statuses or program.spec.digest != claim.attempt.spec_digest:
+                raise OwnershipConflict("claim no longer belongs to current active specification")
+            attempt = program.attempt(claim.attempt.attempt_id)
+            state = program.state(claim.attempt.work_unit_id)
+            if (
+                attempt.status in {AttemptStatus.CANCELLED, AttemptStatus.FAILED}
+                or state.status
+                in {
+                    WorkUnitStatus.CANCELLED,
+                }
+                or (state.status is WorkUnitStatus.SATISFIED and not publication)
+            ):
+                raise OwnershipConflict("claim Attempt/WorkUnit no longer eligible")
+            renewals = [item for item in self._work_records("ownership-renew") if item["claim"] == claim.command_key]
+            horizon = max([claim.expires_at, *(cast(int, item["expires_at"]) for item in renewals)])
+            if self.work_decision_time(claim.attempt.program_id) >= horizon:
+                raise OwnershipConflict("work claim expired; resources remain quarantined")
+        if settled:
+            if not any(
+                self._work_record("ownership-proof", f"{claim.command_key}:{stage}") for stage in ("complete", "stop")
+            ):
+                raise OwnershipConflict("task-scope settlement unknown; preserve conflicting resources")
+            for item in self._work_records("reservation"):
+                if (item["program"], item["attempt"]) == (claim.attempt.program_id, claim.attempt.attempt_id):
+                    if WorkKind(cast(str, item["category"])) in COUNT_ONLY_WORK:
+                        continue
+                    if item["operation"] != exclude_operation and (
+                        self._work_record("settlement", claim.operation_id) is None
+                        if item["operation"] == claim.operation_id
+                        else not self._resource_settled(item)
+                    ):
+                        raise OwnershipConflict("unreconciled effect retains conflicting resources")
+
+    def check_work_claim(self, claim: WorkClaim, *, settled: bool = False) -> None:
+        self._assert_writer_thread()
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._transaction(readings),
+        ):
+            self._check_work_claim(claim, settled=settled, retirement_receipt=settled)
+
+    def renew_work_claim(self, command_key: str, claim: WorkClaim, lease_seconds: int) -> int:
+        self._assert_writer_thread()
+        if type(lease_seconds) is not int or lease_seconds <= 0:
+            raise OwnershipConflict("renewal needs a positive bounded duration")
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._transaction(readings),
+        ):
+            previous = self._work_record("ownership-renew", command_key)
+            if previous is not None:
+                if (previous["claim"], previous["claimant"], previous["lease_seconds"]) != (
+                    claim.command_key,
+                    claim.claimant,
+                    lease_seconds,
+                ):
+                    raise IdempotencyConflict("renew command input or claimant changed")
+                self._check_work_claim(claim)
+                return cast(int, previous["expires_at"])
+            self._check_work_claim(claim)
+            now = self.work_decision_time(claim.attempt.program_id)
+            deadline = self.original_work_deadline(claim.attempt.program_id)
+            assert deadline is not None  # noqa: S101 - original authority checked above.
+            expiry = min(deadline, now + lease_seconds)
+            self._write_work_record(
+                "ownership-renew",
+                command_key,
+                {
+                    "claim": claim.command_key,
+                    "claimant": claim.claimant,
+                    "generation": claim.generation,
+                    "lease_seconds": lease_seconds,
+                    "expires_at": expiry,
+                },
+            )
+            return expiry
+
+    def record_claim_proof(self, claim: WorkClaim, proof: HandoffProof, *, worker_report: bool = False) -> None:
+        self._assert_writer_thread()
+        proof.check(claim, proof.stage)
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._transaction(readings),
+        ):
+            # Exact trusted reconciliation is allowed after revoke/expiry, unlike
+            # worker renewal, candidate reports, acceptance or publication.
+            self._check_work_claim(claim, authority=worker_report or proof.stage == "start")
+            if claim.mode is HandoffMode.MANAGED and proof.stage != "start":
+                started = self._work_record("ownership-proof", f"{claim.command_key}:start")
+                if started is None:
+                    raise OwnershipConflict("managed settlement lacks original exact start witness")
+                original = cast(dict[str, object], started["proof"])
+                if (proof.source, proof.reference) != (original["source"], original["reference"]):
+                    raise OwnershipConflict("managed settlement differs from original owned target/source")
+            self._write_work_record(
+                "ownership-proof",
+                f"{claim.command_key}:{proof.stage}",
+                {
+                    "claim": claim.command_key,
+                    "proof": proof.payload(),
+                },
+            )
+            if proof.stage != "start":
+                self._settle_work_operation(claim.operation_id, proof.reference)
+
+    def observe_claim_workspace(
+        self,
+        claim: WorkClaim,
+        subject: str,
+        snapshot: bytes,
+        *,
+        owner: str | None = None,
+    ) -> None:
+        self._assert_writer_thread()
+        if hashlib.sha256(snapshot).hexdigest() != subject:
+            raise OwnershipConflict("workspace snapshot digest differs")
+        with (
+            self._gate,
+            self._workspace_cut(
+                (claim.attempt.workspace_reference,), ((claim.operation_id, f"workspace:{subject}", snapshot),)
+            ) as readings,
+            self._transaction(readings),
+        ):
+            self._check_work_claim(claim, authority=owner is None)
+            if owner is not None and self._claim_owner(claim) != owner:
+                raise OwnershipConflict("only original owner can observe for expired resource reconciliation")
+            identity = f"{claim.command_key}:{subject}"
+            if self._work_record("ownership-observation", identity) is None:
+                order = (
+                    max((cast(int, item["order"]) for item in self._work_records("ownership-observation")), default=0)
+                    + 1
+                )
+                self._write_work_record(
+                    "ownership-observation",
+                    identity,
+                    {
+                        "claim": claim.command_key,
+                        "subject": subject,
+                        "attribution": "unknown",
+                        "order": order,
+                    },
+                )
+            self._finalize_artifact(claim.operation_id, f"workspace:{subject}", snapshot)
+
+    def reconcile_claim_workspace(self, claim: WorkClaim, owner: str, subject: str, evidence: str) -> None:
+        self._assert_writer_thread()
+        if not evidence.strip():
+            raise OwnershipConflict("explicit reconciliation evidence required")
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,), subjects=(claim,)) as readings,
+            self._transaction(readings),
+        ):
+            self._check_work_claim(claim, authority=False, settled=True)
+            if self._claim_owner(claim) != owner:
+                raise OwnershipConflict("only original owner can reconcile workspace changes")
+            self._check_current_workspace_subject(claim, subject)
+            if self._work_record("ownership-observation", f"{claim.command_key}:{subject}") is None:
+                raise OwnershipConflict("reconciliation needs an exact retained observation")
+            self._write_work_record(
+                "ownership-reconcile",
+                f"{claim.command_key}:{subject}",
+                {
+                    "claim": claim.command_key,
+                    "subject": subject,
+                    "owner": owner,
+                    "evidence": evidence,
+                },
+            )
+
+    def _check_workspace_subject(self, claim: WorkClaim, subject: str, *, fresh: bool = False) -> None:
+        if fresh:
+            self._check_current_workspace_subject(claim, subject)
+        if (
+            subject != claim.workspace_subject
+            and self._work_record(
+                "ownership-reconcile",
+                f"{claim.command_key}:{subject}",
+            )
+            is None
+        ):
+            raise OwnershipConflict("changed/manual workspace bytes require explicit exact-subject reconciliation")
+
+    def _check_claim_candidate(self, claim: WorkClaim, subject: str) -> None:
+        self._check_current_workspace_subject(claim, subject)
+        candidate = self._work_record("ownership-candidate", claim.command_key)
+        observations = [
+            item for item in self._work_records("ownership-observation") if item["claim"] == claim.command_key
+        ]
+        if (
+            candidate is None
+            or candidate["subject"] != subject
+            or (observations and max(observations, key=lambda item: cast(int, item["order"]))["subject"] != subject)
+        ):
+            raise OwnershipConflict("publication/acceptance requires unchanged exact candidate handoff")
+
+    def check_claim_candidate(self, claim: WorkClaim, subject: str) -> None:
+        self._assert_writer_thread()
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,), subjects=(claim,)) as readings,
+            self._transaction(readings),
+        ):
+            self._check_work_claim(claim, settled=True)
+            self._check_claim_candidate(claim, subject)
+
+    def submit_claim_candidate(self, claim: WorkClaim, subject: str, snapshot: bytes) -> str:
+        self._assert_writer_thread()
+        if hashlib.sha256(snapshot).hexdigest() != subject:
+            raise OwnershipConflict("candidate snapshot digest differs")
+        with (
+            self._gate,
+            self._workspace_cut(
+                (claim.attempt.workspace_reference,),
+                ((claim.operation_id, "ownership-candidate", snapshot),),
+                subjects=(claim,),
+            ) as readings,
+            self._transaction(readings),
+        ):
+            self._check_work_claim(claim, settled=True)
+            self._check_workspace_subject(claim, subject, fresh=True)
+            self._write_work_record(
+                "ownership-candidate", claim.command_key, {"claim": claim.command_key, "subject": subject}
+            )
+            self._finalize_artifact(claim.operation_id, "ownership-candidate", snapshot)
+            return subject
+
+    def cleanup_work_claim(
+        self,
+        claim: WorkClaim,
+        owner: str,
+        subject: str,
+        snapshot: bytes,
+        evidence: str,
+        retire: Callable[[], None],
+    ) -> None:
+        self._assert_writer_thread()
+        if not evidence.strip() or hashlib.sha256(snapshot).hexdigest() != subject:
+            raise OwnershipConflict("exact resource retirement evidence required")
+        # Validate before changing the filesystem, then revalidate at release.
+        # No callback/effect executes in the business SQL transaction. A failure
+        # or crash retains ownership, including after physical retirement.
+        with self._gate:
+            with self._workspace_cut((claim.attempt.workspace_reference,)) as readings, self._transaction(readings):
+                self._check_work_claim(claim, authority=False, settled=True)
+                if self._claim_owner(claim) != owner:
+                    raise OwnershipConflict("only original owner can retire resources")
+                self._check_workspace_subject(claim, subject)
+            retire()
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
+            self._transaction(readings),
+        ):
+            self._check_work_claim(claim, authority=False, settled=True)
+            self._write_work_record(
+                "ownership-release", claim.command_key, {"claim": claim.command_key, "evidence": evidence}
+            )
+
+    def _validate_claim_publication(self, record: dict[str, object]) -> OperationRecord:
+        if type(record["generation"]) is not int:
+            raise OwnershipConflict("publication generation must be an exact integer")
+        original = self._work_record("ownership-claim", cast(str, record["claim"]))
+        if original is None:
+            raise OwnershipConflict("publication authorization has no original claim")
+        claim = self._decode_work_claim(original)
+        claim_digest = self.operation(self._work_key("ownership-claim", claim.command_key)).request_digest
+        if (
+            record["claim_digest"],
+            record["claimant"],
+            record["generation"],
+            record["attempt_digest"],
+            record["owner"],
+        ) != (
+            claim_digest,
+            claim.claimant,
+            claim.generation,
+            claim.attempt.digest,
+            self._claim_owner(claim),
+        ):
+            raise OwnershipConflict("publication authorization differs from original owner/claim identity")
+        candidate = self._work_record("ownership-candidate", claim.command_key)
+        if candidate is None or candidate["subject"] != record["subject"]:
+            raise OwnershipConflict("publication authorization lacks its original exact candidate")
+        program = self._load_head(claim.attempt.program_id)
+        if not any(
+            item.reference_id == record["acceptance"]
+            and item.source_attempt_id == claim.attempt.attempt_id
+            and item.spec_digest == claim.attempt.spec_digest
+            for item in program.satisfactions
+        ):
+            raise OwnershipConflict("publication authorization lacks its original accepted fact")
+        operation = self.operation(cast(str, record["operation"]))
+        if (operation.effect_key, operation.request_digest) != (record["effect_key"], record["request_digest"]):
+            raise OwnershipConflict("publication authorization differs from immutable Operation input")
+        reservation = self._work_record("reservation", operation.operation_id)
+        if reservation is None or (reservation["program"], reservation["attempt"], reservation["category"]) != (
+            claim.attempt.program_id,
+            claim.attempt.attempt_id,
+            WorkKind.AUXILIARY.value,
+        ):
+            raise OwnershipConflict("publication authorization lacks its original AUX reservation")
+        binding = self._work_record("dispatch-binding", operation.operation_id)
+        if binding != {
+            "kind": "work-budget-record",
+            "type": "dispatch-binding",
+            **{
+                "program": claim.attempt.program_id,
+                "attempt": claim.attempt.attempt_id,
+                "attempt_digest": claim.attempt.digest,
+                "effect_key": operation.effect_key,
+                "request_digest": operation.request_digest,
+                "operation": operation.operation_id,
+                "spec_digest": claim.attempt.spec_digest,
+                "spec_revision": claim.attempt.spec_revision,
+            },
+        }:
+            raise OwnershipConflict("publication authorization lacks its original dispatch binding")
+        return operation
+
+    def find_claim_publication(
+        self,
+        claim: WorkClaim,
+        owner: str,
+        operation_id: str,
+        effect_key: str,
+        request: dict[str, object],
+    ) -> OperationRecord | None:
+        """Read only an explicit committed owner authorization, never infer one from an AUX intent."""
+        self._assert_writer_thread()
+        self._validate_command_key(operation_id)
+        self._validate_command_key(effect_key)
+        if type(request) is not dict:
+            raise TypeError("request must be a JSON object")
+        with self._gate:
+            original = self._work_record("ownership-claim", claim.command_key)
+            if original is None or self._decode_work_claim(original) != claim or self._claim_owner(claim) != owner:
+                raise IdempotencyConflict("publication caller differs from original claim/owner")
+            record = self._work_record("ownership-publication", operation_id)
+            if record is None:
+                if self._connection.execute(
+                    "SELECT 1 FROM operations WHERE operation_id = ? OR effect_key = ?", (operation_id, effect_key)
+                ).fetchone():
+                    raise IdempotencyConflict("existing effect lacks an original matching owner authorization")
+                return None
+            digest = hashlib.sha256(canonical_json({"version": 1, "request": request}).encode("utf-8")).hexdigest()
+            if (
+                record["claim"],
+                record["owner"],
+                record["generation"],
+                record["effect_key"],
+                record["request_digest"],
+            ) != (
+                claim.command_key,
+                owner,
+                claim.generation,
+                effect_key,
+                digest,
+            ):
+                raise IdempotencyConflict("publication authorization input differs from its recorded decision")
+            return self._validate_claim_publication(record)
+
+    def authorize_claim_publication(
+        self,
+        claim: WorkClaim,
+        owner: str,
+        subject: str,
+        operation_id: str,
+        effect_key: str,
+        request: dict[str, object],
+    ) -> OperationRecord:
+        self._assert_writer_thread()
+        historical = self.find_claim_publication(claim, owner, operation_id, effect_key, request)
+        if historical is not None:
+            return historical
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,), subjects=(claim,)) as readings,
+            self._transaction(readings),
+        ):
+            historical = self.find_claim_publication(claim, owner, operation_id, effect_key, request)
+            if historical is not None:
+                return historical
+            self._check_work_claim(claim, settled=True, publication=True)
+            if self._claim_owner(claim) != owner:
+                raise OwnershipConflict("only original owner authorizes protected effects")
+            self._check_claim_candidate(claim, subject)
+            self._reserve_work(claim.attempt.program_id, claim.attempt.attempt_id, operation_id, WorkKind.AUXILIARY)
+            self._insert_intent(operation_id, effect_key, request)
+            self._bind_work_dispatch(claim.attempt.program_id, claim.attempt.attempt_id, operation_id)
+            self.check_work_dispatch(operation_id)
+            operation = self.operation(operation_id)
+            self._write_work_record(
+                "ownership-publication",
+                operation_id,
+                {
+                    "claim": claim.command_key,
+                    "claim_digest": self.operation(self._work_key("ownership-claim", claim.command_key)).request_digest,
+                    "claimant": claim.claimant,
+                    "generation": claim.generation,
+                    "attempt_digest": claim.attempt.digest,
+                    "owner": owner,
+                    "subject": subject,
+                    "acceptance": self._load_head(claim.attempt.program_id)
+                    .state(claim.attempt.work_unit_id)
+                    .satisfaction_id,
+                    "operation": operation_id,
+                    "effect_key": operation.effect_key,
+                    "request_digest": operation.request_digest,
+                },
+            )
+        return self.operation(operation_id)
+
+    def release_claim_resources(
+        self,
+        claim: WorkClaim,
+        owner: str,
+        subject: str,
+        snapshot: bytes,
+        evidence: str,
+    ) -> None:
+        self._assert_writer_thread()
+        if not evidence.strip() or hashlib.sha256(snapshot).hexdigest() != subject:
+            raise OwnershipConflict("exact owner reconciliation subject required")
+        with (
+            self._gate,
+            self._workspace_cut(
+                (claim.attempt.workspace_reference,),
+                ((claim.operation_id, "ownership-release", snapshot),),
+                subjects=(claim,),
+            ) as readings,
+            self._transaction(readings),
+        ):
+            self._check_work_claim(claim, authority=False, settled=True)
+            if self._claim_owner(claim) != owner:
+                raise OwnershipConflict("only original owner can release settled resources")
+            self._check_workspace_subject(claim, subject, fresh=True)
+            self._finalize_artifact(claim.operation_id, "ownership-release", snapshot)
+            self._write_work_record(
+                "ownership-release",
+                claim.command_key,
+                {
+                    "claim": claim.command_key,
+                    "subject": subject,
+                    "owner": owner,
+                    "evidence": evidence,
+                },
+            )
+
+    def quarantine_work_claim(self, claim: WorkClaim, owner: str | None, evidence: str) -> None:
+        self._assert_writer_thread()
+        if not evidence.strip():
+            raise OwnershipConflict("scope uncertainty requires evidence")
+        with self._gate, self._transaction():
+            self._check_work_claim(claim, authority=False)
+            # None is the trusted application-bound profile producer path, never
+            # a worker request parameter. Explicit owner calls remain checked.
+            if owner is not None and self._claim_owner(claim) != owner:
+                raise OwnershipConflict("only original owner can record scope quarantine")
+            self._write_work_record(
+                "ownership-unknown", claim.command_key, {"claim": claim.command_key, "evidence": evidence}
+            )
+
+    @staticmethod
+    def _resolve_workspace_scope(reference: str) -> ResourceScope | None:
+        try:
+            workspace = ResourceScope("workspace", reference)
+            return workspace if str(Path(reference).resolve(strict=False)) == reference else None
+        except (OwnershipConflict, OSError, RuntimeError):
+            return None
+
+    @staticmethod
+    def _capture_workspace_footprint(reference: str) -> _WorkspaceFootprint:
+        """Probe only this name and its bounded ancestor chains, never search for a lost inode."""
+        scope = SQLiteProgramStore._resolve_workspace_scope(reference)
+        resolved: str | None = None
+        stamps: list[tuple[int, ...]] = []
+        ancestors: list[tuple[int, int, int, int]] = []
+        root = parent = None
+        fd: int | None = None
+        try:
+            resolved = str(Path(reference).resolve(strict=False))
+            parts = Path(resolved).parts
+            if len(parts) > 256 or len(Path(reference).parts) > 256:
+                raise OwnershipConflict("workspace ancestor probe bound exceeded")
+            # Retain alias/root change stamps for preflight ABA detection. Parent
+            # identity/custody, not timestamps of unrelated sibling activity, is relevant.
+            for path in (Path(reference), *Path(reference).parents):
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    continue
+                if str(path) == reference or stat.S_ISLNK(info.st_mode):
+                    stamps.append((info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_ctime_ns))
+            fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            info = os.fstat(fd)
+            ancestors.append((info.st_dev, info.st_ino, info.st_uid, info.st_mode))
+            for index, part in enumerate(parts[1:], 1):
+                try:
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except FileNotFoundError:
+                    if index == len(parts) - 1:
+                        parent = ancestors[-1]
+                    break
+                os.close(fd)
+                fd = child
+                info = os.fstat(fd)
+                ancestors.append((info.st_dev, info.st_ino, info.st_uid, info.st_mode))
+            else:
+                root = ancestors[-1]
+                parent = ancestors[-2] if len(ancestors) > 1 else None
+                stamps.append((info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_ctime_ns))
+            return _WorkspaceFootprint(scope, resolved, root, parent, tuple(reversed(ancestors)), tuple(stamps), True)
+        except (OwnershipConflict, OSError, RuntimeError):
+            return _WorkspaceFootprint(scope, resolved, None, None, (), tuple(stamps), False)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _validate_workspace_identity(self, record: dict[str, object], operation_id: str) -> None:
+        for name in ("program", "attempt", "attempt_digest", "workspace_reference", "command"):
+            if type(record[name]) is not str or not cast(str, record[name]).strip():
+                raise OwnershipConflict("invalid original workspace admission identity")
+        for name in ("operation", "effect_key", "request_digest", "reservation"):
+            if record[name] is not None and (type(record[name]) is not str or not cast(str, record[name]).strip()):
+                raise OwnershipConflict("invalid original workspace intent/reservation identity")
+        program_id, attempt_id = cast(str, record["program"]), cast(str, record["attempt"])
+        attempt = self._load_head(program_id).attempt(attempt_id).spec
+        if self._work_key("ownership-workspace", canonical_json([program_id, attempt_id])) != operation_id or (
+            record["attempt_digest"],
+            record["workspace_reference"],
+        ) != (attempt.digest, attempt.workspace_reference):
+            raise OwnershipConflict("workspace identity differs from its exact original Attempt")
+        ResourceScope("workspace", cast(str, record["workspace_reference"]))
+        for name in ("root", "parent"):
+            value = record[name]
+            if value is not None and (
+                type(value) is not list
+                or len(cast(list[object], value)) != 4
+                or any(type(item) is not int or item < 0 for item in cast(list[int], value))
+                or not stat.S_ISDIR(cast(list[int], value)[3])
+            ):
+                raise OwnershipConflict("invalid original workspace inode/custody facts")
+        if record["root"] is not None and record["parent"] is None:
+            raise OwnershipConflict("original workspace root lacks parent custody facts")
+        admission = self._connection.execute(
+            "SELECT 1 FROM command_admissions WHERE command_key = ? AND program_id = ?", (record["command"], program_id)
+        ).fetchone()
+        # Admissions retain the exact PrepareAttempt input in history, not a new pathname adoption.
+        history = self._connection.execute(
+            "SELECT input_json FROM history WHERE command_key = ? AND program_id = ? "
+            "AND command_type = 'prepare_attempt'",
+            (record["command"], program_id),
+        ).fetchone()
+        if admission is None or history is None:
+            raise OwnershipConflict("workspace identity lacks its original atomic preparation")
+        prepared = cast(dict[str, object], json.loads(history["input_json"]))
+        if prepared != json.loads(
+            command_input_json(
+                program_id,
+                PrepareAttempt(cast(int, prepared["expected_revision"]), cast(str, prepared["actor_id"]), attempt),
+            )
+        ):
+            raise OwnershipConflict("workspace identity differs from original preparation input")
+        if record["operation"] is None:
+            if record["effect_key"] is not None or record["request_digest"] is not None:
+                raise OwnershipConflict("workspace identity invented an original runtime intent")
+        else:
+            intent = self.operation(cast(str, record["operation"]))
+            if (record["effect_key"], record["request_digest"]) != (intent.effect_key, intent.request_digest):
+                raise OwnershipConflict("workspace identity differs from original runtime intent")
+        if record["reservation"] is not None:
+            reservation = self._work_record("reservation", cast(str, record["reservation"]))
+            if reservation is None or (reservation["program"], reservation["attempt"], reservation["category"]) != (
+                program_id,
+                attempt_id,
+                WorkKind.ATTEMPT.value,
+            ):
+                raise OwnershipConflict("workspace identity lacks its original reservation")
+        reservations = [
+            item["operation"]
+            for item in self._work_records("reservation")
+            if (item["program"], item["attempt"], item["category"]) == (program_id, attempt_id, WorkKind.ATTEMPT.value)
+        ]
+        if reservations != ([] if record["reservation"] is None else [record["reservation"]]):
+            raise OwnershipConflict("workspace identity differs from its exact original reservation")
+        if record["operation"] is not None and record["reservation"] is not None:
+            binding = self._work_record("dispatch-binding", cast(str, record["operation"]))
+            if binding is None or (
+                binding["program"],
+                binding["attempt"],
+                binding["attempt_digest"],
+                binding["effect_key"],
+                binding["request_digest"],
+            ) != (program_id, attempt_id, attempt.digest, record["effect_key"], record["request_digest"]):
+                raise OwnershipConflict("workspace identity differs from its original dispatch binding")
+
+    def _attempt_workspace_references(self, program_id: str, attempt_id: str) -> tuple[str | None, ...]:
+        attempt = next(
+            (item.spec for item in self._load_head(program_id).attempts if item.attempt_id == attempt_id), None
+        )
+        return () if attempt is None else (attempt.workspace_reference,)
+
+    def _operation_workspace_references(self, operation_id: str) -> tuple[str | None, ...]:
+        reservation = self._work_record("reservation", operation_id)
+        return (
+            ()
+            if reservation is None
+            else self._attempt_workspace_references(
+                cast(str, reservation["program"]), cast(str, reservation["attempt"])
+            )
+        )
+
+    def _retained_workspaces(self) -> Generator[tuple[AttemptSpec, WorkClaim | None], None, None]:
+        for row in self._connection.execute("SELECT program_id FROM program_projection").fetchall():
+            for item in self._load_head(cast(str, row["program_id"])).attempts:
+                claim = self._attempt_work_claim(item.spec.program_id, item.attempt_id)
+                if claim is not None:
+                    if self._work_record("ownership-release", claim.command_key) is not None:
+                        continue
+                elif self._generic_resource_settled(item.spec):
+                    continue
+                yield item.spec, claim
+
+    def _original_workspace_identity(self, attempt: AttemptSpec, claim: WorkClaim | None) -> _WorkspaceIdentity | None:
+        record = self._work_record("ownership-workspace", canonical_json([attempt.program_id, attempt.attempt_id]))
+        if record is not None:
+            return _WorkspaceIdentity(
+                None if record["root"] is None else tuple(cast(list[int], record["root"])),
+                None if record["parent"] is None else tuple(cast(list[int], record["parent"])),
+            )
+        if claim is None:
+            return None  # Unbound generic history has no original physical producer.
+        # Only the ORIGINAL content-addressed LocalOwnedWorkspace capture is a
+        # compatibility producer. No current marker/path can backfill identity.
+        raw = self.find_artifact(claim.operation_id, "ownership-baseline")
+        if raw is None or hashlib.sha256(raw).hexdigest() != claim.workspace_subject:
+            return None
+        try:
+            captured = cast(dict[str, object], json.loads(raw))
+            owner = cast(dict[str, object], captured["owner"])
+            root = cast(dict[str, object], captured["root"])
+            if (
+                set(captured) != {"version", "owner", "root", "entries"}
+                or type(captured["version"]) is not int
+                or captured["version"] != 1
+                or set(owner) != {"version", "root", "parent", "uid", "token"}
+                or type(owner["version"]) is not int
+                or owner["version"] != 1
+                or type(owner["uid"]) is not int
+                or owner["uid"] < 0
+                or type(owner["token"]) is not str
+                or len(owner["token"]) != 32
+                or any(char not in "0123456789abcdef" for char in owner["token"])
+                or set(root) != {"mode", "mtime", "ctime"}
+                or any(type(value) is not int or value < 0 for value in cast(dict[str, int], root).values())
+                or not stat.S_ISDIR(cast(int, root["mode"]))
+            ):
+                return None
+            for name in ("root", "parent"):
+                if (
+                    type(owner[name]) is not list
+                    or len(cast(list[object], owner[name])) != 2
+                    or any(type(value) is not int or value < 0 for value in cast(list[int], owner[name]))
+                ):
+                    return None
+            # The producer checked controller uid/private parent, but did not
+            # persist exact parent mode. Preserve that narrower original proof.
+            return _WorkspaceIdentity(
+                (*cast(list[int], owner["root"]), owner["uid"], cast(int, root["mode"])),
+                (*cast(list[int], owner["parent"]), owner["uid"]),
+            )
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return None
+
+    @staticmethod
+    def _workspace_identity_matches(
+        original: _WorkspaceIdentity | None,
+        observed: _WorkspaceFootprint,
+        *,
+        retired: bool = False,
+    ) -> bool:
+        return (
+            original is not None
+            and original.parent is not None
+            and observed.complete
+            and observed.parent is not None
+            and (observed.root == original.root or retired and observed.root is None)
+            and observed.parent[: len(original.parent)] == original.parent
+            and (len(original.parent) == 4 or not observed.parent[3] & 0o077)
+        )
+
+    def _original_workspace_retired(self, claim: WorkClaim) -> bool:
+        """Read the actual producer's exact post-rmdir receipt before the clock cut."""
+        try:
+            baseline = self.find_artifact(claim.operation_id, "ownership-baseline")
+            if baseline is None or hashlib.sha256(baseline).hexdigest() != claim.workspace_subject:
+                return False
+            reference = Path(cast(str, claim.attempt.workspace_reference))
+            receipt = LocalOwnedWorkspace(reference.parent, reference.name).retirement()
+            if receipt is None:
+                return False
+            captured = cast(dict[str, object], json.loads(baseline))
+            retired = cast(dict[str, object], json.loads(receipt[1]))
+            return captured["owner"] == retired["owner"] and (
+                receipt[0] == claim.workspace_subject
+                or self._work_record("ownership-reconcile", f"{claim.command_key}:{receipt[0]}") is not None
+            )
+        except (ValueError, TypeError, KeyError, AttributeError, OSError):
+            return False
+
+    def _workspace_references(self, additional: tuple[str | None, ...]) -> frozenset[str]:
+        references = {*additional, *(attempt.workspace_reference for attempt, _ in self._retained_workspaces())}
+        return frozenset(reference for reference in references if reference is not None and reference.startswith("/"))
+
+    def _operation_work_claim(self, operation_id: str) -> WorkClaim | None:
+        reservation = self._work_record("reservation", operation_id)
+        return (
+            None
+            if reservation is None
+            else self._attempt_work_claim(cast(str, reservation["program"]), cast(str, reservation["attempt"]))
+        )
+
+    def _capture_claim_subject(self, claim: WorkClaim) -> str | None:
+        """Current bytes from the original controller producer, never a caller's old digest."""
+        try:
+            original = self._work_record("ownership-claim", claim.command_key)
+            if original is None or self._decode_work_claim(original) != claim:
+                return None
+            baseline = self.find_artifact(claim.operation_id, "ownership-baseline")
+            if baseline is None or hashlib.sha256(baseline).hexdigest() != claim.workspace_subject:
+                return None
+            binding = self._work_binding(claim.attempt.program_id)
+            if binding is None:
+                return None
+            project = self._work_record("project", cast(str, binding["project"]))
+            if project is None:
+                return None
+            # This is a finite verification I/O bound, not recovery of an
+            # unstored adapter max_bytes. Encoded captures exceed their raw
+            # file bytes; existing retention/dedup/headroom gates still apply.
+            limit = min(
+                WorkBudgetPolicy.decode(binding["policy"]).retained_bytes,
+                WorkBudgetPolicy.decode(project["policy"]).retained_bytes,
+            )
+            reference = Path(cast(str, claim.attempt.workspace_reference))
+            subject, snapshot = LocalOwnedWorkspace(reference.parent, reference.name, max_bytes=limit).capture()
+            captured = cast(dict[str, object], json.loads(snapshot))
+            bound = cast(dict[str, object], json.loads(baseline))
+            if hashlib.sha256(snapshot).hexdigest() != subject or captured["owner"] != bound["owner"]:
+                return None
+            return subject
+        except (ValueError, TypeError, KeyError, AttributeError, OSError):
+            return None
+
+    def _check_current_workspace_subject(self, claim: WorkClaim, subject: str) -> None:
+        if (
+            type(subject) is not str
+            or self._workspace_subjects is None
+            or self._workspace_subjects.get(claim.command_key) != subject
+        ):
+            raise OwnershipConflict("fresh candidate/current workspace subject unavailable or changed after capture")
+
+    @contextmanager
+    def _workspace_cut(
+        self,
+        additional: tuple[str | None, ...] | None,
+        artifacts: tuple[tuple[str, str, bytes], ...] = (),
+        *,
+        subjects: tuple[WorkClaim | None, ...] = (),
+    ) -> Generator[dict[str, BootClockReading | None] | None, None, None]:
+        if additional is None:
+            yield None
+            return
+        if self._connection.in_transaction:
+            raise ProgramReadChanged("physical workspace preflight cannot join business SQL")
+        changes = self._connection.total_changes
+        references = self._workspace_references(additional)
+        identities = {
+            (attempt.program_id, attempt.attempt_id): self._original_workspace_identity(attempt, claim)
+            for attempt, claim in self._retained_workspaces()
+            if attempt.workspace_reference in references
+        }
+        footprints = {reference: self._capture_workspace_footprint(reference) for reference in sorted(references)}
+        retirements = frozenset(
+            (attempt.program_id, attempt.attempt_id)
+            for attempt, claim in self._retained_workspaces()
+            if claim is not None
+            and attempt.workspace_reference in footprints
+            and footprints[attempt.workspace_reference].root is None
+            and self._original_workspace_retired(claim)
+        )
+        scopes = {reference: footprint.scope for reference, footprint in footprints.items()}
+        requested = tuple(claim for claim in subjects if claim is not None)
+        captured_subjects = {claim.command_key: self._capture_claim_subject(claim) for claim in requested}
+        prepared: dict[tuple[str, str], str] = {}
+        for operation_id, name, data in artifacts:
+            self._validate_command_key(operation_id)
+            self._validate_command_key(name)
+            if type(data) is not bytes:
+                raise TypeError("artifact must be bytes")
+            digest = hashlib.sha256(data).hexdigest()
+            self._check_owned_artifact_budget(operation_id, digest, len(data))
+            self._stage_blob(digest, data)
+            prepared[(operation_id, name)] = digest
+        verified_subjects = {claim.command_key: self._capture_claim_subject(claim) for claim in requested}
+        verified = {reference: self._capture_workspace_footprint(reference) for reference in sorted(references)}
+        stable = (
+            not self._closed
+            and changes == self._connection.total_changes
+            and footprints == verified
+            and captured_subjects == verified_subjects
+        )
+        if self._closed:
+            raise ProgramReadChanged("owner closed during physical workspace preflight")
+        # Potentially blocking validation precedes the independently durable
+        # clock cut. Business guards below only consume these decision-local facts.
+        readings = self._prepare_work_clocks()
+        if not stable or self._workspace_references(additional) != references:
+            raise ProgramReadChanged("physical workspace/store read cut changed during preflight")
+        previous = self._workspace_scopes
+        previous_artifacts = self._workspace_artifacts
+        previous_footprints = self._workspace_footprints
+        previous_identities = self._workspace_identities
+        previous_retirements = self._workspace_retirements
+        previous_subjects = self._workspace_subjects
+        self._workspace_scopes = scopes
+        self._workspace_footprints = footprints
+        self._workspace_identities = identities
+        self._workspace_retirements = retirements
+        self._workspace_artifacts = prepared
+        self._workspace_subjects = captured_subjects
+        try:
+            yield readings
+        finally:
+            self._workspace_scopes = previous
+            self._workspace_footprints = previous_footprints
+            self._workspace_identities = previous_identities
+            self._workspace_retirements = previous_retirements
+            self._workspace_artifacts = previous_artifacts
+            self._workspace_subjects = previous_subjects
+
+    def _physical_workspace_scope(self, reference: str | None) -> ResourceScope | None:
+        # Legacy keys are opaque, not paths to resolve or silently rewrite.
+        if reference is None or not reference.startswith("/"):
+            return None
+        ResourceScope("workspace", reference)
+        if self._workspace_scopes is None or reference not in self._workspace_scopes:
+            raise ProgramReadChanged("physical workspace lacks this decision's preflight")
+        scope = self._workspace_scopes[reference]
+        if scope is None:
+            raise OwnershipConflict("physical workspace must already be canonical; aliases require reconciliation")
+        if self._workspace_footprints is None or not self._workspace_footprints[reference].complete:
+            raise OwnershipConflict("physical workspace identity/ancestor observation unavailable")
+        return scope
+
+    def _check_workspace_claims(
+        self,
+        attempt: AttemptSpec,
+        *,
+        check_owned_identity: bool = True,
+        retirement_receipt: bool = False,
+    ) -> None:
+        workspace = self._physical_workspace_scope(attempt.workspace_reference)
+        if workspace is None:
+            return
+        if self._attempt_work_claim(attempt.program_id, attempt.attempt_id) is None:
+            original = self._work_record(
+                "ownership-workspace", canonical_json([attempt.program_id, attempt.attempt_id])
+            )
+            if original is not None and original["root"] is not None:
+                assert self._workspace_footprints is not None  # noqa: S101 - physical preflight checked above.
+                observed = self._workspace_footprints[workspace.key]
+                identity = _WorkspaceIdentity(
+                    tuple(cast(list[int], original["root"])),
+                    None if original["parent"] is None else tuple(cast(list[int], original["parent"])),
+                )
+                if not self._workspace_identity_matches(identity, observed):
+                    raise OwnershipConflict(
+                        "original generic workspace identity/custody changed; reconciliation required"
+                    )
+        elif check_owned_identity:
+            if self._workspace_identities is None or self._workspace_footprints is None:
+                raise ProgramReadChanged("original owned workspace lacks this decision's identity preflight")
+            original = self._workspace_identities.get((attempt.program_id, attempt.attempt_id))
+            if not self._workspace_identity_matches(
+                original,
+                self._workspace_footprints[workspace.key],
+                retired=retirement_receipt and (attempt.program_id, attempt.attempt_id) in self._workspace_retirements,
+            ):
+                raise OwnershipConflict("original owned workspace identity/custody unknown; reconciliation required")
+        self._check_retained_workspace_work(workspace, exclude=attempt)
+
+    def _check_retained_workspace_work(self, workspace: ResourceScope, *, exclude: AttemptSpec | None = None) -> None:
+        for attempt, claim in self._retained_workspaces():
+            if exclude is not None and (attempt.program_id, attempt.attempt_id) == (
+                exclude.program_id,
+                exclude.attempt_id,
+            ):
+                continue
+            reference = attempt.workspace_reference
+            if reference is None or not reference.startswith("/"):
+                continue
+            other_workspace = ResourceScope("workspace", reference)
+            if workspace.conflicts(other_workspace):
+                if claim is not None:
+                    raise OwnershipConflict(
+                        "unreleased workspace ownership blocks competing preparation/reservation/delivery"
+                    )
+                raise OwnershipConflict("generic workspace lacks exact settlement proof; retains original pathname")
+            if self._workspace_footprints is None or self._workspace_identities is None:
+                raise ProgramReadChanged("workspace identity lacks this decision's preflight")
+            observed = self._workspace_footprints[reference]
+            candidate = self._workspace_footprints[workspace.key]
+            original = self._workspace_identities.get((attempt.program_id, attempt.attempt_id))
+            # A reserved, still-absent future name is not an inode binding.
+            # Only the original undispatched preparation can prove that no
+            # task capability has yet materialized it. Never adopt a later root.
+            absent_unstarted = (
+                claim is None
+                and original is not None
+                and original.root is None
+                and observed.root is None
+                and observed.scope is not None
+                and self._load_head(attempt.program_id).attempt(attempt.attempt_id).status is AttemptStatus.PREPARED
+                and (
+                    binding := self._work_record(
+                        "ownership-workspace", canonical_json([attempt.program_id, attempt.attempt_id])
+                    )
+                )
+                is not None
+                and binding["operation"] is not None
+                and self.operation(cast(str, binding["operation"])).attempts == 0
+                and all(
+                    item["category"] == WorkKind.ATTEMPT.value
+                    or WorkKind(cast(str, item["category"])) in COUNT_ONLY_WORK
+                    for item in self._work_records("reservation")
+                    if (item["program"], item["attempt"]) == (attempt.program_id, attempt.attempt_id)
+                )
+            )
+            if (
+                not self._workspace_identity_matches(
+                    original,
+                    observed,
+                    retired=(attempt.program_id, attempt.attempt_id) in self._workspace_retirements,
+                )
+                or not candidate.complete
+                or (original is not None and original.root is None and not absent_unstarted)
+            ):
+                raise OwnershipConflict(
+                    "retained workspace canonical identity/custody unknown; reconciliation required"
+                )
+            if observed.resolved is not None and workspace.conflicts(ResourceScope("workspace", observed.resolved)):
+                raise OwnershipConflict("retained workspace holds its observed original-inode alias footprint")
+            if (observed.root is not None and any(item[:2] == observed.root[:2] for item in candidate.ancestors)) or (
+                candidate.root is not None and any(item[:2] == candidate.root[:2] for item in observed.ancestors)
+            ):
+                raise OwnershipConflict("retained workspace inode/ancestor conflict holds the original resource")
+
+    def _generic_resource_settled(self, attempt: AttemptSpec, *, exclude_operation: str | None = None) -> bool:
+        effects = [
+            item
+            for item in self._work_records("reservation")
+            if (item["program"], item["attempt"]) == (attempt.program_id, attempt.attempt_id)
+            and WorkKind(cast(str, item["category"])) not in COUNT_ONLY_WORK
+        ]
+        return any(item["category"] == WorkKind.ATTEMPT.value for item in effects) and all(
+            item["operation"] == exclude_operation or self._resource_settled(item) for item in effects
+        )
+
+    def _check_ownership_command(self, program_id: str, command: DomainCommandType) -> None:
+        if isinstance(command, PrepareAttempt):
+            self._check_workspace_claims(command.attempt)
+            for item in self._work_records("ownership-claim"):
+                if item["program"] != program_id or self._work_record("ownership-release", cast(str, item["command"])):
+                    continue
+                claim = self._decode_work_claim(item)
+                if claim.attempt.work_unit_id == command.attempt.work_unit_id:
+                    raise OwnershipConflict("unreleased task resources block successor Attempt")
+        if isinstance(command, (StartAttempt, FinishAttempt, SatisfyWorkUnit)):
+            attempt_id = (
+                command.satisfaction.source_attempt_id if isinstance(command, SatisfyWorkUnit) else command.attempt_id
+            )
+            known = next(
+                (item.spec for item in self._load_head(program_id).attempts if item.attempt_id == attempt_id), None
+            )
+            if known is not None:
+                self._check_workspace_claims(known)
+            claim = self._attempt_work_claim(program_id, attempt_id)
+            if claim is None and known is not None and isinstance(command, SatisfyWorkUnit):
+                if self._physical_workspace_scope(
+                    known.workspace_reference
+                ) is not None and not self._generic_resource_settled(known):
+                    raise OwnershipConflict("fresh acceptance requires exact task and effect settlement proof")
+            if claim is not None:
+                self._check_work_claim(claim, settled=not isinstance(command, StartAttempt))
+                if isinstance(command, StartAttempt) and any(
+                    self._work_record("ownership-proof", f"{claim.command_key}:{stage}")
+                    for stage in ("complete", "stop")
+                ):
+                    raise OwnershipConflict("settled task capability cannot be restarted")
+                if isinstance(command, StartAttempt) and claim.mode is HandoffMode.MANAGED:
+                    if self._work_record("ownership-proof", f"{claim.command_key}:start") is None:
+                        raise OwnershipConflict("managed start lacks exact profile witness")
+                if (
+                    isinstance(command, SatisfyWorkUnit)
+                    and self._work_record("ownership-candidate", claim.command_key) is None
+                ):
+                    raise OwnershipConflict("acceptance lacks exact reconciled candidate handoff")
+                if isinstance(command, SatisfyWorkUnit):
+                    candidate = cast(dict[str, object], self._work_record("ownership-candidate", claim.command_key))
+                    self._check_claim_candidate(claim, cast(str, candidate["subject"]))
 
     def configure_work_budget(
         self,
@@ -1082,6 +2612,19 @@ class SQLiteProgramStore:
     def check_work_dispatch(self, operation_id: str) -> None:
         """Revalidate NEW dispatch, not historical receipt or reservation replay."""
         self._assert_writer_thread()
+        if self._connection.in_transaction:
+            self._check_work_dispatch(operation_id)
+            return
+        with (
+            self._gate,
+            self._workspace_cut(
+                self._operation_workspace_references(operation_id), subjects=(self._operation_work_claim(operation_id),)
+            ) as readings,
+            self._transaction(readings),
+        ):
+            self._check_work_dispatch(operation_id)
+
+    def _check_work_dispatch(self, operation_id: str) -> None:
         reservation = self._work_record("reservation", operation_id)
         if reservation is None:
             raise BudgetRefused("dispatch lacks original work reservation")
@@ -1092,6 +2635,12 @@ class SQLiteProgramStore:
             attempt = program.attempt(attempt_id)
         except ValueError as error:
             raise BudgetRefused("dispatch lacks its originating Attempt") from error
+        self._check_workspace_claims(attempt.spec)
+        if any(
+            item["operation"] == operation_id and item["basis"] == "trusted-profile"
+            for item in self._work_records("ownership-settlement")
+        ):
+            raise OwnershipConflict("qualified resource settlement closes this operation; no new dispatch")
         if (attempt.spec.spec_revision, attempt.spec.spec_digest) != (program.spec.revision, program.spec.digest):
             raise BudgetRefused("reserved Attempt belongs to a superseded specification")
         operation = self.operation(operation_id)
@@ -1122,6 +2671,40 @@ class SQLiteProgramStore:
             raise BudgetRefused("Operation differs from original Attempt dispatch binding")
         state = program.state(attempt.spec.work_unit_id)
         category = WorkKind(cast(str, reservation["category"]))
+        claim = self._attempt_work_claim(program_id, attempt_id)
+        if claim is None and category is WorkKind.AUXILIARY:
+            if self._physical_workspace_scope(
+                attempt.spec.workspace_reference
+            ) is not None and not self._generic_resource_settled(attempt.spec, exclude_operation=operation_id):
+                raise OwnershipConflict("fresh publication requires exact task and other effect settlement proof")
+        if claim is not None:
+            self._check_work_claim(
+                claim,
+                settled=category is WorkKind.AUXILIARY,
+                exclude_operation=operation_id,
+                publication=category is WorkKind.AUXILIARY,
+            )
+            if category is WorkKind.AUXILIARY:
+                candidate = self._work_record("ownership-candidate", claim.command_key)
+                if candidate is None:
+                    raise OwnershipConflict("publication lacks exact candidate handoff")
+                self._check_claim_candidate(claim, cast(str, candidate["subject"]))
+            if operation_id == claim.operation_id:
+                current_subject = (
+                    None if self._workspace_subjects is None else self._workspace_subjects.get(claim.command_key)
+                )
+                if current_subject is None:
+                    raise OwnershipConflict("current runtime workspace subject unavailable")
+                self._check_workspace_subject(claim, current_subject, fresh=True)
+                if claim.mode is HandoffMode.PULL:
+                    raise OwnershipConflict("pull handoff is not managed Runtime dispatch authority")
+                if self._work_record("ownership-proof", f"{claim.command_key}:start") is None:
+                    raise OwnershipConflict("managed dispatch lacks exact profile start witness")
+                if any(
+                    self._work_record("ownership-proof", f"{claim.command_key}:{stage}")
+                    for stage in ("complete", "stop")
+                ):
+                    raise OwnershipConflict("settled native capability cannot be restarted")
         if category is WorkKind.ATTEMPT:
             if json.loads(operation.request_json)["request"].get("attempt") != attempt.spec.digest:
                 raise BudgetRefused("runtime Operation request differs from originating Attempt")
@@ -1217,11 +2800,19 @@ class SQLiteProgramStore:
             "retained_bytes": retained_bytes,
         }
         prior = self._work_record("reservation", operation_id)
+        known = next(
+            (item.spec for item in self._load_head(program_id).attempts if item.attempt_id == attempt_id), None
+        )
+        if known is not None:
+            self._check_workspace_claims(known)
         if prior is not None:
             if prior != {"kind": "work-budget-record", "type": "reservation", **reservation}:
                 raise BudgetRefused("reservation identity conflicts with original input")
             return
         self.check_work_authority(program_id)
+        claim = self._attempt_work_claim(program_id, attempt_id)
+        if claim is not None:
+            self._check_work_claim(claim, publication=category is WorkKind.AUXILIARY)
         records = self._work_records("reservation")
         if category is WorkKind.ATTEMPT and any(
             item["program"] == program_id and item["attempt"] == attempt_id and item["category"] == category.value
@@ -1241,15 +2832,14 @@ class SQLiteProgramStore:
             active = {
                 (cast(str, item["program"]), cast(str, item["attempt"]))
                 for item in scoped
-                if item["category"] not in {WorkKind.REMEDIATION.value, WorkKind.RETRY.value}
+                if WorkKind(cast(str, item["category"])) not in COUNT_ONLY_WORK
                 and self._work_record("settlement", cast(str, item["operation"])) is None
             }
             if (program_id, attempt_id) not in active and len(active) >= policy.max_active:
                 raise BudgetRefused(f"{scope} active work capacity exhausted")
             retained = 0
             for item in scoped:
-                result = self._work_record("retained", cast(str, item["operation"]))
-                retained += cast(int, result["bytes"] if result is not None else item["retained_bytes"])
+                retained += self._retained_work_bytes(item)
             if retained + retained_bytes > policy.retained_bytes:
                 raise BudgetRefused(f"{scope} retained streaming byte capacity exhausted")
         self._check_resource_headroom(program_id)
@@ -1259,7 +2849,11 @@ class SQLiteProgramStore:
         self, program_id: str, attempt_id: str, operation_id: str, category: WorkKind, *, retained_bytes: int = 0
     ) -> None:
         self._assert_writer_thread()
-        with self._gate, self._transaction():
+        with (
+            self._gate,
+            self._workspace_cut(self._attempt_workspace_references(program_id, attempt_id)) as readings,
+            self._transaction(readings),
+        ):
             self._reserve_work(program_id, attempt_id, operation_id, category, retained_bytes)
 
     def budgeted_intent(
@@ -1274,12 +2868,36 @@ class SQLiteProgramStore:
         retained_bytes: int = 0,
     ) -> OperationRecord:
         self._assert_writer_thread()
-        with self._gate, self._transaction():
+        fresh_subject = category is WorkKind.AUXILIARY and (
+            self._work_record("reservation", operation_id) is None
+            or self._connection.execute("SELECT 1 FROM operations WHERE operation_id = ?", (operation_id,)).fetchone()
+            is None
+        )
+        with (
+            self._gate,
+            self._workspace_cut(
+                self._attempt_workspace_references(program_id, attempt_id),
+                subjects=(self._attempt_work_claim(program_id, attempt_id),) if fresh_subject else (),
+            ) as readings,
+            self._transaction(readings),
+        ):
             existed = self._work_record("reservation", operation_id) is not None
+            fresh = (
+                not existed
+                or self._connection.execute(
+                    "SELECT 1 FROM operations WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+                is None
+            )
             self._reserve_work(program_id, attempt_id, operation_id, category, retained_bytes)
             self._insert_intent(operation_id, effect_key, request)
-            if not existed:
+            if fresh:
                 self._bind_work_dispatch(program_id, attempt_id, operation_id)
+            if fresh and category is WorkKind.AUXILIARY:
+                attempt = self._load_head(program_id).attempt(attempt_id).spec
+                if self._physical_workspace_scope(attempt.workspace_reference) is not None:
+                    self._check_work_dispatch(operation_id)
         return self.operation(operation_id)
 
     def work_program_for_attempt(self, attempt_id: str) -> str:
@@ -1296,7 +2914,11 @@ class SQLiteProgramStore:
 
     def retry_work(self, operation_id: str) -> None:
         self._assert_writer_thread()
-        with self._gate, self._transaction():
+        with (
+            self._gate,
+            self._workspace_cut(self._operation_workspace_references(operation_id)) as readings,
+            self._transaction(readings),
+        ):
             original = self._work_record("reservation", operation_id)
             if original is None:
                 raise BudgetRefused("retry lacks original reservation")
@@ -1306,15 +2928,121 @@ class SQLiteProgramStore:
                 cast(str, original["program"]), cast(str, original["attempt"]), f"{prefix}{count + 1}", WorkKind.RETRY
             )
 
-    def record_work_settlement(self, operation_id: str, evidence: str) -> None:
-        """Trusted profile-specific exact witness, never a lease/turn-terminal inference."""
+    def _settle_work_operation(self, operation_id: str, evidence: str) -> None:
+        if self._work_record("settlement", operation_id) is None:
+            self._write_work_record("settlement", operation_id, {"operation": operation_id, "evidence": evidence})
+
+    def _settlement_subject(self, reservation: dict[str, object]) -> dict[str, object]:
+        program_id, attempt_id = cast(str, reservation["program"]), cast(str, reservation["attempt"])
+        attempt = next(
+            (item.spec for item in self._load_head(program_id).attempts if item.attempt_id == attempt_id), None
+        )
+        try:
+            operation = self.operation(cast(str, reservation["operation"]))
+        except OperationConflict:
+            operation = None
+        return {
+            "operation": reservation["operation"],
+            "program": program_id,
+            "attempt": attempt_id,
+            "category": reservation["category"],
+            "attempt_digest": None if attempt is None else attempt.digest,
+            "workspace_reference": None if attempt is None else attempt.workspace_reference,
+            "effect_key": None if operation is None else operation.effect_key,
+            "request_digest": None if operation is None else operation.request_digest,
+            "fence": None if operation is None else operation.fence,
+        }
+
+    @staticmethod
+    def _settlement_identity(subject: dict[str, object], basis: str) -> str:
+        return canonical_json([subject["operation"], basis, subject["request_digest"], subject["fence"]])
+
+    def _record_settlement_basis(self, reservation: dict[str, object], evidence: str, basis: str) -> None:
+        if WorkKind(cast(str, reservation["category"])) in COUNT_ONLY_WORK:
+            raise BudgetRefused("count-only reservation has no effect settlement receipt")
+        subject = self._settlement_subject(reservation)
+        identity = self._settlement_identity(subject, basis)
+        if self._work_record("ownership-settlement", identity) is None:
+            self._write_work_record("ownership-settlement", identity, {**subject, "basis": basis, "evidence": evidence})
+
+    def _record_work_completion(self, reservation: dict[str, object], evidence: str) -> None:
+        self._settle_work_operation(cast(str, reservation["operation"]), evidence)
+        self._record_settlement_basis(reservation, evidence, "logical-completion")
+
+    def record_work_completion(self, operation_id: str, evidence: str) -> None:
+        """Logical work/capacity completion, never task/resource quiescence."""
         self._assert_writer_thread()
         self._validate_command_key(evidence)
         with self._gate, self._transaction():
-            if self._work_record("reservation", operation_id) is None:
+            reservation = self._work_record("reservation", operation_id)
+            if reservation is None:
+                raise BudgetRefused("completion has no original reservation")
+            self._record_work_completion(reservation, evidence)
+
+    def _resource_settled(self, reservation: dict[str, object]) -> bool:
+        subject = self._settlement_subject(reservation)
+        record = self._work_record("ownership-settlement", self._settlement_identity(subject, "trusted-profile"))
+        return record is not None and all(record[key] == value for key, value in subject.items())
+
+    def _validate_resource_settlement(self, record: dict[str, object], operation_id: str) -> None:
+        reservation = self._work_record("reservation", cast(str, record["operation"]))
+        if reservation is None or WorkKind(cast(str, reservation["category"])) in COUNT_ONLY_WORK:
+            raise OwnershipConflict("resource settlement lacks an original effect reservation")
+        if record["basis"] not in {"logical-completion", "trusted-profile"}:
+            raise OwnershipConflict("unknown settlement qualification")
+        subject = self._settlement_subject(reservation)
+        stable = {"operation", "program", "attempt", "category"}
+        if any(record[key] != subject[key] for key in stable):
+            raise OwnershipConflict("settlement differs from exact originating Attempt/resource")
+        if record["attempt_digest"] is None:
+            if record["workspace_reference"] is not None:
+                raise OwnershipConflict("unprepared settlement cannot assert a physical workspace")
+        elif (record["attempt_digest"], record["workspace_reference"]) != (
+            subject["attempt_digest"],
+            subject["workspace_reference"],
+        ):
+            raise OwnershipConflict("settlement differs from exact originating Attempt/resource")
+        if record["fence"] is None:
+            if record["effect_key"] is not None or record["request_digest"] is not None:
+                raise OwnershipConflict("partial settlement effect identity")
+        elif (
+            type(record["fence"]) is not int
+            or record["fence"] < 0
+            or subject["fence"] is None
+            or record["effect_key"] != subject["effect_key"]
+            or record["request_digest"] != subject["request_digest"]
+            or record["fence"] > cast(int, subject["fence"])
+        ):
+            raise OwnershipConflict("settlement differs from original effect/fence")
+        self._validate_command_key(cast(str, record["evidence"]))
+        if (
+            self._work_key("ownership-settlement", self._settlement_identity(record, cast(str, record["basis"])))
+            != operation_id
+        ):
+            raise OwnershipConflict("settlement identity differs from recorded subject")
+
+    def record_work_settlement(self, operation_id: str, evidence: str, *, expected_fence: int | None = None) -> None:
+        """Trusted profile-specific exact witness, never a lease/turn-terminal inference."""
+        self._assert_writer_thread()
+        self._validate_command_key(evidence)
+        if expected_fence is not None and (type(expected_fence) is not int or expected_fence < 0):
+            raise OwnershipConflict("profile settlement requires an exact nonnegative delivery fence")
+        with (
+            self._gate,
+            self._workspace_cut(self._operation_workspace_references(operation_id)) as readings,
+            self._transaction(readings),
+        ):
+            reservation = self._work_record("reservation", operation_id)
+            if reservation is None:
                 raise BudgetRefused("settlement has no original reservation")
-            if self._work_record("settlement", operation_id) is None:
-                self._write_work_record("settlement", operation_id, {"operation": operation_id, "evidence": evidence})
+            claim = self._attempt_work_claim(cast(str, reservation["program"]), cast(str, reservation["attempt"]))
+            if claim is not None and operation_id == claim.operation_id:
+                self._check_work_claim(claim, authority=False, settled=True)
+            subject = self._settlement_subject(reservation)
+            if expected_fence is not None and subject["fence"] != expected_fence:
+                raise OwnershipConflict("profile settlement differs from original delivery fence")
+            self._record_settlement_basis(reservation, evidence, "trusted-profile")
+            self._settle_work_operation(operation_id, evidence)
 
     def record_retained_bytes(self, operation_id: str, retained_bytes: int) -> None:
         self._assert_writer_thread()
@@ -1345,8 +3073,7 @@ class SQLiteProgramStore:
             used = 0
             for item in records:
                 if item[scope] == identity:
-                    retained = self._work_record("retained", cast(str, item["operation"]))
-                    used += cast(int, item["retained_bytes"] if retained is None else retained["bytes"])
+                    used += self._retained_work_bytes(item)
             available.append(policy.retained_bytes - used)
         return max(0, min(available))
 
@@ -1596,32 +3323,13 @@ class SQLiteProgramStore:
         if type(data) is not bytes:
             raise TypeError("artifact must be bytes")
         digest = hashlib.sha256(data).hexdigest()
+        self._check_owned_artifact_budget(operation_id, digest, len(data))
         with self._gate:
-            directory = self._artifact_directory
-            if not directory.exists():
-                directory.mkdir(mode=0o700)
-                _fsync_directory(directory.parent)
-            if directory.is_symlink() or not directory.is_dir():
-                raise CorruptHistory("artifact directory must be a real directory")
-            _inspect_local_storage(directory)
-            blob = directory / digest
-            if blob.exists():
-                self._verify_blob(blob, digest, len(data))
+            if self._workspace_scopes is not None:
+                if self._workspace_artifacts is None or self._workspace_artifacts.get((operation_id, name)) != digest:
+                    raise ProgramReadChanged("ownership artifact lacks this decision's completed preflight")
             else:
-                descriptor, temporary = tempfile.mkstemp(prefix=".artifact-", dir=directory)
-                try:
-                    with os.fdopen(descriptor, "wb") as stream:
-                        stream.write(data)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    if blob.exists():
-                        self._verify_blob(blob, digest, len(data))
-                    else:
-                        os.replace(temporary, blob)
-                        _fsync_directory(directory)
-                finally:
-                    if os.path.exists(temporary):
-                        os.unlink(temporary)
+                self._stage_blob(digest, data)
             existing = self._connection.execute(
                 "SELECT digest, size FROM artifact_references WHERE operation_id = ? AND name = ?",
                 (operation_id, name),
@@ -1635,6 +3343,81 @@ class SQLiteProgramStore:
                     (operation_id, name, digest, len(data)),
                 )
         return f"sha256:{digest}"
+
+    def _stage_blob(self, digest: str, data: bytes) -> None:
+        directory = self._artifact_directory
+        if not directory.exists():
+            directory.mkdir(mode=0o700)
+            _fsync_directory(directory.parent)
+        if directory.is_symlink() or not directory.is_dir():
+            raise CorruptHistory("artifact directory must be a real directory")
+        _inspect_local_storage(directory)
+        blob = directory / digest
+        if blob.exists():
+            self._verify_blob(blob, digest, len(data))
+            return
+        descriptor, temporary = tempfile.mkstemp(prefix=".artifact-", dir=directory)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if blob.exists():
+                self._verify_blob(blob, digest, len(data))
+            else:
+                os.replace(temporary, blob)
+                _fsync_directory(directory)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _retained_work_bytes(self, reservation: dict[str, object]) -> int:
+        operation_id = cast(str, reservation["operation"])
+        final = self._work_record("retained", operation_id)
+        held = cast(int, reservation["retained_bytes"] if final is None else final["bytes"])
+        if self._attempt_work_claim(cast(str, reservation["program"]), cast(str, reservation["attempt"])) is not None:
+            actual = self._connection.execute(
+                "SELECT COALESCE(SUM(size), 0) FROM (SELECT DISTINCT digest, size FROM artifact_references "
+                "WHERE operation_id = ?)",
+                (operation_id,),
+            ).fetchone()[0]
+            held = max(held, cast(int, actual))
+        return held
+
+    def _check_owned_artifact_budget(self, operation_id: str, digest: str, size: int) -> None:
+        reservation = self._work_record("reservation", operation_id)
+        if (
+            reservation is None
+            or self._attempt_work_claim(
+                cast(str, reservation["program"]),
+                cast(str, reservation["attempt"]),
+            )
+            is None
+        ):
+            return
+        actual, present = self._connection.execute(
+            "SELECT COALESCE(SUM(size), 0), COALESCE(MAX(digest = ?), 0) "
+            "FROM (SELECT DISTINCT digest, size FROM artifact_references WHERE operation_id = ?)",
+            (digest, operation_id),
+        ).fetchone()
+        current = self._retained_work_bytes(reservation)
+        extra = max(current, cast(int, actual) + (0 if present else size)) - current
+        binding = self._work_binding(cast(str, reservation["program"]))
+        assert binding is not None  # noqa: S101 - reservation has its original policy.
+        project = self._work_record("project", cast(str, reservation["project"]))
+        if project is None:
+            raise BudgetRefused("original snapshot capacity authority unavailable")
+        for scope, identity, policy in (
+            ("program", reservation["program"], WorkBudgetPolicy.decode(binding["policy"])),
+            ("project", reservation["project"], WorkBudgetPolicy.decode(project["policy"])),
+        ):
+            used = sum(
+                self._retained_work_bytes(item) for item in self._work_records("reservation") if item[scope] == identity
+            )
+            if used + extra > policy.retained_bytes:
+                raise BudgetRefused(
+                    f"{scope} retained workspace artifact byte capacity exhausted; preserve source bytes"
+                )
 
     def artifact(self, operation_id: str, name: str) -> bytes:
         data = self.find_artifact(operation_id, name)
@@ -1729,7 +3512,7 @@ class SQLiteProgramStore:
             if (
                 manifest["format"] != "creatidy-kernel-sqlite-backup"
                 or type(manifest["schema_version"]) is not int
-                or manifest["schema_version"] not in (1, 2, 3, 4)
+                or manifest["schema_version"] not in (1, 2, 3, 4, 5)
             ):
                 raise ValueError("unsupported backup manifest")
             with (directory / "kernel.sqlite3").open("rb") as stream:
@@ -2088,6 +3871,8 @@ class SQLiteProgramStore:
         original_version = cast(int, self._connection.execute("PRAGMA user_version").fetchone()[0])
         if original_version in (1, 2, 3):
             self._backup_before_schema_four()
+        if original_version in (1, 2, 3, 4):
+            self._backup_before_schema_four(target_schema=5)
         with self._transaction():
             version = cast(int, self._connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SCHEMA_VERSION:
@@ -2104,19 +3889,22 @@ class SQLiteProgramStore:
             if version == 3:
                 self._migrate_3_to_4()
                 version = 4
+            if version == 4:
+                self._migrate_4_to_5()
+                version = 5
             if version != SCHEMA_VERSION:
                 raise UnsupportedSQLiteConfiguration(f"no migration path from schema version {version}")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._validate_schema()
 
-    def _backup_before_schema_four(self) -> None:
+    def _backup_before_schema_four(self, *, target_schema: int = 4) -> None:
         # A content-qualified name reuses the same complete backup after an
         # interrupted upgrade, never overwriting an earlier recovery image.
         digest = hashlib.sha256()
         for statement in self._connection.iterdump():
             digest.update(statement.encode("utf-8"))
             digest.update(b"\n")
-        target = self._path.parent / f"{self._path.name}.pre-schema-4-{digest.hexdigest()}"
+        target = self._path.parent / f"{self._path.name}.pre-schema-{target_schema}-{digest.hexdigest()}"
         if target.exists():
             self._verify_backup_manifest(target)
             original = hashlib.sha256()
@@ -2299,6 +4087,20 @@ class SQLiteProgramStore:
             "pending INTEGER NOT NULL CHECK(pending IN (0,1))) WITHOUT ROWID"
         )
 
+    def _migrate_4_to_5(self) -> None:
+        # Old schema-4 readers must refuse before ignoring resource generations.
+        # Existing records, IDs, clock rows and the schema-3 marker stay intact.
+        self._connection.execute(
+            "CREATE TABLE ownership_contract (version INTEGER PRIMARY KEY CHECK(version = 1), "
+            "contract TEXT NOT NULL CHECK(contract = 'work-resource-ownership:v1')) WITHOUT ROWID"
+        )
+        self._connection.execute("INSERT INTO ownership_contract VALUES (1, 'work-resource-ownership:v1')")
+        for action in ("UPDATE", "DELETE"):
+            self._connection.execute(
+                f"CREATE TRIGGER ownership_contract_no_{action.lower()} BEFORE {action} ON ownership_contract "
+                "BEGIN SELECT RAISE(ABORT, 'ownership contract is immutable'); END"
+            )
+
     def _validate_schema(self) -> None:
         tables = {
             cast(str, row[0])
@@ -2319,6 +4121,7 @@ class SQLiteProgramStore:
             "artifact_references",
             "store_contract",
             "work_clock_state",
+            "ownership_contract",
         }
         if not required <= tables:
             raise UnsupportedSQLiteConfiguration("database schema is missing required K2 tables")
@@ -2351,6 +4154,7 @@ class SQLiteProgramStore:
             "artifact_references": {"operation_id", "name", "digest", "size"},
             "store_contract": {"schema_version", "authority_contract"},
             "work_clock_state": {"program_id", "wall", "boot_ns", "boot_id", "clock", "pending"},
+            "ownership_contract": {"version", "contract"},
         }
         for table, expected in columns.items():
             actual = {cast(str, row["name"]) for row in self._connection.execute(f"PRAGMA table_info({table})")}
@@ -2363,6 +4167,7 @@ class SQLiteProgramStore:
         required_triggers = {"history_no_update", "history_no_delete", "admissions_no_update", "admissions_no_delete"}
         required_triggers |= {"operations_no_delete", "outbox_no_update", "outbox_no_delete"}
         required_triggers |= {"store_contract_no_update", "store_contract_no_delete"}
+        required_triggers |= {"ownership_contract_no_update", "ownership_contract_no_delete"}
         required_triggers |= {
             f"{table}_no_{action}"
             for table in (
@@ -2381,6 +4186,10 @@ class SQLiteProgramStore:
             for row in self._connection.execute("SELECT schema_version, authority_contract FROM store_contract")
         ] != [(3, "work-budget:v1")]:
             raise UnsupportedSQLiteConfiguration("database authority compatibility contract is invalid")
+        if [tuple(row) for row in self._connection.execute("SELECT version, contract FROM ownership_contract")] != [
+            (1, "work-resource-ownership:v1")
+        ]:
+            raise UnsupportedSQLiteConfiguration("database ownership compatibility contract is invalid")
         if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise CorruptHistory("database contains a foreign-key violation")
 

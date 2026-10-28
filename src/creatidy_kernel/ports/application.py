@@ -243,7 +243,7 @@ class BudgetedChecks:
             self.store.observe(
                 key, operation.fence, f"verification-result:{reference}", "accepted", reference=reference
             )
-        self.store.record_work_settlement(key, reference)
+        self.store.record_work_settlement(key, reference, expected_fence=operation.fence)
 
 
 def advance_work_unit(
@@ -733,7 +733,7 @@ def advance_work_unit(
             },
         )
         store.finalize_artifact(rejection_id, "rejected-result", data)
-        store.record_work_settlement(operation_id, reference)
+        store.record_work_completion(operation_id, reference)
         if review_result is not None and review_result.status in {
             ProductReviewStatus.OWNER_DECISION_NEEDED,
             ProductReviewStatus.COMMENT,
@@ -771,5 +771,5 @@ def advance_work_unit(
             "base": collection.base,
         },
     )
-    store.record_work_settlement(operation_id, reference)
+    store.record_work_completion(operation_id, reference)
     return "accepted"

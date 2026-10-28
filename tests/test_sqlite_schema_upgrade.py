@@ -31,7 +31,7 @@ def legacy_database(sqlite_tmp_path: Path, pinned_reader: Path) -> Path:
     return path
 
 
-@pytest.mark.parametrize("migration_step", ["_migrate_2_to_3", "_migrate_3_to_4"])
+@pytest.mark.parametrize("migration_step", ["_migrate_2_to_3", "_migrate_3_to_4", "_migrate_4_to_5"])
 def test_migration_interruption_rolls_back_then_reuses_atomic_original_backup(
     legacy_database: Path, monkeypatch: pytest.MonkeyPatch, migration_step: str
 ) -> None:
@@ -56,7 +56,7 @@ def test_migration_interruption_rolls_back_then_reuses_atomic_original_backup(
     manifest = json.loads((backups[0] / "manifest.json").read_text())
     assert manifest["schema_version"] == 2 and manifest["artifacts"]
     with SQLiteProgramStore(path) as upgraded:
-        assert upgraded.startup_evidence.schema_version == 4
+        assert upgraded.startup_evidence.schema_version == 5
         assert upgraded.artifact("legacy-evidence", "original") == b"synthetic retained original bytes"
     assert list(path.parent.glob(path.name + ".pre-schema-4-*")) == backups
 
@@ -98,7 +98,7 @@ def test_failed_backup_never_installs_the_new_authority_contract(
     assert not list(path.parent.glob(path.name + ".pre-schema-4-*"))
     assert not list(path.parent.glob("." + path.name + ".pre-schema-4-*"))
     with SQLiteProgramStore(path) as recovered:
-        assert recovered.startup_evidence.schema_version == 4
+        assert recovered.startup_evidence.schema_version == 5
 
 
 @pytest.mark.parametrize("corruption", ["schema", "omitted-artifact", "artifact-bytes"])

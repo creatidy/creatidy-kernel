@@ -397,7 +397,8 @@ silently aggregated into a global project quota. Attempt preparation and its out
 atomically; review and publication reserve alongside their intents. Recovery retains reservations,
 counts and unknown work. Successful acceptance releases its logical work slot in the same transaction;
 STOP/expiry still requires the bounded cancellation path's exact witness, not a lease or turn status.
-This is not the general resource/workspace fencing or ordinary dispatcher planned in #59/#105/#106.
+The separate local work/resource handler below extends this with workspace/session fencing; the
+ordinary dispatcher and heterogeneous drivers remain #106/#105.
 
 New delivery rechecks the original Attempt, applicable specification, WorkUnit state, immutable
 Operation binding and current observed resource headroom. Historical reservation/receipt replay is
@@ -433,7 +434,8 @@ An estimate or partial numeric receipt is not complete resource coverage, includ
 settlement. No installed producer supplies the final conservative bound needed to release that
 unknown headroom; further resource-constrained admissions refuse rather than infer zero hidden work.
 
-Work-budget authority uses SQLite schema 4. Its bounded per-Program clock row commits a pending-read
+Work-budget clock authority was introduced in SQLite schema 4; work/resource ownership extends it in
+schema 5 without changing original budget records. Its bounded per-Program clock row commits a pending-read
 marker before acquiring a clock sample and commits guard floors before the capacity/outbox transaction.
 Admission rollback cannot erase observed high-water evidence, and caches contain committed floors
 only. A failed clock flush leaves durable uncertainty: the same live owner may flush its exact captured
@@ -543,6 +545,120 @@ The preparation fixture is also runnable as
 `uv run --locked python tools/check_prepared.py <existing-empty-native-directory>`; it creates only
 synthetic local state, not a real task or live approval. See [contract reception](docs/architecture/contracts.md#local-intake-reception)
 for the strict local declaration format and [migration](docs/architecture/migration.md#ordinary-record-compatibility).
+
+## Local Work Ownership
+
+`ports.ownership.WorkOwnership` is the installed trusted in-process application entrance for #59.
+The host binds the authenticated `Principal`, exact owned workspace, session/effect scopes, interaction
+mode and supported profile when constructing it. Requests cannot supply a Principal or elevate a worker
+to owner. This is not remote authentication or a new CLI/API server. The normal SQLite owner handles
+interleaved clients and Programs; a second process cannot open that owner's active database.
+
+`claim` commits exact Program/WorkUnit/Attempt preparation, Operation intent, existing work-budget
+reservation, claimant and increasing resource generation together. Identical command/input returns the
+historical claim, not renewed authority; changed input or claimant conflicts. Historical lookup compares
+only the explicit revision/Attempt/claimant/mode/profile/resources/lease request before any new capture
+or live-capability check. The first selected workspace baseline remains immutable observation, not a
+caller input: edits, expiry, revocation, quarantine, reopen or exact physical retirement do not prevent
+reading the same recorded result and never make it a renewed grant. `renew`, observations,
+candidate handoff and delivery fences retain the original durably verified wall/boot horizon. Source
+cache acquisition leases remain read-only object-copy leases, not mutation claims. Expiry, revocation
+and missed heartbeats never release conflicting workspace/session/effect resources. Nonconflicting
+work remains independently admissible within its configured project/work capacity.
+
+These physical workspace fences also apply to common store preparation, known-Attempt reservations and
+delivery, including generic/unowned typed callers in other Programs. WorkUnit identity stays
+Program-local; canonical absolute workspace scopes conflict globally, including ancestor/descendant
+paths. Noncanonical absolute paths and symlink aliases refuse rather than normalize, and opaque legacy workspace keys are
+not reinterpreted as filesystem paths. Existing generic physical work without applicable exact
+settlement cannot be silently adopted by a new claim or competing generic work; domain terminal state
+alone is not physical settlement. Late delivery rechecks the currently retained owner/generation.
+
+Physical-path and ownership-artifact validation/staging run outside business SQL before a fresh,
+independently durable original wall/boot-clock cut. Decision-local facts and staged content digests are
+then consumed by pure SQL admission guards; no filesystem validation callback runs after that cut.
+Changed preflight paths or reentrant store changes refuse, while clock floors and committed owner
+cancellations survive failure. Unreferenced staged blobs may remain after rejection, but their references,
+claim, budget and Operation still publish atomically; retained capacity is checked before staging and at
+publication. This relies on the existing cooperative reservation protocol and controller custody of the
+path namespace during an owner decision, not hostile same-UID filesystem isolation or physical preemption.
+
+Logical completion and resource settlement are different facts. `SatisfyWorkUnit` and
+`record_work_completion` may settle logical capacity but never prove workspace/session quiescence.
+For a canonical physical subject, fresh `SatisfyWorkUnit` requires qualified runtime and every real
+effect to be settled even without an ownership claim. `FinishAttempt` may remain a logical terminal
+report so verification can run; neither that report nor a historical accepted fact authorizes a new
+publication. Fresh publication intent and delivery require the same proof, excluding only the actual
+current publication operation, never arbitrary other effects. Existing accepted history remains readable
+and replayable without being upgraded into physical or new publication authority.
+
+Owned publication authorization commits a typed `ownership-publication` receipt with its AUX
+reservation, Operation and dispatch binding. It records the original owner, exact claim/generation,
+accepted candidate and immutable effect/request identity. Exact retries look up that receipt before
+capture, profile or clock checks and return the Operation's current status only as history, including
+after release/retirement or a lost reply. They never renew delivery authority or ignore other pending
+effects. Changed identity/input refuses; an old untyped AUX intent is not invented into original owner
+approval. Fresh authorization and every delivery retain the current proof/subject/clock gates.
+
+Fully qualified closed generic history is filtered before filesystem probing or conflict search.
+A changed old pathname therefore cannot block confirmed independent work. An explicit current target
+is still preflighted and validated even when its previous work was closed: aliases refuse rather than
+normalize, while live/unqualified effects continue to retain their applicable resource holds.
+The trusted-profile `record_work_settlement` entry records separate typed qualification bound to the
+original reservation, Attempt digest, workspace, Operation request and delivery fence; producer code
+supplies the original fence when available. It is not a worker boolean or an evidence-string heuristic.
+Owned claims continue to require their exact cooperative/managed `HandoffProof`, and other real effects
+require applicable qualified settlement. Historical untyped rows stay readable but unqualified; an
+applicable producer can reconcile them without rewriting their original evidence. New typed records
+cause the actual older schema-5 readers to refuse rather than silently erase this distinction.
+
+Retry and remediation reservations consume finite count budgets, not separate physical-effect slots.
+They need no invented termination receipt and are never refunded by resource release. Interrupted
+`BudgetedChecks` recovery uses the same physical preflight and fresh independently durable clock cut
+before reserving a retry; unknown tool/publication effects remain held separately.
+
+The explicit `kernel:cooperative-task-scope:v1` pull profile supports authenticated `quiesce` receipts.
+They cover only the claimed task resources, not the user's Kilo process/server, physical model identity
+or managed cancellation. Managed work can use `CodexOwnedSessionWitness` over the original retained
+`CodexStdio` owner and its version-qualified `codex:owned-session:<version>` group profile. Start and
+normal/STOP settlement must match that exact owner, profile, Attempt, generation and resource set.
+No PID is adopted or shared session signalled. Cold/missing evidence is unknown; observed escaped scope
+is durably quarantined. This retains ADR 0011's same-principal/native-termination residual, not strict
+syscall expiry, escaped-descendant containment or the verification-only sandbox's stronger guarantees.
+
+`adapters.owned_workspace.LocalOwnedWorkspace` creates a new leaf under a private controller-owned
+parent, retaining its ownership records outside the worker leaf. Its durable capacity-authority binding
+prevents a separate database from adopting that tree. Descriptor/no-follow bounded captures include
+tracked, untracked, out-of-scope, verification and symlink entries without following symlinks or running
+Git/hooks. Multiply linked files are refused without reading their bytes. Captures share the original
+work/project retained-byte capacity and retain original bytes as immutable artifacts; any changed subject is unattributed
+until an authenticated owner explicitly reconciles the exact retained subject. There is no reset,
+stash, auto-adoption or rebase. The default capture bound is 16 MiB/10,000 entries; the trusted host can
+configure the byte bound, and oversized/unstable captures refuse rather than omit files.
+Store-side fresh-subject rechecks use the smaller original task/project retained-byte ceiling as a
+conservative finite raw-read bound, not as recovery of an unstored adapter `max_bytes` setting.
+The app's explicit capture limit and encoded-artifact retention, deduplication and remaining-capacity
+checks remain separate and unchanged; rechecking an already retained subject needs no new byte allocation.
+
+`submit`, `candidate_subject`, protected publication intent and `dispatch` check current generation,
+original authority, exact candidate and applicable task/effect settlement. Verification/acceptance
+producers use the fresh `candidate_subject` guard; submission is not verification or acceptance.
+Ordinary consumers must use these handlers rather than claim an owned outbox entry directly. Owner-only
+`release` preserves settled workspace bytes for explicitly reconciled reuse with a new generation.
+`cleanup` can retire only an exact empty owned leaf after settlement/effect reconciliation. It first
+moves the leaf into protected controller custody, checks the moved inode, and uses nonrecursive rmdir:
+racing writes or replaced identities are retained. Nonempty workspaces, artifacts and unknown user data
+are never recursively deleted. A durable exact post-rmdir witness permits retry after a failed SQLite
+release commit; missing witnesses or interrupted retirement remain uncertain, never inferred from
+pathname absence. Do not remove markers or recreate directories to force recovery.
+
+Ownership records use schema 5. Existing schema-1/2/3/4 databases receive a verified original online
+backup named `<database>.pre-schema-5-<logical-digest>` before the atomic authority-boundary migration;
+old history, IDs, unknowns, clock rows and artifacts are not rewritten. Older schema-4 readers refuse
+before they could ignore resource claims. Restoring to a new SQLite identity does not silently rebind
+an old physical workspace. `make package-check` exercises actual installed pull and managed handlers,
+synthetic dedicated native processes and actual pinned schema-2/3/4 reader refusal outside the checkout.
+This does not enable the #106 ordinary dispatcher, #57 remote transport, live inference or Forge effects.
 
 ## Public Operator Surface
 
