@@ -56,7 +56,7 @@ from creatidy_kernel.core.execution import OperationKey
 from creatidy_kernel.core.forge import Effect, EffectStatus, Presence, Reference
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, OwnershipConflict, WorkClaim
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
-from creatidy_kernel.ports.drivers import DriverApplication, ProjectDrivers
+from creatidy_kernel.ports.drivers import DriverApplication, DriverEffectGrant, ProjectDrivers
 from creatidy_kernel.ports.ownership import WorkOwnership
 
 HEAD = "a" * 40
@@ -397,6 +397,11 @@ def accepted(store: SQLiteProgramStore, directory: Path) -> tuple[WorkOwnership,
     return owner, claim
 
 
+def effect_grant(claim: WorkClaim, mutation: DriverMutation) -> DriverEffectGrant:
+    """Synthetic trusted-host policy, separate from durable Kernel work authority."""
+    return DriverEffectGrant(claim, mutation, 1, 1000, threading.Event())
+
+
 def legacy_conformance(services: SyntheticServices, clock: Clock) -> None:
     repository = Reference("forgejo:acme/reference")
     native_binding = ForgeBinding("https://forgejo.example.test", "acme/reference")
@@ -507,7 +512,9 @@ def settlement_recovery(directory: Path, *, rejected: bool) -> None:
                 project,
                 (scm, knowledge),
                 clock.wall,
-                lambda original, value: original == claim and value == mutation,
+                lambda original, value: (
+                    effect_grant(original, value) if original == claim and value == mutation else None
+                ),
             )
             crashed: list[str] = []
 
@@ -553,7 +560,7 @@ def settlement_recovery(directory: Path, *, rejected: bool) -> None:
             def forbidden() -> str:
                 raise AssertionError("cached recovery attempted another provider request")
 
-            def no_new_grant(original: WorkClaim, value: DriverMutation) -> bool:
+            def no_new_grant(original: WorkClaim, value: DriverMutation) -> DriverEffectGrant | None:
                 raise AssertionError("cached recovery requested new publication authority")
 
             for transport in transports:
@@ -676,7 +683,9 @@ def conformance(directory: Path) -> None:
                 project,
                 (scm, knowledge),
                 clock.wall,
-                lambda original, mutation: original == claim and mutation in {review, page},
+                lambda original, mutation: (
+                    effect_grant(original, mutation) if original == claim and mutation in {review, page} else None
+                ),
             )
             before = store.load(claim.attempt.program_id)
             receipt = app.synchronize(claim, "sync:review", "effect:review", review)
@@ -695,6 +704,27 @@ def conformance(directory: Path) -> None:
             require(services.version == 20 and len([item for item in services.requests if item[0] == "PUT"]) == 1)
             require(store.operation("sync:page").attempts == 1 and store.load(claim.attempt.program_id) == before)
             original_request = store.operation("sync:review").request_json
+            grant = effect_grant(claim, review)
+
+            def revoked_credential() -> str:
+                grant.invalidated.set()
+                return "Bearer synthetic-write"
+
+            scm.http.write_authorization = revoked_credential
+            guarded = DriverApplication(
+                store, owner, project, (scm, knowledge), clock.wall, lambda original, value: grant
+            )
+            mutations = sum(method in {"POST", "PUT"} for method, _, _, _ in services.requests)
+            try:
+                guarded.synchronize(claim, "sync:revoked-grant", "effect:revoked-grant", review)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("revoked ephemeral grant allowed native send")
+            require(store.operation("sync:revoked-grant").status == "unknown")
+            require(store.operation("sync:revoked-grant").attempts == 1)
+            require(store.find_artifact("sync:revoked-grant", "driver-receipt") is None)
+            require(sum(method in {"POST", "PUT"} for method, _, _, _ in services.requests) == mutations)
         with SQLiteProgramStore(directory / "drivers.sqlite3", boot_clock=clock.boot) as reopened:
             require(reopened.operation("sync:review").request_json == original_request)
             require(reopened.operation("sync:page").status == "accepted")
@@ -712,5 +742,6 @@ if __name__ == "__main__":
     conformance(Path(sys.argv[1]))
     print(
         "Installed mixed drivers: native HTTP reads/effects, exact outbox recovery "
-        "retained Forgejo facade and terminal receipt settlement crash/reopen recovery passed (synthetic only)."
+        "retained Forgejo facade, ephemeral grant revocation and terminal receipt settlement "
+        "crash/reopen recovery passed (synthetic only)."
     )

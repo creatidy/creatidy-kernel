@@ -715,9 +715,16 @@ also requires the exact approved SCM binding and remote URL, not merely an equal
 `DriverApplication.synchronize` is a trusted host entrance for already accepted work, not the #106
 planner/engine. It uses the original authenticated `WorkOwnership` owner, exact accepted candidate,
 immutable intent, original work budget/deadline, outbox claim, fence, receipt and reconciliation.
-Before send, blocking reads/credential resolution finish, then current target policy, owned workspace,
-Program/Attempt/claim/body pins and actual delivery fence/lease are checked at the existing durable
-clock cut. Workers must not receive drivers, credentials, this application object or authorizer callbacks.
+The potentially blocking host `authorize(claim, mutation)` runs once before dispatch and returns an
+ephemeral `DriverEffectGrant` or `None`, not a Boolean. The immutable grant binds that exact claim/effect,
+a positive policy revision, absolute expiry and a host-owned standard-library `threading.Event`.
+Revoke/replacement permanently sets the old Event; never clear it or share the grant with workers.
+After all reads, credential resolution and workspace captures, the existing durable authority/outbox
+cut returns its exact captured decision time. Only grant expiry against that time and the nonblocking
+Event flag are checked before the HTTP opener; no authorizer, clock callback or local preflight runs
+after the cut. Kernel authority, body pins, original deadlines and delivery fences still independently
+apply. Grants are never persisted or accepted from worker input. Workers must not receive drivers,
+credentials, this application object or authorizer callbacks.
 Supported native effects are explicit-commit GitHub **COMMENT review append** and server-version-
 conditional Confluence current-page replacement. They are not merge permission. GitHub PR creation/
 PATCH and Jira conditional edits/transitions refuse because their supported REST interfaces do not

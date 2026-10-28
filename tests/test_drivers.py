@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
+from threading import Event
 from urllib.parse import urlunsplit
 
 import pytest
@@ -28,7 +29,7 @@ from creatidy_kernel.core.execution import OperationKey
 from creatidy_kernel.core.forge import EffectStatus, Presence, UnsupportedForge
 from creatidy_kernel.core.ownership import WorkClaim
 from creatidy_kernel.core.work_budget import BudgetRefused
-from creatidy_kernel.ports.drivers import DriverApplication
+from creatidy_kernel.ports.drivers import DriverApplication, DriverEffectGrant
 from creatidy_kernel.ports.program_store import OperationRecord
 from tools.check_drivers import (
     BASE,
@@ -39,6 +40,7 @@ from tools.check_drivers import (
     binding,
     configured,
     conformance,
+    effect_grant,
     settlement_recovery,
 )
 
@@ -506,11 +508,10 @@ def test_application_rechecks_real_claim_authority_after_reads_and_credentials(
         SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
     ):
         owner, claim = accepted(store, Path(directory))
-        policy = [True]
-        app = DriverApplication(
-            store, owner, project, (scm, knowledge), clock.wall, lambda original, mutation: policy[0]
-        )
+        invalidated = Event()
         mutation = review_mutation(scm)
+        grant = DriverEffectGrant(claim, mutation, 1, 1000, invalidated)
+        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, lambda original, mutation: grant)
 
         def revoke() -> str:
             if cut in {"credential-stop", "read-stop"}:
@@ -521,7 +522,7 @@ def test_application_rechecks_real_claim_authority_after_reads_and_credentials(
             elif cut == "credential-lease":
                 clock.now = 161
             else:
-                policy[0] = False
+                invalidated.set()
             return "Bearer synthetic-write"
 
         if cut == "read-stop":
@@ -560,7 +561,12 @@ def test_actual_outbox_fence_is_not_a_worker_supplied_integer(services: Syntheti
             store.check_driver_delivery("review", 1, "forged")
         assert not services.requests
         app = DriverApplication(
-            store, owner, project, (scm, knowledge), clock.wall, lambda original, value: value == mutation
+            store,
+            owner,
+            project,
+            (scm, knowledge),
+            clock.wall,
+            lambda original, value: effect_grant(original, value) if value == mutation else None,
         )
         assert app.synchronize(claim, "review", "effect", mutation).status is EffectStatus.ACCEPTED
         with pytest.raises((ValueError, OperationConflict, IdempotencyConflict)):
@@ -591,7 +597,12 @@ def test_exact_intent_and_actual_delivery_claim_are_durable_before_native_send(s
 
         transports[1].write_authorization = credential
         app = DriverApplication(
-            store, owner, project, (scm, knowledge), clock.wall, lambda original, value: value == mutation
+            store,
+            owner,
+            project,
+            (scm, knowledge),
+            clock.wall,
+            lambda original, value: effect_grant(original, value) if value == mutation else None,
         )
         assert app.synchronize(claim, "review", "effect", mutation).status is EffectStatus.ACCEPTED
         assert observed == [store.operation("review").fence]
@@ -607,7 +618,12 @@ def test_original_receipt_replay_is_history_not_fresh_authority(services: Synthe
         owner, claim = accepted(store, Path(directory))
         mutation = review_mutation(scm)
         app = DriverApplication(
-            store, owner, project, (scm, knowledge), clock.wall, lambda original, value: value == mutation
+            store,
+            owner,
+            project,
+            (scm, knowledge),
+            clock.wall,
+            lambda original, value: effect_grant(original, value) if value == mutation else None,
         )
         receipt = app.synchronize(claim, "review", "effect", mutation)
         calls = len(services.requests)
@@ -629,11 +645,13 @@ def test_installed_recipe_runs_same_real_transports_and_shared_handlers() -> Non
 
 @pytest.mark.parametrize("provider", ["github", "confluence"])
 @pytest.mark.parametrize("cut", ["owner-capture", "store-cut"])
+@pytest.mark.parametrize("change", ["revoke", "expire"])
 def test_effect_grant_is_rechecked_after_final_workspace_capture(
     services: SyntheticServices,
     monkeypatch: pytest.MonkeyPatch,
     provider: str,
     cut: str,
+    change: str,
 ) -> None:
     from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
 
@@ -654,10 +672,12 @@ def test_effect_grant_is_rechecked_after_final_workspace_capture(
                 "owner:policy",
             )
         )
-        policy = [True]
+        invalidated = Event()
+        grant = DriverEffectGrant(claim, mutation, 1, 150, invalidated)
         captures: list[int] = []
         observations = 0
         observing_final = False
+        checking_delivery = False
         capture = LocalOwnedWorkspace.capture
         observe = owner.observe
         delivery_cut = store.check_driver_delivery
@@ -673,28 +693,267 @@ def test_effect_grant_is_rechecked_after_final_workspace_capture(
 
         def captured(workspace: LocalOwnedWorkspace) -> tuple[str, bytes]:
             result = capture(workspace)
-            if observing_final and cut == "owner-capture":
+            if (observing_final and cut == "owner-capture") or (checking_delivery and cut == "store-cut"):
                 captures.append(observations)
-                policy[0] = False
+                if change == "revoke":
+                    invalidated.set()
+                else:
+                    clock.now = 150
             return result
 
-        def checked(operation_id: str, fence: int, request_digest: str) -> None:
-            delivery_cut(operation_id, fence, request_digest)
-            if cut == "store-cut":
-                policy[0] = False
+        decisions: list[int] = []
+
+        def checked(operation_id: str, fence: int, request_digest: str) -> int:
+            nonlocal checking_delivery
+            checking_delivery = True
+            try:
+                now = delivery_cut(operation_id, fence, request_digest)
+                decisions.append(now)
+                return now
+            finally:
+                checking_delivery = False
 
         monkeypatch.setattr(owner, "observe", observed)
         monkeypatch.setattr(LocalOwnedWorkspace, "capture", captured)
         monkeypatch.setattr(store, "check_driver_delivery", checked)
-        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, lambda original, value: policy[0])
-        with pytest.raises(ValueError, match="authority revoked"):
+        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, lambda original, value: grant)
+        with pytest.raises(ValueError, match="grant"):
             app.synchronize(claim, "review", "effect", mutation)
-        assert observations == 3 and (captures or cut == "store-cut")
+        assert observations == 3 and captures
+        assert decisions == [150 if change == "expire" else 100]
         assert not any(method in {"POST", "PUT"} for method, _, _, _ in services.requests)
         original = store.operation("review")
         assert original.status == "unknown" and original.attempts == 1
         assert app.synchronize(claim, "review", "effect", mutation).status is EffectStatus.UNKNOWN
         assert store.operation("review") == original
+        assert store.find_artifact("review", "driver-receipt") is None
+
+
+@pytest.mark.parametrize("provider", ["github", "confluence"])
+@pytest.mark.parametrize("change", ["cancel", "expire"])
+def test_pregrant_authorizer_reentry_is_followed_by_fresh_work_authority(
+    services: SyntheticServices,
+    provider: str,
+    change: str,
+) -> None:
+    clock = Clock()
+    project, scm, knowledge, _ = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        owner, claim = accepted(store, Path(directory))
+        mutation = (
+            review_mutation(scm)
+            if provider == "github"
+            else DriverMutation(
+                DriverSubject(knowledge.binding, "page", "900", "19"),
+                "replace_page",
+                (("actor", "synthetic-confluence-writer"), ("body", "<p>new</p>"), ("title", "Guide")),
+                "owner:policy",
+            )
+        )
+        calls: list[str] = []
+
+        def authorize(original: WorkClaim, value: DriverMutation) -> DriverEffectGrant:
+            calls.append(change)
+            if change == "cancel":
+                program = store.load(claim.attempt.program_id)
+                store.admit(program.program_id, "policy:cancel", CancelProgram(program.revision, "owner"))
+            else:
+                clock.now = 1001
+            return DriverEffectGrant(original, value, 1, 2000, Event())
+
+        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, authorize)
+        with pytest.raises((ValueError, BudgetRefused, OperationConflict)):
+            app.synchronize(claim, "review", "effect", mutation)
+        assert calls == [change] and not services.requests
+        operation = store.operation("review")
+        assert operation.attempts == 0 and operation.status not in {"accepted", "rejected"}
+        assert store.find_artifact("review", "driver-receipt") is None
+
+
+@pytest.mark.parametrize("provider", ["github", "confluence"])
+@pytest.mark.parametrize("change", ["cancel", "expire"])
+def test_authorizer_never_runs_after_final_delivery_cut(
+    services: SyntheticServices,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    change: str,
+) -> None:
+    clock = Clock()
+    project, scm, knowledge, _ = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        owner, claim = accepted(store, Path(directory))
+        mutation = (
+            review_mutation(scm)
+            if provider == "github"
+            else DriverMutation(
+                DriverSubject(knowledge.binding, "page", "900", "19"),
+                "replace_page",
+                (("actor", "synthetic-confluence-writer"), ("body", "<p>new</p>"), ("title", "Guide")),
+                "owner:policy",
+            )
+        )
+        calls: list[bool] = []
+        cut_done = False
+        original_cut = store.check_driver_delivery
+
+        def checked(operation_id: str, fence: int, request_digest: str) -> int:
+            nonlocal cut_done
+            now = original_cut(operation_id, fence, request_digest)
+            cut_done = True
+            return now
+
+        def authorize(original: WorkClaim, value: DriverMutation) -> DriverEffectGrant:
+            calls.append(cut_done)
+            if cut_done:
+                if change == "cancel":
+                    program = store.load(claim.attempt.program_id)
+                    store.admit(program.program_id, "policy:cancel", CancelProgram(program.revision, "owner"))
+                else:
+                    clock.now = 1001
+            return DriverEffectGrant(original, value, 1, 2000, Event())
+
+        monkeypatch.setattr(store, "check_driver_delivery", checked)
+        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, authorize)
+        assert app.synchronize(claim, "review", "effect", mutation).status is EffectStatus.ACCEPTED
+        assert calls == [False] and clock.now == 100
+        assert sum(method in {"POST", "PUT"} for method, _, _, _ in services.requests) == 1
+
+
+@pytest.mark.parametrize("scope", ["claim", "mutation"])
+def test_grant_for_different_exact_scope_refuses_before_dispatch(services: SyntheticServices, scope: str) -> None:
+    clock = Clock()
+    project, scm, knowledge, _ = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        owner, claim = accepted(store, Path(directory))
+        mutation = review_mutation(scm)
+        grant = DriverEffectGrant(
+            replace(claim, generation=claim.generation + 1) if scope == "claim" else claim,
+            replace(mutation, authority_reference="owner:different-grant") if scope == "mutation" else mutation,
+            1,
+            1000,
+            Event(),
+        )
+        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, lambda original, value: grant)
+        with pytest.raises(ValueError, match="grant"):
+            app.synchronize(claim, "review", "effect", mutation)
+        assert not services.requests and store.operation("review").attempts == 0
+
+
+@pytest.mark.parametrize(
+    "revision,expires_at",
+    [
+        (0, 1000),
+        (True, 1000),
+        (2**63, 1000),
+        (1, 0),
+        (1, True),
+        (1, 2**63),
+    ],
+)
+def test_effect_grant_validates_revision_and_absolute_expiry(
+    services: SyntheticServices,
+    revision: int,
+    expires_at: int,
+) -> None:
+    clock = Clock()
+    _, scm, _, _ = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        _, claim = accepted(store, Path(directory))
+        with pytest.raises(ValueError, match="ephemeral"):
+            DriverEffectGrant(claim, review_mutation(scm), revision, expires_at, Event())
+
+
+def test_effect_grant_rejects_event_subclass_with_arbitrary_flag_callback(services: SyntheticServices) -> None:
+    class CallbackEvent(Event):
+        def is_set(self) -> bool:
+            pytest.fail("unbounded callback used as a final grant flag")
+
+    clock = Clock()
+    _, scm, _, _ = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        _, claim = accepted(store, Path(directory))
+        with pytest.raises(ValueError, match="ephemeral"):
+            DriverEffectGrant(claim, review_mutation(scm), 1, 1000, CallbackEvent())
+
+
+@pytest.mark.parametrize("revoked", [False, True])
+def test_effect_grant_uses_builtin_event_flag_not_instance_callback(
+    services: SyntheticServices,
+    monkeypatch: pytest.MonkeyPatch,
+    revoked: bool,
+) -> None:
+    clock = Clock()
+    project, scm, knowledge, _ = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        owner, claim = accepted(store, Path(directory))
+        mutation = review_mutation(scm)
+        event = Event()
+        if revoked:
+            event.set()
+
+        def forbidden() -> bool:
+            pytest.fail("instance callback invoked instead of bounded stdlib Event flag read")
+
+        monkeypatch.setattr(event, "is_set", forbidden)
+        grant = DriverEffectGrant(claim, mutation, 1, 1000, event)
+        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, lambda original, value: grant)
+        if revoked:
+            with pytest.raises(ValueError, match="grant"):
+                app.synchronize(claim, "review", "effect", mutation)
+            assert not services.requests
+        else:
+            assert app.synchronize(claim, "review", "effect", mutation).status is EffectStatus.ACCEPTED
+
+
+@pytest.mark.parametrize("provider", ["github", "confluence"])
+def test_denied_effect_grant_never_dispatches_or_resolves_provider_credentials(
+    services: SyntheticServices,
+    provider: str,
+) -> None:
+    clock = Clock()
+    project, scm, knowledge, transports = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        owner, claim = accepted(store, Path(directory))
+        mutation = (
+            review_mutation(scm)
+            if provider == "github"
+            else DriverMutation(
+                DriverSubject(knowledge.binding, "page", "900", "19"),
+                "replace_page",
+                (("actor", "synthetic-confluence-writer"), ("body", "<p>new</p>"), ("title", "Guide")),
+                "owner:policy",
+            )
+        )
+        for transport in transports:
+            transport.read_authorization = transport.write_authorization = lambda: pytest.fail(
+                "denied grant resolved credentials"
+            )
+        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, lambda original, value: None)
+        with pytest.raises(ValueError, match="grant"):
+            app.synchronize(claim, "review", "effect", mutation)
+        assert not services.requests and store.operation("review").attempts == 0
+        assert store.find_artifact("review", "driver-receipt") is None
 
 
 @pytest.mark.parametrize("rejected", [False, True], ids=["github-accepted", "confluence-409-rejected"])
@@ -719,7 +978,7 @@ def test_cached_terminal_receipt_must_match_exact_operation_and_canonical_outcom
     ):
         owner, claim = accepted(store, Path(directory))
         mutation = review_mutation(scm)
-        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, lambda original, value: True)
+        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, effect_grant)
         receipt = app.synchronize(claim, "review", "effect", mutation)
         value = asdict(receipt)
         if mismatch in {"unknown", "stale", "rejected"}:
@@ -770,7 +1029,7 @@ def test_nonterminal_cached_receipt_still_finishes_original_outcome_without_rese
     ):
         owner, claim = accepted(store, Path(directory))
         mutation = review_mutation(scm)
-        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, lambda original, value: True)
+        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, effect_grant)
 
         def crash(*args: object, **kwargs: object) -> None:
             raise RuntimeError("crash after artifact before terminal observation")
@@ -789,7 +1048,7 @@ def test_nonterminal_cached_receipt_still_finishes_original_outcome_without_rese
                 "cache replay contacted provider"
             )
 
-        def no_new_grant(original: WorkClaim, value: DriverMutation) -> bool:
+        def no_new_grant(original: WorkClaim, value: DriverMutation) -> DriverEffectGrant | None:
             pytest.fail("cache replay requested new grant")
 
         app.authorize = no_new_grant

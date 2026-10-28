@@ -69,6 +69,19 @@ typed publication approval and AUX budget reservation precede dispatch. The fina
 combines current work/claim/candidate/spec/body/stop/budget/clock gates with the actual committed
 outbox fence/request/attempt/lease; a worker-supplied fence or callback Boolean is not delivery proof.
 The filesystem/credential/authorizer waits run outside business SQL before the final durable cut.
+The host authorizer resolves exactly once before dispatch into local `DriverEffectGrant | None`.
+This immutable, nonserialized value binds the exact WorkClaim and DriverMutation, a positive bounded
+integer policy revision, absolute `expires_at` and an exact standard-library Event (not an overridable
+flag callback). The host permanently sets the Event on revoke or policy replacement and issues a new
+grant/revision/handle; it must never clear the old Event. Worker input cannot supply this token.
+The existing final store delivery check returns the successful transaction's already captured wall-time
+seconds after all physical preflight and independent durable clock/authority/fence checks. Immediately
+after that cut only immutable expiry comparison (`decision_time < expires_at`) and `Event.is_set()`
+are evaluated. No policy/validation callback, additional clock read, network or filesystem/store
+preflight follows before the HTTP opener. A blocking/reentrant authorizer therefore runs before the
+fresh store gate, never after it; scope mismatch/denial refuses before dispatch, while expiry/revoke
+during later reads/capture preserves conservative uncertainty without sending. This is a trusted-host
+grant contract, not a new persisted capability registry, worker authority or remote atomicity claim.
 Historical receipt replay is read-only evidence, never renewal. Retry deliveries only reconcile; even
 complete empty scans, rate limits and native eventual indexing do not authorize a second append.
 Each driver's outcome remains independently visible in the existing journal. No cross-driver atomicity,

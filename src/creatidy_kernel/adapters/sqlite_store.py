@@ -2624,8 +2624,8 @@ class SQLiteProgramStore:
         ):
             self._check_work_dispatch(operation_id)
 
-    def check_driver_delivery(self, operation_id: str, fence: int, request_digest: str) -> None:
-        """Final native-send cut: existing authority plus the actual current outbox claim."""
+    def check_driver_delivery(self, operation_id: str, fence: int, request_digest: str) -> int:
+        """Validate the native-send cut and return its already captured durable decision time."""
         self._assert_writer_thread()
         if self._connection.in_transaction:
             raise OperationConflict("native send authorization requires its own outside-SQL preflight")
@@ -2652,6 +2652,7 @@ class SQLiteProgramStore:
                 or now >= operation.lease_until
             ):
                 raise OperationConflict("driver delivery fence, request or lease stale")
+        return now
 
     def _check_work_dispatch(self, operation_id: str) -> None:
         reservation = self._work_record("reservation", operation_id)

@@ -4,6 +4,7 @@
 import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from threading import Event
 from typing import Protocol, cast
 
 from creatidy_kernel.core.drivers import (
@@ -62,7 +63,38 @@ class DriverEffects(Protocol):
 
 
 class DriverStore(ApplicationStore, Protocol):
-    def check_driver_delivery(self, operation_id: str, fence: int, request_digest: str) -> None: ...
+    def check_driver_delivery(self, operation_id: str, fence: int, request_digest: str) -> int:
+        """Return the successful durable authority/lease cut's captured wall-time seconds."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class DriverEffectGrant:
+    """Ephemeral trusted-host policy decision, never worker input or persisted authority.
+
+    The host binds the exact immutable claim/effect and owns a fresh Event for each
+    policy revision. Revoke/replacement permanently sets the old Event; never clear
+    it or reuse the grant for a different scope. Resolving policy may block/re-enter.
+    After the durable delivery cut only expiry and the built-in Event flag are read.
+    """
+
+    claim: WorkClaim
+    mutation: DriverMutation
+    revision: int
+    expires_at: int
+    invalidated: Event
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.claim) is not WorkClaim
+            or type(self.mutation) is not DriverMutation
+            or type(self.revision) is not int
+            or not 0 < self.revision < 2**63
+            or type(self.expires_at) is not int
+            or not 0 < self.expires_at < 2**63
+            or type(self.invalidated) is not Event
+        ):
+            raise ValueError("invalid ephemeral driver effect grant")
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +149,8 @@ class DriverApplication:
 
     Existing WorkOwnership owns intent admission and the REAL delivery claim. All
     callbacks and read waits precede a fresh outbox/authority check immediately at send.
+    Policy resolves once into a local exact-scope grant before dispatch. After the
+    final durable cut there is no callback/clock/preflight, only expiry/Event reads.
     """
 
     def __init__(
@@ -126,7 +160,7 @@ class DriverApplication:
         project: ProjectDrivers,
         effects: tuple[DriverEffects, ...],
         clock: Callable[[], int],
-        authorize: Callable[[WorkClaim, DriverMutation], bool],
+        authorize: Callable[[WorkClaim, DriverMutation], DriverEffectGrant | None],
         *,
         lease_seconds: int = 60,
     ) -> None:
@@ -230,18 +264,24 @@ class DriverApplication:
                 )
             return receipt  # Never automatic retry, even after a complete empty scan.
 
-        if not self.authorize(claim, mutation):
-            raise ValueError("exact driver effect not authorized by current host policy")
+        grant = self.authorize(claim, mutation)
+        if (
+            type(grant) is not DriverEffectGrant
+            or grant.claim != claim
+            or grant.mutation != mutation
+            or Event.is_set(grant.invalidated)
+        ):
+            raise ValueError("exact driver effect grant unavailable, revoked or bound to different input")
         fence = self.ownership.dispatch(claim, operation_id, lease_seconds=self.lease_seconds)
         operation = self.store.operation(operation_id)
         delivery = DriverDelivery(key, mutation, fence, operation.attempts)
 
         def before_send() -> None:
             self.ownership.observe(claim)
-            self.store.check_driver_delivery(operation_id, delivery.fence, key.request_digest)
-            # Blocking physical/clock preflight may revoke the separate host effect grant.
-            if not self.authorize(claim, mutation):
-                raise ValueError("driver effect authority revoked during observation/credential resolution")
+            now = self.store.check_driver_delivery(operation_id, delivery.fence, key.request_digest)
+            # Only immutable values and the built-in, nonblocking Event flag after this cut.
+            if now >= grant.expires_at or Event.is_set(grant.invalidated):
+                raise ValueError("driver effect grant expired or authority revoked before send")
 
         try:
             receipt = driver.apply(delivery, before_send)
