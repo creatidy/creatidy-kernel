@@ -118,6 +118,8 @@ class HTTPSForgejoTransport:
             and signal.getitimer(signal.ITIMER_REAL)[0] == 0
         )
 
+    deadline_available = _deadline_available
+
     def authoritative_absence(self, path: str) -> bool:
         # Forgejo can conceal permission failures as 404; HTTP status alone is not proof.
         return False
@@ -180,6 +182,11 @@ class HTTPSForgejoTransport:
         except (URLError, TimeoutError) as error:
             raise OSError("forge HTTP outcome unknown") from error
         return status, payload
+
+
+# Other native driver adapters share only these transport mechanisms, not Forgejo semantics.
+http_deadline = _deadline
+NoRedirectHTTPHandler = _NoRedirect
 
 
 def run_git_bounded(

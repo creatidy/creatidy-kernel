@@ -36,6 +36,43 @@ Do not rewrite real profiles, rotate keys, delete user work or widen platform/tr
 schema migration. Destructive operations, release activation and real user-data transitions remain
 separate owner decisions. Linux/local-storage limitations remain until an actual received alternative.
 
+## Independent Driver Migration
+
+#105 adds separate implementation-major-1 driver bindings/ports, not an automatic rewrite of existing
+intake or persisted Programs. `kernel-driver-subject:v1` preserves opaque native strings with full
+family/implementation/API/origin+port/tenant/namespace/kind/revision attribution. Its canonical reader
+refuses unknown versions/fields; it does not parse or reinterpret a legacy `Reference` or numeric
+`IssueSubject`. Internal Task/WorkUnit identity remains distinct. Jira updated strings, Git SHAs and
+Confluence versions are not cross-provider revision orderings.
+
+Explicitly configure the four families and each knowledge source. Do not derive SCM/CI/wiki instances
+from a tracker URL, map old integers to Jira keys, copy a Forgejo credential into GitHub, treat a read
+scope as write/merge, infer rights from accessibility or upgrade cooperative trust into containment.
+`binding_from_mapping` accepts only the documented fields and implementation major; native constructors
+also refuse unknown API profiles. Credentials are separately injected host callbacks, not migrated
+fields, ambient tokens or serialized authority. Read-only construction/reconciliation needs no write
+token; expected native writer identities remain explicit evidence, not a credential lookup.
+
+The retained Forgejo version-1 facade calls the original read/apply/reconcile implementation with
+unchanged Reference/Effect/AGit bytes and guarantees. Its review/independent remote-commit limitations
+stay explicit. Existing frozen examples/source-cache ownership/conditional Git are not replaced by
+the new GitHub review transport. Repository knowledge uses an already owner-prepared exact local Git
+source; it does not clone, take over cache custody or adopt a new source-acquisition profile.
+
+No SQL schema/category/old-codec change or migration is introduced here. New effects are ordinary
+existing Operations/artifacts with a versioned exact request envelope; legacy readers can retain the
+bytes as history, not execute an unknown driver action. Existing backup/unsupported-old-reader gates
+remain unchanged. Installed-package mixed-provider tests create/synchronize/close/reopen actual existing
+SQLite Operations and compare original request bytes, while existing pinned old-producer/reader tests
+continue to guard prior persistence changes. A future actual persistence migration must still supply
+its own backup/interruption/downgrade proof, never normalize these new external identities into old IDs.
+
+The implemented capability matrix and explicit refusals are in [contracts](contracts.md#independent-provider-contracts).
+Synthetic transport/installed receipts are not live reception. The separate **live provider/profile
+reception gate** needs owner-authorized account/data rights, exact deployed service/plugin profile,
+expected principal, permission/conditional-conflict and real receipt evidence. It neither silently
+authorizes live effects now nor makes #52/#55/Console/MI/Router feeds prerequisites of #105.
+
 ## Current Public Transition
 
 Kernel `eb4f4a2956712bfaf39a3271e1523e7f77a91e26` integrates public source acquisition, generic

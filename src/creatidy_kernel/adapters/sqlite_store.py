@@ -2624,6 +2624,35 @@ class SQLiteProgramStore:
         ):
             self._check_work_dispatch(operation_id)
 
+    def check_driver_delivery(self, operation_id: str, fence: int, request_digest: str) -> None:
+        """Final native-send cut: existing authority plus the actual current outbox claim."""
+        self._assert_writer_thread()
+        if self._connection.in_transaction:
+            raise OperationConflict("native send authorization requires its own outside-SQL preflight")
+        with (
+            self._gate,
+            self._workspace_cut(
+                self._operation_workspace_references(operation_id), subjects=(self._operation_work_claim(operation_id),)
+            ) as readings,
+            self._transaction(readings),
+        ):
+            self._check_work_dispatch(operation_id)
+            operation = self.operation(operation_id)
+            reservation = self._work_record("reservation", operation_id)
+            if reservation is None:
+                raise OperationConflict("driver delivery lacks original reservation")
+            now = self.work_decision_time(cast(str, reservation["program"]))
+            if (
+                operation.fence != fence
+                or operation.request_digest != request_digest
+                or operation.status != "dispatched"
+                or operation.attempts != 1
+                or operation.retry_proof is not None
+                or operation.lease_until is None
+                or now >= operation.lease_until
+            ):
+                raise OperationConflict("driver delivery fence, request or lease stale")
+
     def _check_work_dispatch(self, operation_id: str) -> None:
         reservation = self._work_record("reservation", operation_id)
         if reservation is None:

@@ -13,6 +13,19 @@ A0 copied no upstream product source. K8's bounded transport adaptation is recor
 Default-branch snapshots below are inspection evidence, not production-tested dependency pins.
 Licensing was read for repository scope; copying requires checking the particular file and its notices.
 
+## Independent Driver Protocol Evidence
+
+#105 reuses the local HTTPS no-redirect/finite-byte/total-deadline mechanism, owned exact Git object
+reader, existing Forgejo facade and immutable Operation/WorkOwnership/outbox/budget/receipt/reconcile
+path. The native providers have separate semantic adapters, not a new SDK/registry/workflow framework.
+Official protocol/version/permissions/terms observations dated 2026-10-28 and exact tagged Jenkins
+export-shape source are listed in [contracts](contracts.md#provider-evidence-and-rights). Jenkins MIT
+source was inspected, not copied. GitHub/Jira/Confluence schemas are implemented independently with
+synthetic fixture payloads; API permission/data rights are not code licences. No third-party code,
+SDK, service binary or dependency is adopted, so existing NOTICE is unchanged. Commercial service
+use remains subject to the operator's actual vendor/account/data terms, not public documentation
+access. Native capabilities unsupported by those evidenced interfaces explicitly refuse.
+
 ## Shared-Architecture Reuse Gate
 
 [ADR 0007](../adr/0007-shared-harness-routing-observability.md) and

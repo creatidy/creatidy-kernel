@@ -34,6 +34,62 @@ class GitContentSource:
         self.repository = repository
         self.binding = binding
 
+    def read(self, revision: str, path: str) -> bytes | None:
+        """Bounded exact-blob content for the independent repository knowledge driver."""
+        oid(revision)
+        candidate = PurePosixPath(path)
+        if candidate.is_absolute() or ".." in candidate.parts or path in {"", "."} or candidate.as_posix() != path:
+            raise IntakeRefused("invalid documentation path")
+        git = shutil.which("git", path=os.defpath)
+        if git is None:
+            return None
+        environment = {
+            "HOME": "/tmp",  # noqa: S108 - No files or credentials loaded.
+            "PATH": os.defpath,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+        }
+        from creatidy_kernel.adapters.forgejo_transport import run_git_bounded
+
+        def run(arguments: list[str]) -> str:
+            result = run_git_bounded(
+                [git, "--no-replace-objects", "--literal-pathspecs", "-C", str(self.repository), *arguments],
+                self.repository,
+                environment,
+                5,
+                1_100_000,
+            )
+            if result.returncode:
+                raise ValueError("documentation object unavailable")
+            return result.stdout
+
+        try:
+            entry = run(["ls-tree", "-z", revision, "--", path])
+            metadata, separator, name = entry.partition("\t")
+            fields = metadata.split()
+            if (
+                not separator
+                or len(fields) != 3
+                or fields[0] not in {"100644", "100755"}
+                or fields[1] != "blob"
+                or name != path + "\x00"
+            ):
+                return None
+            if not 0 <= int(run(["cat-file", "-s", fields[2]])) <= 262144:
+                return None
+            # Documentation is UTF-8; undecodable blobs remain explicitly unavailable.
+            from creatidy_kernel.adapters.forgejo_transport import GIT_OUTPUT_ERRORS
+
+            token = GIT_OUTPUT_ERRORS.set("strict")
+            try:
+                return run(["cat-file", "blob", fields[2]]).encode("utf-8")
+            finally:
+                GIT_OUTPUT_ERRORS.reset(token)
+        except (OSError, ValueError, UnicodeError, subprocess.SubprocessError, OverflowError):
+            return None
+
     def matches(self, subject: IssueSubject, revision: str, criteria: tuple[ContentCriterion, ...]) -> bool | None:
         if self.binding != ForgeBinding(subject.origin, subject.repository):
             raise IntakeRefused("source binding differs")

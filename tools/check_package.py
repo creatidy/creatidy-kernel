@@ -107,6 +107,10 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
         subprocess.run(
             [str(python), "-I", str(ROOT / "tools/check_work_ownership.py"), ownership_directory], cwd=work, check=True
         )
+    with tempfile.TemporaryDirectory(prefix="drivers-", dir=storage_root) as driver_directory:
+        subprocess.run(
+            [str(python), "-I", str(ROOT / "tools/check_drivers.py"), driver_directory], cwd=work, check=True
+        )
     subprocess.run(
         [sys.executable, str(ROOT / "tools/check_schema_upgrade.py"), str(python), str(storage_root)],
         cwd=work,

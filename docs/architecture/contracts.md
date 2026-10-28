@@ -33,6 +33,63 @@ bounded mechanisms, not deployment or live reception.
 | State/observation | Dedicated EXCLUSIVE SQLite and offline CLI export/status | [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) owner-served snapshot/events/commands/notifications. Console cannot open active SQLite or weaken durability. |
 | Knowledge/outcomes | Durable context/allocation artifacts, pure unitful `core.outcomes`, richer reference and thin task export | [#55](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/55) utilized MI references, [#56](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/56) full budgets/costs, [#58](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/58) versioned private export. Unknown is not zero or model quality. |
 
+## Independent Provider Contracts
+
+The implemented #105 family ports are `WorkManagement`, `SourceManagement`, `ContinuousIntegration`
+and `Knowledge` in `ports.drivers`. `ProjectDrivers.observe` has real family consumers and returns
+attributed native evidence; it does not choose work, translate external state into satisfaction or
+implement #106. `DriverApplication` publishes only already owner-authorized accepted work through
+the retained outbox and ownership machinery. Each concrete adapter explicitly validates its supported
+implementation/API major and independent binding before requests. Core remains offline/stdlib-only.
+
+| Profile | Actual interface and rights | Native guarantee and refusal |
+| --- | --- | --- |
+| `jira-cloud`, implementation 1, Cloud REST 3 | `GET /rest/api/3/issue/{issueIdOrKey}` with explicit summary/description/updated/status/project/issuelinks/parent. Browse Projects and applicable issue security; classic `read:jira-work` or documented granular equivalents; approved Basic/OAuth or public read as supported by the native account | Opaque issue key/ID, native status and directed typed links/parent retained; linked issues independently read for exact project/revision. Two identical bounded reads, not a native snapshot. Visible links are **never** complete absence proof; an explicit trusted owner exact-edge/freshness obligation is mandatory for readiness consumers. Missing fields, inaccessible target, cap, changed scan, 404/permission or time failure remain unknown. Conditional edit/transition unsupported: updated strings are not server-enforced CAS. |
+| `github`, implementation 1, REST `2026-03-10` | `/repos/{owner}/{repo}`, `/git/ref/heads/{ref}`, `/git/commits/{sha}`, `/pulls/{number}`, `/pulls/{number}/reviews`. Read repository metadata/Contents/Pull requests as applicable; public reads can be anonymous. Review append needs native Pull requests **write** for the configured writer, not merge/admin | Exact namespace/ref/commit/change base+head and native review actor/state/commit. Bounded numbered pages continue to an empty page even if server caps below requested page size; duplicate/moving/missing pages or changed PR cut refuse completeness. Explicit `commit_id`, `event=COMMENT` creates an append bound to that commit; it **does not CAS current PR head**. PR create/PATCH lack a documented expected-head precondition and are refused; merge is not exposed. No hidden REST retry or GitHub AGit claim. |
+| `jenkins`, implementation 1, `jenkins-2.479.3;git-5.7.0;git-client-6.1.0` | `GET /job/{folder}/job/{job}/{build}/api/json?tree=...`. Native Overall/Read + Job/Read and access to the exact build; approved Basic header/API token or authorized public read | Runtime `X-Jenkins` must match the declared core profile. Exact numbered build, native building/result/timestamp/duration/artifacts and `hudson.plugins.git.util.BuildData.remoteUrls` + `lastBuiltRevision.SHA1` bind the configured SCM subject. Parameters, job names, latest-build aliases, different remotes/bindings and ambiguous multi-SCM evidence are not checkout proof. Plugin profile is explicit owner configuration evidence, **not independently live-attested** by a build response. Trigger/cancel unsupported. No SUCCESS-to-Kernel-acceptance conversion. |
+| `confluence-cloud`, implementation 1, Cloud REST 2 | `GET /wiki/api/v2/pages/{id}?body-format=storage&version={number}`, with repeated current-visible page read; native `read:page:confluence` and space/page visibility. `PUT /wiki/api/v2/pages/{id}` requires `write:page:confluence` and page update rights | Exact space/page/version/storage bytes and configured data rights. Withdrawn/moving/inaccessible page, missing version/body and 404 are not content absence. PUT uses the **server-required incremented `version.number`**, never an ignored If-Match header/read-then-write CAS. 409 is stale; unqualified errors are unknown. Response plus visible versioned marker/actor/content proves a receipt; valid-but-not-yet-visible response is unknown. No blind PUT retry. |
+| `repository-docs`, implementation 1, `git-object-v1` | Owner-prepared local `GitContentSource` bound to explicit repository origin/namespace, exact commit and literal regular-blob path; operator owns use/access/data rights | Bounded UTF-8 Git object bytes and SHA-256 provenance, no ambient Git credentials/config, lazy fetch or working-tree fallback. Missing/binary/symlink/unsafe paths are unavailable. This is independently useful knowledge, not a Confluence fallback, source acquisition or a second cache owner. |
+| `forgejo-facade`, implementation 1, API profile 1 | Explicit family views over actual `ForgejoForge` read/effect methods | Legacy numeric intake, Reference and AGit bytes/conditional Git/marker/reconciliation unchanged. `apply_legacy`/`reconcile_legacy` retain the original exact Effect and trusted authorizer. No synthesized native review enumeration or universal remote commit reader: those unsupported facade operations explicitly report unavailable. |
+
+All HTTP profiles require configured canonical HTTPS origins and exact namespace prefixes, reject
+redirects/cross-origin URLs and path escapes, bound response/request bytes and each total request
+deadline, and retain the existing main-thread/no-nested-timer restriction. They neither read ambient
+credentials nor infer another family's host, namespace, credential scope or trust. Read and write
+Authorization callbacks are separate. No token is needed merely to construct/read a public binding;
+no mutation credential is resolved on missing expected revision or unsupported action. Confluence
+and GitHub effects include the expected native actor in immutable inputs and check the native actor
+on receipts/reconciliation; a matching public marker written by another actor is not a receipt.
+Review `commit_id` and CI checkout SHAs identify **related SCM commits**, not revisions of mutable
+review/build/status resources. Those resources explicitly have unavailable native revisions;
+`DriverFact.observation_digest` protects observed bytes without inventing a native version/CAS token.
+
+An Operation request uses `kernel-driver-effect-v1`, the full driver-qualified target/revision, exact
+canonical input fields, owner authority reference, original Attempt/claim/generation. The original
+typed publication approval and AUX budget reservation precede dispatch. The final native-send check
+combines current work/claim/candidate/spec/body/stop/budget/clock gates with the actual committed
+outbox fence/request/attempt/lease; a worker-supplied fence or callback Boolean is not delivery proof.
+The filesystem/credential/authorizer waits run outside business SQL before the final durable cut.
+Historical receipt replay is read-only evidence, never renewal. Retry deliveries only reconcile; even
+complete empty scans, rate limits and native eventual indexing do not authorize a second append.
+Each driver's outcome remains independently visible in the existing journal. No cross-driver atomicity,
+compensation, distributed transaction or new authority source is claimed.
+
+### Provider Evidence And Rights
+
+Inspected 2026-10-28 before implementation, using official public documentation and tagged public
+source. REST documentation is a dated contract observation, not a vendored immutable implementation
+or live account receipt. The named **live provider/profile reception gate** must verify deployed
+versions, expected principal, effective permissions, data rights, conditional conflicts and actual
+receipts before a deployment claims reception; it is not a global prerequisite for these implemented
+adapters or for unrelated Kernel work.
+
+- [Jira Cloud v3 get issue, fields and permissions](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-get).
+- [GitHub API versions](https://docs.github.com/en/rest/about-the-rest-api/api-versions), [pull request reads/create/update](https://docs.github.com/en/rest/pulls/pulls) and [review reads/create, commit_id and permissions](https://docs.github.com/en/rest/pulls/reviews).
+- [Jenkins Remote Access API, tree and authentication](https://www.jenkins.io/doc/book/using/remote-access-api/); exact core tag [jenkins-2.479.3 Run exports](https://github.com/jenkinsci/jenkins/blob/jenkins-2.479.3/core/src/main/java/hudson/model/Run.java), plugin tag [git-5.7.0 BuildData exports](https://github.com/jenkinsci/git-plugin/blob/git-5.7.0/src/main/java/hudson/plugins/git/util/BuildData.java), client tag [git-client-6.1.0 Revision SHA1 export](https://github.com/jenkinsci/git-client-plugin/blob/git-client-6.1.0/src/main/java/hudson/plugins/git/Revision.java). These are export-shape pins, not new installed dependencies or endorsement of an old service release.
+- Anonymous read-only public Git tag resolution pinned those source revisions respectively to `ff61e3756a7e7c301c28a5a042f965ebcc6a90cc`, `184036c37732c4c87eb28a45de96025937dbfe0f`, and `673e5a8c4df7dcae1efc92b504b0d92ae87d2a48`. The MIT [core licence](https://github.com/jenkinsci/jenkins/blob/ff61e3756a7e7c301c28a5a042f965ebcc6a90cc/LICENSE.txt) and file-specific MIT headers were inspected; no implementation was copied.
+- [Confluence Cloud v2 page read/update, version and permissions](https://developer.atlassian.com/cloud/confluence/rest/v2/api-group-page/); official public [CONFCLOUD-76640](https://jira.atlassian.com/browse/CONFCLOUD-76640) records server version-increment refusal; [native eventual version visibility](https://community.developer.atlassian.com/t/lag-in-updating-page-version-number-v2-confluence-rest-api/68821) is why response/empty read alone never establishes committed state/nonexecution.
+- [GitHub API terms](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service#h-api-terms) and [Atlassian Developer Terms](https://developer.atlassian.com/platform/marketplace/atlassian-developer-terms/) require authorized account/data use and respect for rate limits; public access is not redistribution/commercial data permission. Native Jenkins source is MIT and was inspected for protocol evidence only. No SDK, vendor implementation, sample payload or third-party code was copied; all fixtures are synthetic. Existing local transport mechanisms are reused; no new dependency or NOTICE attribution is needed.
+
 ## Local Work And Resource Ownership
 
 The concrete #59 handler is `ports.ownership.WorkOwnership`, composed by the trusted local host with
