@@ -98,8 +98,8 @@ class OwnerReviewedForgejoEvidence:
         return tuple(records)
 
     @staticmethod
-    def snapshot_digest(evidence: IntakeEvidence) -> str:
-        return evidence.digest
+    def snapshot_digest(evidence: IntakeEvidence, declaration: Declaration) -> str:
+        return digest(encode({"snapshot": evidence.digest, "declaration": declaration.digest}))
 
     def review(
         self,
@@ -123,7 +123,7 @@ class OwnerReviewedForgejoEvidence:
         ):
             raise IntakeRefused("bounded explicit owner assessment, reason and decision identity required")
         snapshot = self.snapshot(subject, declaration)
-        basis = self.snapshot_digest(snapshot)
+        basis = self.snapshot_digest(snapshot, declaration)
         proof = snapshot.relevance_proof
         if (
             basis != expected_snapshot
@@ -164,7 +164,7 @@ class OwnerReviewedForgejoEvidence:
         snapshot = self.snapshot(subject, declaration)
         if snapshot.disposition is not Disposition.EQUIVALENCE:
             return snapshot
-        history = self._history(self.snapshot_digest(snapshot))
+        history = self._history(self.snapshot_digest(snapshot, declaration))
         if not history:
             return snapshot
         record = history[-1]

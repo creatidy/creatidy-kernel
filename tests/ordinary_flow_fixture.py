@@ -43,6 +43,7 @@ from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.task_execution import VerificationCommand
 from creatidy_kernel.core.authority import Principal
+from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import AuthorityEnvelope, BudgetPolicy, DomainAction, PolicyReference, ProgramStatus
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.intake import Declaration, Disposition, IntakeRefused, IssueSubject, OwnerPolicy, encode
@@ -79,9 +80,38 @@ for line in sys.stdin:
 
 
 @contextmanager
-def forge_service(base: str, *, lose_comment_reply: bool = False) -> Generator[tuple[str, dict[str, object]]]:
+def forge_service(
+    base: str,
+    *,
+    lose_comment_reply: bool = False,
+    unrelated_branch: bool = False,
+    lose_pr_reply: bool = False,
+    copied_marker: bool = False,
+    diamond: bool = False,
+) -> Generator[tuple[str, dict[str, object]]]:
     created = datetime.now(UTC).isoformat()
-    state: dict[str, object] = {"prs": [], "comments": [], "sends": [], "base": base, "lost_replies": 0}
+    prs: list[dict[str, object]] = []
+    if unrelated_branch:
+        prs.append(
+            {
+                "number": 1,
+                "state": "open",
+                "merged": False,
+                "updated_at": created,
+                "title": "Unrelated branch change",
+                "body": "unrelated work",
+                "head": {"sha": base, "ref": "feature/unrelated", "repo": {"full_name": "team/project"}},
+                "base": {"sha": base, "ref": "develop", "repo": {"full_name": "team/project"}},
+            }
+        )
+    state: dict[str, object] = {
+        "prs": prs,
+        "comments": [],
+        "sends": [],
+        "base": base,
+        "lost_replies": 0,
+        "lost_pr_replies": 0,
+    }
 
     def issue(number: int) -> dict[str, object]:
         return {
@@ -112,11 +142,13 @@ def forge_service(base: str, *, lose_comment_reply: bool = False) -> Generator[t
             if not path:
                 self.reply({"full_name": "team/project", "permissions": {"admin": True, "push": True, "pull": True}})
             elif path == "/issues":
-                self.reply([issue(731), issue(732)] if page == 1 else [])
-            elif re.fullmatch(r"/issues/73[12]", path):
+                self.reply([issue(number) for number in range(731, 735 if diamond else 733)] if page == 1 else [])
+            elif re.fullmatch(r"/issues/73[1234]", path):
                 self.reply(issue(int(path.rsplit("/", 1)[1])))
             elif path.endswith("/dependencies"):
-                self.reply([issue(731)] if path == "/issues/732/dependencies" and page == 1 else [])
+                dependencies = {732: [731], 733: [731], 734: [732, 733]} if diamond else {732: [731]}
+                number = int(path.split("/")[2])
+                self.reply([issue(item) for item in dependencies.get(number, [])] if page == 1 else [])
             elif path.endswith("/comments"):
                 number = int(path.split("/")[2])
                 self.reply(
@@ -165,6 +197,13 @@ def forge_service(base: str, *, lose_comment_reply: bool = False) -> Generator[t
                         "base": {"sha": state["base"], "ref": "develop", "repo": {"full_name": "team/project"}},
                     }
                 )
+                if copied_marker and number == 2:
+                    prs[0]["body"] = prs[-1]["body"]
+                if lose_pr_reply and state["lost_pr_replies"] == 0:
+                    state["lost_pr_replies"] = 1
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    self.connection.close()
+                    return
                 self.reply({"number": number}, 201)
             elif self.path.endswith("/comments"):
                 number = int(self.path.split("/")[-2])
@@ -204,9 +243,10 @@ def run_ordinary_flow(
     source.mkdir(mode=0o700)
     reference_git(source, "init", "--initial-branch=develop")
     (source / "base.py").write_text("BASELINE = True\n")
-    (source / "alpha.py").write_text("VALUE = 0\n")
-    (source / "beta.py").write_text("VALUE = 0\n")
-    reference_git(source, "add", "base.py", "alpha.py", "beta.py")
+    units = ("alpha", "beta", "gamma", "delta") if exercise in {"diamond", "diamond-conflict"} else ("alpha", "beta")
+    for unit in units:
+        (source / (unit + ".py")).write_text("VALUE = 0\n")
+    reference_git(source, "add", "base.py", *(unit + ".py" for unit in units))
     reference_git(source, "commit", "-m", "Synthetic received baseline")
     repository_url = "https://forge.invalid/team/project.git"
     reference_git(source, "remote", "add", "origin", repository_url)
@@ -214,8 +254,17 @@ def run_ordinary_flow(
     protected = root / "owned"
     protected.mkdir(mode=0o700)
     with (
-        forge_service(base, lose_comment_reply=exercise == "lost-reply") as (endpoint, native_state),
-        review_peer(root / "native", native_binary) as (review_origin, calls),
+        forge_service(
+            base,
+            lose_comment_reply=exercise == "lost-reply",
+            unrelated_branch=exercise in {"branch-pr", "ambiguous-pr"},
+            lose_pr_reply=exercise in {"branch-pr", "ambiguous-pr"},
+            copied_marker=exercise == "ambiguous-pr",
+            diamond=exercise in {"diamond", "diamond-conflict"},
+        ) as (endpoint, native_state),
+        review_peer(
+            root / "native", native_binary, lose_first_reply=exercise in {"review-lost", "review-lost-reopen"}
+        ) as (review_origin, calls),
         ExitStack() as owners,
     ):
 
@@ -266,14 +315,16 @@ print("Done")
         assert discovery.discover().status is ScanStatus.OBSERVED
         recipes = ("ordinary:clean-baseline:v1",)
         baseline = ForgejoBaseline(read_http, recipes, frozenset({"ci/baseline"}))
-        criteria = (
-            "alpha.VALUE is one; preserve unrelated modules",
-            "beta.VALUE is two and uses the received alpha obligation",
-        )
+        criteria = tuple(f"{unit}.VALUE is {index + 1}; preserve unrelated modules" for index, unit in enumerate(units))
         subjects = tuple(
-            IssueSubject("https://forge.invalid", "team/project", number, "develop", base) for number in (731, 732)
+            IssueSubject("https://forge.invalid", "team/project", number, "develop", base)
+            for number in range(731, 731 + len(units))
         )
-        with SQLiteProgramStore(root / "state.db") as store:
+        time_offset = [0]
+        boot_clock = lambda: BootClockReading(  # noqa: E731 - Controlled fixture clock.
+            int(time.time()) + time_offset[0], time.monotonic_ns() + time_offset[0] * 10**9, "ordinary-fixture-boot"
+        )
+        with SQLiteProgramStore(root / "state.db", boot_clock=boot_clock) as store:
             reader = OwnerReviewedForgejoEvidence(
                 store,
                 Principal("owner", "owner"),
@@ -295,7 +346,7 @@ print("Done")
                 policy_ref,
                 BudgetPolicy(6, 1),
                 authority,
-                paths=frozenset({"alpha.py", "beta.py"}),
+                paths=frozenset(unit + ".py" for unit in units),
                 network=frozenset(),
                 effects=frozenset({"forgejo:pr", "forgejo:receipt"}),
                 recipes=frozenset(recipes),
@@ -305,6 +356,7 @@ print("Done")
                 project_id="ordinary-project",
                 project_budget=budget,
             )
+            decision_clock = lambda: int(time.time()) + time_offset[0]  # noqa: E731 - Controlled fixture clock.
             app = OrdinaryProgram(
                 store,
                 OrdinaryIntake(store, reader, lambda: int(time.time())),
@@ -312,7 +364,7 @@ print("Done")
                 Principal("owner", "owner"),
                 owner_policy,
                 VerificationPolicy(policy_ref, ("paths", "structural", "commands")),
-                lambda: int(time.time()),
+                decision_clock,
                 execution_profile=encode(
                     {
                         "harness": "kilo-pull+codex",
@@ -337,7 +389,9 @@ print("Done")
                                 "interface": ["Python module"],
                                 "context": [],
                                 "unknowns": [],
-                                "paths": [unit + ".py"],
+                                "paths": [unit + ".py", "beta.py"]
+                                if exercise == "diamond-conflict" and unit == "gamma"
+                                else [unit + ".py"],
                                 "effects": ["forgejo:pr", "forgejo:receipt"],
                                 "network": [],
                                 "recipes": list(recipes),
@@ -346,7 +400,7 @@ print("Done")
                         )
                     ),
                 )
-                for unit, subject, criterion in zip(("alpha", "beta"), subjects, criteria, strict=True)
+                for unit, subject, criterion in zip(units, subjects, criteria, strict=True)
             )
             proposal = app.propose("everyday-program", "Receive two native-dependent obligations", selections)
             assert all(item.evidence.disposition is Disposition.EQUIVALENCE for item in proposal.drafts)
@@ -363,7 +417,7 @@ print("Done")
                 reader.review(
                     subject,
                     declaration,
-                    expected_snapshot=reader.snapshot_digest(snapshot),
+                    expected_snapshot=reader.snapshot_digest(snapshot, declaration),
                     disposition=Disposition.REMAINS,
                     decision_id="owner-source-" + unit,
                     reason=(
@@ -371,6 +425,15 @@ print("Done")
                         "requested behavior is absent"
                     ),
                 )
+            if exercise == "owner-binding":
+                subject = selections[0][1]
+                original = selections[0][2]
+                changed_value = dict(original.value)
+                changed_value["criteria"] = ["a different condition must hold"]
+                changed = Declaration(encode(changed_value))
+                assert reader.snapshot(subject, original).digest == reader.snapshot(subject, changed).digest
+                assert reader.read(subject, changed).disposition is Disposition.EQUIVALENCE
+                return {"status": "unassessed"}
             proposal = app.propose("everyday-program", "Receive two native-dependent obligations", selections)
             approved = app.approve(proposal, decision_id="owner-program-v1", expires_at=int(time.time()) + 900)
             assert approved.program.status is ProgramStatus.DRAFT
@@ -379,10 +442,8 @@ print("Done")
             sessions: list[str] = []
             review_operations: set[str] = set()
             rejected_attempt: str | None = None
-            for position, unit in enumerate(
-                ("alpha", "alpha", "beta") if exercise == "remediation" else ("alpha", "beta")
-            ):
-                ordinal = 0 if unit == "alpha" else 1
+            for position, unit in enumerate(("alpha", "alpha", "beta") if exercise == "remediation" else units):
+                ordinal = units.index(unit)
                 bad_candidate = exercise == "remediation" and position == 0
                 leaf = unit + "-" + str(position)
                 tree = LocalOwnedWorkspace(protected, leaf, create=True)
@@ -485,7 +546,7 @@ print("Done")
                 )
                 if exercise == "reopen" and ordinal == 0:
                     store.close()
-                    store = owners.enter_context(SQLiteProgramStore(root / "state.db"))
+                    store = owners.enter_context(SQLiteProgramStore(root / "state.db", boot_clock=boot_clock))
                     reader = OwnerReviewedForgejoEvidence(
                         store,
                         Principal("owner", "owner"),
@@ -569,6 +630,8 @@ print("Done")
                     (tree.path / (unit + ".py")).write_text(
                         "VALUE = " + str(-1 if bad_candidate else ordinal + 1) + "\n"
                     )
+                    if exercise == "diamond-conflict" and unit == "gamma":
+                        (tree.path / "beta.py").write_text("VALUE = 999\n")
                     client.quiesce(handoff, "authenticated-kilo-sdk-task-scope-closed")
                 control.reconcile(
                     handoff.claim,
@@ -576,6 +639,70 @@ print("Done")
                     evidence="owner receives exact task-owned bytes after qualified task-scope quiescence",
                 )
                 outcome = client.report(handoff)
+                if exercise in {"review-lost", "review-lost-reopen"} and position == 0:
+                    assert outcome == "review_unknown"
+                    assert len(calls) == 1
+                    time_offset[0] = 61
+                    if exercise == "review-lost-reopen":
+                        store.close()
+                        store = owners.enter_context(SQLiteProgramStore(root / "state.db", boot_clock=boot_clock))
+                        reader = OwnerReviewedForgejoEvidence(
+                            store,
+                            Principal("owner", "owner"),
+                            forge,
+                            read_http.binding,
+                            GitContentSource(source, read_http.binding),
+                            baseline,
+                            lambda: int(time.time()),
+                            max_pages=4,
+                        )
+                        app = OrdinaryProgram(
+                            store,
+                            OrdinaryIntake(store, reader, lambda: int(time.time())),
+                            discovery,
+                            Principal("owner", "owner"),
+                            owner_policy,
+                            VerificationPolicy(policy_ref, ("paths", "structural", "commands")),
+                            decision_clock,
+                            execution_profile=encode(
+                                {
+                                    "harness": "kilo-pull+codex",
+                                    "provider": "fixture-provider",
+                                    "model": "fixture-model",
+                                    "effort": None,
+                                    "trust": "trusted_development",
+                                }
+                            ),
+                        )
+                        workspace = OrdinaryGitWorkspace(
+                            store,
+                            tree,
+                            source,
+                            repository_url,
+                            proposal,
+                            (command,),
+                            ("Fixture Owner", "owner@example.invalid"),
+                            authority_deadline=approved.expires_at,
+                        )
+                        worker = bind(Principal("worker", "worker"), store, tree, selected, witness)
+                        control = bind(Principal("owner", "owner"), store, tree, selected, witness)
+                        workspace.control = control
+                        reviewer = NativeKiloReview(
+                            store,
+                            review_origin,
+                            root,
+                            "product-review",
+                            lambda _, ws=workspace: ws.review_input(),
+                            lambda: int(time.time()),
+                            freshness_seconds=900,
+                            timeout_seconds=30,
+                            authority_deadline=approved.expires_at,
+                        )
+                        client = app.client(
+                            approved, Principal("worker", "worker"), workspace, worker, control, reviewer
+                        )
+                    outcome = client.report(handoff)
+                    assert len(calls) == 1  # Reconciliation must not issue a second native prompt.
                 if bad_candidate:
                     assert outcome == "rejected", outcome
                     assert not store.load("everyday-program").satisfactions
@@ -608,13 +735,19 @@ print("Done")
             for sync, raw_handoff in publications:
                 handoff = raw_handoff
                 first = sync.publish(handoff)
+                if exercise == "ambiguous-pr":
+                    assert first == ("unknown", "held")
+                    assert sync.publish(handoff) == first
+                    assert len(cast(list[object], native_state["sends"])) == 1
+                    return {"status": "unknown", "native_sends": 1}
                 assert all(item.startswith("forgejo:") for item in first), first
                 repeated = sync.publish(handoff)
                 assert repeated == first, (first, repeated)
-            assert len(cast(list[object], native_state["prs"])) == 2
-            assert len(cast(list[object], native_state["comments"])) == 2
+            assert len(cast(list[object], native_state["prs"])) == len(units) + (1 if exercise == "branch-pr" else 0)
+            assert len(cast(list[object], native_state["comments"])) == len(units)
             assert native_state["lost_replies"] == (1 if exercise == "lost-reply" else 0)
-            assert len(set(sessions)) == 2 and all(
+            assert native_state["lost_pr_replies"] == (1 if exercise == "branch-pr" else 0)
+            assert len(set(sessions)) == len(units) and all(
                 item.startswith("ses_") and item != "ses_fixture" for item in sessions
             )
             assert calls
@@ -623,6 +756,7 @@ print("Done")
                 "mode": mode,
                 "sessions": sessions,
                 "native_kilo": native_binary is not None,
+                "review_calls": len(calls),
                 "satisfactions": len(store.load("everyday-program").satisfactions),
                 "native_sends": len(cast(list[object], native_state["sends"])),
             }

@@ -148,7 +148,7 @@ class OrdinaryGitWorkspace:
                 raise IntakeRefused("predecessor output bytes differ from the accepted immutable input")
             saved = self.objects / ("input-" + digest(patch) + ".patch")
             saved.write_bytes(patch)
-            self._git("apply", "--cached", "--binary", str(saved), index=index)
+            self._git("apply", "--cached", "--3way", "--binary", str(saved), index=index)
         self.input_tree = self._text("write-tree", index=index)
         self.prepared_revision = (
             subject.base

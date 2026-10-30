@@ -37,11 +37,16 @@ from creatidy_kernel.core.intake import (
 )
 from creatidy_kernel.core.ordinary import DependencyEvidence, OrdinaryProposal
 from creatidy_kernel.core.ownership import HandoffMode, WorkClaim
-from creatidy_kernel.core.verification import VerificationPolicy
+from creatidy_kernel.core.verification import CandidateResult, EvidenceSubject, ProductReviewRequest, VerificationPolicy
 from creatidy_kernel.ports.application import Collection, receive_candidate
 from creatidy_kernel.ports.intake import IntakeStore, OrdinaryIntake, draft_from
 from creatidy_kernel.ports.ownership import OwnershipStore, WorkOwnership
-from creatidy_kernel.ports.verification import ProductReviewDispatcher
+from creatidy_kernel.ports.verification import (
+    ProductReviewDispatcher,
+    ProductReviewStatus,
+    dispatch_product_review,
+    product_review_operation_id,
+)
 
 
 class OrdinaryStore(IntakeStore, OwnershipStore, Protocol):
@@ -580,7 +585,11 @@ class OrdinaryWorkClient:
             self.quiesce(handoff, cooperative_receipt)
         # Changed bytes require a separate exact owner reconciliation call. A
         # worker report cannot silently attribute manual edits to its runtime.
-        self.worker.submit(claim)
+        submitted = app.store.find_artifact(claim.operation_id, "ownership-candidate")
+        if submitted is None:
+            self.worker.submit(claim)
+        elif self.worker.observe(claim) != digest(submitted):
+            raise IntakeRefused("workspace differs from the original submitted candidate")
         self.workspace.restore(attempt)
         candidate, collection = self.workspace.collect(attempt, claim)
         program = app.store.load(attempt.program_id)
@@ -590,6 +599,51 @@ class OrdinaryWorkClient:
                 f"ordinary-finish:{attempt.attempt_id}",
                 FinishAttempt(program.revision, self.principal.actor_id, attempt.attempt_id),
             )
+
+        if submitted is not None and app.verification.reviewer_required:
+            result = CandidateResult(
+                f"candidate:{attempt.attempt_id}",
+                candidate,
+                tuple(
+                    (name, "candidate.patch") for name in sorted(program.spec.work_unit(attempt.work_unit_id).outputs)
+                ),
+            )
+            subject = EvidenceSubject(
+                result.digest,
+                attempt.digest,
+                program.spec.digest,
+                app.verification.reference.digest,
+                collection.repository,
+                collection.base,
+                collection.head,
+            )
+            request = ProductReviewRequest(
+                result,
+                subject,
+                attempt.attempt_id,
+                program.attempt(attempt.attempt_id).actor_id,
+                app.verification.reference,
+            )
+            operation_id = product_review_operation_id(request)
+            operations = app.store.operations(operation_id)
+            if (
+                len(operations) == 1
+                and operations[0].operation_id == operation_id
+                and operations[0].status in {"unknown", "dispatched"}
+            ):
+
+                def no_new_prompt(_operation: str, _lease: int) -> int:
+                    raise IntakeRefused("review recovery may not dispatch a new native prompt")
+
+                recovered = dispatch_product_review(
+                    app.store,
+                    request,
+                    self.reviewer,
+                    now=app.store.work_decision_time(attempt.program_id),
+                    delivery=no_new_prompt,
+                )
+                if recovered.status is ProductReviewStatus.UNKNOWN:
+                    return "review_unknown"
 
         def current() -> None:
             app.check(self.approved)

@@ -246,7 +246,9 @@ def native_kilo(root: Path, binary: Path, *, reject_first: bool = False) -> Gene
 
 
 @contextmanager
-def review_peer(root: Path, binary: Path | None, *, reject_first: bool = False) -> Generator[tuple[str, list[object]]]:
+def review_peer(
+    root: Path, binary: Path | None, *, reject_first: bool = False, lose_first_reply: bool = False
+) -> Generator[tuple[str, list[object]]]:
     """Default protocol peer is synthetic; explicit binary exercises real Kilo."""
     if binary is not None:
         with native_kilo(root, binary, reject_first=reject_first) as peer:
@@ -326,6 +328,10 @@ def review_peer(root: Path, binary: Path | None, *, reject_first: bool = False) 
                 },
                 result,
             ]
+            if lose_first_reply and len(calls) == 1:
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+                return
             self.reply(result)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

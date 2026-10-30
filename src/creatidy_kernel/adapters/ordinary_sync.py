@@ -9,13 +9,13 @@ An unknown write can only be read back; an empty scan never authorizes replay.
 from dataclasses import asdict
 from typing import cast
 
-from creatidy_kernel.adapters.forge_refs import fresh_agit_topic
+from creatidy_kernel.adapters.forge_refs import fresh_agit_topic, number
 from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.forgejo_transport import ConditionalGitTransport, HTTPSForgejoTransport
 from creatidy_kernel.adapters.ordinary_workspace import OrdinaryGitWorkspace
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.execution import OperationKey
-from creatidy_kernel.core.forge import Effect, EffectStatus, Presence, Receipt, Reference, effect_marker
+from creatidy_kernel.core.forge import Effect, EffectStatus, ForgeConflict, Presence, Receipt, Reference, effect_marker
 from creatidy_kernel.core.intake import IntakeRefused, digest, encode, strings
 from creatidy_kernel.core.verification import CandidateResult, EvidenceSubject
 from creatidy_kernel.ports.ordinary import OrdinaryApproval, OrdinaryHandoff, OrdinaryProgram
@@ -193,7 +193,24 @@ class OrdinaryForgejoSync:
                 if item.presence is not Presence.FOUND or item.reference is None or item.reference in seen:
                     return Receipt(EffectStatus.UNKNOWN, effect.operation)
                 seen.add(item.reference)
-                receipt = self.forge.reconcile(effect, item.reference)
+                prefix = f"{effect.repository.value}#"
+                suffix = item.reference.value.removeprefix(prefix)
+                if not item.reference.value.startswith(prefix) or not number(suffix):
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation)
+                status, raw = self.http.request("GET", f"/repos/{self.http.binding.repository}/pulls/{suffix}")
+                if status != 200 or type(raw) is not dict:
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation)
+                body = cast(dict[str, object], raw).get("body")
+                if body is None:
+                    continue
+                if type(body) is not str:
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation)
+                if effect_marker(effect.operation) not in body:
+                    continue
+                try:
+                    receipt = self.forge.reconcile(effect, item.reference)
+                except ForgeConflict:
+                    return Receipt(EffectStatus.UNKNOWN, effect.operation)
                 if receipt.status is EffectStatus.ACCEPTED and receipt.observed_base == expected_base:
                     references.append(item.reference)
             if page.next_cursor is None:

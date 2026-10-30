@@ -70,6 +70,49 @@ def test_refused_claim_never_materializes_workspace(tmp_path: Path, monkeypatch:
         run_ordinary_flow(tmp_path / "refused-claim", None, mode="pull")
 
 
+def test_owner_source_judgement_is_bound_to_exact_declaration(tmp_path: Path) -> None:
+    assert run_ordinary_flow(tmp_path / "owner-binding", None, mode="pull", exercise="owner-binding") == {
+        "status": "unassessed"
+    }
+
+
+def test_lost_agit_reply_ignores_unrelated_branch_pr_without_duplicate_write(tmp_path: Path) -> None:
+    result = run_ordinary_flow(tmp_path / "branch-pr", None, mode="pull", exercise="branch-pr")
+    assert result["status"] == "completed"
+    assert result["native_sends"] == 4
+
+
+def test_copied_marker_on_unrelated_branch_is_unknown_without_retry(tmp_path: Path) -> None:
+    assert run_ordinary_flow(tmp_path / "ambiguous-pr", None, mode="pull", exercise="ambiguous-pr") == {
+        "status": "unknown",
+        "native_sends": 1,
+    }
+
+
+@pytest.mark.parametrize("exercise", ["review-lost", "review-lost-reopen"])
+def test_completed_review_receipt_recovers_without_second_prompt(tmp_path: Path, exercise: str) -> None:
+    result = run_ordinary_flow(tmp_path / exercise, None, mode="pull", exercise=exercise)
+    assert result["status"] == "completed"
+    assert result["review_calls"] == 2
+
+
+def test_diamond_dag_composes_shared_ancestor_once(tmp_path: Path) -> None:
+    result = run_ordinary_flow(tmp_path / "diamond", None, mode="pull", exercise="diamond")
+    assert result["status"] == "completed"
+    assert result["satisfactions"] == 4
+    assert result["native_sends"] == 8
+
+
+def test_diamond_dag_preserves_conflicting_predecessors_without_accepting_join(tmp_path: Path) -> None:
+    root = tmp_path / "diamond-conflict"
+    with pytest.raises(IntakeRefused, match="bounded ordinary Git operation refused"):
+        run_ordinary_flow(root, None, mode="pull", exercise="diamond-conflict")
+    with closing(SQLiteProgramStore(root / "state.db")) as store:
+        program = store.load("everyday-program")
+        assert {item.work_unit_id for item in program.satisfactions} == {"alpha", "beta", "gamma"}
+        assert program.state("delta").satisfaction_id is None
+
+
 def test_interrupted_preparation_retains_claim_and_unknown_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
