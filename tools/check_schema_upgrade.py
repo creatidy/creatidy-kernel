@@ -18,6 +18,7 @@ PINNED_PREQUALIFICATION_ID = "3aa2b8f0232892ddfc61545bff7c646176253628"  # Exact
 PINNED_PRE_ACCEPTANCE_ID = "88d59fcd594cbf7fd529971a12139628bef9b6a5"  # Exact public Git object ID.
 PINNED_PRE_PUBLICATION_ID = "3ebd84a28c6c3bfcf6ed7f4b1937fc425ae05b13"  # Exact public Git object ID.
 PINNED_PRE_WORKSPACE_ID = "397ee0cb6a11f0638b9b19f48076f34d1d1c69b1"  # Exact public schema-5 pathname-only producer.
+PINNED_PRE_ORDINARY_ID = "b1c9ffca16f06596e5c3afdca3b9893cf7422d8d"  # Exact integrated pre-ordinary reader.
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -79,7 +80,7 @@ from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy
 clock = lambda: BootClockReading(100, 1000000000, 'installed-synthetic-boot')
 path = Path(sys.argv[1])
 with SQLiteProgramStore(path, boot_clock=clock) as store:
-    assert store.startup_evidence.schema_version == 5
+    assert store.startup_evidence.schema_version == 6
     program = store.load('reference')
     assert store.artifact('legacy-evidence', 'original') == b'synthetic retained original bytes'
     policy = WorkBudgetPolicy.basic(1, 1, verifications=1, retained_bytes=1024)
@@ -92,7 +93,7 @@ with SQLiteProgramStore(path, boot_clock=clock) as store:
     store.revoke_work_budget('reference', 'synthetic owner stop')
     before = store.work_budget_status('reference')
     bundle = store.backup(path.parent / 'schema-four-backup')
-    assert bundle.schema_version == 5
+    assert bundle.schema_version == 6
 restored = SQLiteProgramStore.restore_backup(bundle, path.parent / 'restored-four.sqlite3')
 with SQLiteProgramStore(restored, boot_clock=clock) as store:
     assert store.work_budget_status('reference') == before
@@ -114,7 +115,7 @@ old_bundle = BackupBundle(backups[0], backups[0] / 'kernel.sqlite3', backups[0] 
                           manifest['database_sha256'], manifest['history_record_count'], old_schema)
 restored = SQLiteProgramStore.restore_backup(old_bundle, path.parent / 'restored-original.sqlite3')
 with SQLiteProgramStore(restored, boot_clock=clock) as store:
-    assert store.startup_evidence.schema_version == 5
+    assert store.startup_evidence.schema_version == 6
     assert not store.has_work_budget('reference')
     assert store.artifact('legacy-evidence', 'original') == b'synthetic retained original bytes'
 """
@@ -281,11 +282,11 @@ with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
 REFUSE_QUALIFICATION_DOWNGRADE = """
 import sys
 from pathlib import Path
-from creatidy_kernel.adapters.sqlite_store import CorruptHistory,SQLiteProgramStore
+from creatidy_kernel.adapters.sqlite_store import CorruptHistory,SQLiteProgramStore,UnsupportedSQLiteConfiguration
 try:
     with SQLiteProgramStore(Path(sys.argv[1])):
         raise AssertionError('old reader ignored the logical/profile settlement distinction')
-except CorruptHistory:
+except (CorruptHistory, UnsupportedSQLiteConfiguration):
     pass
 """
 
@@ -475,7 +476,7 @@ def main(new_python: Path, storage_root: Path) -> None:
             with closing(sqlite3.connect(path)) as current:
                 if (
                     tuple(current.iterdump()) != before
-                    or current.execute("PRAGMA user_version").fetchone()[0] != 5
+                    or current.execute("PRAGMA user_version").fetchone()[0] != 6
                     or current.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] != 0
                 ):
                     raise RuntimeError("downgraded reader changed protected records or dispatched")
@@ -498,10 +499,15 @@ def main(new_python: Path, storage_root: Path) -> None:
             )
             if state != "conflict":
                 with closing(sqlite3.connect(path)) as current:
-                    if tuple(current.iterdump()) != before:
-                        raise RuntimeError(
-                            "historical explicit-request replay rewrote original claim/history/clock rows"
-                        )
+                    upgraded = tuple(current.iterdump())
+                    if tuple(line for line in upgraded if "ordinary_preparation_contract" not in line) != before:
+                        raise RuntimeError("schema-6 migration rewrote original claim/history/clock rows")
+                subprocess.run(
+                    [str(new_python), "-I", "-c", REPLAY_ORIGINAL_CLAIM, str(fixture), state], cwd=fixture, check=True
+                )
+                with closing(sqlite3.connect(path)) as current:
+                    if tuple(current.iterdump()) != upgraded:
+                        raise RuntimeError("historical explicit-request replay rewrote migrated original rows")
         qualification = directory / "qualification"
         qualification.mkdir()
         prior_python = install_pinned_reader(qualification, commit_id=PINNED_PREQUALIFICATION_ID)
@@ -513,7 +519,7 @@ def main(new_python: Path, storage_root: Path) -> None:
             before = tuple(current.iterdump())
         subprocess.run([str(new_python), "-I", "-c", REFUSE_LOGICAL_REUSE, str(legacy)], cwd=legacy, check=True)
         with closing(sqlite3.connect(path)) as current:
-            if tuple(current.iterdump()) != before:
+            if tuple(line for line in current.iterdump() if "ordinary_preparation_contract" not in line) != before:
                 raise RuntimeError("old untyped settlement was rewritten/promoted on recovery")
         typed = qualification / "typed"
         typed.mkdir()
@@ -547,7 +553,7 @@ def main(new_python: Path, storage_root: Path) -> None:
             check=True,
         )
         with closing(sqlite3.connect(path)) as current:
-            if tuple(current.iterdump()) != before:
+            if tuple(line for line in current.iterdump() if "ordinary_preparation_contract" not in line) != before:
                 raise RuntimeError("original unproven publication history was rewritten or authorized")
         new_publication = publication / "typed"
         new_publication.mkdir()
@@ -604,7 +610,10 @@ def main(new_python: Path, storage_root: Path) -> None:
                 check=True,
             )
             with closing(sqlite3.connect(path)) as current:
-                if tuple(current.iterdump()) != before:
+                after = tuple(current.iterdump())
+                if (bound and after != before) or (
+                    not bound and tuple(line for line in after if "ordinary_preparation_contract" not in line) != before
+                ):
                     raise RuntimeError("workspace compatibility rewrote original history or identity records")
         original_owned = workspace / "original-owned-alias"
         original_owned.mkdir()
@@ -622,9 +631,26 @@ def main(new_python: Path, storage_root: Path) -> None:
             cwd=original_owned,
             check=True,
         )
+        ordinary = directory / "ordinary-preparation"
+        ordinary.mkdir()
+        pre_ordinary_python = install_pinned_reader(ordinary, commit_id=PINNED_PRE_ORDINARY_ID)
+        fixture = ordinary / "installed-flow"
+        fixture.mkdir()
+        subprocess.run(
+            [str(new_python), "-I", str(ROOT / "tools/check_ordinary.py"), str(fixture)], cwd=fixture, check=True
+        )
+        path = fixture / "pull-normal" / "state.db"
+        with closing(sqlite3.connect(path)) as current:
+            before = tuple(current.iterdump())
+        subprocess.run(
+            [str(pre_ordinary_python), "-I", "-c", REFUSE_QUALIFICATION_DOWNGRADE, str(path)], cwd=fixture, check=True
+        )
+        with closing(sqlite3.connect(path)) as current:
+            if tuple(current.iterdump()) != before:
+                raise RuntimeError("pre-ordinary reader changed controller preparation records")
         print(
             f"Installed schema upgrade: actual readers {PINNED_BASE_ID}, {PINNED_PRECLOCK_ID}, "
-            f"{PINNED_PREOWNERSHIP_ID} refuse schema 5; original bytes, v2/v3/v4/v5 backups and artifacts preserved; "
+            f"{PINNED_PREOWNERSHIP_ID} refuse schema 6; original bytes, v2/v3/v4/v5 backups and artifacts preserved; "
             f"original schema-5 claims from {PINNED_INITIAL_OWNERSHIP_ID} replay unchanged "
             "and conflicting work stays fenced."
         )
@@ -641,6 +667,7 @@ def main(new_python: Path, storage_root: Path) -> None:
             f"{PINNED_PRE_WORKSPACE_ID} refuses the new identity category without writes; its original owned capture "
             "retains the aliased inode while the actual shared handler admits independent work without backfill."
         )
+        print(f"Installed ordinary preparation: actual prior reader {PINNED_PRE_ORDINARY_ID} refuses without writes.")
 
 
 if __name__ == "__main__":

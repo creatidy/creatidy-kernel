@@ -6,6 +6,7 @@ import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 
 from creatidy_kernel.adapters.forge_refs import ForgeBinding, oid
 from creatidy_kernel.core.forge import Presence, Reference
@@ -33,6 +34,35 @@ class GitContentSource:
     def __init__(self, repository: Path, binding: ForgeBinding) -> None:
         self.repository = repository
         self.binding = binding
+
+    def tree_readable(self, subject: IssueSubject, revision: str) -> bool:
+        """Verify the exact tree object exists, not that its contents are semantically reviewed."""
+        if self.binding != ForgeBinding(subject.origin, subject.repository):
+            raise IntakeRefused("source binding differs")
+        oid(revision)
+        git = shutil.which("git", path=os.defpath)
+        if git is None:
+            return False
+        environment = {
+            "HOME": "/tmp",  # noqa: S108 - Operational value only.
+            "PATH": os.defpath,
+            "LANG": "C.UTF-8",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+        }
+        try:
+            result = subprocess.run(  # noqa: S603 - Fixed Git arguments and validated object ID.
+                [git, "--no-replace-objects", "-C", str(self.repository), "cat-file", "-e", f"{revision}^{{tree}}"],
+                env=environment,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
 
     def matches(self, subject: IssueSubject, revision: str, criteria: tuple[ContentCriterion, ...]) -> bool | None:
         if self.binding != ForgeBinding(subject.origin, subject.repository):
@@ -101,6 +131,45 @@ class GitContentSource:
         return result if criteria else None
 
 
+class ForgejoOrdinaryEvidence:
+    """Host-bound literal obligations per exact subject, not proposer-selected checks.
+
+    The finite binding is owner configuration. Unsupported meanings remain the
+    existing unresolved-equivalence disposition; they never inherit another issue's
+    criteria. All source/native freshness logic is the received #54 implementation.
+    """
+
+    def __init__(
+        self,
+        forge: IntakeForge,
+        binding: ForgeBinding,
+        source: ContentSource,
+        baseline: BaselineReader,
+        obligations: tuple[tuple[IssueSubject, tuple[ContentCriterion, ...]], ...],
+        clock: Callable[[], int],
+        *,
+        max_pages: int,
+    ) -> None:
+        if type(obligations) is not tuple or len({subject for subject, _ in obligations}) != len(obligations):
+            raise IntakeRefused("finite unique controller-owned obligation bindings required")
+        self.forge, self.binding, self.source, self.baseline, self.clock = forge, binding, source, baseline, clock
+        self.obligations = MappingProxyType(dict(obligations))
+        self.max_pages = max_pages
+        self.producer = "forgejo-ordinary-evidence:v1"
+
+    def read(self, subject: IssueSubject, declaration: Declaration) -> IntakeEvidence:
+        return ForgeIntakeEvidence(
+            self.forge,
+            self.binding,
+            self.source,
+            self.baseline,
+            self.obligations.get(subject, ()),
+            self.producer,
+            self.clock,
+            max_pages=self.max_pages,
+        ).read(subject, declaration)
+
+
 class ForgeIntakeEvidence:
     """Supported positive paths require controller-owned exact-content criteria.
 
@@ -120,6 +189,7 @@ class ForgeIntakeEvidence:
         clock: Callable[[], int],
         *,
         max_pages: int,
+        inventory_only: bool = False,
     ) -> None:
         if max_pages <= 0 or not producer:
             raise IntakeRefused("bounded scan and identified producer required")
@@ -128,6 +198,7 @@ class ForgeIntakeEvidence:
         self.source = source
         self.baseline = baseline
         self.criteria = criteria
+        self.inventory_only = inventory_only
         self.producer = producer
         self.clock = clock
         self.max_pages = max_pages
@@ -178,12 +249,19 @@ class ForgeIntakeEvidence:
             disposition = Disposition.INCOMPLETE
         elif source_revision != subject.base:
             disposition = Disposition.STALE
-        elif supported:
-            implemented = self.source.matches(subject, subject.base, self.criteria)
+        elif supported or self.inventory_only:
+            tree_readable = getattr(self.source, "tree_readable", None)
+            source_readable = (
+                bool(tree_readable(subject, subject.base))
+                if self.inventory_only and callable(tree_readable)
+                else not self.inventory_only
+            )
+            implemented = None if self.inventory_only else self.source.matches(subject, subject.base, self.criteria)
             proof.append(
                 {
                     "source": subject.base,
                     "content_result": implemented,
+                    **({"owner_review_tree_available": source_readable is True} if self.inventory_only else {}),
                     "criteria": [
                         {"criterion": item.criterion, "path": item.path, "expected_digest": digest(item.expected)}
                         for item in self.criteria
@@ -206,8 +284,12 @@ class ForgeIntakeEvidence:
                     if observation.head is None or observation.base != Reference(f"forgejo:{subject.base}"):
                         unresolved = True
                     else:
-                        matched = self.source.matches(
-                            subject, observation.head.value.removeprefix("forgejo:"), self.criteria
+                        matched = (
+                            None
+                            if self.inventory_only
+                            else self.source.matches(
+                                subject, observation.head.value.removeprefix("forgejo:"), self.criteria
+                            )
                         )
                         active = active or matched is True
                         unresolved = unresolved or matched is None
@@ -263,6 +345,8 @@ class ForgeIntakeEvidence:
                 incomplete = incomplete or changed
             if incomplete is not None:
                 disposition = incomplete
+            elif self.inventory_only and source_readable is not True:
+                disposition = Disposition.INCOMPLETE
             elif implemented:
                 disposition = Disposition.IMPLEMENTED
             elif active:

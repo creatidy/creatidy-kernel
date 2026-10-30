@@ -62,7 +62,7 @@ from creatidy_kernel.core.ownership import (
 from creatidy_kernel.core.work_budget import COUNT_ONLY_WORK, BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _APPLICATION_ID = 0x43544B31
 _DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _LOCAL_FILESYSTEMS = {
@@ -837,6 +837,7 @@ class SQLiteProgramStore:
             "ownership-proof": {"claim", "proof"},
             "ownership-observation": {"claim", "subject", "attribution", "order"},
             "ownership-reconcile": {"claim", "subject", "owner", "evidence"},
+            "ownership-prepared": {"claim", "subject", "owner", "attempt_digest", "prepared_digest"},
             "ownership-candidate": {"claim", "subject"},
             "ownership-release": {"claim", "evidence"},
             "ownership-unknown": {"claim", "evidence"},
@@ -904,6 +905,19 @@ class SQLiteProgramStore:
                     if claim_record is None:
                         raise OwnershipConflict("ownership record has no original claim")
                     claim = self._decode_work_claim(claim_record)
+                    if kind == "ownership-prepared":
+                        prepared = self.artifact(f"ordinary-workspace:{claim.attempt.attempt_id}", "prepared")
+                        data = cast(dict[str, object], json.loads(prepared))
+                        if (
+                            record["owner"] != self._claim_owner(claim)
+                            or record["attempt_digest"] != claim.attempt.digest
+                            or record["prepared_digest"] != hashlib.sha256(prepared).hexdigest()
+                            or data.get("attempt") != claim.attempt.digest
+                            or data.get("prepared_subject") != record["subject"]
+                            or self._work_key(kind, f"{claim.command_key}:{record['subject']}")
+                            != operation.operation_id
+                        ):
+                            raise OwnershipConflict("ordinary preparation proof differs from the original claim")
                     if kind == "ownership-publication":
                         self._validate_claim_publication(record)
                         if self._work_key(kind, cast(str, record["operation"])) != operation.operation_id:
@@ -1373,6 +1387,50 @@ class SQLiteProgramStore:
                 },
             )
 
+    def accept_ordinary_preparation(self, claim: WorkClaim, owner: str, subject: str) -> None:
+        """Admit exact controller materialization before any worker dispatch, without claiming settlement."""
+        self._assert_writer_thread()
+        prepared_key = f"ordinary-workspace:{claim.attempt.attempt_id}"
+        prepared = self.artifact(prepared_key, "prepared")
+        proof = cast(dict[str, object], json.loads(prepared))
+        prepared_digest = hashlib.sha256(prepared).hexdigest()
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,), subjects=(claim,)) as readings,
+            self._transaction(readings),
+        ):
+            self._check_work_claim(claim)
+            operation = self.operation(claim.operation_id)
+            attempt = self._load_head(claim.attempt.program_id).attempt(claim.attempt.attempt_id)
+            artifact = self._connection.execute(
+                "SELECT digest, size FROM artifact_references WHERE operation_id = ? AND name = ?",
+                (prepared_key, "prepared"),
+            ).fetchone()
+            if (
+                owner != self._claim_owner(claim)
+                or attempt.status is not AttemptStatus.PREPARED
+                or operation.status != "intent"
+                or operation.attempts != 0
+                or proof.get("attempt") != claim.attempt.digest
+                or proof.get("prepared_subject") != subject
+                or artifact is None
+                or (artifact["digest"], artifact["size"]) != (prepared_digest, len(prepared))
+                or self._work_record("ownership-observation", f"{claim.command_key}:{subject}") is None
+            ):
+                raise OwnershipConflict("exact original controller preparation before dispatch required")
+            self._check_current_workspace_subject(claim, subject)
+            self._write_work_record(
+                "ownership-prepared",
+                f"{claim.command_key}:{subject}",
+                {
+                    "claim": claim.command_key,
+                    "subject": subject,
+                    "owner": owner,
+                    "attempt_digest": claim.attempt.digest,
+                    "prepared_digest": prepared_digest,
+                },
+            )
+
     def _check_workspace_subject(self, claim: WorkClaim, subject: str, *, fresh: bool = False) -> None:
         if fresh:
             self._check_current_workspace_subject(claim, subject)
@@ -1383,6 +1441,7 @@ class SQLiteProgramStore:
                 f"{claim.command_key}:{subject}",
             )
             is None
+            and self._work_record("ownership-prepared", f"{claim.command_key}:{subject}") is None
         ):
             raise OwnershipConflict("changed/manual workspace bytes require explicit exact-subject reconciliation")
 
@@ -2624,6 +2683,50 @@ class SQLiteProgramStore:
         ):
             self._check_work_dispatch(operation_id)
 
+    def check_operation_delivery(self, operation_id: str, fence: int, *, deadline: int | None = None) -> None:
+        """Final send cut after credentials/input callbacks, not a cached admission.
+
+        The transport must invoke this after all potentially reentrant preparation
+        and immediately before its physical send. No external callbacks run after
+        the sampled workspace/clock cut. Historical reads do not call this gate.
+        """
+        self._assert_writer_thread()
+        with (
+            self._gate,
+            self._workspace_cut(
+                self._operation_workspace_references(operation_id), subjects=(self._operation_work_claim(operation_id),)
+            ) as readings,
+            self._transaction(readings),
+        ):
+            self._check_work_dispatch(operation_id)
+            operation = self.operation(operation_id)
+            reservation = self._work_record("reservation", operation_id)
+            if reservation is None:
+                raise BudgetRefused("delivery lacks original reservation")
+            now = self.work_decision_time(cast(str, reservation["program"]))
+            if deadline is not None and (type(deadline) is not int or now >= deadline):
+                raise BudgetRefused("original delivery consent deadline expired or invalid")
+            if (
+                type(fence) is not int
+                or operation.fence != fence
+                or operation.status != "dispatched"
+                or operation.lease_until is None
+                or now >= operation.lease_until
+            ):
+                raise OperationConflict("delivery fence, active status or original lease no longer current")
+            claim = self._operation_work_claim(operation_id)
+            if claim is not None and operation_id != claim.operation_id:
+                self._check_work_claim(
+                    claim,
+                    settled=True,
+                    publication=reservation["category"] == WorkKind.AUXILIARY.value,
+                    exclude_operation=operation_id,
+                )
+                candidate = self._work_record("ownership-candidate", claim.command_key)
+                if candidate is None:
+                    raise OwnershipConflict("delivery lacks an exact submitted candidate")
+                self._check_claim_candidate(claim, cast(str, candidate["subject"]))
+
     def _check_work_dispatch(self, operation_id: str) -> None:
         reservation = self._work_record("reservation", operation_id)
         if reservation is None:
@@ -3512,7 +3615,7 @@ class SQLiteProgramStore:
             if (
                 manifest["format"] != "creatidy-kernel-sqlite-backup"
                 or type(manifest["schema_version"]) is not int
-                or manifest["schema_version"] not in (1, 2, 3, 4, 5)
+                or manifest["schema_version"] not in (1, 2, 3, 4, 5, 6)
             ):
                 raise ValueError("unsupported backup manifest")
             with (directory / "kernel.sqlite3").open("rb") as stream:
@@ -3873,6 +3976,8 @@ class SQLiteProgramStore:
             self._backup_before_schema_four()
         if original_version in (1, 2, 3, 4):
             self._backup_before_schema_four(target_schema=5)
+        if original_version in (1, 2, 3, 4, 5):
+            self._backup_before_schema_four(target_schema=6)
         with self._transaction():
             version = cast(int, self._connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SCHEMA_VERSION:
@@ -3892,6 +3997,9 @@ class SQLiteProgramStore:
             if version == 4:
                 self._migrate_4_to_5()
                 version = 5
+            if version == 5:
+                self._migrate_5_to_6()
+                version = 6
             if version != SCHEMA_VERSION:
                 raise UnsupportedSQLiteConfiguration(f"no migration path from schema version {version}")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -4101,6 +4209,22 @@ class SQLiteProgramStore:
                 "BEGIN SELECT RAISE(ABORT, 'ownership contract is immutable'); END"
             )
 
+    def _migrate_5_to_6(self) -> None:
+        # Schema-5 readers must refuse before ignoring the controller-preparation authority boundary.
+        self._connection.execute(
+            "CREATE TABLE ordinary_preparation_contract (version INTEGER PRIMARY KEY CHECK(version = 1), "
+            "contract TEXT NOT NULL CHECK(contract = 'ordinary-owned-preparation:v1')) WITHOUT ROWID"
+        )
+        self._connection.execute(
+            "INSERT INTO ordinary_preparation_contract VALUES (1, 'ordinary-owned-preparation:v1')"
+        )
+        for action in ("UPDATE", "DELETE"):
+            self._connection.execute(
+                f"CREATE TRIGGER ordinary_preparation_contract_no_{action.lower()} BEFORE {action} "
+                "ON ordinary_preparation_contract BEGIN "
+                "SELECT RAISE(ABORT, 'ordinary preparation contract is immutable'); END"
+            )
+
     def _validate_schema(self) -> None:
         tables = {
             cast(str, row[0])
@@ -4122,6 +4246,7 @@ class SQLiteProgramStore:
             "store_contract",
             "work_clock_state",
             "ownership_contract",
+            "ordinary_preparation_contract",
         }
         if not required <= tables:
             raise UnsupportedSQLiteConfiguration("database schema is missing required K2 tables")
@@ -4155,6 +4280,7 @@ class SQLiteProgramStore:
             "store_contract": {"schema_version", "authority_contract"},
             "work_clock_state": {"program_id", "wall", "boot_ns", "boot_id", "clock", "pending"},
             "ownership_contract": {"version", "contract"},
+            "ordinary_preparation_contract": {"version", "contract"},
         }
         for table, expected in columns.items():
             actual = {cast(str, row["name"]) for row in self._connection.execute(f"PRAGMA table_info({table})")}
@@ -4168,6 +4294,7 @@ class SQLiteProgramStore:
         required_triggers |= {"operations_no_delete", "outbox_no_update", "outbox_no_delete"}
         required_triggers |= {"store_contract_no_update", "store_contract_no_delete"}
         required_triggers |= {"ownership_contract_no_update", "ownership_contract_no_delete"}
+        required_triggers |= {"ordinary_preparation_contract_no_update", "ordinary_preparation_contract_no_delete"}
         required_triggers |= {
             f"{table}_no_{action}"
             for table in (
@@ -4190,6 +4317,11 @@ class SQLiteProgramStore:
             (1, "work-resource-ownership:v1")
         ]:
             raise UnsupportedSQLiteConfiguration("database ownership compatibility contract is invalid")
+        if [
+            tuple(row)
+            for row in self._connection.execute("SELECT version, contract FROM ordinary_preparation_contract")
+        ] != [(1, "ordinary-owned-preparation:v1")]:
+            raise UnsupportedSQLiteConfiguration("database ordinary preparation compatibility contract is invalid")
         if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise CorruptHistory("database contains a foreign-key violation")
 

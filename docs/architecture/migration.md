@@ -174,6 +174,16 @@ authorization. Installed tests preserve that database unchanged on refusal and v
 older reader refuses new typed authorization records. The schema number remains 5 and unsupported
 ownership record types continue to fail closed.
 
+Ordinary execution introduces schema 6 for the controller-owned preparation boundary. Before upgrading
+any schema-1 through schema-5 database, the store publishes a verified
+`<database>.pre-schema-6-<logical-digest>` backup, retaining original history, clock rows and artifacts.
+The new immutable marker and `ownership-prepared` evidence distinguish exact controller materialization
+after a resource claim from worker settlement or general owner reconciliation. A schema-5 reader refuses
+schema 6 before it can write a clock observation or dispatch; an actual pinned reader at
+`b1c9ffca16f06596e5c3afdca3b9893cf7422d8d` is tested against the installed ordinary journey. Unknown or
+interrupted preparation remains retained rather than adopted. This migration does not rewrite old
+claim or source identities and does not provide physical worker settlement.
+
 ## Verification Compatibility
 
 Verification changes under #50 preserve the original Task #143/#166 payloads, policy references,

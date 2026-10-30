@@ -137,6 +137,7 @@ def test_k2a_migration_and_artifacts_survive_bundle_with_manifest(sqlite_tmp_pat
     with SQLiteProgramStore(path) as store:
         expected = store.create(spec(), "same-command")
     connection = sqlite3.connect(path)
+    connection.execute("DROP TABLE ordinary_preparation_contract")
     connection.execute("DROP TABLE ownership_contract")
     connection.execute("DROP TABLE store_contract")
     connection.execute("DROP TABLE work_clock_state")
@@ -163,7 +164,7 @@ def test_k2a_migration_and_artifacts_survive_bundle_with_manifest(sqlite_tmp_pat
     migrated = SQLiteProgramStore.restore_backup(old_bundle, sqlite_tmp_path / "migrated.sqlite3")
     with SQLiteProgramStore(migrated) as old_restore:
         assert old_restore.load("program-1") == expected
-        assert old_restore.startup_evidence.schema_version == 5
+        assert old_restore.startup_evidence.schema_version == 6
     with SQLiteProgramStore(path) as store:
         assert store.load("program-1") == expected
         assert store.create(spec(), "same-command") == expected

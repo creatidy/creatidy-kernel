@@ -90,6 +90,7 @@ class ForgejoForge(Forge):
         authorize: Callable[[Effect], bool],
         *,
         page_size: int = 30,
+        authorize_reconcile: Callable[[Effect], bool] | None = None,
     ) -> None:
         if page_size <= 0:
             raise ValueError("page size must be positive")
@@ -99,6 +100,7 @@ class ForgejoForge(Forge):
         self.http = http
         self.git = git
         self.authorize = authorize
+        self.authorize_reconcile = authorize if authorize_reconcile is None else authorize_reconcile
         self.page_size = page_size
 
     def capabilities(self) -> frozenset[str]:
@@ -354,12 +356,13 @@ class ForgejoForge(Forge):
         if not self.http.supports_reads:
             raise UnsupportedForge("forge reads unsupported")
 
-    def _authorized(self, effect: Effect) -> None:
+    def _authorized(self, effect: Effect, *, reconciliation: bool = False) -> None:
         self._repo(effect.repository)
         valid_branch(effect.branch)
         if effect.base_branch is not None:
             valid_branch(effect.base_branch)
-        if not self.authorize(effect):
+        permitted = self.authorize_reconcile(effect) if reconciliation else self.authorize(effect)
+        if not permitted:
             raise ForgeConflict("exact forge effect was not authorized")
         if effect.revision is None:
             raise ForgeConflict("revision required")
@@ -434,7 +437,7 @@ class ForgejoForge(Forge):
         return receipt
 
     def reconcile(self, effect: Effect, known_reference: Reference | None = None) -> Receipt:
-        self._authorized(effect)
+        self._authorized(effect, reconciliation=True)
         if effect.action != "pr":
             return Receipt(EffectStatus.UNKNOWN, effect.operation)
         if known_reference is None:
