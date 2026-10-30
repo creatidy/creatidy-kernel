@@ -15,7 +15,7 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -63,6 +63,7 @@ from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.intake import OrdinaryIntake
 from creatidy_kernel.ports.ordinary import OrdinaryHandoff, OrdinaryProgram
 from creatidy_kernel.ports.ownership import WorkOwnership
+from creatidy_kernel.ports.program_store import OperationRecord
 
 CODEX_PEER = """import json, pathlib, sys
 if sys.argv[1:] == ["--version"]:
@@ -486,6 +487,7 @@ print("Done")
                         + repr("VALUE = " + str(ordinal + 1) + "\n"),
                     ),
                     10,
+                    2 if exercise == "command-evidence-partial" else 1,
                 )
                 workspace = OrdinaryGitWorkspace(
                     store,
@@ -663,7 +665,144 @@ print("Done")
                     control.observe(handoff.claim),
                     evidence="owner receives exact task-owned bytes after qualified task-scope quiescence",
                 )
-                outcome = client.report(handoff)
+                if (
+                    exercise in {"command-evidence-crash", "command-evidence-no-witness", "command-evidence-partial"}
+                    and position == 0
+                ):
+                    finalize = SQLiteProgramStore.finalize_artifact
+
+                    def fail_aggregate(
+                        store_arg: SQLiteProgramStore,
+                        operation: str,
+                        name: str,
+                        data: bytes,
+                        original: Callable[[SQLiteProgramStore, str, str, bytes], str] = finalize,
+                    ) -> str:
+                        if name.startswith("command-evidence:"):
+                            raise RuntimeError("synthetic aggregate Evidence crash")
+                        return original(store_arg, operation, name, data)
+
+                    with patch.object(SQLiteProgramStore, "finalize_artifact", fail_aggregate):
+                        try:
+                            client.report(handoff)
+                        except RuntimeError as error:
+                            assert str(error) == "synthetic aggregate Evidence crash"
+                        else:
+                            raise AssertionError("aggregate Evidence crash was not exercised")
+                    assert not calls
+                    original_command = store.operations(f"ordinary-command:{handoff.attempt.attempt_id}:")[0]
+                    original_result = json.loads(store.artifact(original_command.operation_id, "result"))["result"]
+                    original_observed_at = original_result["observed_at"]
+                    time_offset[0] = 10
+                    store.close()
+                    store = owners.enter_context(SQLiteProgramStore(root / "state.db", boot_clock=boot_clock))
+                    reader = OwnerReviewedForgejoEvidence(
+                        store,
+                        Principal("owner", "owner"),
+                        forge,
+                        read_http.binding,
+                        GitContentSource(source, read_http.binding),
+                        baseline,
+                        lambda: int(time.time()),
+                        max_pages=4,
+                    )
+                    app = OrdinaryProgram(
+                        store,
+                        OrdinaryIntake(store, reader, lambda: int(time.time())),
+                        discovery,
+                        Principal("owner", "owner"),
+                        owner_policy,
+                        VerificationPolicy(policy_ref, ("paths", "structural", "commands")),
+                        decision_clock,
+                        execution_profile=app.execution_profile,
+                    )
+                    workspace = OrdinaryGitWorkspace(
+                        store,
+                        tree,
+                        source,
+                        repository_url,
+                        proposal,
+                        (command,),
+                        ("Fixture Owner", "owner@example.invalid"),
+                        authority_deadline=approved.expires_at,
+                    )
+                    worker = bind(Principal("worker", "worker"), store, tree, selected, witness)
+                    control = bind(Principal("owner", "owner"), store, tree, selected, witness)
+                    workspace.control = control
+                    reviewer = NativeKiloReview(
+                        store,
+                        review_origin,
+                        root,
+                        "product-review",
+                        lambda _, ws=workspace: ws.review_input(),
+                        lambda: int(time.time()),
+                        freshness_seconds=900,
+                        timeout_seconds=30,
+                        authority_deadline=approved.expires_at,
+                    )
+                    client = app.client(approved, Principal("worker", "worker"), workspace, worker, control, reviewer)
+                    if exercise == "command-evidence-partial":
+                        find_artifact = SQLiteProgramStore.find_artifact
+
+                        def hide_result(
+                            store_arg: SQLiteProgramStore,
+                            operation: str,
+                            name: str,
+                            original: Callable[[SQLiteProgramStore, str, str], bytes | None] = find_artifact,
+                        ) -> bytes | None:
+                            if (
+                                operation.startswith("ordinary-command:")
+                                and operation.endswith(":0:1")
+                                and name == "result"
+                            ):
+                                return None
+                            return original(store_arg, operation, name)
+
+                        with patch.object(SQLiteProgramStore, "find_artifact", hide_result):
+                            try:
+                                client.report(handoff)
+                            except IntakeRefused as error:
+                                assert "results are incomplete" in str(error)
+                            else:
+                                raise AssertionError("partial original command results were accepted")
+                        assert not calls
+                        assert all(
+                            item.attempts == 1
+                            for item in store.operations(f"ordinary-command:{handoff.attempt.attempt_id}:")
+                        )
+                        return {"status": "unknown", "native_sends": 0}
+                    if exercise == "command-evidence-no-witness":
+                        operations = SQLiteProgramStore.operations
+
+                        def hide_witness(
+                            store_arg: SQLiteProgramStore,
+                            prefix: str = "",
+                            original: Callable[[SQLiteProgramStore, str], tuple[OperationRecord, ...]] = operations,
+                        ) -> tuple[OperationRecord, ...]:
+                            return () if prefix.startswith("command-settlement:") else original(store_arg, prefix)
+
+                        with patch.object(SQLiteProgramStore, "operations", hide_witness):
+                            try:
+                                client.report(handoff)
+                            except IntakeRefused as error:
+                                assert "settlement witness" in str(error)
+                            else:
+                                raise AssertionError("missing original command witness was accepted")
+                        assert not calls
+                        assert store.operation(original_command.operation_id).attempts == 1
+                        return {"status": "unknown", "native_sends": 0}
+                    outcome = client.report(handoff)
+                    command_operations = store.operations(f"ordinary-command:{handoff.attempt.attempt_id}:")
+                    assert len(command_operations) == 1 and command_operations[0].attempts == 1
+                    acceptance = store.operation(f"acceptance:{handoff.attempt.attempt_id}")
+                    acceptance_request = json.loads(acceptance.request_json)["request"]
+                    manifest_name = "verification:" + acceptance_request["manifest"].removeprefix("sha256:")
+                    accepted_result = json.loads(store.artifact(handoff.claim.operation_id, manifest_name))
+                    command_evidence = next(item for item in accepted_result["evidence"] if item["check"] == "commands")
+                    assert command_evidence["observed_at"] == original_observed_at
+                    assert command_evidence["fresh_until"] == original_observed_at + 900
+                else:
+                    outcome = client.report(handoff)
                 if exercise in {"review-lost", "review-lost-reopen"} and position == 0:
                     assert outcome == "review_unknown"
                     assert len(calls) == 1

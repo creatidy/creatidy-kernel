@@ -123,6 +123,21 @@ def test_unpaginated_comment_collection_above_thirty_is_complete(tmp_path: Path)
     assert result["status"] == "completed" and result["native_sends"] == 4
 
 
+def test_completed_command_evidence_recovers_after_aggregate_commit_failure(tmp_path: Path) -> None:
+    result = run_ordinary_flow(tmp_path / "aggregate-crash", None, mode="pull", exercise="command-evidence-crash")
+    assert result["status"] == "completed" and result["satisfactions"] == 2
+
+
+def test_command_aggregate_recovery_refuses_missing_original_witness(tmp_path: Path) -> None:
+    result = run_ordinary_flow(tmp_path / "missing-witness", None, mode="pull", exercise="command-evidence-no-witness")
+    assert result == {"status": "unknown", "native_sends": 0}
+
+
+def test_command_aggregate_recovery_refuses_partial_results_without_rerun(tmp_path: Path) -> None:
+    result = run_ordinary_flow(tmp_path / "partial-results", None, mode="pull", exercise="command-evidence-partial")
+    assert result == {"status": "unknown", "native_sends": 0}
+
+
 @pytest.mark.parametrize("exercise", ["duplicate-comments", "oversized-comments"])
 def test_ambiguous_or_oversized_comment_collection_never_retries(tmp_path: Path, exercise: str) -> None:
     result = run_ordinary_flow(tmp_path / exercise, None, mode="pull", exercise=exercise)

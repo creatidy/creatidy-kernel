@@ -29,7 +29,14 @@ for mode in ("pull", "managed"):
         raise SystemExit(f"installed ordinary {mode} STOP did not revoke authority")
     if result["settled"] != (False if mode == "pull" else "cancelled"):
         raise SystemExit(f"installed ordinary {mode} STOP misreported task-scope settlement")
-for exercise in ("branch-pr", "review-lost", "review-lost-reopen", "diamond", "many-comments"):
+for exercise in (
+    "branch-pr",
+    "review-lost",
+    "review-lost-reopen",
+    "diamond",
+    "many-comments",
+    "command-evidence-crash",
+):
     result = run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise)
     expected = 4 if exercise == "diamond" else 2
     if result["status"] != "completed" or result["satisfactions"] != expected or result["review_calls"] != expected:
@@ -47,6 +54,12 @@ for exercise in ("duplicate-comments", "oversized-comments"):
     result = run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise)
     if result["status"] != "unknown":
         raise SystemExit("installed ambiguous comment collection was accepted")
+for exercise in ("command-evidence-no-witness", "command-evidence-partial"):
+    if run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise) != {
+        "status": "unknown",
+        "native_sends": 0,
+    }:
+        raise SystemExit("installed recovery accepted incomplete original command evidence")
 for exercise in ("rejected-replay", "rejected-replay-reopen"):
     result = run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise)
     if result["status"] != "rejected":

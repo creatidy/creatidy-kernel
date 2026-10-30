@@ -321,11 +321,13 @@ class OrdinaryGitWorkspace:
         self.collected = candidate, Collection(manifest, self.repository_url, self.base, head, self)
         return self.collected
 
-    def _evidence(self, name: str, subject: EvidenceSubject, passed: bool, payload: object) -> Evidence:
+    def _evidence(
+        self, name: str, subject: EvidenceSubject, passed: bool, payload: object, *, observed_at: int | None = None
+    ) -> Evidence:
         assert self._attempt is not None  # noqa: S101 - collection establishes original Attempt.
         raw = encode(payload)
         reference = self.store.finalize_artifact(f"runtime:{self._attempt.attempt_id}", name + ":" + digest(raw), raw)
-        now = int(time.time())
+        now = int(time.time()) if observed_at is None else observed_at
         return Evidence(
             reference + ":" + name,
             name,
@@ -381,13 +383,19 @@ class OrdinaryGitWorkspace:
         if boundary is None or integrity is None or not boundary.passed or not integrity.passed:
             return None  # Never execute repository code for a known-invalid scope.
         runs: list[dict[str, object]] = []
-        recovered_partial = False
+        command_keys = [
+            f"ordinary-command:{attempt.attempt_id}:{subject.candidate_digest}:{ordinal}:{repeat}"
+            for ordinal, command in enumerate(self.commands)
+            for repeat in range(command.repeats)
+        ]
+        retained_results = [self.store.find_artifact(key, "result") for key in command_keys]
+        if any(item is not None for item in retained_results) and any(item is None for item in retained_results):
+            raise IntakeRefused("original command results are incomplete; preserve the partial run")
         for ordinal, command in enumerate(self.commands):
             for repeat in range(command.repeats):
                 key = f"ordinary-command:{attempt.attempt_id}:{subject.candidate_digest}:{ordinal}:{repeat}"
                 prior = self.store.find_artifact(key, "result")
                 if prior is not None:
-                    recovered_partial = True
                     # Only a result published AFTER the original owner observed
                     # group settlement and immutable candidate integrity is reusable.
                     receipt = object_from(prior)
@@ -397,11 +405,39 @@ class OrdinaryGitWorkspace:
                     ):
                         raise IntakeRefused("retained command integrity differs; preserve exact bytes")
                     original = self.store.operation(key)
+                    binding = object_from(self.store.artifact(key, "owner"))
+                    result = receipt.get("result")
+                    if (
+                        type(result) is not dict
+                        or type(cast(dict[str, object], result).get("observed_at")) is not int
+                        or binding.get("operation") != key
+                        or binding.get("effect_key") != original.effect_key
+                        or binding.get("request_digest") != original.request_digest
+                        or binding.get("fence") != original.fence
+                        or self.store.artifact(f"runtime:{attempt.attempt_id}", key)
+                        != encode(cast(dict[str, object], result))
+                    ):
+                        raise IntakeRefused("original command result or binding differs")
+                    qualified = False
+                    for fact in self.store.operations(f"command-settlement:{key}:"):
+                        request = object_from(fact.request_json.encode()).get("request")
+                        witness = cast(dict[str, object], request).get("witness") if type(request) is dict else None
+                        if (
+                            type(witness) is dict
+                            and all(
+                                cast(dict[str, object], witness).get(name) == value for name, value in binding.items()
+                            )
+                            and cast(dict[str, object], witness).get("owned_group_settled") is True
+                            and cast(dict[str, object], witness).get("result_reconciled") is True
+                            and cast(dict[str, object], witness).get("result_digest")
+                            == "sha256:" + digest(encode(cast(dict[str, object], result)))
+                        ):
+                            qualified = True
+                    if not qualified:
+                        raise IntakeRefused("original command settlement witness is unavailable")
                     self.store.record_work_settlement(key, "sha256:" + digest(prior), expected_fence=original.fence)
-                    runs.append(cast(dict[str, object], receipt["result"]))
+                    runs.append(cast(dict[str, object], result))
                     continue
-                if recovered_partial:
-                    raise IntakeRefused("original aggregate command Evidence is unavailable; preserve the partial run")
                 existing = self.store.find_artifact(key, "owner")
                 if existing is not None:
                     raise IntakeRefused("original verification outcome/group unknown; no cold subprocess replay")
@@ -448,9 +484,10 @@ class OrdinaryGitWorkspace:
             and not any(item.get(field) for field in ("timed_out", "authority_lost", "output_exhausted"))
             for item in runs
         )
-        if recovered_partial:
-            raise IntakeRefused("original aggregate command Evidence is unavailable; preserve the partial run")
-        evidence = self._evidence(name, subject, passed, {"runs": runs})
+        if not runs or any(type(item.get("observed_at")) is not int for item in runs):
+            raise IntakeRefused("original command observation times are unavailable")
+        observed_at = max(cast(int, item["observed_at"]) for item in runs)
+        evidence = self._evidence(name, subject, passed, {"runs": runs}, observed_at=observed_at)
         self.store.finalize_artifact(f"runtime:{attempt.attempt_id}", evidence_name, encode(asdict(evidence)))
         return evidence
 
