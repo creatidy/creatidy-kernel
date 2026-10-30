@@ -17,10 +17,12 @@ import threading
 import time
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
+from dataclasses import asdict
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
@@ -46,9 +48,17 @@ from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import AuthorityEnvelope, BudgetPolicy, DomainAction, PolicyReference, ProgramStatus
 from creatidy_kernel.core.forge import Reference
-from creatidy_kernel.core.intake import Declaration, Disposition, IntakeRefused, IssueSubject, OwnerPolicy, encode
+from creatidy_kernel.core.intake import (
+    Declaration,
+    Disposition,
+    IntakeRefused,
+    IssueSubject,
+    OwnerPolicy,
+    digest,
+    encode,
+)
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode
-from creatidy_kernel.core.verification import VerificationPolicy
+from creatidy_kernel.core.verification import EvidenceSubject, VerificationPolicy
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.intake import OrdinaryIntake
 from creatidy_kernel.ports.ordinary import OrdinaryHandoff, OrdinaryProgram
@@ -88,6 +98,8 @@ def forge_service(
     lose_pr_reply: bool = False,
     copied_marker: bool = False,
     diamond: bool = False,
+    initial_comments: int = 0,
+    duplicate_comment: bool = False,
 ) -> Generator[tuple[str, dict[str, object]]]:
     created = datetime.now(UTC).isoformat()
     prs: list[dict[str, object]] = []
@@ -104,9 +116,18 @@ def forge_service(
                 "base": {"sha": base, "ref": "develop", "repo": {"full_name": "team/project"}},
             }
         )
+    comments = [
+        {
+            "id": item,
+            "body": f"existing-{item}",
+            "user": {"login": "other"},
+            "issue_url": "https://forge.invalid/api/v1/repos/team/project/issues/731",
+        }
+        for item in range(1, initial_comments + 1)
+    ]
     state: dict[str, object] = {
         "prs": prs,
-        "comments": [],
+        "comments": comments,
         "sends": [],
         "base": base,
         "lost_replies": 0,
@@ -157,8 +178,6 @@ def forge_service(
                         for item in cast(list[dict[str, object]], state["comments"])
                         if item["issue_url"] == f"https://forge.invalid/api/v1/repos/team/project/issues/{number}"
                     ]
-                    if page == 1
-                    else []
                 )
             elif path.startswith("/commits/") and path.endswith("/statuses"):
                 self.reply(
@@ -215,6 +234,8 @@ def forge_service(
                     "issue_url": f"https://forge.invalid/api/v1/repos/team/project/issues/{number}",
                 }
                 comments.append(row)
+                if duplicate_comment and len(cast(list[object], state["sends"])) == 2:
+                    comments.append({**row, "id": len(comments) + 1})
                 if lose_comment_reply and state["lost_replies"] == 0:
                     state["lost_replies"] = 1
                     self.connection.shutdown(socket.SHUT_RDWR)
@@ -261,6 +282,8 @@ def run_ordinary_flow(
             lose_pr_reply=exercise in {"branch-pr", "ambiguous-pr"},
             copied_marker=exercise == "ambiguous-pr",
             diamond=exercise in {"diamond", "diamond-conflict"},
+            initial_comments=31 if exercise == "many-comments" else 241 if exercise == "oversized-comments" else 0,
+            duplicate_comment=exercise == "duplicate-comments",
         ) as (endpoint, native_state),
         review_peer(
             root / "native", native_binary, lose_first_reply=exercise in {"review-lost", "review-lost-reopen"}
@@ -444,7 +467,9 @@ print("Done")
             rejected_attempt: str | None = None
             for position, unit in enumerate(("alpha", "alpha", "beta") if exercise == "remediation" else units):
                 ordinal = units.index(unit)
-                bad_candidate = exercise == "remediation" and position == 0
+                bad_candidate = (
+                    exercise in {"remediation", "rejected-replay", "rejected-replay-reopen"} and position == 0
+                )
                 leaf = unit + "-" + str(position)
                 tree = LocalOwnedWorkspace(protected, leaf, create=True)
                 selected = (
@@ -707,6 +732,76 @@ print("Done")
                     assert outcome == "rejected", outcome
                     assert not store.load("everyday-program").satisfactions
                     assert not native_state["sends"]
+                    if exercise in {"rejected-replay", "rejected-replay-reopen"}:
+                        original = store.artifact(f"rejection:{handoff.attempt.attempt_id}", "rejected-result")
+                        rejected_subject = EvidenceSubject(**json.loads(original)["subject"])
+                        evidence_name = "command-evidence:" + digest(encode(asdict(rejected_subject)))
+                        evidence = store.artifact(handoff.claim.operation_id, evidence_name)
+                        review_count = len(calls)
+                        original_wall = time.time()
+                        if exercise == "rejected-replay-reopen":
+                            store.close()
+                            store = owners.enter_context(SQLiteProgramStore(root / "state.db", boot_clock=boot_clock))
+                            reader = OwnerReviewedForgejoEvidence(
+                                store,
+                                Principal("owner", "owner"),
+                                forge,
+                                read_http.binding,
+                                GitContentSource(source, read_http.binding),
+                                baseline,
+                                lambda: int(time.time()),
+                                max_pages=4,
+                            )
+                            app = OrdinaryProgram(
+                                store,
+                                OrdinaryIntake(store, reader, lambda: int(time.time())),
+                                discovery,
+                                Principal("owner", "owner"),
+                                owner_policy,
+                                VerificationPolicy(policy_ref, ("paths", "structural", "commands")),
+                                decision_clock,
+                                execution_profile=app.execution_profile,
+                            )
+                            workspace = OrdinaryGitWorkspace(
+                                store,
+                                tree,
+                                source,
+                                repository_url,
+                                proposal,
+                                (command,),
+                                ("Fixture Owner", "owner@example.invalid"),
+                                authority_deadline=approved.expires_at,
+                            )
+                            worker = bind(Principal("worker", "worker"), store, tree, selected, witness)
+                            control = bind(Principal("owner", "owner"), store, tree, selected, witness)
+                            workspace.control = control
+                            reviewer = NativeKiloReview(
+                                store,
+                                review_origin,
+                                root,
+                                "product-review",
+                                lambda _, ws=workspace: ws.review_input(),
+                                lambda: int(time.time()),
+                                freshness_seconds=900,
+                                timeout_seconds=30,
+                                authority_deadline=approved.expires_at,
+                            )
+                            client = app.client(
+                                approved, Principal("worker", "worker"), workspace, worker, control, reviewer
+                            )
+                        with patch(
+                            "creatidy_kernel.adapters.ordinary_workspace.time.time", return_value=original_wall + 10
+                        ):
+                            if exercise == "rejected-replay-reopen":
+                                workspace.restore(handoff.attempt)
+                                workspace.claim = handoff.claim
+                            retained = workspace.check("commands", rejected_subject)
+                            assert retained is not None
+                            assert encode(asdict(retained)) == evidence
+                            assert client.report(handoff) == "rejected"
+                        assert store.artifact(f"rejection:{handoff.attempt.attempt_id}", "rejected-result") == original
+                        assert len(calls) == review_count
+                        return {"status": "rejected", "review_calls": review_count}
                     control.release(
                         handoff.claim, evidence="owner retained rejected workspace and reconciled settled effects"
                     )
@@ -735,6 +830,12 @@ print("Done")
             for sync, raw_handoff in publications:
                 handoff = raw_handoff
                 first = sync.publish(handoff)
+                if exercise in {"duplicate-comments", "oversized-comments"}:
+                    assert first == ("unknown", "held")
+                    sends = 2 if exercise == "duplicate-comments" else 1
+                    assert sync.publish(handoff) == first
+                    assert len(cast(list[object], native_state["sends"])) == sends
+                    return {"status": "unknown", "native_sends": sends}
                 if exercise == "ambiguous-pr":
                     assert first == ("unknown", "held")
                     assert sync.publish(handoff) == first
@@ -744,7 +845,9 @@ print("Done")
                 repeated = sync.publish(handoff)
                 assert repeated == first, (first, repeated)
             assert len(cast(list[object], native_state["prs"])) == len(units) + (1 if exercise == "branch-pr" else 0)
-            assert len(cast(list[object], native_state["comments"])) == len(units)
+            assert len(cast(list[object], native_state["comments"])) == len(units) + (
+                31 if exercise == "many-comments" else 0
+            )
             assert native_state["lost_replies"] == (1 if exercise == "lost-reply" else 0)
             assert native_state["lost_pr_replies"] == (1 if exercise == "branch-pr" else 0)
             assert len(set(sessions)) == len(units) and all(

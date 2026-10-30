@@ -29,7 +29,7 @@ for mode in ("pull", "managed"):
         raise SystemExit(f"installed ordinary {mode} STOP did not revoke authority")
     if result["settled"] != (False if mode == "pull" else "cancelled"):
         raise SystemExit(f"installed ordinary {mode} STOP misreported task-scope settlement")
-for exercise in ("branch-pr", "review-lost", "review-lost-reopen", "diamond"):
+for exercise in ("branch-pr", "review-lost", "review-lost-reopen", "diamond", "many-comments"):
     result = run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise)
     expected = 4 if exercise == "diamond" else 2
     if result["status"] != "completed" or result["satisfactions"] != expected or result["review_calls"] != expected:
@@ -43,4 +43,12 @@ if run_ordinary_flow(storage / "ambiguous-pr", None, mode="pull", exercise="ambi
     "native_sends": 1,
 }:
     raise SystemExit("installed ambiguous Forgejo marker was accepted or retried")
+for exercise in ("duplicate-comments", "oversized-comments"):
+    result = run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise)
+    if result["status"] != "unknown":
+        raise SystemExit("installed ambiguous comment collection was accepted")
+for exercise in ("rejected-replay", "rejected-replay-reopen"):
+    result = run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise)
+    if result["status"] != "rejected":
+        raise SystemExit("installed original rejected result did not replay")
 print("Installed ordinary pull/managed/mixed normal/reopen/remediation/lost-reply and STOP journeys passed.")

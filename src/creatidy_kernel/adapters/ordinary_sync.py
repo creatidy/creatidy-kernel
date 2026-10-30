@@ -145,38 +145,35 @@ class OrdinaryForgejoSync:
         self.accepted(self.handoff)
         return True  # Read permission for the recorded effect is not a new delivery lease.
 
-    def _comments(self, issue: int, body: str) -> str | None:
+    def _comments(self, issue: int, body: str, identity: OperationKey) -> tuple[str, ...] | None:
         matches: list[str] = []
         seen: set[int] = set()
-        for page in range(1, self.max_pages + 1):
-            status, raw = self.http.request(
-                "GET", f"/repos/{self.http.binding.repository}/issues/{issue}/comments?page={page}&limit=30"
-            )
-            if status != 200 or type(raw) is not list:
+        # Forgejo v13 ListIssueComments ignores page/limit and returns the complete collection.
+        status, raw = self.http.request("GET", f"/repos/{self.http.binding.repository}/issues/{issue}/comments")
+        if status != 200 or type(raw) is not list or len(cast(list[object], raw)) > self.max_pages * 30:
+            return None
+        for item in cast(list[object], raw):
+            value = cast(dict[str, object], item) if type(item) is dict else {}
+            key = value.get("id")
+            if type(key) is not int or key <= 0 or key in seen:
                 return None
-            rows = cast(list[object], raw)
-            if not rows:
-                return matches[0] if len(matches) == 1 else None
-            if len(rows) > 30:
+            seen.add(key)
+            content = value.get("body")
+            if type(content) is not str:
                 return None
-            for item in rows:
-                value = cast(dict[str, object], item) if type(item) is dict else {}
-                key = value.get("id")
-                if type(key) is not int or key <= 0 or key in seen:
-                    return None
-                seen.add(key)
-                user = value.get("user")
-                expected_issue = (
-                    f"{self.http.binding.origin}/api/v1/repos/{self.http.binding.repository}/issues/{issue}"
-                )
-                if (
-                    value.get("body") == body
-                    and type(user) is dict
-                    and cast(dict[str, object], user).get("login") == self.login
-                    and value.get("issue_url") == expected_issue
-                ):
-                    matches.append(f"forgejo:{self.http.binding.repository}:comment:{key}")
-        return None
+            if effect_marker(identity) not in content:
+                continue
+            user = value.get("user")
+            expected_issue = f"{self.http.binding.origin}/api/v1/repos/{self.http.binding.repository}/issues/{issue}"
+            if (
+                content != body
+                or type(user) is not dict
+                or cast(dict[str, object], user).get("login") != self.login
+                or value.get("issue_url") != expected_issue
+            ):
+                return None
+            matches.append(f"forgejo:{self.http.binding.repository}:comment:{key}")
+        return tuple(matches)
 
     def _pr_readback(self, effect: Effect) -> Receipt:
         if self.handoff is None:
@@ -319,9 +316,10 @@ class OrdinaryForgejoSync:
                         else None
                     )
                 else:
-                    reference = self._comments(draft.evidence.subject.issue, body)
+                    matches = self._comments(draft.evidence.subject.issue, body, identity)
+                    reference = matches[0] if matches is not None and len(matches) == 1 else None
                     started = self.store.find_artifact(key, "physical-send")
-                    if reference is None and started is None and op.status == "dispatched":
+                    if matches == () and started is None and op.status == "dispatched":
                         self.native_current()
                         self.store.finalize_artifact(key, "physical-send", encode({"operation": key, "fence": fence}))
                         try:
@@ -332,7 +330,8 @@ class OrdinaryForgejoSync:
                             )
                         except OSError:
                             pass
-                        reference = self._comments(draft.evidence.subject.issue, body)
+                        matches = self._comments(draft.evidence.subject.issue, body, identity)
+                        reference = matches[0] if matches is not None and len(matches) == 1 else None
                 if reference is not None:
                     try:
                         self.native_current()

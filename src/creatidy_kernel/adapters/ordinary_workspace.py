@@ -354,16 +354,40 @@ class OrdinaryGitWorkspace:
                 lambda: int(time.time()),
                 delivery=lambda key, seconds: control.dispatch(claim, key, lease_seconds=seconds),
             ).check(name, subject)
+        evidence_name = "command-evidence:" + digest(encode(asdict(subject)))
+        retained_evidence = self.store.find_artifact(f"runtime:{attempt.attempt_id}", evidence_name)
+        if retained_evidence is not None:
+            value = object_from(retained_evidence)
+            raw_subject = cast(dict[str, object], value.get("subject", {}))
+            if set(raw_subject) != set(asdict(subject)):
+                raise IntakeRefused("retained command Evidence subject is malformed")
+            retained = Evidence(
+                cast(str, value["evidence_id"]),
+                cast(str, value["check"]),
+                EvidenceSubject(**cast(dict[str, str], raw_subject)),
+                cast(str, value["producer"]),
+                cast(str, value["tool_version"]),
+                cast(str, value["artifact_reference"]),
+                cast(int, value["observed_at"]),
+                cast(int, value["fresh_until"]),
+                cast(bool, value["passed"]),
+                cast(str | None, value.get("reviewer_session")),
+            )
+            if retained.subject != subject or retained.check != name or encode(asdict(retained)) != retained_evidence:
+                raise IntakeRefused("retained command Evidence differs from the exact candidate")
+            return retained
         boundary = self.pure_check("paths", subject)
         integrity = self.pure_check("structural", subject)
         if boundary is None or integrity is None or not boundary.passed or not integrity.passed:
             return None  # Never execute repository code for a known-invalid scope.
         runs: list[dict[str, object]] = []
+        recovered_partial = False
         for ordinal, command in enumerate(self.commands):
             for repeat in range(command.repeats):
                 key = f"ordinary-command:{attempt.attempt_id}:{subject.candidate_digest}:{ordinal}:{repeat}"
                 prior = self.store.find_artifact(key, "result")
                 if prior is not None:
+                    recovered_partial = True
                     # Only a result published AFTER the original owner observed
                     # group settlement and immutable candidate integrity is reusable.
                     receipt = object_from(prior)
@@ -376,6 +400,8 @@ class OrdinaryGitWorkspace:
                     self.store.record_work_settlement(key, "sha256:" + digest(prior), expected_fence=original.fence)
                     runs.append(cast(dict[str, object], receipt["result"]))
                     continue
+                if recovered_partial:
+                    raise IntakeRefused("original aggregate command Evidence is unavailable; preserve the partial run")
                 existing = self.store.find_artifact(key, "owner")
                 if existing is not None:
                     raise IntakeRefused("original verification outcome/group unknown; no cold subprocess replay")
@@ -422,7 +448,11 @@ class OrdinaryGitWorkspace:
             and not any(item.get(field) for field in ("timed_out", "authority_lost", "output_exhausted"))
             for item in runs
         )
-        return self._evidence(name, subject, passed, {"runs": runs})
+        if recovered_partial:
+            raise IntakeRefused("original aggregate command Evidence is unavailable; preserve the partial run")
+        evidence = self._evidence(name, subject, passed, {"runs": runs})
+        self.store.finalize_artifact(f"runtime:{attempt.attempt_id}", evidence_name, encode(asdict(evidence)))
+        return evidence
 
     def review_input(self) -> str:
         if self._attempt is None or self._head is None:

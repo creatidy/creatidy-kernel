@@ -580,6 +580,30 @@ class OrdinaryWorkClient:
             for fact in historical.satisfactions
         ):
             return "accepted"  # Historical read, not another acceptance or freshness renewal.
+        rejection_id = f"rejection:{attempt.attempt_id}"
+        rejected = app.store.find_artifact(rejection_id, "rejected-result")
+        if rejected is not None:
+            record = app.store.operation(rejection_id)
+            request = cast(dict[str, object], object_from(record.request_json.encode()).get("request", {}))
+            result = object_from(rejected)
+            subject = result.get("subject")
+            if (
+                claim.attempt != attempt
+                or historical.spec.digest != attempt.spec_digest
+                or record.operation_id != rejection_id
+                or record.effect_key != rejection_id
+                or request.get("manifest") != "sha256:" + digest(rejected)
+                or type(subject) is not dict
+                or cast(dict[str, object], subject).get("attempt_digest") != attempt.digest
+                or cast(dict[str, object], subject).get("spec_digest") != attempt.spec_digest
+            ):
+                raise IntakeRefused("retained rejection differs from the original exact Attempt")
+            status = request.get("product_review_status")
+            if status in {"owner_decision_needed", "comment", "invalid"}:
+                return cast(str, status)
+            if status not in {None, "changes_requested"}:
+                raise IntakeRefused("retained rejection has an unsupported review status")
+            return "rejected"  # Historical read only; no fresh evidence or authority.
         app.check(self.approved)
         if cooperative_receipt is not None:
             self.quiesce(handoff, cooperative_receipt)

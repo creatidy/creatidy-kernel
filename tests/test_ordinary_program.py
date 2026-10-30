@@ -113,6 +113,22 @@ def test_diamond_dag_preserves_conflicting_predecessors_without_accepting_join(t
         assert program.state("delta").satisfaction_id is None
 
 
+@pytest.mark.parametrize("exercise", ["rejected-replay", "rejected-replay-reopen"])
+def test_rejected_report_replays_exact_evidence_after_time_and_reopen(tmp_path: Path, exercise: str) -> None:
+    assert run_ordinary_flow(tmp_path / exercise, None, mode="pull", exercise=exercise)["status"] == "rejected"
+
+
+def test_unpaginated_comment_collection_above_thirty_is_complete(tmp_path: Path) -> None:
+    result = run_ordinary_flow(tmp_path / "many-comments", None, mode="pull", exercise="many-comments")
+    assert result["status"] == "completed" and result["native_sends"] == 4
+
+
+@pytest.mark.parametrize("exercise", ["duplicate-comments", "oversized-comments"])
+def test_ambiguous_or_oversized_comment_collection_never_retries(tmp_path: Path, exercise: str) -> None:
+    result = run_ordinary_flow(tmp_path / exercise, None, mode="pull", exercise=exercise)
+    assert result["status"] == "unknown"
+
+
 def test_interrupted_preparation_retains_claim_and_unknown_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
