@@ -7,6 +7,7 @@ Forgejo/Codex/model peers are synthetic; Kilo sessions are real native sessions.
 """
 
 import base64
+import inspect
 import json
 import os
 import re
@@ -267,7 +268,11 @@ def run_ordinary_flow(
     source.mkdir(mode=0o700)
     reference_git(source, "init", "--initial-branch=develop")
     (source / "base.py").write_text("BASELINE = True\n")
-    units = ("alpha", "beta", "gamma", "delta") if exercise in {"diamond", "diamond-conflict"} else ("alpha", "beta")
+    units = (
+        ("alpha", "beta", "gamma", "delta")
+        if exercise in {"diamond", "diamond-conflict", "diamond-inherited"}
+        else ("alpha", "beta")
+    )
     for unit in units:
         (source / (unit + ".py")).write_text("VALUE = 0\n")
     reference_git(source, "add", "base.py", *(unit + ".py" for unit in units))
@@ -284,7 +289,7 @@ def run_ordinary_flow(
             unrelated_branch=exercise in {"branch-pr", "ambiguous-pr"},
             lose_pr_reply=exercise in {"branch-pr", "ambiguous-pr"},
             copied_marker=exercise == "ambiguous-pr",
-            diamond=exercise in {"diamond", "diamond-conflict"},
+            diamond=exercise in {"diamond", "diamond-conflict", "diamond-inherited"},
             initial_comments=31 if exercise == "many-comments" else 241 if exercise == "oversized-comments" else 0,
             duplicate_comment=exercise == "duplicate-comments",
             baseline_status=exercise.removeprefix("baseline-") if exercise.startswith("baseline-") else "success",
@@ -432,6 +437,8 @@ print("Done")
                                 "unknowns": [],
                                 "paths": [unit + ".py", "beta.py"]
                                 if exercise == "diamond-conflict" and unit == "gamma"
+                                else [unit + ".py", "alpha.py"]
+                                if exercise == "diamond-inherited" and unit == "beta"
                                 else [unit + ".py", "renamed.py"]
                                 if exercise == "rename-outside" and unit == "alpha"
                                 else [unit + ".py"],
@@ -609,6 +616,136 @@ print("Done")
                 )
                 client = app.client(approved, Principal("worker", "worker"), workspace, worker, control, reviewer)
                 command_key = "owner-assignment-" + leaf
+                if exercise == "claim-revoked-during-preparation":
+                    git_call = cast(Callable[..., bytes], inspect.getattr_static(OrdinaryGitWorkspace, "_git"))
+                    observed: list[str] = []
+
+                    def revoke_after_init(
+                        workspace_arg: OrdinaryGitWorkspace,
+                        *arguments: str,
+                        index: Path | None = None,
+                        source: Path | None = None,
+                        original: Callable[..., bytes] = git_call,
+                        events: list[str] = observed,
+                        target_store: SQLiteProgramStore = store,
+                    ) -> bytes:
+                        events.append(arguments[0])
+                        result = original(workspace_arg, *arguments, index=index, source=source)
+                        if arguments[0] == "init":
+                            target_store.revoke_work_budget(
+                                "everyday-program", "owner revoked during controller preparation"
+                            )
+                        return result
+
+                    with patch.object(OrdinaryGitWorkspace, "_git", revoke_after_init):
+                        try:
+                            client.request(command_key, lease_seconds=30)
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError("revocation during preparation was ignored")
+                    assert "init" in observed and "fetch" not in observed
+                    assert json.loads(tree.capture()[1])["entries"] == []
+                    assert not native_state["sends"]
+                    return {"status": "refused", "native_sends": 0}
+                if exercise in {
+                    "claim-expired",
+                    "claim-expired-reopen",
+                    "claim-revoked",
+                    "claim-stale",
+                    "claim-generation",
+                    "claim-current",
+                }:
+                    with patch.object(
+                        OrdinaryGitWorkspace, "initialize", side_effect=RuntimeError("interrupted preparation")
+                    ):
+                        try:
+                            client.request(command_key, lease_seconds=30)
+                        except RuntimeError as error:
+                            assert str(error) == "interrupted preparation"
+                        else:
+                            raise AssertionError("preparation interruption was not exercised")
+                    original = store.load("everyday-program").attempts[-1].spec
+                    revision = int(store.artifact(f"ordinary-client:{original.attempt_id}", "revision"))
+                    claim = worker.claim(command_key, revision, original, lease_seconds=30)
+                    if exercise == "claim-expired-reopen":
+                        store.close()
+                        store = owners.enter_context(SQLiteProgramStore(root / "state.db", boot_clock=boot_clock))
+                        reader = OwnerReviewedForgejoEvidence(
+                            store,
+                            Principal("owner", "owner"),
+                            forge,
+                            read_http.binding,
+                            GitContentSource(source, read_http.binding),
+                            baseline,
+                            lambda: int(time.time()),
+                            max_pages=4,
+                        )
+                        app = OrdinaryProgram(
+                            store,
+                            OrdinaryIntake(store, reader, lambda: int(time.time())),
+                            discovery,
+                            Principal("owner", "owner"),
+                            owner_policy,
+                            VerificationPolicy(policy_ref, ("paths", "structural", "commands")),
+                            decision_clock,
+                            execution_profile=app.execution_profile,
+                        )
+                        workspace = OrdinaryGitWorkspace(
+                            store,
+                            tree,
+                            source,
+                            repository_url,
+                            proposal,
+                            (command,),
+                            ("Fixture Owner", "owner@example.invalid"),
+                            authority_deadline=approved.expires_at,
+                        )
+                        worker = bind(Principal("worker", "worker"), store, tree, selected, witness)
+                        control = bind(Principal("owner", "owner"), store, tree, selected, witness)
+                        workspace.control = control
+                        client = app.client(
+                            approved, Principal("worker", "worker"), workspace, worker, control, reviewer
+                        )
+                    if exercise in {"claim-expired", "claim-expired-reopen"}:
+                        time_offset[0] = 31
+                    elif exercise == "claim-revoked":
+                        store.revoke_work_budget("everyday-program", "owner revoked this work")
+                    elif exercise == "claim-stale":
+                        store.quarantine_work_claim(claim, "owner", "unreconciled original scope")
+                    if exercise == "claim-current":
+                        recovered = client.request(command_key, lease_seconds=30)
+                        assert recovered.claim == claim
+                        assert client.request(command_key, lease_seconds=30) == recovered
+                        original_operations = store.operations()
+                        time_offset[0] = 31
+                        with patch.object(
+                            OrdinaryGitWorkspace, "initialize", side_effect=AssertionError("history mutated")
+                        ):
+                            assert client.request(command_key, lease_seconds=30) == recovered
+                        assert store.operations() == original_operations
+                        return {"status": "recovered", "native_sends": 0}
+                    if exercise == "claim-generation":
+                        with patch.object(
+                            WorkOwnership, "claim", return_value=replace(claim, generation=claim.generation + 1)
+                        ):
+                            try:
+                                client.request(command_key, lease_seconds=30)
+                            except ValueError:
+                                pass
+                            else:
+                                raise AssertionError("different claim generation authorized preparation")
+                    else:
+                        try:
+                            client.request(command_key, lease_seconds=30)
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError("expired or revoked historical claim authorized preparation")
+                    assert not workspace.objects.exists()
+                    assert json.loads(tree.capture()[1])["entries"] == []
+                    assert not native_state["sends"]
+                    return {"status": "refused", "native_sends": 0}
                 handoff = client.request(
                     command_key, lease_seconds=600, remediation_of=rejected_attempt if unit == "alpha" else None
                 )
@@ -746,6 +883,10 @@ print("Done")
                     (tree.path / (unit + ".py")).write_text(
                         "VALUE = " + str(-1 if bad_candidate else ordinal + 1) + "\n"
                     )
+                    if exercise == "diamond-inherited" and unit == "beta":
+                        (tree.path / "alpha.py").write_text("VALUE = 2\n")
+                    if exercise == "diamond-inherited" and unit == "delta":
+                        assert (tree.path / "alpha.py").read_text() == "VALUE = 2\n"
                     if exercise == "rename-outside" and unit == "alpha":
                         (tree.path / "base.py").rename(tree.path / "renamed.py")
                     if exercise == "diamond-conflict" and unit == "gamma":

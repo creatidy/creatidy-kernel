@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
+from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 
@@ -30,15 +31,41 @@ def test_ordinary_installed_handlers_with_synthetic_external_peers(
 def test_materialization_cannot_precede_atomic_claim(sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     initialize = OrdinaryGitWorkspace.initialize
 
-    def guarded(workspace: OrdinaryGitWorkspace, attempt: AttemptSpec) -> str:
+    def guarded(workspace: OrdinaryGitWorkspace, attempt: AttemptSpec, check_current: Callable[[], None]) -> str:
         program = workspace.store.load(attempt.program_id)
         assert any(item.attempt_id == attempt.attempt_id for item in program.attempts), (
             "workspace mutation began before the Attempt and resource claim were admitted"
         )
-        return initialize(workspace, attempt)
+        return initialize(workspace, attempt, check_current)
 
     monkeypatch.setattr(OrdinaryGitWorkspace, "initialize", guarded)
     run_ordinary_flow(sqlite_tmp_path / "claimed-before-materialization", None, mode="pull")
+
+
+@pytest.mark.parametrize(
+    "exercise", ["claim-expired", "claim-expired-reopen", "claim-revoked", "claim-stale", "claim-generation"]
+)
+def test_historical_claim_without_authority_cannot_begin_preparation(sqlite_tmp_path: Path, exercise: str) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise) == {
+        "status": "refused",
+        "native_sends": 0,
+    }
+
+
+def test_current_claim_can_recover_interrupted_preparation_without_new_grant(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / "claim-current", None, mode="pull", exercise="claim-current") == {
+        "status": "recovered",
+        "native_sends": 0,
+    }
+
+
+def test_revocation_during_preparation_stops_before_next_git_mutation(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "claim-revoked-during-preparation",
+        None,
+        mode="pull",
+        exercise="claim-revoked-during-preparation",
+    ) == {"status": "refused", "native_sends": 0}
 
 
 def test_changed_preparation_is_preserved_and_not_auto_attributed(
@@ -47,8 +74,10 @@ def test_changed_preparation_is_preserved_and_not_auto_attributed(
     initialize = OrdinaryGitWorkspace.initialize
     touched: list[Path] = []
 
-    def edit_after_preparation(workspace: OrdinaryGitWorkspace, attempt: AttemptSpec) -> str:
-        subject = initialize(workspace, attempt)
+    def edit_after_preparation(
+        workspace: OrdinaryGitWorkspace, attempt: AttemptSpec, check_current: Callable[[], None]
+    ) -> str:
+        subject = initialize(workspace, attempt, check_current)
         target = workspace.workspace.path / "alpha.py"
         target.write_bytes(b"manual change must be retained\n")
         touched.append(target)
@@ -104,6 +133,12 @@ def test_diamond_dag_composes_shared_ancestor_once(sqlite_tmp_path: Path) -> Non
     assert result["status"] == "completed"
     assert result["satisfactions"] == 4
     assert result["native_sends"] == 8
+
+
+def test_diamond_branch_advances_shared_ancestor_while_other_inherits(sqlite_tmp_path: Path) -> None:
+    result = run_ordinary_flow(sqlite_tmp_path / "diamond-inherited", None, mode="pull", exercise="diamond-inherited")
+    assert result["status"] == "completed"
+    assert result["satisfactions"] == 4
 
 
 @pytest.mark.parametrize("mode", ["pull", "managed"])
@@ -216,7 +251,7 @@ def test_interrupted_preparation_retains_claim_and_unknown_bytes(
     touched: list[Path] = []
     attempts: list[str] = []
 
-    def interrupted(workspace: OrdinaryGitWorkspace, attempt: AttemptSpec) -> str:
+    def interrupted(workspace: OrdinaryGitWorkspace, attempt: AttemptSpec, _check_current: Callable[[], None]) -> str:
         target = workspace.workspace.path / "interrupted.txt"
         target.write_bytes(b"preserve interrupted controller data\n")
         touched.append(target)

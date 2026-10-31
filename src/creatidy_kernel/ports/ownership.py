@@ -228,6 +228,13 @@ class WorkOwnership:
         self.observe(claim)
         return self._store.renew_work_claim(command_key, claim, lease_seconds)
 
+    def check_current(self, claim: WorkClaim) -> None:
+        """Validate the exact retained generation without renewing its authority."""
+        self._caller(claim)
+        if self._principal.role != "worker":
+            raise OwnershipConflict("current work authority requires the original claimant")
+        self._store.check_work_claim(claim)
+
     def observe(self, claim: WorkClaim) -> str:
         self._caller(claim)
         subject, snapshot = self._workspace.capture()

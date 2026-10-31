@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import cast
 
 import creatidy_kernel
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.core.intake import IntakeRefused
 
 ROOT = Path(__file__).resolve().parents[1]
 if Path(creatidy_kernel.__file__).resolve().is_relative_to(ROOT):
@@ -49,11 +51,12 @@ for exercise in (
     "review-lost",
     "review-lost-reopen",
     "diamond",
+    "diamond-inherited",
     "many-comments",
     "command-evidence-crash",
 ):
     result = run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise)
-    expected = 4 if exercise == "diamond" else 2
+    expected = 4 if exercise in {"diamond", "diamond-inherited"} else 2
     if result["status"] != "completed" or result["satisfactions"] != expected or result["review_calls"] != expected:
         raise SystemExit(f"installed ordinary {exercise} recovery did not retain exact completed work")
 if run_ordinary_flow(storage / "owner-binding", None, mode="pull", exercise="owner-binding") != {
@@ -110,4 +113,28 @@ for exercise in ("rejected-replay", "rejected-replay-reopen"):
     result = run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise)
     if result["status"] != "rejected":
         raise SystemExit("installed original rejected result did not replay")
+for exercise in ("claim-expired", "claim-expired-reopen", "claim-revoked", "claim-stale", "claim-generation"):
+    if run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise) != {
+        "status": "refused",
+        "native_sends": 0,
+    }:
+        raise SystemExit("installed preparation used historical claim authority")
+if run_ordinary_flow(
+    storage / "claim-revoked-during-preparation", None, mode="pull", exercise="claim-revoked-during-preparation"
+) != {"status": "refused", "native_sends": 0}:
+    raise SystemExit("installed preparation continued after authority revocation")
+if run_ordinary_flow(storage / "claim-current", None, mode="pull", exercise="claim-current") != {
+    "status": "recovered",
+    "native_sends": 0,
+}:
+    raise SystemExit("installed current claim failed deterministic recovery")
+conflict = storage / "diamond-conflict"
+try:
+    run_ordinary_flow(conflict, None, mode="pull", exercise="diamond-conflict")
+except IntakeRefused:
+    with SQLiteProgramStore(conflict / "state.db") as store:
+        if store.load("everyday-program").state("delta").satisfaction_id is not None:
+            raise SystemExit("installed conflicting join was accepted") from None
+else:
+    raise SystemExit("installed conflicting diamond was not refused")
 print("Installed ordinary pull/managed/mixed normal/reopen/remediation/lost-reply and STOP journeys passed.")

@@ -1431,6 +1431,32 @@ class SQLiteProgramStore:
                 },
             )
 
+    def find_ordinary_preparation(self, claim: WorkClaim) -> bool:
+        """Read the original admitted preparation without renewing or sampling authority."""
+        self._assert_writer_thread()
+        original = self._work_record("ownership-claim", claim.command_key)
+        if original is None or self._decode_work_claim(original) != claim:
+            raise OwnershipConflict("historical preparation claim generation or identity differs")
+        prepared = self.find_artifact(f"ordinary-workspace:{claim.attempt.attempt_id}", "prepared")
+        if prepared is None:
+            return False
+        data = cast(dict[str, object], json.loads(prepared))
+        subject = data.get("prepared_subject")
+        if type(subject) is not str or data.get("attempt") != claim.attempt.digest:
+            raise OwnershipConflict("retained ordinary preparation differs from the exact Attempt")
+        record = self._work_record("ownership-prepared", f"{claim.command_key}:{subject}")
+        if record is None:
+            return False
+        if (
+            record.get("claim") != claim.command_key
+            or record.get("subject") != subject
+            or record.get("owner") != self._claim_owner(claim)
+            or record.get("attempt_digest") != claim.attempt.digest
+            or record.get("prepared_digest") != hashlib.sha256(prepared).hexdigest()
+        ):
+            raise OwnershipConflict("retained ordinary preparation receipt is inconsistent")
+        return True
+
     def _check_workspace_subject(self, claim: WorkClaim, subject: str, *, fresh: bool = False) -> None:
         if fresh:
             self._check_current_workspace_subject(claim, subject)

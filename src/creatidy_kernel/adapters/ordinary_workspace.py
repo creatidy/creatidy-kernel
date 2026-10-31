@@ -11,6 +11,7 @@ import shutil
 import stat
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import cast
@@ -24,7 +25,7 @@ from creatidy_kernel.adapters.task_execution import (
     VerificationCommand,
     run_verification_command,
 )
-from creatidy_kernel.core.domain import AttemptSpec
+from creatidy_kernel.core.domain import AttemptSpec, InputBinding
 from creatidy_kernel.core.execution import Artifact, ArtifactManifest, Candidate
 from creatidy_kernel.core.intake import IntakeRefused, digest, encode, object_from, strings
 from creatidy_kernel.core.ordinary import OrdinaryProposal
@@ -114,7 +115,7 @@ class OrdinaryGitWorkspace:
     def _text(self, *arguments: str, index: Path | None = None) -> str:
         return self._git(*arguments, index=index).decode().strip()
 
-    def initialize(self, attempt: AttemptSpec) -> str:
+    def initialize(self, attempt: AttemptSpec, check_current: Callable[[], None]) -> str:
         key = "ordinary-workspace:" + attempt.attempt_id
         previous = self.store.find_artifact(key, "prepared")
         if previous is not None:
@@ -129,34 +130,98 @@ class OrdinaryGitWorkspace:
             raise IntakeRefused("new ordinary handoff requires a fresh owned leaf; preserve existing bytes")
         if self.objects.exists():
             raise IntakeRefused("unclaimed ordinary object directory retained, not adopted")
+        check_current()
         self.objects.mkdir(mode=0o700)
+        check_current()
         self._git("init", "--bare", "--template=", str(self.objects), source=self.objects.parent)
         subject = draft.evidence.subject
+        source_base = subject.base
         with source_use(self.source, self.repository_url) as leased:
             validate_checkout(leased)
+            check_current()
             self._git("fetch", "--no-tags", "--no-write-fetch-head", str(leased), subject.base)
         self.base = subject.base
         index = self.objects / "controller-index"
+        check_current()
         self._git("read-tree", subject.base, index=index)
         program = self.store.load(attempt.program_id)
-        for binding in attempt.effective_inputs:
+        deltas: dict[str, bytes] = {}
+        ancestry: dict[str, tuple[str, ...]] = {}
+        visiting: set[str] = set()
+
+        def apply_patch(data: bytes, target_index: Path) -> None:
+            if not data:
+                return
+            saved = self.objects / ("input-" + digest(data) + ".patch")
+            check_current()
+            saved.write_bytes(data)
+            check_current()
+            self._git("apply", "--cached", "--3way", "--binary", str(saved), index=target_index)
+
+        def resolve(binding: InputBinding) -> tuple[str, ...]:
             if binding.source_kind != "predecessor":
-                continue
-            fact = next(item for item in program.satisfactions if item.reference_id == binding.satisfaction_id)
-            patch = self.store.artifact(f"runtime:{fact.source_attempt_id}", "candidate.patch")
+                return ()
+            fact = next((item for item in program.satisfactions if item.reference_id == binding.satisfaction_id), None)
+            if fact is None or fact.work_unit_id != binding.source_work_unit_id:
+                raise IntakeRefused("predecessor acceptance provenance is unavailable")
+            if not any(
+                item.name == binding.output_name and item.reference == binding.reference
+                for item in fact.output_bindings
+            ):
+                raise IntakeRefused("predecessor output differs from its accepted binding")
+            producer = program.attempt(fact.source_attempt_id).spec
+            patch = self.store.artifact(f"runtime:{producer.attempt_id}", "candidate.patch")
             if binding.reference != "artifact:sha256:" + digest(patch):
                 raise IntakeRefused("predecessor output bytes differ from the accepted immutable input")
-            saved = self.objects / ("input-" + digest(patch) + ".patch")
-            saved.write_bytes(patch)
-            self._git("apply", "--cached", "--3way", "--binary", str(saved), index=index)
+            if producer.attempt_id in ancestry:
+                return ancestry[producer.attempt_id]
+            if producer.attempt_id in visiting:
+                raise IntakeRefused("cyclic accepted input provenance")
+            visiting.add(producer.attempt_id)
+            ancestors: list[str] = []
+            for original in producer.effective_inputs:
+                for ancestor in resolve(original):
+                    if ancestor not in ancestors:
+                        ancestors.append(ancestor)
+            prepared = object_from(self.store.artifact("ordinary-workspace:" + producer.attempt_id, "prepared"))
+            if prepared.get("attempt") != producer.digest or prepared.get("base") != source_base:
+                raise IntakeRefused("predecessor preparation differs from its original Attempt or base")
+            prior_index = self.objects / ("ancestor-index-" + digest(producer.attempt_id.encode()))
+            check_current()
+            self._git("read-tree", source_base, index=prior_index)
+            for ancestor in ancestors:
+                apply_patch(deltas[ancestor], prior_index)
+            check_current()
+            prior_tree = self._text("write-tree", index=prior_index)
+            if prepared.get("input_tree") != prior_tree:
+                raise IntakeRefused("accepted producer input tree does not match its recorded ancestry")
+            candidate_index = self.objects / ("candidate-index-" + digest(producer.attempt_id.encode()))
+            check_current()
+            self._git("read-tree", source_base, index=candidate_index)
+            apply_patch(patch, candidate_index)
+            check_current()
+            candidate_tree = self._text("write-tree", index=candidate_index)
+            deltas[producer.attempt_id] = self._git("diff", "--binary", "--full-index", prior_tree, candidate_tree)
+            visiting.remove(producer.attempt_id)
+            ancestry[producer.attempt_id] = (*ancestors, producer.attempt_id)
+            return ancestry[producer.attempt_id]
+
+        ordered: list[str] = []
+        for binding in attempt.effective_inputs:
+            for producer in resolve(binding):
+                if producer not in ordered:
+                    ordered.append(producer)
+        for producer in ordered:
+            apply_patch(deltas[producer], index)
+        check_current()
         self.input_tree = self._text("write-tree", index=index)
-        self.prepared_revision = (
-            subject.base
-            if self.input_tree == self._text("rev-parse", subject.base + "^{tree}")
-            else self._text(
+        if self.input_tree == self._text("rev-parse", subject.base + "^{tree}"):
+            self.prepared_revision = subject.base
+        else:
+            check_current()
+            self.prepared_revision = self._text(
                 "commit-tree", self.input_tree, "-p", subject.base, "-m", "Prepared ordinary inputs " + attempt.digest
             )
-        )
         expected_files: dict[str, tuple[bytes, bytes]] = {}
         expected_directories: set[str] = set()
         for item in self._git("ls-tree", "-r", "-z", self.input_tree).split(b"\0"):
@@ -168,11 +233,14 @@ class OrdinaryGitWorkspace:
             if kind != b"blob" or mode not in {b"100644", b"100755"}:
                 raise IntakeRefused("ordinary profile requires regular source files; no symlink/submodule adoption")
             target = self.workspace.path / path
+            check_current()
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             contents = self._git("cat-file", "blob", oid.decode())
             expected_files[path] = (mode, contents)
             expected_directories.update(str(parent) for parent in Path(path).parents if str(parent) != ".")
+            check_current()
             target.write_bytes(contents)
+            check_current()
             target.chmod(0o755 if mode == b"100755" else 0o644)
         self._attempt = attempt
         subject, captured = self.workspace.capture()
@@ -193,11 +261,13 @@ class OrdinaryGitWorkspace:
                     or base64.b64decode(cast(str, item.get("bytes", "")), validate=True) != expected_bytes
                 ):
                     raise IntakeRefused("prepared workspace bytes differ from exact approved Git tree")
+        check_current()
         self.store.intent(
             key,
             key,
             {"kind": "ordinary-intake-record", "version": 1, "bytes": encode({"attempt": attempt.digest}).decode()},
         )
+        check_current()
         self.store.finalize_artifact(
             key,
             "prepared",
