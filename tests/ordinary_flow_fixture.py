@@ -508,7 +508,9 @@ print("Done")
                         + sys.executable
                         + "\n"
                         + (
-                            CODEX_PEER.replace('("1" if unit == "alpha" else "2")', '"-1"')
+                            CODEX_PEER.replace('"status": "completed"', '"status": "inProgress"')
+                            if exercise in {"managed-program-stop", "managed-budget-revoke"}
+                            else CODEX_PEER.replace('("1" if unit == "alpha" else "2")', '"-1"')
                             if bad_candidate
                             else CODEX_PEER
                         )
@@ -626,6 +628,15 @@ print("Done")
                 if connection is not None:
                     managed = OrdinaryManagedRun(client, workspace, connection)
                     managed.start(handoff)
+                    if exercise in {"managed-program-stop", "managed-budget-revoke"}:
+                        if exercise == "managed-program-stop":
+                            app.stop(approved, "owner stopped the Program")
+                        else:
+                            store.revoke_work_budget("everyday-program", "owner revoked remaining work")
+                        assert managed.finish() == "cancelled"
+                        assert not native_state["sends"]
+                        assert len(store.operations("runtime:")) == 1
+                        return {"status": "stopped", "native_sends": 0}
                     if exercise == "stop":
                         settled = managed.request_stop("owner requested STOP")
                         assert store.load("everyday-program").status is ProgramStatus.CANCELLED
@@ -966,6 +977,18 @@ print("Done")
                     (OrdinaryForgejoSync(app, approved, control, workspace, http(), pub_git, "fixture-owner"), handoff)
                 )
             assert store.load("everyday-program").status is ProgramStatus.COMPLETED
+            if exercise == "stop-completed":
+                original = store.load("everyday-program")
+                app.stop(approved, "owner withdrew publication")
+                assert store.load("everyday-program") == original
+                try:
+                    publications[0][0].publish(publications[0][1])
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("revoked completed Program published a Forgejo effect")
+                assert not native_state["sends"]
+                return {"status": "completed-revoked", "native_sends": 0}
             for sync, raw_handoff in publications:
                 handoff = raw_handoff
                 first = sync.publish(handoff)

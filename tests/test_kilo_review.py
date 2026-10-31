@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 import pytest
 from test_product_review import configure_budget, request
+from test_sqlite_store import sqlite_tmp_path as sqlite_tmp_path
 
 from creatidy_kernel.adapters.kilo_review import KILO_VERSION, NativeKiloReview, review_permissions
 from creatidy_kernel.adapters.reference import reference_spec
@@ -148,16 +149,16 @@ def ready(store: SQLiteProgramStore) -> None:
 
 
 def test_real_http_adapter_receives_native_structured_review_without_author_conversation(
-    tmp_path: Path, native: tuple[NativeService, str]
+    sqlite_tmp_path: Path, native: tuple[NativeService, str]
 ) -> None:
     service, origin = native
-    with SQLiteProgramStore(tmp_path / "state.db") as store:
+    with SQLiteProgramStore(sqlite_tmp_path / "state.db") as store:
         ready(store)
         review = request()
         dispatcher = NativeKiloReview(
             store,
             origin,
-            tmp_path,
+            sqlite_tmp_path,
             "product-review",
             lambda _: "Exact immutable diff and AC.",
             lambda: int(time.time()),
@@ -177,13 +178,13 @@ def test_real_http_adapter_receives_native_structured_review_without_author_conv
 
 @pytest.mark.parametrize("mode", ["version", "inherited", "poisoned", "revoked", "lease"])
 def test_unsupported_or_lost_authority_never_forges_independence_or_sends_an_unadmitted_prompt(
-    tmp_path: Path, native: tuple[NativeService, str], mode: str
+    sqlite_tmp_path: Path, native: tuple[NativeService, str], mode: str
 ) -> None:
     service, origin = native
     service.version = "unsupported" if mode == "version" else KILO_VERSION
     service.inherited = mode == "inherited"
     service.changed_input = mode == "poisoned"
-    with SQLiteProgramStore(tmp_path / "state.db") as store:
+    with SQLiteProgramStore(sqlite_tmp_path / "state.db") as store:
         ready(store)
 
         def credential() -> str:
@@ -199,7 +200,7 @@ def test_unsupported_or_lost_authority_never_forges_independence_or_sends_an_una
         dispatcher = NativeKiloReview(
             store,
             origin,
-            tmp_path,
+            sqlite_tmp_path,
             "product-review",
             lambda _: "Exact diff and AC.",
             lambda: int(time.time()),
@@ -215,16 +216,16 @@ def test_unsupported_or_lost_authority_never_forges_independence_or_sends_an_una
 
 
 def test_lost_native_reply_recovers_exact_retained_session_without_second_prompt(
-    tmp_path: Path, native: tuple[NativeService, str]
+    sqlite_tmp_path: Path, native: tuple[NativeService, str]
 ) -> None:
     service, origin = native
     service.lose_reply = True
-    with SQLiteProgramStore(tmp_path / "state.db") as store:
+    with SQLiteProgramStore(sqlite_tmp_path / "state.db") as store:
         ready(store)
         dispatcher = NativeKiloReview(
             store,
             origin,
-            tmp_path,
+            sqlite_tmp_path,
             "product-review",
             lambda _: "Exact diff and AC.",
             lambda: int(time.time()),
@@ -252,9 +253,9 @@ def test_lost_native_reply_recovers_exact_retained_session_without_second_prompt
         "http://127.0.0.1:1?x=1",
     ],
 )
-def test_native_client_does_not_accept_ambient_or_remote_runtime_endpoints(tmp_path: Path, origin: str) -> None:
-    with SQLiteProgramStore(tmp_path / "state.db") as store:
+def test_native_client_does_not_accept_ambient_or_remote_runtime_endpoints(sqlite_tmp_path: Path, origin: str) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / "state.db") as store:
         with pytest.raises(ValueError):
             NativeKiloReview(
-                store, origin, tmp_path, "product-review", lambda _: "source", lambda: 100, freshness_seconds=60
+                store, origin, sqlite_tmp_path, "product-review", lambda _: "source", lambda: 100, freshness_seconds=60
             )

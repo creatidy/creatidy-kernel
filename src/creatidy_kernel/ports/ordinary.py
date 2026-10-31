@@ -51,6 +51,7 @@ from creatidy_kernel.ports.verification import (
 
 class OrdinaryStore(IntakeStore, OwnershipStore, Protocol):
     def work_decision_time(self, program_id: str) -> int: ...
+    def check_work_authority(self, program_id: str) -> None: ...
     def revoke_work_budget(self, program_id: str, evidence: str) -> None: ...
     def accept_ordinary_preparation(self, claim: WorkClaim, owner: str, subject: str) -> None: ...
 
@@ -372,7 +373,7 @@ class OrdinaryProgram:
         if not reason.strip() or self.recover(approved.decision_id).proposal != approved.proposal:
             raise IntakeRefused("exact owner decision and substantive STOP reason required")
         program = self.store.load(approved.program.program_id)
-        if program.status.value != "cancelled":
+        if program.status.value not in {"cancelled", "completed"}:
             self.store.admit(
                 program.program_id,
                 "ordinary-stop:" + approved.decision_id,
@@ -412,6 +413,7 @@ class OrdinaryProgram:
                 raise IntakeRefused("ordinary read cut changed during qualified clock acquisition")
 
         self.store.program_read_cut(captured.program_id, close, lambda: now)
+        self.store.check_work_authority(captured.program_id)
 
     def client(
         self,

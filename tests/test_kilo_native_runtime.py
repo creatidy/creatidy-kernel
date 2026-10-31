@@ -9,23 +9,24 @@ import pytest
 from native_kilo_fixture import native_kilo
 from test_kilo_review import ready
 from test_product_review import request
+from test_sqlite_store import sqlite_tmp_path as sqlite_tmp_path
 
 from creatidy_kernel.adapters.kilo_review import NativeKiloReview
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.ports.verification import ProductReviewStatus, dispatch_product_review
 
 
-def test_real_native_cold_review_session(tmp_path: Path) -> None:
+def test_real_native_cold_review_session(sqlite_tmp_path: Path) -> None:
     binary = os.environ.get("CREATIDY_KILO_NATIVE_TEST_BINARY")
     if not binary:
         pytest.skip("explicit pinned native test binary not supplied; no auto-download")
-    with native_kilo(tmp_path / "native", Path(binary)) as (origin, calls):
-        with SQLiteProgramStore(tmp_path / "kernel.db") as store:
+    with native_kilo(sqlite_tmp_path / "native", Path(binary)) as (origin, calls):
+        with SQLiteProgramStore(sqlite_tmp_path / "kernel.db") as store:
             ready(store)
             dispatcher = NativeKiloReview(
                 store,
                 origin,
-                tmp_path,
+                sqlite_tmp_path,
                 "product-review",
                 lambda _: "Exact test diff and approved criteria; fixture only.",
                 lambda: int(time.time()),

@@ -60,6 +60,17 @@ for exercise in ("command-evidence-no-witness", "command-evidence-partial"):
         "native_sends": 0,
     }:
         raise SystemExit("installed recovery accepted incomplete original command evidence")
+if run_ordinary_flow(storage / "stop-completed", None, mode="pull", exercise="stop-completed") != {
+    "status": "completed-revoked",
+    "native_sends": 0,
+}:
+    raise SystemExit("installed STOP changed completion or allowed later publication")
+for exercise in ("managed-program-stop", "managed-budget-revoke"):
+    if run_ordinary_flow(storage / exercise, None, mode="managed", exercise=exercise) != {
+        "status": "stopped",
+        "native_sends": 0,
+    }:
+        raise SystemExit("installed managed reconciliation failed to retire the original target")
 for exercise in ("rejected-replay", "rejected-replay-reopen"):
     result = run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise)
     if result["status"] != "rejected":
