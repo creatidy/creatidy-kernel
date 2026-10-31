@@ -18,11 +18,19 @@ fixture = runpy.run_path(str(ROOT / "tests/ordinary_flow_fixture.py"))
 run_ordinary_flow = cast(Callable[..., dict[str, object]], fixture["run_ordinary_flow"])
 
 storage = Path(sys.argv[1])
+preparation_only = len(sys.argv) == 3 and sys.argv[2] == "--preparation-only"
+if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and not preparation_only):
+    raise SystemExit("expected storage directory and optional --preparation-only")
 for mode in ("pull", "managed", "mixed"):
     for exercise in ("normal", "reopen", "remediation", "lost-reply"):
+        if preparation_only and (mode, exercise) != ("pull", "normal"):
+            continue
         result = run_ordinary_flow(storage / f"{mode}-{exercise}", None, mode=mode, exercise=exercise)
         if result["status"] != "completed" or result["satisfactions"] != 2 or result["native_sends"] != 4:
             raise SystemExit(f"installed ordinary {mode}/{exercise} did not complete exact accepted work")
+if preparation_only:
+    print("Installed ordinary preparation fixture passed.")
+    raise SystemExit(0)
 for mode in ("pull", "managed"):
     result = run_ordinary_flow(storage / f"{mode}-stop", None, mode=mode, exercise="stop")
     if result["status"] != "stopped" or result["native_sends"] != 0:
@@ -71,6 +79,11 @@ for exercise in ("managed-program-stop", "managed-budget-revoke"):
         "native_sends": 0,
     }:
         raise SystemExit("installed managed reconciliation failed to retire the original target")
+for exercise in ("baseline-pending", "baseline-unsupported", "baseline-failure", "baseline-error"):
+    result = run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise)
+    expected = "refused" if exercise in {"baseline-pending", "baseline-unsupported"} else "approved"
+    if result["status"] != expected:
+        raise SystemExit("installed native baseline state was mistaken for a completed result")
 for exercise in ("rejected-replay", "rejected-replay-reopen"):
     result = run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise)
     if result["status"] != "rejected":

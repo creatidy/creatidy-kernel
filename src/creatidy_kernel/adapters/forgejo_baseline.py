@@ -69,6 +69,9 @@ class ForgejoBaseline:
                     selected[context] = row
             if frozenset(selected) != self.contexts:
                 return None
+            if any(row["status"] not in {"success", "failure", "error"} for row in selected.values()):
+                # Pending and unrecognised native states are unresolved, not completed failures.
+                return None
             timestamps = [datetime.fromisoformat(cast(str, row["created_at"])) for row in selected.values()]
             if any(value.tzinfo is None for value in timestamps):
                 return None

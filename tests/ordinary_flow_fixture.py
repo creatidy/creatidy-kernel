@@ -17,7 +17,7 @@ import threading
 import time
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -101,6 +101,7 @@ def forge_service(
     diamond: bool = False,
     initial_comments: int = 0,
     duplicate_comment: bool = False,
+    baseline_status: str = "success",
 ) -> Generator[tuple[str, dict[str, object]]]:
     created = datetime.now(UTC).isoformat()
     prs: list[dict[str, object]] = []
@@ -133,6 +134,7 @@ def forge_service(
         "base": base,
         "lost_replies": 0,
         "lost_pr_replies": 0,
+        "baseline_created": created,
     }
 
     def issue(number: int) -> dict[str, object]:
@@ -182,7 +184,7 @@ def forge_service(
                 )
             elif path.startswith("/commits/") and path.endswith("/statuses"):
                 self.reply(
-                    [{"id": 1, "context": "ci/baseline", "status": "success", "created_at": created}]
+                    [{"id": 1, "context": "ci/baseline", "status": baseline_status, "created_at": created}]
                     if page == 1
                     else []
                 )
@@ -285,6 +287,7 @@ def run_ordinary_flow(
             diamond=exercise in {"diamond", "diamond-conflict"},
             initial_comments=31 if exercise == "many-comments" else 241 if exercise == "oversized-comments" else 0,
             duplicate_comment=exercise == "duplicate-comments",
+            baseline_status=exercise.removeprefix("baseline-") if exercise.startswith("baseline-") else "success",
         ) as (endpoint, native_state),
         review_peer(
             root / "native", native_binary, lose_first_reply=exercise in {"review-lost", "review-lost-reopen"}
@@ -380,6 +383,16 @@ print("Done")
                 project_id="ordinary-project",
                 project_budget=budget,
             )
+            if exercise.startswith("baseline-"):
+                status_row = {
+                    "id": 1,
+                    "context": "ci/baseline",
+                    "status": exercise.removeprefix("baseline-"),
+                    "created_at": native_state["baseline_created"],
+                }
+                owner_policy = replace(
+                    owner_policy, repair_baseline_reference="forgejo-statuses:" + digest(encode([status_row]))
+                )
             decision_clock = lambda: int(time.time()) + time_offset[0]  # noqa: E731 - Controlled fixture clock.
             app = OrdinaryProgram(
                 store,
@@ -438,17 +451,23 @@ print("Done")
             for unit, subject, declaration in selections:
                 snapshot = reader.snapshot(subject, declaration)
                 assert (source / (unit + ".py")).read_text() == "VALUE = 0\n"
-                reader.review(
-                    subject,
-                    declaration,
-                    expected_snapshot=reader.snapshot_digest(snapshot, declaration),
-                    disposition=Disposition.REMAINS,
-                    decision_id="owner-source-" + unit,
-                    reason=(
-                        "Owner inspected pinned existing zero value and complete native PR inventory; "
-                        "requested behavior is absent"
-                    ),
-                )
+                try:
+                    reader.review(
+                        subject,
+                        declaration,
+                        expected_snapshot=reader.snapshot_digest(snapshot, declaration),
+                        disposition=Disposition.REMAINS,
+                        decision_id="owner-source-" + unit,
+                        reason=(
+                            "Owner inspected pinned existing zero value and complete native PR inventory; "
+                            "requested behavior is absent"
+                        ),
+                    )
+                except IntakeRefused:
+                    if exercise not in {"baseline-pending", "baseline-unsupported"}:
+                        raise
+                    assert store.find_program("everyday-program") is None
+                    return {"status": "refused"}
             if exercise == "owner-binding":
                 subject = selections[0][1]
                 original = selections[0][2]
@@ -460,6 +479,10 @@ print("Done")
                 return {"status": "unassessed"}
             proposal = app.propose("everyday-program", "Receive two native-dependent obligations", selections)
             approved = app.approve(proposal, decision_id="owner-program-v1", expires_at=int(time.time()) + 900)
+            if exercise in {"baseline-pending", "baseline-unsupported"}:
+                raise AssertionError("unresolved baseline was authorized as a failing baseline")
+            if exercise in {"baseline-failure", "baseline-error"}:
+                return {"status": "approved"}
             assert approved.program.status is ProgramStatus.DRAFT
             assert app.activate(approved).ready_work_unit_ids == ("alpha",)
             publications: list[tuple[OrdinaryForgejoSync, OrdinaryHandoff]] = []

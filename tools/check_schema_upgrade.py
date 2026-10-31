@@ -637,7 +637,9 @@ def main(new_python: Path, storage_root: Path) -> None:
         fixture = ordinary / "installed-flow"
         fixture.mkdir()
         subprocess.run(
-            [str(new_python), "-I", str(ROOT / "tools/check_ordinary.py"), str(fixture)], cwd=fixture, check=True
+            [str(new_python), "-I", str(ROOT / "tools/check_ordinary.py"), str(fixture), "--preparation-only"],
+            cwd=fixture,
+            check=True,
         )
         path = fixture / "pull-normal" / "state.db"
         with closing(sqlite3.connect(path)) as current:

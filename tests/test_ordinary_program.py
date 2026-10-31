@@ -162,6 +162,16 @@ def test_managed_reconciliation_retires_original_target_after_revocation(sqlite_
     }
 
 
+@pytest.mark.parametrize("exercise", ["baseline-pending", "baseline-unsupported"])
+def test_unresolved_native_baseline_cannot_use_failing_baseline_exception(sqlite_tmp_path: Path, exercise: str) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise) == {"status": "refused"}
+
+
+@pytest.mark.parametrize("exercise", ["baseline-failure", "baseline-error"])
+def test_exact_completed_native_failure_allows_explicit_repair_policy(sqlite_tmp_path: Path, exercise: str) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise) == {"status": "approved"}
+
+
 @pytest.mark.parametrize("exercise", ["duplicate-comments", "oversized-comments"])
 def test_ambiguous_or_oversized_comment_collection_never_retries(sqlite_tmp_path: Path, exercise: str) -> None:
     result = run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise)
