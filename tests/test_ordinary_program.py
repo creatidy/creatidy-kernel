@@ -106,6 +106,18 @@ def test_diamond_dag_composes_shared_ancestor_once(sqlite_tmp_path: Path) -> Non
     assert result["native_sends"] == 8
 
 
+@pytest.mark.parametrize("mode", ["pull", "managed"])
+def test_substantive_review_findings_reach_remediation_author(sqlite_tmp_path: Path, mode: str) -> None:
+    result = run_ordinary_flow(sqlite_tmp_path / mode, None, mode=mode, exercise="review-remediation")
+    assert result["status"] == "completed" and result["satisfactions"] == 2
+
+
+def test_remediation_refuses_review_receipt_with_different_subject(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "tampered-review", None, mode="pull", exercise="review-remediation-tampered"
+    ) == {"status": "refused", "native_sends": 0}
+
+
 def test_out_of_scope_source_renamed_to_allowed_destination_is_rejected(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(sqlite_tmp_path / "rename-outside", None, mode="pull", exercise="rename-outside") == {
         "status": "rejected",

@@ -290,7 +290,10 @@ def run_ordinary_flow(
             baseline_status=exercise.removeprefix("baseline-") if exercise.startswith("baseline-") else "success",
         ) as (endpoint, native_state),
         review_peer(
-            root / "native", native_binary, lose_first_reply=exercise in {"review-lost", "review-lost-reopen"}
+            root / "native",
+            native_binary,
+            reject_first=exercise in {"review-remediation", "review-remediation-tampered"},
+            lose_first_reply=exercise in {"review-lost", "review-lost-reopen"},
         ) as (review_origin, calls),
         ExitStack() as owners,
     ):
@@ -492,7 +495,11 @@ print("Done")
             sessions: list[str] = []
             review_operations: set[str] = set()
             rejected_attempt: str | None = None
-            for position, unit in enumerate(("alpha", "alpha", "beta") if exercise == "remediation" else units):
+            for position, unit in enumerate(
+                ("alpha", "alpha", "beta")
+                if exercise in {"remediation", "review-remediation", "review-remediation-tampered"}
+                else units
+            ):
                 ordinal = units.index(unit)
                 bad_candidate = (
                     exercise in {"remediation", "rejected-replay", "rejected-replay-reopen"} and position == 0
@@ -541,6 +548,19 @@ print("Done")
                             else CODEX_PEER
                         )
                     )
+                    if exercise == "review-remediation" and position == 1:
+                        peer.write_text(
+                            peer.read_text().replace(
+                                'unit = context["work_unit"]',
+                                'assert context["remediation"]["review_operation_id"].startswith("product-review:")\n'
+                                '        assert context["remediation"]["findings"][0]["finding_id"]'
+                                ' == "msg_synthetic_result:0"\n'
+                                '        assert context["remediation"]["findings"][0]["fingerprint"] == "edge-case"\n'
+                                '        assert context["remediation"]["findings"][0]["reason"]'
+                                ' == "Implement the approved edge case."\n'
+                                '        unit = context["work_unit"]',
+                            )
+                        )
                     peer.chmod(0o700)
                     connection = CodexStdio(
                         (str(peer), "app-server"),
@@ -599,6 +619,38 @@ print("Done")
                     )
                     == handoff
                 )
+                if exercise == "review-remediation-tampered" and position == 1:
+                    artifact = SQLiteProgramStore.artifact
+
+                    def mismatched_receipt(
+                        store_arg: SQLiteProgramStore,
+                        operation: str,
+                        name: str,
+                        original: Callable[[SQLiteProgramStore, str, str], bytes] = artifact,
+                    ) -> bytes:
+                        data = original(store_arg, operation, name)
+                        if operation.startswith("product-review:") and name == "review-receipt":
+                            record = json.loads(data)
+                            record["subject"]["candidate_digest"] = "sha256:" + "0" * 64
+                            return encode(record)
+                        return data
+
+                    with patch.object(SQLiteProgramStore, "artifact", mismatched_receipt):
+                        try:
+                            client.context(handoff)
+                        except ValueError as error:
+                            assert "differs from rejected candidate subject" in str(error)
+                        else:
+                            raise AssertionError("mismatched original review subject was accepted")
+                    assert not native_state["sends"] and len(calls) == 1
+                    return {"status": "refused", "native_sends": 0}
+                if exercise == "review-remediation" and position == 1 and selected is HandoffMode.PULL:
+                    remediation = json.loads(client.context(handoff))["remediation"]
+                    assert remediation["review_operation_id"] == store.operations("product-review:")[0].operation_id
+                    assert remediation["attempt"] == rejected_attempt
+                    assert remediation["findings"][0]["finding_id"] == "msg_synthetic_result:0"
+                    assert remediation["findings"][0]["fingerprint"] == "edge-case"
+                    assert remediation["findings"][0]["reason"] == "Implement the approved edge case."
                 if exercise == "reopen" and ordinal == 0:
                     store.close()
                     store = owners.enter_context(SQLiteProgramStore(root / "state.db", boot_clock=boot_clock))
@@ -849,6 +901,12 @@ print("Done")
                     assert not (tree.path / "base.py").exists()
                     assert (tree.path / "renamed.py").read_text() == "BASELINE = True\n"
                     return {"status": "rejected", "native_sends": 0}
+                if exercise in {"review-remediation", "review-remediation-tampered"} and position == 0:
+                    assert outcome == "rejected"
+                    assert not store.load("everyday-program").satisfactions and not native_state["sends"]
+                    control.release(handoff.claim, evidence="owner reconciled the reviewed original workspace")
+                    rejected_attempt = handoff.attempt.attempt_id
+                    continue
                 if exercise in {"review-lost", "review-lost-reopen"} and position == 0:
                     assert outcome == "review_unknown"
                     assert len(calls) == 1

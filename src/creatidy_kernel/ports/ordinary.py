@@ -38,7 +38,7 @@ from creatidy_kernel.core.intake import (
 from creatidy_kernel.core.ordinary import DependencyEvidence, OrdinaryProposal
 from creatidy_kernel.core.ownership import HandoffMode, WorkClaim
 from creatidy_kernel.core.verification import CandidateResult, EvidenceSubject, ProductReviewRequest, VerificationPolicy
-from creatidy_kernel.ports.application import Collection, receive_candidate
+from creatidy_kernel.ports.application import Collection, receive_candidate, remediation_context
 from creatidy_kernel.ports.intake import IntakeStore, OrdinaryIntake, draft_from
 from creatidy_kernel.ports.ownership import OwnershipStore, WorkOwnership
 from creatidy_kernel.ports.verification import (
@@ -536,6 +536,19 @@ class OrdinaryWorkClient:
         self.application.check(self.approved)
         self.worker.observe(handoff.claim)
         remediation = handoff.attempt.remediation_of
+        remediation_data: dict[str, object] | None = None
+        if remediation is not None:
+            review_operation_id, findings = remediation_context(self.application.store, remediation)
+            if not findings:
+                raise IntakeRefused("substantive original remediation findings are unavailable")
+            remediation_data = {
+                "attempt": remediation,
+                "rejection": object_from(
+                    self.application.store.artifact(f"rejection:{remediation}", "rejected-result")
+                ),
+                "review_operation_id": review_operation_id,
+                "findings": findings,
+            }
         return encode(
             {
                 "version": 1,
@@ -544,14 +557,7 @@ class OrdinaryWorkClient:
                 "approved": self.approved.proposal.payload,
                 "inputs": [item.payload() for item in handoff.attempt.effective_inputs],
                 "workspace": self.workspace.reference,
-                "remediation": None
-                if remediation is None
-                else {
-                    "attempt": remediation,
-                    "rejection": object_from(
-                        self.application.store.artifact(f"rejection:{remediation}", "rejected-result")
-                    ),
-                },
+                "remediation": remediation_data,
                 "identity_and_guarantees": (
                     "cooperative trusted-development; no hostile isolation or model measurement attested"
                 ),

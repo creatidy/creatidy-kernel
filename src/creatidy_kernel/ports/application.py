@@ -68,7 +68,7 @@ def manifest_bytes(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
-def _remediation_context(store: ApplicationStore, source_attempt_id: str) -> tuple[str | None, list[dict[str, str]]]:
+def remediation_context(store: ApplicationStore, source_attempt_id: str) -> tuple[str | None, list[dict[str, str]]]:
     operation_id = f"rejection:{source_attempt_id}"
     operation = store.operation(operation_id)
     envelope_value: object = json.loads(operation.request_json)
@@ -112,8 +112,17 @@ def _remediation_context(store: ApplicationStore, source_attempt_id: str) -> tup
         if receipt.get("subject") != result["subject"]:
             raise ValueError("product review receipt differs from rejected candidate subject")
         verdict = receipt.get("verdict")
-        if verdict == ProductReviewVerdict.REQUEST_CHANGES.value:
+        if review_status == ProductReviewStatus.CHANGES_REQUESTED.value:
+            if verdict != ProductReviewVerdict.REQUEST_CHANGES.value:
+                raise ValueError("product review verdict differs from rejected candidate status")
             findings = receipt.get("findings")
+        elif review_status == ProductReviewStatus.APPROVED.value:
+            if verdict != ProductReviewVerdict.APPROVE.value:
+                raise ValueError("product review verdict differs from rejected candidate status")
+        else:
+            raise ValueError("product review receipt lacks a matching terminal status")
+    elif review_status in {ProductReviewStatus.CHANGES_REQUESTED.value, ProductReviewStatus.APPROVED.value}:
+        raise ValueError("product review status lacks its original receipt")
     if type(findings) is not list:
         raise ValueError("persisted rejection findings are invalid")
     normalized: list[dict[str, str]] = []
@@ -319,7 +328,7 @@ def advance_work_unit(
                 return "remediation_paused"
             if store.find_artifact(f"rejection:{remediation_of}", "rejected-result") is None:
                 return "remediation_paused"
-            review_operation_id, findings = _remediation_context(store, remediation_of)
+            review_operation_id, findings = remediation_context(store, remediation_of)
             if not findings:
                 return "remediation_paused"
             history: list[frozenset[str]] = []
@@ -327,7 +336,7 @@ def advance_work_unit(
                 previous_data = store.find_artifact(f"rejection:{previous.attempt_id}", "rejected-result")
                 if previous_data is None:
                     continue
-                _, previous_findings = _remediation_context(store, previous.attempt_id)
+                _, previous_findings = remediation_context(store, previous.attempt_id)
                 if previous_findings:
                     history.append(frozenset(item["fingerprint"] for item in previous_findings))
             current_fingerprints = frozenset(item["fingerprint"] for item in findings)

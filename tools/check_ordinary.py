@@ -37,6 +37,13 @@ for mode in ("pull", "managed"):
         raise SystemExit(f"installed ordinary {mode} STOP did not revoke authority")
     if result["settled"] != (False if mode == "pull" else "cancelled"):
         raise SystemExit(f"installed ordinary {mode} STOP misreported task-scope settlement")
+    result = run_ordinary_flow(storage / f"{mode}-review-remediation", None, mode=mode, exercise="review-remediation")
+    if result["status"] != "completed" or result["satisfactions"] != 2:
+        raise SystemExit(f"installed ordinary {mode} failed to deliver substantive review findings")
+if run_ordinary_flow(
+    storage / "review-remediation-tampered", None, mode="pull", exercise="review-remediation-tampered"
+) != {"status": "refused", "native_sends": 0}:
+    raise SystemExit("installed remediation accepted a review receipt from another subject")
 for exercise in (
     "branch-pr",
     "review-lost",
