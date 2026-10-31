@@ -6,6 +6,7 @@ supported. Native close/edit/merge is not acceptance and is not authorized here.
 An unknown write can only be read back; an empty scan never authorizes replay.
 """
 
+import re
 from dataclasses import asdict
 from typing import cast
 
@@ -16,7 +17,7 @@ from creatidy_kernel.adapters.ordinary_workspace import OrdinaryGitWorkspace
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.execution import OperationKey
 from creatidy_kernel.core.forge import Effect, EffectStatus, ForgeConflict, Presence, Receipt, Reference, effect_marker
-from creatidy_kernel.core.intake import IntakeRefused, digest, encode, strings
+from creatidy_kernel.core.intake import IntakeRefused, digest, encode, object_from, strings
 from creatidy_kernel.core.verification import CandidateResult, EvidenceSubject
 from creatidy_kernel.ports.ordinary import OrdinaryApproval, OrdinaryHandoff, OrdinaryProgram
 from creatidy_kernel.ports.ownership import WorkOwnership
@@ -229,16 +230,39 @@ class OrdinaryForgejoSync:
         attempt = handoff.attempt
         topic_key = f"ordinary-publication-topic:{attempt.attempt_id}"
         saved_topic = self.store.find_artifact(topic_key, "topic")
-        if saved_topic is None:
+        prior = tuple(item for item in self.store.operations(topic_key) if item.operation_id == topic_key)
+        if not prior:
+            if saved_topic is not None:
+                raise IntakeRefused("publication topic has no original intent")
             topic = fresh_agit_topic()
             self.store.intent(
                 topic_key,
                 topic_key,
                 {"kind": "ordinary-intake-record", "version": 1, "bytes": encode({"topic": topic}).decode()},
             )
-            self.store.finalize_artifact(topic_key, "topic", topic.encode())
         else:
-            topic = saved_topic.decode()
+            if len(prior) != 1 or prior[0].effect_key != topic_key:
+                raise IntakeRefused("publication topic intent is ambiguous")
+            wrapper = object_from(prior[0].request_json.encode())
+            request = wrapper.get("request")
+            if type(request) is not dict:
+                raise IntakeRefused("publication topic intent is malformed")
+            original = cast(dict[str, object], request)
+            raw = original.get("bytes")
+            if original.get("kind") != "ordinary-intake-record" or original.get("version") != 1 or type(raw) is not str:
+                raise IntakeRefused("publication topic intent is malformed")
+            topic_value = object_from(raw.encode())
+            topic = cast(str, topic_value.get("topic"))
+            if (
+                set(topic_value) != {"topic"}
+                or type(topic) is not str
+                or re.fullmatch(r"kernel-pr-[0-9a-f]{32}", topic) is None
+            ):
+                raise IntakeRefused("publication topic intent is invalid")
+        if saved_topic is None:
+            self.store.finalize_artifact(topic_key, "topic", topic.encode())
+        elif saved_topic != topic.encode():
+            raise IntakeRefused("publication topic artifact differs from original intent")
         repository = Reference("forgejo:" + self.http.binding.repository)
         draft = next(item for item in self.approved.proposal.drafts if item.task_id == attempt.work_unit_id)
         results: list[str] = []

@@ -68,6 +68,21 @@ for exercise in ("command-evidence-no-witness", "command-evidence-partial"):
         "native_sends": 0,
     }:
         raise SystemExit("installed recovery accepted incomplete original command evidence")
+if run_ordinary_flow(storage / "rename-outside", None, mode="pull", exercise="rename-outside") != {
+    "status": "rejected",
+    "native_sends": 0,
+}:
+    raise SystemExit("installed scope gate accepted an out-of-scope rename source")
+if run_ordinary_flow(storage / "topic-crash", None, mode="pull", exercise="topic-crash") != {
+    "status": "topic-recovered",
+    "native_sends": 2,
+}:
+    raise SystemExit("installed publication failed to recover its original topic")
+if run_ordinary_flow(storage / "topic-artifact-conflict", None, mode="pull", exercise="topic-artifact-conflict") != {
+    "status": "unknown",
+    "native_sends": 0,
+}:
+    raise SystemExit("installed publication accepted a conflicting topic artifact")
 if run_ordinary_flow(storage / "stop-completed", None, mode="pull", exercise="stop-completed") != {
     "status": "completed-revoked",
     "native_sends": 0,

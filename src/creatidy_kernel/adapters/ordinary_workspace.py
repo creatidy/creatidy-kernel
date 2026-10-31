@@ -297,7 +297,9 @@ class OrdinaryGitWorkspace:
         )
         patch = self._git("diff", "--binary", self.base, head, "--")
         self._paths = tuple(
-            path.decode() for path in self._git("diff", "--name-only", "-z", self.input_tree, head).split(b"\0") if path
+            path.decode()
+            for path in self._git("diff", "--no-renames", "--name-only", "-z", self.input_tree, head).split(b"\0")
+            if path
         )
         if self.workspace.capture()[0] != before:
             raise IntakeRefused("candidate changed while collecting exact bytes")

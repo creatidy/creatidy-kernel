@@ -373,7 +373,8 @@ print("Done")
                 policy_ref,
                 BudgetPolicy(6, 1),
                 authority,
-                paths=frozenset(unit + ".py" for unit in units),
+                paths=frozenset(unit + ".py" for unit in units)
+                | (frozenset({"renamed.py"}) if exercise == "rename-outside" else frozenset[str]()),
                 network=frozenset(),
                 effects=frozenset({"forgejo:pr", "forgejo:receipt"}),
                 recipes=frozenset(recipes),
@@ -428,6 +429,8 @@ print("Done")
                                 "unknowns": [],
                                 "paths": [unit + ".py", "beta.py"]
                                 if exercise == "diamond-conflict" and unit == "gamma"
+                                else [unit + ".py", "renamed.py"]
+                                if exercise == "rename-outside" and unit == "alpha"
                                 else [unit + ".py"],
                                 "effects": ["forgejo:pr", "forgejo:receipt"],
                                 "network": [],
@@ -691,6 +694,8 @@ print("Done")
                     (tree.path / (unit + ".py")).write_text(
                         "VALUE = " + str(-1 if bad_candidate else ordinal + 1) + "\n"
                     )
+                    if exercise == "rename-outside" and unit == "alpha":
+                        (tree.path / "base.py").rename(tree.path / "renamed.py")
                     if exercise == "diamond-conflict" and unit == "gamma":
                         (tree.path / "beta.py").write_text("VALUE = 999\n")
                     client.quiesce(handoff, "authenticated-kilo-sdk-task-scope-closed")
@@ -837,6 +842,13 @@ print("Done")
                     assert command_evidence["fresh_until"] == original_observed_at + 900
                 else:
                     outcome = client.report(handoff)
+                if exercise == "rename-outside" and position == 0:
+                    assert outcome == "rejected"
+                    assert not store.load("everyday-program").satisfactions
+                    assert not native_state["sends"]
+                    assert not (tree.path / "base.py").exists()
+                    assert (tree.path / "renamed.py").read_text() == "BASELINE = True\n"
+                    return {"status": "rejected", "native_sends": 0}
                 if exercise in {"review-lost", "review-lost-reopen"} and position == 0:
                     assert outcome == "review_unknown"
                     assert len(calls) == 1
@@ -1014,6 +1026,96 @@ print("Done")
                 return {"status": "completed-revoked", "native_sends": 0}
             for sync, raw_handoff in publications:
                 handoff = raw_handoff
+                if exercise in {"topic-crash", "topic-artifact-conflict"}:
+                    finalize = SQLiteProgramStore.finalize_artifact
+
+                    def fail_topic(
+                        store_arg: SQLiteProgramStore,
+                        operation: str,
+                        name: str,
+                        data: bytes,
+                        original: Callable[[SQLiteProgramStore, str, str, bytes], str] = finalize,
+                    ) -> str:
+                        if operation.startswith("ordinary-publication-topic:") and name == "topic":
+                            raise RuntimeError("synthetic topic artifact crash")
+                        return original(store_arg, operation, name, data)
+
+                    with patch.object(SQLiteProgramStore, "finalize_artifact", fail_topic):
+                        try:
+                            sync.publish(handoff)
+                        except RuntimeError as error:
+                            assert str(error) == "synthetic topic artifact crash"
+                        else:
+                            raise AssertionError("topic crash was not exercised")
+                    assert not native_state["sends"]
+                    key = "ordinary-publication-topic:" + handoff.claim.attempt.attempt_id
+                    original_request = store.operation(key).request_json
+                    original_topic = json.loads(json.loads(original_request)["request"]["bytes"])["topic"]
+                    if exercise == "topic-artifact-conflict":
+                        store.finalize_artifact(key, "topic", b"kernel-pr-00000000000000000000000000000000")
+                    old_workspace = sync.workspace
+                    old_tree = old_workspace.workspace
+                    store.close()
+                    store = owners.enter_context(SQLiteProgramStore(root / "state.db", boot_clock=boot_clock))
+                    reader = OwnerReviewedForgejoEvidence(
+                        store,
+                        Principal("owner", "owner"),
+                        forge,
+                        read_http.binding,
+                        GitContentSource(source, read_http.binding),
+                        baseline,
+                        lambda: int(time.time()),
+                        max_pages=4,
+                    )
+                    app = OrdinaryProgram(
+                        store,
+                        OrdinaryIntake(store, reader, lambda: int(time.time())),
+                        discovery,
+                        Principal("owner", "owner"),
+                        owner_policy,
+                        VerificationPolicy(policy_ref, ("paths", "structural", "commands")),
+                        decision_clock,
+                        execution_profile=app.execution_profile,
+                    )
+                    workspace = OrdinaryGitWorkspace(
+                        store,
+                        old_tree,
+                        source,
+                        repository_url,
+                        proposal,
+                        old_workspace.commands,
+                        ("Fixture Owner", "owner@example.invalid"),
+                        authority_deadline=approved.expires_at,
+                    )
+                    workspace.restore(handoff.attempt)
+                    control = WorkOwnership(
+                        store, Principal("owner", "owner"), old_tree, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
+                    )
+                    workspace.control = control
+                    pub_git = ConditionalGitTransport(
+                        repository=Reference("forgejo:team/project"),
+                        remote_url=repository_url,
+                        object_source=workspace.objects,
+                    )
+                    pub_git.git_binary = str(git_peer)
+                    resumed = OrdinaryForgejoSync(app, approved, control, workspace, http(), pub_git, "fixture-owner")
+                    if exercise == "topic-artifact-conflict":
+                        try:
+                            resumed.publish(handoff)
+                        except IntakeRefused:
+                            pass
+                        else:
+                            raise AssertionError("topic artifact inconsistent with immutable intent was accepted")
+                        assert store.operation(key).request_json == original_request
+                        assert not native_state["sends"]
+                        return {"status": "unknown", "native_sends": 0}
+                    first = resumed.publish(handoff)
+                    assert all(item.startswith("forgejo:") for item in first)
+                    assert resumed.publish(handoff) == first
+                    assert store.operation(key).request_json == original_request
+                    assert store.artifact(key, "topic").decode() == original_topic
+                    assert len(cast(list[object], native_state["sends"])) == 2
+                    return {"status": "topic-recovered", "native_sends": 2}
                 first = sync.publish(handoff)
                 if exercise in {"duplicate-comments", "oversized-comments"}:
                     assert first == ("unknown", "held")

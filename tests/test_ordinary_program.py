@@ -106,6 +106,26 @@ def test_diamond_dag_composes_shared_ancestor_once(sqlite_tmp_path: Path) -> Non
     assert result["native_sends"] == 8
 
 
+def test_out_of_scope_source_renamed_to_allowed_destination_is_rejected(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / "rename-outside", None, mode="pull", exercise="rename-outside") == {
+        "status": "rejected",
+        "native_sends": 0,
+    }
+
+
+def test_topic_intent_recovers_exact_original_after_artifact_crash_and_reopen(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / "topic-crash", None, mode="pull", exercise="topic-crash") == {
+        "status": "topic-recovered",
+        "native_sends": 2,
+    }
+
+
+def test_topic_artifact_different_from_original_intent_never_publishes(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "topic-artifact-conflict", None, mode="pull", exercise="topic-artifact-conflict"
+    ) == {"status": "unknown", "native_sends": 0}
+
+
 def test_diamond_dag_preserves_conflicting_predecessors_without_accepting_join(sqlite_tmp_path: Path) -> None:
     root = sqlite_tmp_path / "diamond-conflict"
     with pytest.raises(IntakeRefused, match="bounded ordinary Git operation refused"):
