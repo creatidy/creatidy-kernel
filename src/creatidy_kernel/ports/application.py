@@ -68,7 +68,7 @@ def manifest_bytes(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
-def _remediation_context(store: ApplicationStore, source_attempt_id: str) -> tuple[str | None, list[dict[str, str]]]:
+def remediation_context(store: ApplicationStore, source_attempt_id: str) -> tuple[str | None, list[dict[str, str]]]:
     operation_id = f"rejection:{source_attempt_id}"
     operation = store.operation(operation_id)
     envelope_value: object = json.loads(operation.request_json)
@@ -112,8 +112,17 @@ def _remediation_context(store: ApplicationStore, source_attempt_id: str) -> tup
         if receipt.get("subject") != result["subject"]:
             raise ValueError("product review receipt differs from rejected candidate subject")
         verdict = receipt.get("verdict")
-        if verdict == ProductReviewVerdict.REQUEST_CHANGES.value:
+        if review_status == ProductReviewStatus.CHANGES_REQUESTED.value:
+            if verdict != ProductReviewVerdict.REQUEST_CHANGES.value:
+                raise ValueError("product review verdict differs from rejected candidate status")
             findings = receipt.get("findings")
+        elif review_status == ProductReviewStatus.APPROVED.value:
+            if verdict != ProductReviewVerdict.APPROVE.value:
+                raise ValueError("product review verdict differs from rejected candidate status")
+        else:
+            raise ValueError("product review receipt lacks a matching terminal status")
+    elif review_status in {ProductReviewStatus.CHANGES_REQUESTED.value, ProductReviewStatus.APPROVED.value}:
+        raise ValueError("product review status lacks its original receipt")
     if type(findings) is not list:
         raise ValueError("persisted rejection findings are invalid")
     normalized: list[dict[str, str]] = []
@@ -173,13 +182,21 @@ class Collector(Protocol):
 
 class BudgetedChecks:
     def __init__(
-        self, store: ApplicationStore, checks: CheckProducer, program_id: str, attempt_id: str, clock: Callable[[], int]
+        self,
+        store: ApplicationStore,
+        checks: CheckProducer,
+        program_id: str,
+        attempt_id: str,
+        clock: Callable[[], int],
+        *,
+        delivery: Callable[[str, int], int] | None = None,
     ) -> None:
         self.store = store
         self.checks = checks
         self.program_id = program_id
         self.attempt_id = attempt_id
         self.clock = clock
+        self.delivery = delivery
 
     def check(self, name: str, subject: EvidenceSubject) -> Evidence | None:
         self.store.check_work_authority(self.program_id)
@@ -225,7 +242,10 @@ class BudgetedChecks:
             # uncertain external effect. Native command producers retain their
             # separate exact per-command reservations and crash receipts.
             return self._run(name, subject, key)
-        self.store.claim(key, now=self.clock(), lease_seconds=1)
+        if self.delivery is None:
+            self.store.claim(key, now=self.clock(), lease_seconds=1)
+        else:
+            self.delivery(key, 1)
         return self._run(name, subject, key)
 
     def _run(self, name: str, subject: EvidenceSubject, key: str) -> Evidence | None:
@@ -308,7 +328,7 @@ def advance_work_unit(
                 return "remediation_paused"
             if store.find_artifact(f"rejection:{remediation_of}", "rejected-result") is None:
                 return "remediation_paused"
-            review_operation_id, findings = _remediation_context(store, remediation_of)
+            review_operation_id, findings = remediation_context(store, remediation_of)
             if not findings:
                 return "remediation_paused"
             history: list[frozenset[str]] = []
@@ -316,7 +336,7 @@ def advance_work_unit(
                 previous_data = store.find_artifact(f"rejection:{previous.attempt_id}", "rejected-result")
                 if previous_data is None:
                     continue
-                _, previous_findings = _remediation_context(store, previous.attempt_id)
+                _, previous_findings = remediation_context(store, previous.attempt_id)
                 if previous_findings:
                     history.append(frozenset(item["fingerprint"] for item in previous_findings))
             current_fingerprints = frozenset(item["fingerprint"] for item in findings)
@@ -658,12 +678,55 @@ def advance_work_unit(
     if deadline is not None and decision_clock() >= deadline:
         return "expired"
     collection = collector.collect(request, candidate, now=decision_clock())
+    return receive_candidate(
+        store,
+        program,
+        attempt_id,
+        candidate,
+        collection,
+        policy,
+        now=now,
+        clock=decision_clock,
+        artifact_path=artifact_path,
+        product_reviewer=product_reviewer,
+        deadline=deadline,
+        cancel_requested=cancel_requested,
+    )
+
+
+def receive_candidate(
+    store: ApplicationStore,
+    program: Program,
+    attempt_id: str,
+    candidate: Candidate,
+    collection: Collection,
+    policy: VerificationPolicy,
+    *,
+    now: int,
+    clock: Callable[[], int],
+    artifact_path: str,
+    product_reviewer: ProductReviewDispatcher | None = None,
+    deadline: int | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+    current_subject: Callable[[], None] = lambda: None,
+    review_delivery: Callable[[str, int], int] | None = None,
+    admitted_checks: CheckProducer | None = None,
+) -> str:
+    """Shared candidate reception, irrespective of cooperative or managed handoff.
+
+    Trusted collectors supply exact bytes/subjects and ordered checks. The host
+    supplies its current source/ownership guard outside candidate data. Transport
+    completion alone never issues satisfaction.
+    """
+    decision_clock = clock
+    operation_id = f"runtime:{attempt_id}"
+    unit_id = program.attempt(attempt_id).spec.work_unit_id
     store.check_work_authority(program.program_id)
     unit = program.spec.work_unit(unit_id)
     proposal = CandidateResult(
         f"candidate:{attempt_id}", candidate, tuple((name, artifact_path) for name in sorted(unit.outputs))
     )
-    checks = collection.checks
+    checks = collection.checks if admitted_checks is None else admitted_checks
     review_request: ProductReviewRequest | None = None
     review_checks: DurableProductReviewChecks | None = None
     if product_reviewer is not None and policy.reviewer_required:
@@ -685,10 +748,11 @@ def advance_work_unit(
         )
         review_checks = DurableProductReviewChecks(
             store,
-            collection.checks,
+            checks,
             lambda _: review_request,
             product_reviewer,
             clock=decision_clock,
+            delivery=review_delivery,
         )
         checks = review_checks
     result = verify_candidate(
@@ -696,7 +760,9 @@ def advance_work_unit(
         proposal,
         collection.manifest,
         policy,
-        BudgetedChecks(store, checks, program.program_id, attempt_id, decision_clock),
+        BudgetedChecks(store, checks, program.program_id, attempt_id, decision_clock)
+        if admitted_checks is None
+        else checks,
         repository=collection.repository,
         base_revision=collection.base,
         head_revision=collection.head,
@@ -743,6 +809,10 @@ def advance_work_unit(
         return "rejected"
     if cancel_requested is not None and cancel_requested():
         return "cancel_requested"
+    current_subject()
+    current = store.load(program.program_id)
+    if current.revision != program.revision or current.spec.digest != program.spec.digest:
+        raise ValueError("candidate reception Program changed while checking current subject")
     accepted_at = decision_clock()
     store.check_work_authority(program.program_id)
     if deadline is not None and accepted_at >= deadline:

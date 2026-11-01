@@ -37,7 +37,9 @@ from creatidy_kernel.adapters.forge_refs import (
 from creatidy_kernel.core.forge import EffectStatus, ForgeConflict, Reference, UnsupportedForge
 
 GIT_LEASE_FDS: ContextVar[tuple[int, ...]] = ContextVar("git_lease_fds", default=())
-GIT_OUTPUT_ERRORS: ContextVar[Literal["strict", "replace"]] = ContextVar("git_output_errors", default="replace")
+GIT_OUTPUT_ERRORS: ContextVar[Literal["strict", "replace", "surrogateescape"]] = ContextVar(
+    "git_output_errors", default="replace"
+)
 
 
 def _https(url: str) -> None:
@@ -47,7 +49,7 @@ def _https(url: str) -> None:
         raise ValueError("forge transport requires an HTTPS URL without embedded credentials")
 
 
-class _NoRedirect(HTTPRedirectHandler):
+class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req: Request, fp: object, code: int, msg: str, headers: object, newurl: str) -> None:
         return None
 
@@ -57,7 +59,7 @@ class LocalRequestRefusal(ValueError):
 
 
 @contextmanager
-def _deadline(seconds: int):
+def transport_deadline(seconds: int):
     # urllib's socket timeout is per I/O; on non-main threads there is no
     # interruptible total deadline, so never claim one there.
     if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
@@ -90,6 +92,7 @@ class HTTPSForgejoTransport:
         *,
         timeout: int = 15,
         max_bytes: int = 1_000_000,
+        before_send: Callable[[], None] | None = None,
     ) -> None:
         _https(api_url)
         origin = https_origin(api_url)
@@ -100,7 +103,8 @@ class HTTPSForgejoTransport:
         self.token = token
         self.timeout = timeout
         self.max_bytes = max_bytes
-        self.opener = build_opener(_NoRedirect())
+        self.opener = build_opener(NoRedirect())
+        self.before_send = before_send
 
     @property
     def supports_reads(self) -> bool:
@@ -149,7 +153,7 @@ class HTTPSForgejoTransport:
         else:
             data = None
         try:
-            with _deadline(self.timeout):
+            with transport_deadline(self.timeout):
                 secret = self.token()
                 if not secret or "\n" in secret or "\r" in secret:
                     raise ValueError("invalid forge credential")
@@ -163,6 +167,8 @@ class HTTPSForgejoTransport:
                     },
                     method=method,
                 )
+                if method != "GET" and self.before_send is not None:
+                    self.before_send()
                 try:
                     with self.opener.open(request, timeout=self.timeout) as response:
                         status = response.status
@@ -257,6 +263,7 @@ class ConditionalGitTransport:
         timeout: int = 60,
         askpass: Path | None = None,
         max_output_bytes: int = 65536,
+        before_send: Callable[[], None] | None = None,
     ) -> None:
         _https(remote_url)
         repo_path = repository_path(repository)
@@ -290,6 +297,7 @@ class ConditionalGitTransport:
         )
         self.timeout = timeout
         self.max_output_bytes = max_output_bytes
+        self.before_send = before_send
         # The caller supplies a trusted executable which obtains a scoped credential
         # outside the worktree. Never inherit Git's ambient credential helpers.
         if askpass is not None and (
@@ -331,6 +339,8 @@ class ConditionalGitTransport:
                 env["GIT_ASKPASS"] = str(self.askpass)
 
             def run_git(argv: list[str]) -> subprocess.CompletedProcess[str]:
+                if self.before_send is not None:
+                    self.before_send()
                 return run_git_bounded(argv, root, env, self.timeout, self.max_output_bytes)
 
             try:
@@ -433,6 +443,8 @@ class ConditionalGitTransport:
                 env["GIT_ASKPASS"] = str(self.askpass)
 
             def run_git(argv: list[str]) -> subprocess.CompletedProcess[str]:
+                if self.before_send is not None:
+                    self.before_send()
                 return run_git_bounded(argv, root, env, self.timeout, self.max_output_bytes)
 
             try:

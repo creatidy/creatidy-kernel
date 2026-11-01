@@ -20,9 +20,8 @@ Ordinary feature development requires verified architecture/backlog alignment; t
 2026-10-27 mandate delegates that objective acceptance and subsequent normal `/loop` continuation.
 
 **Status: deterministic domain, durable persistence, bounded Forge and Codex Runtime adapters,
-an offline two-node CLI reference flow, bounded TaskSpec support for two frozen real
-tasks, and inert ordinary preparation/approval through a trusted local API, not a general
-autonomous Program engine.**
+an offline two-node CLI reference flow, bounded TaskSpec support for two frozen real tasks,
+and a trusted-local Forgejo ordinary Program SDK for cooperative pull and managed push.**
 The code includes immutable Program intent, legal domain commands, single-controller SQLite history
 and rebuildable projections, an external-operation journal/outbox with a synthetic effect seam and
 content-addressed artifacts, plus a replaceable resource allocator. Synthetic Runtime, Workspace and
@@ -90,11 +89,10 @@ Public dependencies may be reused; no private `creatidy-onprem` is required for 
 [ADR 0007](docs/adr/0007-shared-harness-routing-observability.md) records the owner's 2026-10-04
 shared-architecture direction and source availability. [The coverage roadmap](docs/architecture/successor.md)
 maps the accepted AC4 baseline separately from observed evidence and registered work still to prove.
-The current foundations and bounded intake are not evidence that ordinary execution, rich routing, gateway,
-product review, isolation, full costs or
-Console integration are complete. Durable synthetic-first product review/remediation is now integrated
-through #54/PR #92 and bounded cancellation settlement through #90/PR #93; ordinary/native full-path
-composition is still incomplete. No Creatidy cloud account is required by the target architecture.
+The trusted-local ordinary SDK composes durable Program execution and exact-subject product review with
+the existing bounded adapters. Synthetic installed journeys do not establish live provider, rich routing,
+gateway, hostile isolation, complete costs or Console integration. No Creatidy cloud account is required
+by the target architecture.
 
 ## Development Authority
 
@@ -398,7 +396,7 @@ atomically; review and publication reserve alongside their intents. Recovery ret
 counts and unknown work. Successful acceptance releases its logical work slot in the same transaction;
 STOP/expiry still requires the bounded cancellation path's exact witness, not a lease or turn status.
 The separate local work/resource handler below extends this with workspace/session fencing; the
-ordinary dispatcher and heterogeneous drivers remain #106/#105.
+ordinary SDK composes these boundaries; heterogeneous drivers remain deferred in #105.
 
 New delivery rechecks the original Attempt, applicable specification, WorkUnit state, immutable
 Operation binding and current observed resource headroom. Historical reservation/receipt replay is
@@ -475,6 +473,31 @@ covers versioned private full-path outcome/cost export, preserving unknowns and 
 Current status/export open SQLite themselves and are not concurrent views of an active exclusive
 controller. [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) owns the served
 snapshot/events/command/notification contract; no future API/flag is asserted here.
+
+## Ordinary Forgejo SDK
+
+The trusted host composes `ports.ordinary.OrdinaryProgram` and `OrdinaryWorkClient` with independently
+configured Forgejo discovery/dependency, intake, source, verification and product-review producers.
+The same durable Program, Attempt, claim and budget path serves cooperative pull and retained managed
+Codex handoff. The SDK exposes owner approval, worker request/start/report, exact candidate review and
+separately authorized Forgejo synchronization; native ticket state is not Kernel acceptance. This is
+not a remote API, a replacement coding agent or an automatic owner-approval mechanism.
+
+The host must supply an authenticated owner, delegated worker, finite original budget and deadline,
+trusted verification recipes, and a review profile with no inherited implementation context. Kilo
+review uses a fresh native session and validates the only prompt and returned receipt. Tests run actual
+installed handlers against synthetic Forgejo services; an optional pinned Kilo binary can exercise the
+real local session protocol with a deterministic local provider. These checks are not a live provider,
+billing, hostile-isolation or remote-deployment guarantee. Incomplete discovery, stale evidence, missing
+settlement, unsupported native conditional effects and unknown synchronization outcomes refuse rather
+than being interpreted as success.
+
+The original approved source is materialized only after the shared resource claim. Exact controller
+preparation has its own immutable schema-6 evidence; interrupted preparation and unrecognized workspace
+bytes remain retained and require reconciliation. Schema-5 readers refuse schema 6 before issuing work.
+`make package-check` exercises installed pull, managed and mixed two-obligation Programs, reopen,
+remediation, STOP and a lost Forgejo response without a duplicate send. The narrower `task run` command
+below remains limited to frozen TaskSpecs and is not the ordinary SDK.
 
 ## Ordinary Preparation
 
@@ -658,7 +681,8 @@ old history, IDs, unknowns, clock rows and artifacts are not rewritten. Older sc
 before they could ignore resource claims. Restoring to a new SQLite identity does not silently rebind
 an old physical workspace. `make package-check` exercises actual installed pull and managed handlers,
 synthetic dedicated native processes and actual pinned schema-2/3/4 reader refusal outside the checkout.
-This does not enable the #106 ordinary dispatcher, #57 remote transport, live inference or Forge effects.
+The ordinary SDK adds its separately versioned schema-6 controller-preparation boundary; it does not
+enable #57 remote transport, live inference or unapproved Forge effects.
 
 ## Public Operator Surface
 

@@ -47,6 +47,44 @@ evidence leaves a **candidate**, not an approved library, command, protocol or p
 Permission, inference and live service evidence are separately scoped; this documentation task grants
 no product call. ACP's candidacy does not authorize a custom harness, protocol or VS Code plugin.
 
+## Ordinary Native Protocol Components
+
+The #106 native protocol components are not an ordinary end-to-end application acceptance receipt.
+`ForgejoDiscovery` qualifies repeated, bounded caller-visible issue/dependency observations; it does
+not claim a provider snapshot, derive dependencies from prose, equate a closed ticket with accepted
+work or acquire additional permissions. Incomplete, hidden, malformed or moving dependency data
+remains explicit. An empty repeated scan is still not a transactional absence guarantee.
+
+The public Forgejo API implementation inspected is v13.0.1, exact tag revision
+`714b88f8b2947125ef829329744ce0a3cce48690`, specifically `routers/api/v1/repo/issue.go`,
+`routers/api/v1/repo/issue_dependency.go`, `models/issues/issue.go`,
+`routers/api/v1/repo/repo.go` and `services/convert/repository.go`. Native dependencies page before
+substituting inaccessible issue subjects. The issue update API does not expose the caller's
+expected content version as server-enforced CAS; reading before an unconditional update is not a
+substitute. No such update capability is added. These file-level MIT notices and the repository's
+GPL-3.0 license were read; Kernel independently implements a wire client and copies no Forgejo
+implementation. No Forgejo source, server or new dependency is distributed.
+
+`NativeKiloReview` uses the native Kilo 7.8.25 session API, not a model launcher or inference wrapper.
+Public release source `b3b2f3d1d9460e3de0bcf528d757c0e8ac4cbb2c` was inspected at
+`packages/opencode/src/session/session.ts`, `packages/opencode/src/session/prompt.ts`,
+`packages/opencode/src/server/routes/instance/httpapi/{groups,handlers}/session.ts`,
+`packages/opencode/src/tool/task.ts` and `packages/sdk/js/src/v2/gen/{types,sdk}.gen.ts`.
+The native independent-session mechanism and the native `AssistantMessage.structured` field are
+distinct from a prose completion. This client creates a no-parent, tool-denied session, retains
+the original sole prompt, and requires exact native-message readback. Lost results reconcile the
+retained session; lost creation identity is unknown, not permission to create or prompt again.
+The trusted host supplies source/criteria without author conversation and independently configures
+the local native server and review agent. Session permissions are not an OS isolation guarantee.
+
+The separately acquired official `@kilocode/cli-linux-x64@7.8.25` artifact returned `7.8.25` under
+a closed synthetic environment. Its bundled MIT and third-party notices were read. It is outside
+the repository; Kernel redistributes neither the executable nor upstream source and adds no Kilo
+dependency. The new transport regressions use deterministic HTTP services and actual Kernel
+transports, not live inference. They do **not** establish semantic review by a real native session,
+ordinary Program activation, a CLI work-client journey or full #106 acceptance. The reference
+application's ordinary-dispatch refusal remains until that composition is implemented and received.
+
 ## Verification-Only Utility Adoption
 
 Under the owner's 2026-10-07 decision for [#50](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/50),

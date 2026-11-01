@@ -11,6 +11,7 @@ import json
 import os
 import stat
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -271,6 +272,92 @@ class LocalOwnedWorkspace:
                 raise OwnershipConflict("workspace changed during capture")
             return hashlib.sha256(first).hexdigest(), first
         finally:
+            os.close(root)
+            os.close(parent)
+
+    def materialize(self, files: tuple[tuple[str, bytes, int], ...], check_current: Callable[[], None]) -> None:
+        """Create only absent regular files under the verified owned directory descriptor."""
+        check_current()
+        parent, root = self._open()
+        directories: dict[tuple[str, ...], int] = {(): root}
+        identities: dict[tuple[str, ...], tuple[int, int]] = {}
+        try:
+            if os.listdir(root):
+                raise OwnershipConflict("workspace is not empty; preserve unexpected entries")
+            root_info = os.fstat(root)
+            identities[()] = (root_info.st_dev, root_info.st_ino)
+            for path, contents, mode in files:
+                parts = tuple(path.split("/"))
+                if (
+                    not parts
+                    or any(part in {"", ".", ".."} for part in parts)
+                    or type(contents) is not bytes
+                    or mode not in {0o644, 0o755}
+                ):
+                    raise OwnershipConflict("invalid controller materialization entry")
+                prefix: tuple[str, ...] = ()
+                for name in parts[:-1]:
+                    directory = directories[prefix]
+                    child_key = (*prefix, name)
+                    if child_key not in directories:
+                        check_current()
+                        os.mkdir(name, 0o700, dir_fd=directory)
+                        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                        try:
+                            info = os.fstat(child)
+                            current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                            if (
+                                not stat.S_ISDIR(info.st_mode)
+                                or info.st_uid != os.geteuid()
+                                or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)
+                            ):
+                                raise OwnershipConflict("created workspace directory identity changed")
+                        except BaseException:
+                            os.close(child)
+                            raise
+                        directories[child_key] = child
+                        identities[child_key] = (info.st_dev, info.st_ino)
+                    else:
+                        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                        if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != identities[child_key]:
+                            raise OwnershipConflict("created workspace directory was replaced")
+                    prefix = child_key
+                check_current()
+                descriptor = os.open(
+                    parts[-1],
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directories[prefix],
+                )
+                try:
+                    info = os.fstat(descriptor)
+                    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+                        raise OwnershipConflict("created workspace file identity is unsafe")
+                    remaining = memoryview(contents)
+                    while remaining:
+                        check_current()
+                        written = os.write(descriptor, remaining[:65536])
+                        if written <= 0:
+                            raise OwnershipConflict("workspace file write did not progress")
+                        remaining = remaining[written:]
+                    check_current()
+                    final = os.fstat(descriptor)
+                    current = os.stat(parts[-1], dir_fd=directories[prefix], follow_symlinks=False)
+                    if (
+                        final.st_nlink != 1
+                        or not stat.S_ISREG(current.st_mode)
+                        or (final.st_dev, final.st_ino) != (current.st_dev, current.st_ino)
+                    ):
+                        raise OwnershipConflict("created workspace file identity changed or acquired another link")
+                    os.fchmod(descriptor, mode)
+                finally:
+                    os.close(descriptor)
+        except OSError as error:
+            raise OwnershipConflict("workspace materialization encountered an existing or unsafe entry") from error
+        finally:
+            for key, descriptor in reversed(tuple(directories.items())):
+                if key:
+                    os.close(descriptor)
             os.close(root)
             os.close(parent)
 

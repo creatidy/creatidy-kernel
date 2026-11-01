@@ -487,6 +487,28 @@ class OrdinaryIntake:
         self._check_authority(principal, draft, policy, current, history, program)
         self._check_time(draft, policy, current, expires_at, baseline_age, self.clock())
 
+    def validate_authority(
+        self, principal: Principal, draft: Draft, policy: OwnerPolicy, current: IntakeEvidence
+    ) -> None:
+        """Reuse received-meaning validation for a finite multi-obligation Program."""
+        self._check_authority(
+            principal,
+            draft,
+            policy,
+            current,
+            self.history(draft.task_id),
+            self.store.find_program(f"ordinary:{draft.task_id}"),
+        )
+
+    def baseline_age(self, evidence: IntakeEvidence) -> int:
+        return self._baseline_age(evidence)
+
+    @staticmethod
+    def check_time(
+        draft: Draft, policy: OwnerPolicy, current: IntakeEvidence, expires_at: int, baseline_age: int, now: int
+    ) -> None:
+        OrdinaryIntake._check_time(draft, policy, current, expires_at, baseline_age, now)
+
     @staticmethod
     def _check_authority(
         principal: Principal,
