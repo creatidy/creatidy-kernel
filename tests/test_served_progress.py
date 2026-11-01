@@ -241,7 +241,12 @@ def test_snapshot_projects_recorded_candidate_session_and_decision(sqlite_tmp_pa
             },
         )
         assert current.decisions == (
-            {"source": "product-review", "attempt": granted.attempt.attempt_id, "status": "owner_decision_needed"},
+            {
+                "source": "product-review",
+                "attempt": granted.attempt.attempt_id,
+                "status": "owner_decision_needed",
+                "applicability": "pending",
+            },
         )
         assert projection.events(before.position).gap is True
 

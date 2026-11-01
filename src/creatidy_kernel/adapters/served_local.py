@@ -47,6 +47,8 @@ class LocalDecisionNotifier:
 
     def publish(self, snapshot: ServedSnapshot) -> None:
         for decision in snapshot.decisions:
+            if decision.get("applicability") != "pending":
+                continue
             if decision.get("status") not in {
                 "owner_decision_needed",
                 "comment",

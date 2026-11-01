@@ -2550,6 +2550,7 @@ print("Done")
                     assert outcome == "rejected" and not store.operations(command_prefix("everyday-program"))
                     snapshot = OwnerProjection(store, "everyday-program").snapshot()
                     assert any(item.get("status") == "changes_requested" for item in snapshot.decisions)
+                    assert any(item.get("applicability") == "pending" for item in snapshot.decisions)
                     sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
                     with sender, receiver:
                         notifier = LocalDecisionNotifier(sender)
@@ -2868,6 +2869,14 @@ print("Done")
                 item.startswith("ses_") and item != "ses_fixture" for item in sessions
             )
             assert calls
+            if exercise == "review-remediation-served":
+                snapshot = OwnerProjection(store, "everyday-program").snapshot()
+                prior = [item for item in snapshot.decisions if item.get("status") == "changes_requested"]
+                assert prior and all(item.get("applicability") == "historical" for item in prior)
+                sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+                with sender, receiver:
+                    LocalDecisionNotifier(sender).publish(snapshot)
+                    assert not select.select([receiver], [], [], 0)[0]
             return {
                 "status": "completed",
                 "mode": mode,

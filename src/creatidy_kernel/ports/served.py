@@ -236,7 +236,36 @@ class OwnerProjection:
                     {"source": "product-review", "attempt": attempt.attempt_id, "status": status or "rejected"}
                 )
         correlation_facts = tuple(correlations)
-        decision_facts = tuple(decisions)
+        decision_facts_list: list[dict[str, object]] = []
+        for decision in decisions:
+            attempt = next(
+                (
+                    item
+                    for item in (() if program is None else program.attempts)
+                    if item.attempt_id == decision.get("attempt")
+                ),
+                None,
+            )
+            unit = next(
+                (
+                    item
+                    for item in (() if program is None else program.work_unit_states)
+                    if attempt is not None and item.work_unit_id == attempt.spec.work_unit_id
+                ),
+                None,
+            )
+            if program is None or attempt is None or unit is None:
+                applicability = "unknown"
+            elif (
+                program.status.value in {"completed", "cancelled"}
+                or unit.status.value in {"satisfied", "cancelled"}
+                or attempt.spec.spec_digest != program.spec.digest
+            ):
+                applicability = "historical"
+            else:
+                applicability = "pending"
+            decision_facts_list.append({**decision, "applicability": applicability})
+        decision_facts = tuple(decision_facts_list)
         raw_totals = budget.get("resource_totals", [])
         if type(raw_totals) is not list or len(cast(list[object], raw_totals)) > 1024:
             raise ValueError("producer usage projection is unavailable or exceeds its bound")

@@ -29,7 +29,9 @@ recorded workspace subject and recorded reconciliation need are journal facts, n
 filesystem scan, current lease guarantee or physical-settlement assertion. When multiple subjects were
 observed, the legacy journal cannot establish their last visit, so these fields are unknown. Recorded
 workspace, candidate and runtime identifiers and review dispositions are correlated to their Attempt;
-absent evidence remains unknown. Usage values are grouped by metric, unit and provenance as known
+absent evidence remains unknown. Decision applicability is `pending`, `historical` or `unknown` based
+on the current Program, WorkUnit and Attempt specification; resolved or superseded decisions remain
+in history but do not generate new action-required alerts. Usage values are grouped by metric, unit and provenance as known
 subtotals; unreported work remains unknown and is never counted as zero.
 
 The status includes the original task deadline, original claim expiry and latest recorded renewal

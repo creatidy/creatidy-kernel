@@ -160,7 +160,14 @@ def test_decision_notification_is_bounded_deduplicated_and_best_effort(sqlite_tm
         before = (store.history(program.program_id), store.operations())
         snapshot = replace(
             OwnerProjection(store, program.program_id).snapshot(),
-            decisions=({"source": "product-review", "attempt": "a", "status": "owner_decision_needed"},),
+            decisions=(
+                {
+                    "source": "product-review",
+                    "attempt": "a",
+                    "status": "owner_decision_needed",
+                    "applicability": "pending",
+                },
+            ),
         )
         owner, observer = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
         with owner, observer:
@@ -171,7 +178,9 @@ def test_decision_notification_is_bounded_deduplicated_and_best_effort(sqlite_tm
             notifier.publish(snapshot)
             assert not select.select([observer], [], [], 0)[0]
             observer.close()
-            notifier.publish(replace(snapshot, decisions=({"status": "comment", "attempt": "b"},)))
+            notifier.publish(
+                replace(snapshot, decisions=({"status": "comment", "attempt": "b", "applicability": "pending"},))
+            )
             assert notifier.dropped is True
         assert (store.history(program.program_id), store.operations()) == before
 
