@@ -20,9 +20,11 @@ class ServedStore(Protocol):
     def find_operation(self, operation_id: str) -> OperationRecord | None: ...
     def served_operations(self, program_id: str) -> tuple[OperationRecord, ...]: ...
     def served_operation_count(self, program_id: str) -> int: ...
+    def served_change_token(self) -> tuple[int, int]: ...
     def served_authority_horizon(self, program_id: str) -> dict[str, object]: ...
     def served_claims(self, program_id: str, *, offset: int = 0, limit: int = 8) -> tuple[dict[str, object], ...]: ...
     def served_claim_count(self, program_id: str) -> int: ...
+    def served_expired_claim_count(self, program_id: str, observed_at: int) -> int: ...
     def find_artifact(self, operation_id: str, name: str) -> bytes | None: ...
 
 
@@ -70,6 +72,7 @@ class OwnerProjection:
     def snapshot(self, *, page: int = 0) -> ServedSnapshot:
         if type(page) is not int or page < 0 or page > 1_000_000:
             raise ValueError("invalid snapshot page")
+        source_token = self._store.served_change_token()
         program = self._store.find_program(self._scope)
         configured = program is not None and self._store.has_work_budget(self._scope)
         budget = self._store.work_budget_status(self._scope) if configured else {}
@@ -97,7 +100,7 @@ class OwnerProjection:
                 raise ValueError("producer returned an invalid reservation")
             row = cast(dict[str, object], raw)
             attempt, operation, category = row.get("attempt"), row.get("operation"), row.get("category")
-            if any(type(item) is not str or not item or len(item) > 512 for item in (attempt, operation, category)):
+            if any(type(item) is not str or not item for item in (attempt, operation, category)):
                 raise ValueError("producer returned an invalid reservation identity")
             operation_id = cast(str, operation)
             found = self._store.find_operation(operation_id)
@@ -138,7 +141,7 @@ class OwnerProjection:
             action, actor, key = request.get("action"), request.get("actor"), request.get("command_id")
             if (
                 request.get("scope") != self._scope
-                or any(type(item) is not str or not item or len(item) > 512 for item in (action, actor, key))
+                or any(type(item) is not str or not item for item in (action, actor, key))
                 or operation.operation_id != command_prefix(self._scope) + digest(encode([actor, key]))
             ):
                 raise ValueError("producer returned an inconsistent served command identity")
@@ -239,7 +242,7 @@ class OwnerProjection:
             head = None if candidate is None else candidate.get("head")
             subject = None if candidate is None else candidate.get("scope")
             handle = None if runtime is None else runtime.get("handle")
-            if any(item is not None and (type(item) is not str or len(item) > 512) for item in (head, subject, handle)):
+            if any(item is not None and type(item) is not str for item in (head, subject, handle)):
                 raise ValueError("producer returned invalid candidate or session identity")
             correlations.append(
                 {
@@ -312,10 +315,7 @@ class OwnerProjection:
             )
             unknown, unreported = row.get("unknown_receipts"), row.get("unreported_operations")
             if (
-                any(
-                    type(item) is not str or not item or len(item) > 512
-                    for item in (metric, unit, provenance, subtotal, coverage)
-                )
+                any(type(item) is not str or not item for item in (metric, unit, provenance, subtotal, coverage))
                 or type(unknown) is not int
                 or unknown < 0
                 or type(unreported) is not int
@@ -344,21 +344,26 @@ class OwnerProjection:
             "reservations": retained,
             "commands": command_facts,
             "command_coverage": command_coverage,
-            "claims": claims,
+            "claim_count": claim_count,
             "correlations": correlation_facts,
             "decisions": decision_facts,
             "usage_subtotals": usage_subtotals,
             "budget_configured": configured,
             "budget_revoked": revoked,
             "authority": {**authority, "observed_at": None},
+            "expired_claim_count": (
+                None if observed is None else self._store.served_expired_claim_count(self._scope, observed)
+            ),
             "missing_usage": missing,
+            "source_token": source_token,
         }
+        if self._store.served_change_token() != source_token:
+            raise ValueError("producer changed during snapshot; resync required")
         fingerprint = digest(encode(facts))
-        if page == 0 and self._last_digest is not None and fingerprint != self._last_digest:
+        if self._last_digest is not None and fingerprint != self._last_digest:
             # Polling a snapshot cannot prove that intermediate durable facts were observed.
             self._buffer.append("resync-required", 0 if program is None else program.revision)
-        if page == 0:
-            self._last_digest = fingerprint
+        self._last_digest = fingerprint
         decision_facts = tuple(sorted(decision_facts, key=lambda item: item.get("applicability") != "pending"))
         collections = {
             "work_units": work_units,

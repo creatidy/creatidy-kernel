@@ -30,7 +30,7 @@ from creatidy_kernel.ports.served import OwnerProjection, ServedSnapshot
 MAX_REQUEST = 65536
 MAX_RESPONSE = 1024 * 1024
 SNAPSHOT_COLLECTIONS = frozenset(
-    {"work_units", "attempts", "reservations", "claims", "correlations", "decisions", "usage_subtotals"}
+    {"work_units", "attempts", "reservations", "commands", "claims", "correlations", "decisions", "usage_subtotals"}
 )
 
 
@@ -148,7 +148,7 @@ class LocalReadChannel:
                     if len(raw) > 4096:
                         items[number] = {
                             "oversized": True,
-                            "index": page * 8 + number,
+                            "index": number if name == "commands" else page * 8 + number,
                             "bytes": len(raw),
                             "sha256": digest(raw),
                         }
@@ -177,13 +177,14 @@ class LocalReadChannel:
             current = self._owner.snapshot()
             if cast(dict[str, object], after) != asdict(current.position):
                 raise LocalChannelRefused("snapshot changed; restart pagination")
-            page = asdict(self._owner.snapshot(page=index // 8))
+            page = asdict(self._owner.snapshot(page=0 if name == "commands" else index // 8))
             if cast(dict[str, object], after) != asdict(self._owner.snapshot().position):
                 raise LocalChannelRefused("snapshot changed; restart pagination")
             items = cast(tuple[object, ...], page[name])
-            if index % 8 >= len(items):
+            within_page = index if name == "commands" else index % 8
+            if within_page >= len(items):
                 raise LocalChannelRefused("snapshot record is absent")
-            raw = encode(items[index % 8])
+            raw = encode(items[within_page])
             if offset > len(raw):
                 raise LocalChannelRefused("snapshot record offset is invalid")
             chunk = raw[offset : offset + 8192]

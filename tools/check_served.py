@@ -15,7 +15,7 @@ from unittest.mock import patch
 import creatidy_kernel
 from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
 from creatidy_kernel.adapters.reference import reference_spec
-from creatidy_kernel.adapters.served_local import LocalReadChannel
+from creatidy_kernel.adapters.served_local import LocalChannelRefused, LocalReadChannel
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.deadlines import BootClockReading
@@ -24,11 +24,12 @@ from creatidy_kernel.core.domain import (
     AttemptSpec,
     AuthorityEnvelope,
     BudgetPolicy,
+    PrepareAttempt,
     ProgramSpec,
     WorkUnit,
 )
-from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode
-from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, WorkClaim
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.ownership import WorkOwnership
 from creatidy_kernel.ports.served import OwnerProjection
 
@@ -177,6 +178,7 @@ with SQLiteProgramStore(storage / "served-real-history.db", boot_clock=lambda: r
     budget = WorkBudgetPolicy.basic(9, 9, verifications=9, retained_bytes=1_000_000)
     store.bind_work_budget(program.program_id, "real-history-project", budget, budget, 110)
     store.admit(program.program_id, "activate-real-history", ActivateProgram(program.revision, "owner"))
+    actual_claims: list[WorkClaim] = []
     for index in range(9):
         tree = LocalOwnedWorkspace(parent, f"tree-{index}", create=True)
         worker = WorkOwnership(
@@ -192,7 +194,7 @@ with SQLiteProgramStore(storage / "served-real-history.db", boot_clock=lambda: r
             current.resolved_inputs(f"unit-{index}"),
             workspace_reference=str(tree.path),
         )
-        worker.claim(f"claim-{index}-" + "x" * 125000, current.revision, attempt, lease_seconds=5)
+        actual_claims.append(worker.claim(f"claim-{index}-" + "x" * 125000, current.revision, attempt, lease_seconds=5))
     projection = OwnerProjection(store, program.program_id)
     before = (store.history(program.program_id), store.operations())
     first = request(projection, ["snapshot"])
@@ -246,4 +248,93 @@ with SQLiteProgramStore(storage / "served-real-history.db", boot_clock=lambda: r
         raise RuntimeError("installed observer lost the original real claim identity")
     if (store.history(program.program_id), store.operations()) != before:
         raise RuntimeError("installed resync or detail reads mutated durable authority")
+    later_id = store.served_claims(program.program_id, offset=8)[0]["claim"]
+    later = next(item for item in actual_claims if item.command_key == later_id)
+    store.quarantine_work_claim(later, "owner", "synthetic later-page uncertainty")
+    changed = request(projection, ["snapshot", "--page", "1"])
+    if changed["position"] == last["position"]:
+        raise RuntimeError("installed observer failed to detect later-page claim mutation")
+    try:
+        request(
+            projection,
+            [
+                "record",
+                "--collection",
+                "claims",
+                "--index",
+                "8",
+                "--offset",
+                "0",
+                "--producer",
+                str(position["producer"]),
+                "--scope",
+                str(position["scope"]),
+                "--sequence",
+                str(position["sequence"]),
+            ],
+        )
+    except LocalChannelRefused:
+        pass
+    else:
+        raise RuntimeError("installed observer accepted a stale later-page detail cursor")
+with SQLiteProgramStore(storage / "served-long-identities.db", boot_clock=lambda: reading[0]) as store:
+    program = store.create(reference_spec(), "create-long")
+    budget = WorkBudgetPolicy.basic(3, 1, verifications=6, retained_bytes=16384)
+    store.bind_work_budget(program.program_id, "long-project", budget, budget, 110)
+    program = store.admit(program.program_id, "activate-long", ActivateProgram(program.revision, "owner"))
+    attempt_id = "a" * 5000
+    attempt = AttemptSpec(
+        attempt_id,
+        program.program_id,
+        "first",
+        program.spec.revision,
+        program.spec.digest,
+        program.resolved_inputs("first"),
+    )
+    operation = "runtime:" + attempt_id
+    store.admit_with_intent(
+        program.program_id,
+        "prepare-long",
+        PrepareAttempt(program.revision, "worker", attempt),
+        operation,
+        operation,
+        {"attempt": attempt.digest},
+    )
+    store.reserve_work(program.program_id, attempt_id, operation, WorkKind.ATTEMPT)
+    store.finalize_artifact(operation, "runtime-receipt", json.dumps({"version": 2, "handle": "h" * 5000}).encode())
+    projection = OwnerProjection(store, program.program_id)
+    first = request(projection, ["snapshot"])
+    position = cast(dict[str, object], first["position"])
+    for collection in ("reservations", "correlations"):
+        collection_records = cast(list[dict[str, object]], first[collection])
+        if collection_records[0].get("oversized") is not True:
+            raise RuntimeError("installed observer rejected or omitted a long producer identity")
+        recovered = bytearray()
+        while True:
+            part = request(
+                projection,
+                [
+                    "record",
+                    "--collection",
+                    collection,
+                    "--index",
+                    "0",
+                    "--offset",
+                    str(len(recovered)),
+                    "--producer",
+                    str(position["producer"]),
+                    "--scope",
+                    str(position["scope"]),
+                    "--sequence",
+                    str(position["sequence"]),
+                ],
+            )
+            recovered.extend(base64.b64decode(cast(str, part["data_base64"])))
+            if part["complete"] is True:
+                break
+        record = json.loads(recovered)
+        if (record[1] if collection == "reservations" else record["runtime_handle"]) != (
+            operation if collection == "reservations" else "h" * 5000
+        ):
+            raise RuntimeError("installed observer changed a long producer identity")
 print("Installed host-bound local observer reads owner projection without a competing SQLite reader.")

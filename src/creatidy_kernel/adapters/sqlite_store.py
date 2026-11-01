@@ -723,6 +723,13 @@ class SQLiteProgramStore:
             ).fetchone()
             return cast(int, row[0])
 
+    def served_change_token(self) -> tuple[int, int]:
+        """Read conservative connection-local and external SQLite change counters."""
+        self._assert_writer_thread()
+        with self._gate:
+            row = self._connection.execute("PRAGMA data_version").fetchone()
+            return (self._connection.total_changes, cast(int, row[0]))
+
     def served_claims(self, program_id: str, *, offset: int = 0, limit: int = 8) -> tuple[dict[str, object], ...]:
         """Project only recorded ownership facts for one Program, without sampling authority."""
         self._assert_writer_thread()
@@ -810,6 +817,24 @@ class SQLiteProgramStore:
                 (program_id,),
             ).fetchone()
             return cast(int, row[0])
+
+    def served_expired_claim_count(self, program_id: str, observed_at: int) -> int:
+        """Count displayed claim cutoffs using original claims and recorded renewals."""
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        if type(observed_at) is not int or observed_at < 0:
+            raise ValueError("invalid display clock observation")
+        with self._gate:
+            renewals = self._work_records("ownership-renew")
+            expiries: dict[str, int] = {}
+            for item in renewals:
+                key, expiry = cast(str, item["claim"]), cast(int, item["expires_at"])
+                expiries[key] = max(expiries.get(key, expiry), expiry)
+            return sum(
+                max(cast(int, item["expires_at"]), expiries.get(cast(str, item["command"]), 0)) <= observed_at
+                for item in self._work_records("ownership-claim")
+                if item["program"] == program_id
+            )
 
     def operations(self, prefix: str = "") -> tuple[OperationRecord, ...]:
         """Return stable operation identities for bounded application recovery/export."""

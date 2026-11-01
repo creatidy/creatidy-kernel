@@ -55,6 +55,10 @@ page, event reads also report a gap. Records exceeding 4096 encoded bytes appear
 count and index rather than inflating the frame; `record` reads their canonical JSON in 8192-byte
 base64 chunks, qualified by the exact producer position, collection and index. A changed position
 refuses the detail request. All of these reads preserve durable authority.
+The position conservatively incorporates SQLite's owning-connection and external change counters
+across every page, so unrelated database writes can also require resynchronization. A clock sample's
+exact display timestamp is not part of the durable cut; changes in task or claim expiry classifications
+do advance the position.
 
 The host creates an already-connected local `socket.socketpair()` and binds one endpoint to a
 `LocalReadChannel`, `LocalWorkerSession` or `LocalOwnerSession`; it passes only the peer descriptor to

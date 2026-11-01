@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 from test_sqlite_store import sqlite_tmp_path as sqlite_tmp_path
-from test_work_budget import Clock, initialize, policy
+from test_work_budget import Clock, initialize, policy, prepare
 from test_work_ownership import claim, client, workspace
 
 from creatidy_kernel.adapters.reference import reference_spec
@@ -39,8 +39,9 @@ from creatidy_kernel.core.domain import (
     WorkUnit,
 )
 from creatidy_kernel.core.intake import encode
+from creatidy_kernel.core.ownership import WorkClaim
 from creatidy_kernel.core.served import command_prefix
-from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.ordinary import OrdinaryWorkClient
 from creatidy_kernel.ports.served import OwnerProjection
 
@@ -359,6 +360,7 @@ def test_real_claim_history_exceeding_frame_remains_readable(sqlite_tmp_path: Pa
         budget = WorkBudgetPolicy.basic(9, 9, verifications=9, retained_bytes=1_000_000)
         store.bind_work_budget(program.program_id, "large-project", budget, budget, 110)
         store.admit(program.program_id, "activate-large", ActivateProgram(program.revision, "owner"))
+        granted_claims: list[WorkClaim] = []
         for index in range(9):
             tree = workspace(sqlite_tmp_path, f"large-real-{index}")
             current = store.load(program.program_id)
@@ -371,7 +373,9 @@ def test_real_claim_history_exceeding_frame_remains_readable(sqlite_tmp_path: Pa
                 current.resolved_inputs(f"unit-{index}"),
                 workspace_reference=str(tree.path),
             )
-            client(store, tree).claim(f"claim-{index}-" + "x" * 125000, current.revision, attempt, lease_seconds=5)
+            granted_claims.append(
+                client(store, tree).claim(f"claim-{index}-" + "x" * 125000, current.revision, attempt, lease_seconds=5)
+            )
         projection = OwnerProjection(store, program.program_id)
         owner, observer = socket.socketpair()
         with owner, observer:
@@ -386,6 +390,38 @@ def test_real_claim_history_exceeding_frame_remains_readable(sqlite_tmp_path: Pa
             final = json.loads(read_frame(observer, bound=1024 * 1024))["result"]
             assert final["coverage"]["claims"] == [8, 9, True]
             assert first["position"] == final["position"]
+            later_id = store.served_claims(program.program_id, offset=8)[0]["claim"]
+            later = next(item for item in granted_claims if item.command_key == later_id)
+            store.quarantine_work_claim(later, "owner", "synthetic later-page uncertainty")
+            write_frame(observer, encode({"version": 1, "action": "snapshot", "page": 1}), bound=65536)
+            channel.serve_once()
+            changed = json.loads(read_frame(observer, bound=1024 * 1024))["result"]
+            assert changed["position"] != final["position"]
+            stale_owner, stale_peer = socket.socketpair()
+            with stale_owner, stale_peer:
+                stale_channel = LocalReadChannel(projection, stale_owner)
+                write_frame(
+                    stale_peer,
+                    encode(
+                        {
+                            "version": 1,
+                            "action": "record",
+                            "collection": "claims",
+                            "index": 8,
+                            "offset": 0,
+                            "after": final["position"],
+                        }
+                    ),
+                    bound=65536,
+                )
+                with pytest.raises(LocalChannelRefused):
+                    stale_channel.serve_once()
+            current = store.load(program.program_id)
+            store.admit(program.program_id, "cancel-large", CancelProgram(current.revision, "owner"))
+            write_frame(observer, encode({"version": 1, "action": "snapshot", "page": 1}), bound=65536)
+            channel.serve_once()
+            cancelled = json.loads(read_frame(observer, bound=1024 * 1024))["result"]
+            assert cancelled["position"] != changed["position"]
 
 
 def test_separate_client_reads_position_qualified_record(sqlite_tmp_path: Path) -> None:
@@ -435,3 +471,49 @@ def test_separate_client_reads_position_qualified_record(sqlite_tmp_path: Path) 
                 if process.poll() is None:
                     process.kill()
                     process.wait(timeout=10)
+
+
+def test_real_long_attempt_and_runtime_handle_are_chunk_readable(sqlite_tmp_path: Path) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / "long-identities.db", boot_clock=Clock()) as store:
+        program = initialize(store)
+        attempt = "a" * 5000
+        prepare(store, program, attempt)
+        operation = "runtime:" + attempt
+        store.reserve_work(program.program_id, attempt, operation, WorkKind.ATTEMPT)
+        store.finalize_artifact(operation, "runtime-receipt", encode({"version": 2, "handle": "h" * 5000}))
+        projection = OwnerProjection(store, program.program_id)
+        owner, peer = socket.socketpair()
+        with owner, peer:
+            channel = LocalReadChannel(projection, owner)
+            write_frame(peer, encode({"version": 1, "action": "snapshot"}), bound=65536)
+            channel.serve_once()
+            snapshot = json.loads(read_frame(peer, bound=1024 * 1024))["result"]
+            assert snapshot["reservations"][0]["oversized"] is True
+            assert snapshot["correlations"][0]["oversized"] is True
+            for collection in ("reservations", "correlations"):
+                offset, collected = 0, bytearray()
+                while True:
+                    write_frame(
+                        peer,
+                        encode(
+                            {
+                                "version": 1,
+                                "action": "record",
+                                "collection": collection,
+                                "index": 0,
+                                "offset": offset,
+                                "after": snapshot["position"],
+                            }
+                        ),
+                        bound=65536,
+                    )
+                    channel.serve_once()
+                    result = json.loads(read_frame(peer, bound=1024 * 1024))["result"]
+                    collected.extend(base64.b64decode(result["data_base64"]))
+                    offset = len(collected)
+                    if result["complete"]:
+                        break
+                decoded = json.loads(collected)
+                assert (
+                    decoded[1] == operation if collection == "reservations" else decoded["runtime_handle"] == "h" * 5000
+                )

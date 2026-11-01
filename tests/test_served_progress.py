@@ -306,7 +306,12 @@ def test_snapshot_displays_claim_and_task_expiry_without_renewal(sqlite_tmp_path
         assert before.authority["cutoff"] == "not-expired-observed"
         assert before.claims[0]["original_expires_at"] == granted.expires_at == 105
         assert before.claims[0]["cutoff"] == "not-expired-observed"
+        projection = OwnerProjection(store, program.program_id)
+        stable = projection.snapshot().position
+        clock.reading = BootClockReading(101, 2_000_000_000, "synthetic-boot-a")
+        assert projection.snapshot().position == stable
         clock.reading = BootClockReading(106, 7_000_000_000, "synthetic-boot-a")
+        assert projection.snapshot().position != stable
         reconnected = OwnerProjection(store, program.program_id).snapshot()
         assert reconnected.status == "active" and reconnected.claims[0]["cutoff"] == "expired"
         assert reconnected.authority["cutoff"] == "not-expired-observed"
