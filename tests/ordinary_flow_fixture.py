@@ -11,8 +11,10 @@ import inspect
 import json
 import os
 import re
+import select
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -29,7 +31,7 @@ from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
 from native_kilo_fixture import review_peer
 
-from creatidy_kernel.adapters.codex_runtime import CodexOwnedSessionWitness
+from creatidy_kernel.adapters.codex_runtime import CodexInputs, CodexOwnedSessionWitness
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
 from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.forgejo_baseline import ForgejoBaseline
@@ -43,11 +45,30 @@ from creatidy_kernel.adapters.ordinary_sync import OrdinaryForgejoSync
 from creatidy_kernel.adapters.ordinary_workspace import OrdinaryGitWorkspace
 from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
 from creatidy_kernel.adapters.reference import reference_git
+from creatidy_kernel.adapters.served_local import (
+    LocalChannelRefused,
+    LocalOwnerChannel,
+    LocalOwnerSession,
+    LocalWorkerChannel,
+    LocalWorkerSession,
+    read_frame,
+    write_frame,
+)
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.task_execution import VerificationCommand
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.deadlines import BootClockReading
-from creatidy_kernel.core.domain import AuthorityEnvelope, BudgetPolicy, DomainAction, PolicyReference, ProgramStatus
+from creatidy_kernel.core.domain import (
+    AuthorityEnvelope,
+    BudgetPolicy,
+    DomainAction,
+    PauseProgram,
+    PolicyReference,
+    ProgramSpec,
+    ProgramStatus,
+    ResumeProgram,
+)
+from creatidy_kernel.core.execution import ExecutionRequest
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.intake import (
     Declaration,
@@ -58,13 +79,14 @@ from creatidy_kernel.core.intake import (
     digest,
     encode,
 )
-from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode
+from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, WorkClaim
 from creatidy_kernel.core.verification import EvidenceSubject, VerificationPolicy
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.intake import OrdinaryIntake
-from creatidy_kernel.ports.ordinary import OrdinaryHandoff, OrdinaryProgram
+from creatidy_kernel.ports.ordinary import OrdinaryApproval, OrdinaryHandoff, OrdinaryProgram
 from creatidy_kernel.ports.ownership import WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
+from creatidy_kernel.ports.served import OwnerProjection
 
 CODEX_PEER = """import json, pathlib, sys
 if sys.argv[1:] == ["--version"]:
@@ -491,13 +513,265 @@ print("Done")
                 assert reader.read(subject, changed).disposition is Disposition.EQUIVALENCE
                 return {"status": "unassessed"}
             proposal = app.propose("everyday-program", "Receive two native-dependent obligations", selections)
+            if exercise == "served-owner-multi-client":
+                binding = LocalOwnerSession(OwnerProjection(store, "everyday-program"), app, None, proposal=proposal)
+
+                def invoke_owner(arguments: list[str]) -> dict[str, object]:
+                    owner_socket, owner_client = socket.socketpair()
+                    with owner_socket, owner_client:
+                        channel = binding.attach(owner_socket)
+                        process = subprocess.Popen(  # noqa: S603 - Fixed installed module, synthetic descriptor only.
+                            [
+                                sys.executable,
+                                "-I",
+                                "-m",
+                                "creatidy_kernel.adapters.served_client",
+                                "--fd",
+                                str(owner_client.fileno()),
+                                *arguments,
+                            ],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            pass_fds=(owner_client.fileno(),),
+                            env={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                        )
+                        try:
+                            assert select.select([owner_socket], [], [], 10)[0]
+                            channel.serve_once()
+                            stdout, stderr = process.communicate(timeout=10)
+                            assert process.returncode == 0, stderr.decode(errors="replace")
+                            return cast(dict[str, object], json.loads(stdout)["result"])
+                        finally:
+                            if process.poll() is None:
+                                process.kill()
+                                process.wait(timeout=10)
+                            binding.detach(channel)
+
+                first = invoke_owner(
+                    [
+                        "approve",
+                        "--command-id",
+                        "owner-approve",
+                        "--expected-revision",
+                        "-1",
+                        "--decision-id",
+                        "owner-decision",
+                        "--expires-at",
+                        str(int(time.time()) + 900),
+                    ]
+                )
+                assert first["status"] == "approved"
+                revision = store.load("everyday-program").revision
+                stopped = invoke_owner(
+                    [
+                        "stop",
+                        "--command-id",
+                        "owner-stop",
+                        "--expected-revision",
+                        str(revision),
+                        "--reason",
+                        "owner stopped unstarted work",
+                    ]
+                )
+                assert stopped["status"] == "accepted" and stopped["settlement"] == "unknown"
+                assert store.load("everyday-program").status is ProgramStatus.CANCELLED
+                binding.revoke()
+                return {"status": "stopped", "native_sends": 0}
+            if exercise == "approve-revision-race":
+                current_call = OrdinaryProgram.current
+                altered = [False]
+
+                def create_during_validation(
+                    application: OrdinaryProgram,
+                    selected: object,
+                    expires_at: int,
+                    original: Callable[..., None] = current_call,
+                    target_store: SQLiteProgramStore = store,
+                    flag: list[bool] = altered,
+                ) -> None:
+                    original(application, selected, expires_at)
+                    if not flag[0]:
+                        flag[0] = True
+                        spec_builder = cast(Callable[..., object], inspect.getattr_static(OrdinaryProgram, "_spec"))
+                        target_store.create(
+                            cast(ProgramSpec, spec_builder(application, proposal, None)), "concurrent-owner-create"
+                        )
+
+                with patch.object(OrdinaryProgram, "current", create_during_validation):
+                    try:
+                        app.approve(
+                            proposal,
+                            decision_id="stale-creation",
+                            expires_at=int(time.time()) + 900,
+                            expected_revision=-1,
+                        )
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError("approval admitted after another owner created the Program")
+                assert altered[0] and store.find_program("everyday-program") is not None
+                assert store.find_artifact("ordinary-program:approval:stale-creation", "record") is None
+                return {"status": "refused", "native_sends": 0}
+            if exercise in {"served-owner-approve", "served-owner-approve-stale"}:
+                owner_socket, owner_client = socket.socketpair()
+                with owner_socket, owner_client:
+                    server = LocalOwnerChannel(
+                        OwnerProjection(store, "everyday-program"), owner_socket, app, None, proposal=proposal
+                    )
+                    request = {
+                        "version": 1,
+                        "action": "approve",
+                        "command_id": "owner-approval-command",
+                        "expected_revision": 0 if exercise == "served-owner-approve-stale" else -1,
+                        "decision_id": "served-owner-decision",
+                        "expires_at": int(time.time()) + 900,
+                    }
+                    wire = json.dumps(request, sort_keys=True).encode()
+                    write_frame(owner_client, wire, bound=65536)
+                    if exercise == "served-owner-approve-stale":
+                        try:
+                            server.serve_once()
+                        except LocalChannelRefused:
+                            pass
+                        else:
+                            raise AssertionError("stale expected revision approved a new Program")
+                        assert store.find_program("everyday-program") is None
+                        assert not store.operations("served-command:")
+                        return {"status": "refused", "native_sends": 0}
+                    server.serve_once()
+                    result = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
+                    assert result["status"] == "approved"
+                    approved_program = store.load("everyday-program")
+                    write_frame(owner_client, wire, bound=65536)
+                    server.serve_once()
+                    assert json.loads(read_frame(owner_client, bound=1024 * 1024))["result"] == result
+                    assert store.load("everyday-program") == approved_program
+                    request["expires_at"] = cast(int, request["expires_at"]) + 1
+                    write_frame(owner_client, json.dumps(request).encode(), bound=65536)
+                    try:
+                        server.serve_once()
+                    except LocalChannelRefused:
+                        pass
+                    else:
+                        raise AssertionError("changed approval replay was accepted")
+                    return {"status": "approved", "native_sends": 0}
+            if exercise == "approve-expected":
+                try:
+                    app.approve(
+                        proposal, decision_id="wrong-expected", expires_at=int(time.time()) + 900, expected_revision=0
+                    )
+                except IntakeRefused:
+                    pass
+                else:
+                    raise AssertionError("approval with stale caller expectation was accepted")
+                assert store.find_program("everyday-program") is None
+                app.approve(
+                    proposal, decision_id="expected-absent", expires_at=int(time.time()) + 900, expected_revision=-1
+                )
+                return {"status": "approved", "native_sends": 0}
             approved = app.approve(proposal, decision_id="owner-program-v1", expires_at=int(time.time()) + 900)
+            if exercise == "served-owner-amend":
+                amended = app.propose("everyday-program", "A revised owner-approved objective", selections)
+                owner_socket, owner_client = socket.socketpair()
+                with owner_socket, owner_client:
+                    server = LocalOwnerChannel(
+                        OwnerProjection(store, "everyday-program"), owner_socket, app, approved, proposal=amended
+                    )
+                    request = {
+                        "version": 1,
+                        "action": "approve",
+                        "command_id": "owner-amend-command",
+                        "expected_revision": approved.program.revision,
+                        "decision_id": "owner-amend-v1",
+                        "expires_at": approved.expires_at,
+                    }
+                    wire = json.dumps(request, sort_keys=True).encode()
+                    write_frame(owner_client, wire, bound=65536)
+                    server.serve_once()
+                    result = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
+                    assert result["status"] == "approved" and result["expires_at"] == approved.expires_at
+                    current = store.load("everyday-program")
+                    assert current.spec.digest != approved.program.spec.digest
+                    write_frame(owner_client, wire, bound=65536)
+                    server.serve_once()
+                    assert json.loads(read_frame(owner_client, bound=1024 * 1024))["result"] == result
+                    assert store.load("everyday-program") == current
+                    return {"status": "amended", "native_sends": 0}
             if exercise in {"baseline-pending", "baseline-unsupported"}:
                 raise AssertionError("unresolved baseline was authorized as a failing baseline")
             if exercise in {"baseline-failure", "baseline-error"}:
                 return {"status": "approved"}
             assert approved.program.status is ProgramStatus.DRAFT
             assert app.activate(approved).ready_work_unit_ids == ("alpha",)
+            if exercise in {"served-owner-stop", "served-owner-stale"}:
+                before = store.load("everyday-program")
+                owner_socket, owner_client = socket.socketpair()
+                with owner_socket, owner_client:
+                    server = LocalOwnerChannel(OwnerProjection(store, "everyday-program"), owner_socket, app, approved)
+                    request = {
+                        "version": 1,
+                        "action": "stop",
+                        "command_id": "owner-stop-1",
+                        "expected_revision": before.revision - 1
+                        if exercise == "served-owner-stale"
+                        else before.revision,
+                        "reason": "owner stopped the ordinary Program",
+                    }
+                    wire = json.dumps(request, sort_keys=True).encode()
+                    write_frame(owner_client, wire, bound=65536)
+                    if exercise == "served-owner-stale":
+                        try:
+                            server.serve_once()
+                        except LocalChannelRefused:
+                            pass
+                        else:
+                            raise AssertionError("stale owner STOP was accepted")
+                        assert store.load("everyday-program") == before
+                        assert not store.operations("served-command:")
+                        return {"status": "refused", "native_sends": 0}
+                    server.serve_once()
+                    result = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
+                    assert result == {
+                        "version": 1,
+                        "status": "accepted",
+                        "settlement": "unknown",
+                        "authority": "historical-only",
+                    }
+                    stopped = store.load("everyday-program")
+                    assert stopped.status is ProgramStatus.CANCELLED
+                    write_frame(owner_client, wire, bound=65536)
+                    server.serve_once()
+                    assert json.loads(read_frame(owner_client, bound=1024 * 1024))["result"] == result
+                    assert store.load("everyday-program") == stopped
+                    try:
+                        store.check_work_authority("everyday-program")
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError("owner STOP did not revoke work authority")
+                    assert not native_state["sends"]
+                    return {"status": "stopped", "native_sends": 0}
+            if exercise == "stop-atomic-failure":
+                before = store.load("everyday-program")
+                original_write = cast(
+                    Callable[..., object], inspect.getattr_static(SQLiteProgramStore, "_write_work_record")
+                )
+
+                def fail_revocation(store_arg: SQLiteProgramStore, kind: str, *args: object) -> object:
+                    if kind == "revoked":
+                        raise RuntimeError("synthetic revocation failure")
+                    return original_write(store_arg, kind, *args)
+
+                with patch.object(SQLiteProgramStore, "_write_work_record", fail_revocation):
+                    try:
+                        app.stop(approved, "owner stopped work")
+                    except RuntimeError as error:
+                        assert str(error) == "synthetic revocation failure"
+                    else:
+                        raise AssertionError("revocation failure was not exercised")
+                assert store.load("everyday-program") == before
+                return {"status": "refused", "native_sends": 0}
             publications: list[tuple[OrdinaryForgejoSync, OrdinaryHandoff]] = []
             sessions: list[str] = []
             review_operations: set[str] = set()
@@ -616,6 +890,649 @@ print("Done")
                 )
                 client = app.client(approved, Principal("worker", "worker"), workspace, worker, control, reviewer)
                 command_key = "owner-assignment-" + leaf
+                if exercise == "served-multi-client":
+                    binding = LocalWorkerSession(OwnerProjection(store, "everyday-program"), client)
+
+                    def invoke_local(
+                        arguments: list[str], current_binding: LocalWorkerSession = binding
+                    ) -> dict[str, object]:
+                        owner_socket, worker_socket = socket.socketpair()
+                        with owner_socket, worker_socket:
+                            channel = current_binding.attach(owner_socket)
+                            process = subprocess.Popen(  # noqa: S603 - Fixed module and synthetic descriptor capability.
+                                [
+                                    sys.executable,
+                                    "-I",
+                                    "-m",
+                                    "creatidy_kernel.adapters.served_client",
+                                    "--fd",
+                                    str(worker_socket.fileno()),
+                                    *arguments,
+                                ],
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                pass_fds=(worker_socket.fileno(),),
+                                env={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                            )
+                            try:
+                                assert select.select([owner_socket], [], [], 10)[0]
+                                channel.serve_once()
+                                stdout, stderr = process.communicate(timeout=10)
+                                assert process.returncode == 0, stderr.decode(errors="replace")
+                                return cast(dict[str, object], json.loads(stdout)["result"])
+                            finally:
+                                if process.poll() is None:
+                                    process.kill()
+                                    process.wait(timeout=10)
+                                current_binding.detach(channel)
+
+                    revision = store.load("everyday-program").revision
+                    claimed = invoke_local(
+                        [
+                            "claim",
+                            "--command-id",
+                            command_key,
+                            "--expected-revision",
+                            str(revision),
+                            "--lease-seconds",
+                            "300",
+                        ]
+                    )
+                    started_revision = store.load("everyday-program").revision
+                    started = invoke_local(
+                        [
+                            "start",
+                            "--command-id",
+                            "process-start",
+                            "--expected-revision",
+                            str(started_revision),
+                            "--claim-id",
+                            command_key,
+                        ]
+                    )
+                    assert claimed["program_id"] == "everyday-program" and started["status"] == "accepted"
+                    state = store.load("everyday-program")
+                    binding.revoke()
+                    other_owner, other_client = socket.socketpair()
+                    with other_owner, other_client:
+                        try:
+                            binding.attach(other_owner)
+                        except LocalChannelRefused:
+                            pass
+                        else:
+                            raise AssertionError("revoked worker capability accepted a new channel")
+                    assert store.load("everyday-program") == state and state.status is ProgramStatus.ACTIVE
+                    return {"status": "checked", "native_sends": 0}
+                if exercise in {"served-worker-stop", "served-worker-approve"}:
+                    before = store.load("everyday-program")
+                    owner_socket, worker_socket = socket.socketpair()
+                    with owner_socket, worker_socket:
+                        server = LocalWorkerChannel(OwnerProjection(store, "everyday-program"), owner_socket, client)
+                        request = {
+                            "version": 1,
+                            "action": "stop",
+                            "command_id": "forged-owner-stop",
+                            "expected_revision": before.revision,
+                            "reason": "forged owner request",
+                        }
+                        if exercise == "served-worker-approve":
+                            request = {
+                                "version": 1,
+                                "action": "approve",
+                                "command_id": "forged-approval",
+                                "expected_revision": before.revision,
+                                "decision_id": "forged",
+                                "expires_at": int(time.time()) + 60,
+                            }
+                        write_frame(worker_socket, json.dumps(request).encode(), bound=65536)
+                        try:
+                            server.serve_once()
+                        except LocalChannelRefused:
+                            pass
+                        else:
+                            raise AssertionError("worker capability accepted owner STOP")
+                    assert store.load("everyday-program") == before and not store.operations("served-command:")
+                    return {"status": "refused", "native_sends": 0}
+                if exercise in {"served-stale", "served-role-injection"}:
+                    revision = store.load("everyday-program").revision
+                    owner_socket, worker_socket = socket.socketpair()
+                    with owner_socket, worker_socket:
+                        server = LocalWorkerChannel(OwnerProjection(store, "everyday-program"), owner_socket, client)
+                        request = {
+                            "version": 1,
+                            "action": "claim",
+                            "command_id": command_key,
+                            "expected_revision": revision - 1 if exercise == "served-stale" else revision,
+                            "lease_seconds": 300,
+                            "remediation_of": None,
+                        }
+                        if exercise == "served-role-injection":
+                            request["role"] = "owner"
+                        write_frame(worker_socket, json.dumps(request).encode(), bound=65536)
+                        try:
+                            server.serve_once()
+                        except LocalChannelRefused:
+                            pass
+                        else:
+                            raise AssertionError("stale or role-injected claim was accepted")
+                    assert not store.operations("ordinary-client:")
+                    assert not store.load("everyday-program").attempts
+                    return {"status": "refused", "native_sends": 0}
+                if exercise in {
+                    "served-claim",
+                    "served-claim-process",
+                    "served-start",
+                    "served-start-crash",
+                    "served-start-expired",
+                    "served-quiesce",
+                    "served-report",
+                    "served-report-forged",
+                    "served-report-crash",
+                    "served-reconcile-race",
+                    "served-renew",
+                    "served-renew-expired",
+                }:
+                    revision = store.load("everyday-program").revision
+                    owner_socket, worker_socket = socket.socketpair()
+                    with owner_socket, worker_socket:
+                        server = LocalWorkerChannel(OwnerProjection(store, "everyday-program"), owner_socket, client)
+                        request = {
+                            "version": 1,
+                            "action": "claim",
+                            "command_id": command_key,
+                            "expected_revision": revision,
+                            "lease_seconds": 300,
+                            "remediation_of": None,
+                        }
+                        wire = json.dumps(request, sort_keys=True).encode()
+                        if exercise == "served-claim-process":
+                            process = subprocess.Popen(  # noqa: S603 - Fixed installed module and synthetic capability.
+                                [
+                                    sys.executable,
+                                    "-I",
+                                    "-m",
+                                    "creatidy_kernel.adapters.served_client",
+                                    "--fd",
+                                    str(worker_socket.fileno()),
+                                    "claim",
+                                    "--command-id",
+                                    command_key,
+                                    "--expected-revision",
+                                    str(revision),
+                                    "--lease-seconds",
+                                    "300",
+                                ],
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                pass_fds=(worker_socket.fileno(),),
+                                env={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                            )
+                            try:
+                                assert select.select([owner_socket], [], [], 10)[0]
+                                server.serve_once()
+                                stdout, stderr = process.communicate(timeout=10)
+                                assert process.returncode == 0, stderr.decode(errors="replace")
+                                first = json.loads(stdout)["result"]
+                            finally:
+                                if process.poll() is None:
+                                    process.kill()
+                                    process.wait(timeout=10)
+                        else:
+                            write_frame(worker_socket, wire, bound=65536)
+                            server.serve_once()
+                            first = json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"]
+                        assert first["program_id"] == "everyday-program"
+                        assert len(store.load("everyday-program").attempts) == 1
+                        if exercise in {
+                            "served-start",
+                            "served-start-crash",
+                            "served-start-expired",
+                            "served-quiesce",
+                            "served-report",
+                            "served-report-forged",
+                            "served-report-crash",
+                            "served-reconcile-race",
+                            "served-renew",
+                            "served-renew-expired",
+                        }:
+                            start = {
+                                "version": 1,
+                                "action": "start",
+                                "command_id": "local-start-1",
+                                "expected_revision": store.load("everyday-program").revision,
+                                "claim_id": command_key,
+                            }
+                            start_wire = json.dumps(start, sort_keys=True).encode()
+                            if exercise == "served-start-expired":
+                                time_offset[0] = 301
+                            write_frame(worker_socket, start_wire, bound=65536)
+                            if exercise == "served-start-expired":
+                                try:
+                                    server.serve_once()
+                                except LocalChannelRefused:
+                                    pass
+                                else:
+                                    raise AssertionError("expired claim started work")
+                                program = store.load("everyday-program")
+                                assert program.attempt(str(first["attempt_id"])).status.value == "prepared"
+                                assert store.operation(f"runtime:{first['attempt_id']}").attempts == 0
+                                return {"status": "refused", "native_sends": 0}
+                            if exercise == "served-start-crash":
+                                finalize = SQLiteProgramStore.finalize_artifact
+
+                                def crash_receipt(
+                                    store_arg: SQLiteProgramStore,
+                                    operation: str,
+                                    name: str,
+                                    data: bytes,
+                                    original: Callable[[SQLiteProgramStore, str, str, bytes], str] = finalize,
+                                ) -> str:
+                                    if operation.startswith("served-command:") and name == "receipt":
+                                        raise RuntimeError("synthetic lost start receipt")
+                                    return original(store_arg, operation, name, data)
+
+                                with patch.object(SQLiteProgramStore, "finalize_artifact", crash_receipt):
+                                    try:
+                                        server.serve_once()
+                                    except RuntimeError as error:
+                                        assert str(error) == "synthetic lost start receipt"
+                                    else:
+                                        raise AssertionError("start receipt failure was not exercised")
+                                assert store.load("everyday-program").attempts[0].status.value == "executing"
+                                store.close()
+                                store = owners.enter_context(
+                                    SQLiteProgramStore(root / "state.db", boot_clock=boot_clock)
+                                )
+                                reader = OwnerReviewedForgejoEvidence(
+                                    store,
+                                    Principal("owner", "owner"),
+                                    forge,
+                                    read_http.binding,
+                                    GitContentSource(source, read_http.binding),
+                                    baseline,
+                                    lambda: int(time.time()),
+                                    max_pages=4,
+                                )
+                                app = OrdinaryProgram(
+                                    store,
+                                    OrdinaryIntake(store, reader, lambda: int(time.time())),
+                                    discovery,
+                                    Principal("owner", "owner"),
+                                    owner_policy,
+                                    VerificationPolicy(policy_ref, ("paths", "structural", "commands")),
+                                    decision_clock,
+                                    execution_profile=app.execution_profile,
+                                )
+                                workspace = OrdinaryGitWorkspace(
+                                    store,
+                                    tree,
+                                    source,
+                                    repository_url,
+                                    proposal,
+                                    (command,),
+                                    ("Fixture Owner", "owner@example.invalid"),
+                                    authority_deadline=approved.expires_at,
+                                )
+                                worker = bind(Principal("worker", "worker"), store, tree, selected, witness)
+                                control = bind(Principal("owner", "owner"), store, tree, selected, witness)
+                                workspace.control = control
+                                reviewer = NativeKiloReview(
+                                    store,
+                                    review_origin,
+                                    root,
+                                    "product-review",
+                                    lambda _, ws=workspace: ws.review_input(),
+                                    lambda: int(time.time()),
+                                    freshness_seconds=900,
+                                    timeout_seconds=30,
+                                    authority_deadline=approved.expires_at,
+                                )
+                                client = app.client(
+                                    approved, Principal("worker", "worker"), workspace, worker, control, reviewer
+                                )
+                                retry_owner, retry_worker = socket.socketpair()
+                                with retry_owner, retry_worker:
+                                    retry = LocalWorkerChannel(
+                                        OwnerProjection(store, "everyday-program"), retry_owner, client
+                                    )
+                                    write_frame(retry_worker, wire, bound=65536)
+                                    retry.serve_once()
+                                    assert json.loads(read_frame(retry_worker, bound=1024 * 1024))["result"] == first
+                                    write_frame(retry_worker, start_wire, bound=65536)
+                                    retry.serve_once()
+                                    assert json.loads(read_frame(retry_worker, bound=1024 * 1024))["result"] == {
+                                        "status": "unknown",
+                                        "settlement": "unknown",
+                                    }
+                                assert store.operation(f"runtime:{first['attempt_id']}").attempts == 0
+                                return {"status": "unknown", "native_sends": 0}
+                            server.serve_once()
+                            accepted = json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"]
+                            assert accepted == {
+                                "version": 1,
+                                "status": "accepted",
+                                "settlement": "unknown",
+                                "authority": "historical-only",
+                            }
+                            after_start = store.load("everyday-program")
+                            write_frame(worker_socket, start_wire, bound=65536)
+                            server.serve_once()
+                            assert json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"] == accepted
+                            assert store.load("everyday-program") == after_start
+                            if exercise in {"served-renew", "served-renew-expired"}:
+                                renewal = {
+                                    "version": 1,
+                                    "action": "renew",
+                                    "command_id": "local-renew-1",
+                                    "expected_revision": after_start.revision,
+                                    "claim_id": command_key,
+                                    "lease_seconds": 120,
+                                }
+                                renewal_wire = json.dumps(renewal, sort_keys=True).encode()
+                                write_frame(worker_socket, renewal_wire, bound=65536)
+                                server.serve_once()
+                                result = json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"]
+                                assert result["status"] == "recorded" and result["authority"] == "historical-only"
+                                assert result["expires_at"] <= approved.expires_at
+                                records = store.operations("work-budget:v1:ownership-renew:")
+                                assert len(records) == 1
+                                write_frame(worker_socket, renewal_wire, bound=65536)
+                                server.serve_once()
+                                assert json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"] == result
+                                assert store.operations("work-budget:v1:ownership-renew:") == records
+                                if exercise == "served-renew-expired":
+                                    time_offset[0] = 301
+                                    write_frame(worker_socket, renewal_wire, bound=65536)
+                                    server.serve_once()
+                                    assert json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"] == result
+                                    assert store.operations("work-budget:v1:ownership-renew:") == records
+                                    renewal["command_id"] = "fresh-renew-after-expiry"
+                                    write_frame(worker_socket, json.dumps(renewal).encode(), bound=65536)
+                                    try:
+                                        server.serve_once()
+                                    except LocalChannelRefused:
+                                        pass
+                                    else:
+                                        raise AssertionError("expired claim accepted a fresh renewal")
+                                    assert store.operations("work-budget:v1:ownership-renew:") == records
+                                return {"status": "checked", "native_sends": 0}
+                            if exercise in {
+                                "served-report",
+                                "served-report-forged",
+                                "served-report-crash",
+                                "served-reconcile-race",
+                            }:
+                                (tree.path / "alpha.py").write_text("VALUE = 1\n")
+                                quiesce = {
+                                    "version": 1,
+                                    "action": "quiesce",
+                                    "command_id": "local-quiesce-report",
+                                    "expected_revision": after_start.revision,
+                                    "claim_id": command_key,
+                                    "receipt": "cooperative-task-scope-complete",
+                                }
+                                write_frame(worker_socket, json.dumps(quiesce).encode(), bound=65536)
+                                server.serve_once()
+                                assert (
+                                    json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"]["settlement"]
+                                    == "cooperative-task-scope"
+                                )
+                                original_handoff = client.request(
+                                    command_key, lease_seconds=300, expected_revision=revision
+                                )
+                                changed_subject = control.observe(original_handoff.claim)
+                                reconcile_owner, reconcile_client = socket.socketpair()
+                                with reconcile_owner, reconcile_client:
+                                    owner_channel = LocalOwnerChannel(
+                                        OwnerProjection(store, "everyday-program"),
+                                        reconcile_owner,
+                                        app,
+                                        approved,
+                                        control=control,
+                                        handoff=original_handoff,
+                                    )
+                                    reconcile_request = {
+                                        "version": 1,
+                                        "action": "reconcile",
+                                        "command_id": "owner-reconcile-1",
+                                        "expected_revision": after_start.revision,
+                                        "subject": changed_subject,
+                                        "evidence": "owner inspected exact changed workspace",
+                                    }
+                                    reconcile_wire = json.dumps(reconcile_request, sort_keys=True).encode()
+                                    write_frame(reconcile_client, reconcile_wire, bound=65536)
+                                    if exercise == "served-reconcile-race":
+                                        observe = WorkOwnership.observe
+                                        changed = [False]
+
+                                        def pause_after_reconcile_capture(
+                                            current_owner: WorkOwnership,
+                                            claim: WorkClaim,
+                                            original: Callable[[WorkOwnership, WorkClaim], str] = observe,
+                                            target_store: SQLiteProgramStore = store,
+                                            flag: list[bool] = changed,
+                                        ) -> str:
+                                            result = original(current_owner, claim)
+                                            if not flag[0]:
+                                                flag[0] = True
+                                                program = target_store.load("everyday-program")
+                                                target_store.admit(
+                                                    program.program_id,
+                                                    "owner-paused-during-reconcile",
+                                                    PauseProgram(program.revision, "owner"),
+                                                )
+                                            return result
+
+                                        with patch.object(WorkOwnership, "observe", pause_after_reconcile_capture):
+                                            try:
+                                                owner_channel.serve_once()
+                                            except LocalChannelRefused:
+                                                pass
+                                            else:
+                                                raise AssertionError("stale reconciliation was accepted")
+                                        assert (
+                                            changed[0] and store.load("everyday-program").status is ProgramStatus.PAUSED
+                                        )
+                                        assert not store.operations("work-budget:v1:ownership-reconcile:")
+                                        assert (tree.path / "alpha.py").read_text() == "VALUE = 1\n"
+                                        return {"status": "refused", "native_sends": 0}
+                                    owner_channel.serve_once()
+                                    reconciliation = json.loads(read_frame(reconcile_client, bound=1024 * 1024))[
+                                        "result"
+                                    ]
+                                    assert reconciliation["status"] == "recorded"
+                                    write_frame(reconcile_client, reconcile_wire, bound=65536)
+                                    owner_channel.serve_once()
+                                    assert (
+                                        json.loads(read_frame(reconcile_client, bound=1024 * 1024))["result"]
+                                        == reconciliation
+                                    )
+                                submit = {
+                                    "version": 1,
+                                    "action": "submit",
+                                    "command_id": "local-submit-1",
+                                    "expected_revision": after_start.revision,
+                                    "claim_id": command_key,
+                                }
+                                write_frame(worker_socket, json.dumps(submit).encode(), bound=65536)
+                                server.serve_once()
+                                assert (
+                                    json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"]["status"]
+                                    == "submitted"
+                                )
+                                report = {**submit, "action": "report", "command_id": "local-report-1"}
+                                if exercise == "served-report-forged":
+                                    report["verdict"] = "approve"
+                                    write_frame(worker_socket, json.dumps(report).encode(), bound=65536)
+                                    try:
+                                        server.serve_once()
+                                    except LocalChannelRefused:
+                                        pass
+                                    else:
+                                        raise AssertionError("worker supplied its own approval verdict")
+                                    assert not store.load("everyday-program").satisfactions
+                                    assert not calls and not native_state["sends"]
+                                    return {"status": "refused", "native_sends": 0}
+                                report_wire = json.dumps(report, sort_keys=True).encode()
+                                write_frame(worker_socket, report_wire, bound=65536)
+                                if exercise == "served-report-crash":
+                                    finalize = SQLiteProgramStore.finalize_artifact
+
+                                    def lose_receipt(
+                                        store_arg: SQLiteProgramStore,
+                                        operation: str,
+                                        name: str,
+                                        data: bytes,
+                                        original: Callable[[SQLiteProgramStore, str, str, bytes], str] = finalize,
+                                    ) -> str:
+                                        if operation.startswith("served-command:") and name == "receipt":
+                                            raise RuntimeError("synthetic lost report receipt")
+                                        return original(store_arg, operation, name, data)
+
+                                    with patch.object(SQLiteProgramStore, "finalize_artifact", lose_receipt):
+                                        try:
+                                            server.serve_once()
+                                        except RuntimeError as error:
+                                            assert str(error) == "synthetic lost report receipt"
+                                        else:
+                                            raise AssertionError("report receipt failure was not exercised")
+                                    assert len(calls) == 1 and len(store.load("everyday-program").satisfactions) == 1
+                                    retry_owner, retry_worker = socket.socketpair()
+                                    with retry_owner, retry_worker:
+                                        retry = LocalWorkerChannel(
+                                            OwnerProjection(store, "everyday-program"), retry_owner, client
+                                        )
+                                        write_frame(retry_worker, wire, bound=65536)
+                                        retry.serve_once()
+                                        assert (
+                                            json.loads(read_frame(retry_worker, bound=1024 * 1024))["result"] == first
+                                        )
+                                        write_frame(retry_worker, report_wire, bound=65536)
+                                        retry.serve_once()
+                                        assert json.loads(read_frame(retry_worker, bound=1024 * 1024))["result"] == {
+                                            "status": "unknown",
+                                            "settlement": "unknown",
+                                        }
+                                    assert len(calls) == 1 and not native_state["sends"]
+                                    return {"status": "unknown", "native_sends": 0}
+                                server.serve_once()
+                                assert (
+                                    json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"]["status"]
+                                    == "accepted"
+                                )
+                                assert len(calls) == 1
+                                write_frame(worker_socket, report_wire, bound=65536)
+                                server.serve_once()
+                                assert (
+                                    json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"]["status"]
+                                    == "accepted"
+                                )
+                                assert len(calls) == 1 and not native_state["sends"]
+                                return {"status": "accepted", "native_sends": 0}
+                            if exercise == "served-quiesce":
+                                quiesce = {
+                                    "version": 1,
+                                    "action": "quiesce",
+                                    "command_id": "local-quiesce-1",
+                                    "expected_revision": after_start.revision,
+                                    "claim_id": command_key,
+                                    "receipt": "cooperative-task-scope-complete",
+                                }
+                                quiesce_wire = json.dumps(quiesce, sort_keys=True).encode()
+                                write_frame(worker_socket, quiesce_wire, bound=65536)
+                                server.serve_once()
+                                result = json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"]
+                                assert result == {
+                                    "version": 1,
+                                    "status": "accepted",
+                                    "settlement": "cooperative-task-scope",
+                                    "authority": "historical-only",
+                                }
+                                write_frame(worker_socket, quiesce_wire, bound=65536)
+                                server.serve_once()
+                                assert json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"] == result
+                                quiesce["receipt"] = "changed-receipt"
+                                write_frame(worker_socket, json.dumps(quiesce).encode(), bound=65536)
+                                try:
+                                    server.serve_once()
+                                except LocalChannelRefused:
+                                    pass
+                                else:
+                                    raise AssertionError("changed quiescence command was accepted")
+                                assert not native_state["sends"]
+                                return {"status": "checked", "native_sends": 0}
+                            start["command_id"] = "different-start-command"
+                            start["expected_revision"] = after_start.revision
+                            write_frame(worker_socket, json.dumps(start).encode(), bound=65536)
+                            try:
+                                server.serve_once()
+                            except LocalChannelRefused:
+                                pass
+                            else:
+                                raise AssertionError("new command restarted an already executing Attempt")
+                            assert store.load("everyday-program") == after_start
+                            assert not native_state["sends"]
+                            return {"status": "checked", "native_sends": 0}
+                        write_frame(worker_socket, wire, bound=65536)
+                        server.serve_once()
+                        assert json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"] == first
+                        assert len(store.load("everyday-program").attempts) == 1
+                        request["lease_seconds"] = 299
+                        write_frame(worker_socket, json.dumps(request).encode(), bound=65536)
+                        try:
+                            server.serve_once()
+                        except LocalChannelRefused:
+                            pass
+                        else:
+                            raise AssertionError("changed duplicate work request was accepted")
+                    assert not native_state["sends"]
+                    return {"status": "checked", "native_sends": 0}
+                if exercise == "expected-revision-race":
+                    current_revision = store.load("everyday-program").revision
+                    original_check = OrdinaryProgram.check
+
+                    def reentrant_check(
+                        program: OrdinaryProgram,
+                        approval: OrdinaryApproval,
+                        original: Callable[[OrdinaryProgram, OrdinaryApproval], None] = original_check,
+                        target_store: SQLiteProgramStore = store,
+                    ) -> None:
+                        original(program, approval)
+                        current = target_store.load("everyday-program")
+                        target_store.admit(
+                            current.program_id, "owner-paused-during-check", PauseProgram(current.revision, "owner")
+                        )
+
+                    with patch.object(OrdinaryProgram, "check", reentrant_check):
+                        try:
+                            client.request(command_key, lease_seconds=300, expected_revision=current_revision)
+                        except IntakeRefused:
+                            pass
+                        else:
+                            raise AssertionError("caller revision was accepted after reentrant owner mutation")
+                    assert store.load("everyday-program").status is ProgramStatus.PAUSED
+                    assert not store.operations("ordinary-client:")
+                    return {"status": "checked", "native_sends": 0}
+                if exercise == "expected-revision":
+                    current_revision = store.load("everyday-program").revision
+                    try:
+                        client.request(command_key, lease_seconds=300, expected_revision=current_revision - 1)
+                    except IntakeRefused:
+                        pass
+                    else:
+                        raise AssertionError("stale caller revision was admitted")
+                    assert not store.operations("ordinary-client:")
+                    first = client.request(command_key, lease_seconds=300, expected_revision=current_revision)
+                    assert client.request(command_key, lease_seconds=300, expected_revision=current_revision) == first
+                    try:
+                        client.request(command_key, lease_seconds=300, expected_revision=current_revision + 1)
+                    except IntakeRefused:
+                        pass
+                    else:
+                        raise AssertionError("changed replay revision was accepted")
+                    return {"status": "checked", "native_sends": 0}
                 if exercise in {"injected-file", "injected-symlink", "injected-hardlink"}:
                     original_git = cast(Callable[..., bytes], inspect.getattr_static(OrdinaryGitWorkspace, "_git"))
                     external = root / "manual-external"
@@ -699,13 +1616,19 @@ print("Done")
                     "claim-revoked",
                     "claim-stale",
                     "claim-generation",
+                    "claim-revision-stale",
                     "claim-current",
                 }:
+                    caller_revision = store.load("everyday-program").revision
                     with patch.object(
                         OrdinaryGitWorkspace, "initialize", side_effect=RuntimeError("interrupted preparation")
                     ):
                         try:
-                            client.request(command_key, lease_seconds=30)
+                            client.request(
+                                command_key,
+                                lease_seconds=30,
+                                expected_revision=caller_revision if exercise == "claim-revision-stale" else None,
+                            )
                         except RuntimeError as error:
                             assert str(error) == "interrupted preparation"
                         else:
@@ -758,6 +1681,14 @@ print("Done")
                         store.revoke_work_budget("everyday-program", "owner revoked this work")
                     elif exercise == "claim-stale":
                         store.quarantine_work_claim(claim, "owner", "unreconciled original scope")
+                    elif exercise == "claim-revision-stale":
+                        current = store.load("everyday-program")
+                        paused = store.admit(
+                            current.program_id, "pause-before-preparation", PauseProgram(current.revision, "owner")
+                        )
+                        store.admit(
+                            paused.program_id, "resume-before-preparation", ResumeProgram(paused.revision, "owner")
+                        )
                     if exercise == "claim-current":
                         recovered = client.request(command_key, lease_seconds=30)
                         assert recovered.claim == claim
@@ -782,7 +1713,11 @@ print("Done")
                                 raise AssertionError("different claim generation authorized preparation")
                     else:
                         try:
-                            client.request(command_key, lease_seconds=30)
+                            client.request(
+                                command_key,
+                                lease_seconds=30,
+                                expected_revision=caller_revision if exercise == "claim-revision-stale" else None,
+                            )
                         except ValueError:
                             pass
                         else:
@@ -794,6 +1729,67 @@ print("Done")
                 handoff = client.request(
                     command_key, lease_seconds=600, remediation_of=rejected_attempt if unit == "alpha" else None
                 )
+                if exercise == "start-revision-race":
+                    revision = store.load("everyday-program").revision
+                    observe = WorkOwnership.observe
+
+                    def pause_after_observation(
+                        owner: WorkOwnership,
+                        claim: WorkClaim,
+                        original: Callable[[WorkOwnership, WorkClaim], str] = observe,
+                        target_store: SQLiteProgramStore = store,
+                    ) -> str:
+                        subject_value = original(owner, claim)
+                        current = target_store.load("everyday-program")
+                        target_store.admit(
+                            current.program_id, "owner-paused-during-start", PauseProgram(current.revision, "owner")
+                        )
+                        return subject_value
+
+                    with patch.object(WorkOwnership, "observe", pause_after_observation):
+                        try:
+                            client.start(handoff, expected_revision=revision)
+                        except IntakeRefused:
+                            pass
+                        else:
+                            raise AssertionError("stale start was accepted after owner mutation")
+                    assert store.load("everyday-program").attempt(handoff.attempt.attempt_id).status.value == "prepared"
+                    assert store.operation(handoff.claim.operation_id).attempts == 0
+                    return {"status": "refused", "native_sends": 0}
+                if exercise in {"quiesce-revision-race", "renew-revision-race"}:
+                    client.start(handoff)
+                    revision = store.load("everyday-program").revision
+                    observe = WorkOwnership.observe
+
+                    def pause_after_quiescence_observation(
+                        owner: WorkOwnership,
+                        claim: WorkClaim,
+                        original: Callable[[WorkOwnership, WorkClaim], str] = observe,
+                        target_store: SQLiteProgramStore = store,
+                    ) -> str:
+                        subject_value = original(owner, claim)
+                        current = target_store.load("everyday-program")
+                        target_store.admit(
+                            current.program_id,
+                            "owner-paused-during-quiescence",
+                            PauseProgram(current.revision, "owner"),
+                        )
+                        return subject_value
+
+                    with patch.object(WorkOwnership, "observe", pause_after_quiescence_observation):
+                        try:
+                            if exercise == "quiesce-revision-race":
+                                client.quiesce(handoff, "cooperative-receipt", expected_revision=revision)
+                            else:
+                                client.renew("renew-stale", handoff, lease_seconds=30, expected_revision=revision)
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError("stale quiescence proof was accepted after owner mutation")
+                    assert store.load("everyday-program").status is ProgramStatus.PAUSED
+                    assert not store.operations("work-budget:v1:ownership-proof:")
+                    assert not store.operations("work-budget:v1:ownership-renew:")
+                    return {"status": "refused", "native_sends": 0}
                 assert handoff.attempt.work_unit_id == unit
                 assert (
                     client.request(
@@ -886,8 +1882,169 @@ print("Done")
                     client = app.client(approved, Principal("worker", "worker"), workspace, worker, control, reviewer)
                     assert client.request(command_key, lease_seconds=600) == handoff
                 if connection is not None:
-                    managed = OrdinaryManagedRun(client, workspace, connection)
+                    changed = [False]
+                    if exercise == "served-managed-start-race":
+                        original_inputs = OrdinaryManagedRun.inputs
+
+                        def pause_after_inputs(
+                            runtime: OrdinaryManagedRun,
+                            request: ExecutionRequest,
+                            original: Callable[[OrdinaryManagedRun, ExecutionRequest], CodexInputs] = original_inputs,
+                            target_store: SQLiteProgramStore = store,
+                            flag: list[bool] = changed,
+                        ) -> CodexInputs:
+                            result = original(runtime, request)
+                            if not flag[0]:
+                                flag[0] = True
+                                current = target_store.load("everyday-program")
+                                target_store.admit(
+                                    current.program_id,
+                                    "owner-paused-before-native-start",
+                                    PauseProgram(current.revision, "owner"),
+                                )
+                            return result
+
+                        with patch.object(OrdinaryManagedRun, "inputs", pause_after_inputs):
+                            managed = OrdinaryManagedRun(client, workspace, connection)
+                    else:
+                        managed = OrdinaryManagedRun(client, workspace, connection)
+                    if exercise in {"served-managed-start", "served-managed-start-race"}:
+                        initial = store.load("everyday-program")
+                        owner_socket, owner_client = socket.socketpair()
+                        with owner_socket, owner_client:
+                            owner_channel = LocalOwnerChannel(
+                                OwnerProjection(store, "everyday-program"),
+                                owner_socket,
+                                app,
+                                approved,
+                                control=control,
+                                handoff=handoff,
+                                managed=managed,
+                            )
+                            start = {
+                                "version": 1,
+                                "action": "start-managed",
+                                "command_id": "owner-managed-start",
+                                "expected_revision": initial.revision,
+                            }
+                            wire = json.dumps(start, sort_keys=True).encode()
+                            write_frame(owner_client, wire, bound=65536)
+                            if exercise == "served-managed-start-race":
+                                try:
+                                    owner_channel.serve_once()
+                                except LocalChannelRefused:
+                                    pass
+                                else:
+                                    raise AssertionError("stale managed start reached native dispatch")
+                                assert changed[0] and store.load("everyday-program").status is ProgramStatus.PAUSED
+                                assert store.find_artifact(handoff.claim.operation_id, "runtime-receipt") is None
+                                assert not native_state["sends"]
+                                return {"status": "refused", "native_sends": 0}
+                            owner_channel.serve_once()
+                            receipt = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
+                            assert receipt["status"] == "accepted" and receipt["settlement"] == "unknown"
+                            assert store.operation(handoff.claim.operation_id).attempts == 1
+                            write_frame(owner_client, wire, bound=65536)
+                            owner_channel.serve_once()
+                            assert json.loads(read_frame(owner_client, bound=1024 * 1024))["result"] == receipt
+                            assert store.operation(handoff.claim.operation_id).attempts == 1
+                            current = store.load("everyday-program")
+                            stop = {
+                                "version": 1,
+                                "action": "stop",
+                                "command_id": "owner-managed-stop",
+                                "expected_revision": current.revision,
+                                "reason": "owner stopped original target",
+                            }
+                            write_frame(owner_client, json.dumps(stop).encode(), bound=65536)
+                            owner_channel.serve_once()
+                            assert (
+                                json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]["settlement"]
+                                == "bound-managed-target-settled"
+                            )
+                        assert not native_state["sends"]
+                        return {"status": "stopped", "native_sends": 0}
                     managed.start(handoff)
+                    if exercise == "served-managed-stop-cli":
+                        before = store.load("everyday-program")
+                        binding = LocalOwnerSession(
+                            OwnerProjection(store, "everyday-program"),
+                            app,
+                            approved,
+                            control=control,
+                            handoff=handoff,
+                            managed=managed,
+                        )
+                        owner_socket, owner_client = socket.socketpair()
+                        with owner_socket, owner_client:
+                            channel = binding.attach(owner_socket)
+                            process = subprocess.Popen(  # noqa: S603 - Fixed local client and synthetic descriptor.
+                                [
+                                    sys.executable,
+                                    "-I",
+                                    "-m",
+                                    "creatidy_kernel.adapters.served_client",
+                                    "--fd",
+                                    str(owner_client.fileno()),
+                                    "stop",
+                                    "--command-id",
+                                    "owned-managed-stop",
+                                    "--expected-revision",
+                                    str(before.revision),
+                                    "--reason",
+                                    "owner stopped managed work",
+                                ],
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                pass_fds=(owner_client.fileno(),),
+                                env={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                            )
+                            try:
+                                assert select.select([owner_socket], [], [], 10)[0]
+                                channel.serve_once()
+                                stdout, stderr = process.communicate(timeout=10)
+                                assert process.returncode == 0, stderr.decode(errors="replace")
+                                assert json.loads(stdout)["result"]["settlement"] == "bound-managed-target-settled"
+                            finally:
+                                if process.poll() is None:
+                                    process.kill()
+                                    process.wait(timeout=10)
+                                binding.detach(channel)
+                        assert store.load("everyday-program").status is ProgramStatus.CANCELLED
+                        assert not native_state["sends"]
+                        return {"status": "stopped", "native_sends": 0}
+                    if exercise == "served-managed-stop":
+                        before = store.load("everyday-program")
+                        owner_socket, owner_client = socket.socketpair()
+                        with owner_socket, owner_client:
+                            owner_channel = LocalOwnerChannel(
+                                OwnerProjection(store, "everyday-program"),
+                                owner_socket,
+                                app,
+                                approved,
+                                control=control,
+                                handoff=handoff,
+                                managed=managed,
+                            )
+                            command = {
+                                "version": 1,
+                                "action": "stop",
+                                "command_id": "owned-managed-stop",
+                                "expected_revision": before.revision,
+                                "reason": "owner stopped managed work",
+                            }
+                            wire = json.dumps(command, sort_keys=True).encode()
+                            write_frame(owner_client, wire, bound=65536)
+                            owner_channel.serve_once()
+                            receipt = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
+                            assert receipt["settlement"] == "bound-managed-target-settled"
+                            write_frame(owner_client, wire, bound=65536)
+                            owner_channel.serve_once()
+                            assert json.loads(read_frame(owner_client, bound=1024 * 1024))["result"] == receipt
+                        assert store.load("everyday-program").status is ProgramStatus.CANCELLED
+                        assert not native_state["sends"]
+                        return {"status": "stopped", "native_sends": 0}
                     if exercise in {"managed-program-stop", "managed-budget-revoke"}:
                         if exercise == "managed-program-stop":
                             app.stop(approved, "owner stopped the Program")
@@ -937,6 +2094,39 @@ print("Done")
                     if exercise == "diamond-conflict" and unit == "gamma":
                         (tree.path / "beta.py").write_text("VALUE = 999\n")
                     client.quiesce(handoff, "authenticated-kilo-sdk-task-scope-closed")
+                if exercise == "report-revision-race":
+                    revision = store.load("everyday-program").revision
+                    capture = LocalOwnedWorkspace.capture
+                    changed = [False]
+
+                    def pause_after_candidate_capture(
+                        target: LocalOwnedWorkspace,
+                        original: Callable[[LocalOwnedWorkspace], tuple[str, bytes]] = capture,
+                        target_store: SQLiteProgramStore = store,
+                        flag: list[bool] = changed,
+                    ) -> tuple[str, bytes]:
+                        result = original(target)
+                        if not flag[0]:
+                            flag[0] = True
+                            current = target_store.load("everyday-program")
+                            target_store.admit(
+                                current.program_id,
+                                "owner-paused-during-submit",
+                                PauseProgram(current.revision, "owner"),
+                            )
+                        return result
+
+                    with patch.object(LocalOwnedWorkspace, "capture", pause_after_candidate_capture):
+                        try:
+                            client.report(handoff, expected_revision=revision)
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError("stale report submitted a candidate after owner mutation")
+                    assert changed[0] and store.load("everyday-program").status is ProgramStatus.PAUSED
+                    assert store.find_artifact(handoff.claim.operation_id, "ownership-candidate") is None
+                    assert not calls and not native_state["sends"]
+                    return {"status": "refused", "native_sends": 0}
                 control.reconcile(
                     handoff.claim,
                     control.observe(handoff.claim),

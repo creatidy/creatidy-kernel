@@ -111,6 +111,8 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
         subprocess.run(
             [str(python), "-I", str(ROOT / "tools/check_ordinary.py"), ordinary_directory], cwd=work, check=True
         )
+    with tempfile.TemporaryDirectory(prefix="served-", dir=storage_root) as served_directory:
+        subprocess.run([str(python), "-I", str(ROOT / "tools/check_served.py"), served_directory], cwd=work, check=True)
     subprocess.run(
         [sys.executable, str(ROOT / "tools/check_schema_upgrade.py"), str(python), str(storage_root)],
         cwd=work,

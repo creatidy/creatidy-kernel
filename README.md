@@ -499,6 +499,27 @@ bytes remain retained and require reconciliation. Schema-5 readers refuse schema
 remediation, STOP and a lost Forgejo response without a duplicate send. The narrower `task run` command
 below remains limited to frozen TaskSpecs and is not the ordinary SDK.
 
+## Local Owner-Served State
+
+For a running trusted-local controller, construct `OwnerProjection` with its existing
+`SQLiteProgramStore` on the store-owning thread. The local version-1 client is
+`creatidy-kernel-client`: it reads `snapshot` or `events`, or uses a separately host-bound worker or
+owner capability for the documented ordinary commands. It never opens the active SQLite file.
+
+The host supplies a preconnected local descriptor, for example by creating a `socket.socketpair()`,
+binding the owner endpoint with `LocalWorkerSession.attach()`, passing the peer with
+`subprocess.Popen(..., pass_fds=(peer.fileno(),))`, calling `serve_once()` on the owner thread when
+the endpoint is readable, and then calling `detach()`. Owner and observer capabilities are distinct;
+the wire request cannot choose a principal, provider policy, review verdict or outbox fence. The CLI
+accepts only an already-passed `--fd`, not a network URL. See the [version-1 local contract](docs/architecture/contracts.md#local-owner-served-contract)
+for commands, expected revisions, gap handling and limitations.
+
+Progress is bounded, producer-scoped and lossy. A `gap` requires a new snapshot; it is not a durable
+global event log. Historical command receipts do not renew authority. Closing a client descriptor
+does not cancel an Attempt or prove physical settlement. The trusted host must authenticate and bind
+callers before passing a descriptor; this is not a remote authentication or hostile same-UID isolation
+scheme, and no remote listener is enabled by this contract.
+
 ## Ordinary Preparation
 
 Ordinary issues use the installed Python API `creatidy_kernel.ports.intake.OrdinaryIntake`,

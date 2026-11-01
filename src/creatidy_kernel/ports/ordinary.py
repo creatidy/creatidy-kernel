@@ -15,7 +15,6 @@ from creatidy_kernel.core.domain import (
     ActivateProgram,
     AmendProgramSpec,
     AttemptSpec,
-    CancelProgram,
     FinishAttempt,
     InputBinding,
     Program,
@@ -41,6 +40,7 @@ from creatidy_kernel.core.verification import CandidateResult, EvidenceSubject, 
 from creatidy_kernel.ports.application import Collection, receive_candidate, remediation_context
 from creatidy_kernel.ports.intake import IntakeStore, OrdinaryIntake, draft_from
 from creatidy_kernel.ports.ownership import OwnershipStore, WorkOwnership
+from creatidy_kernel.ports.program_store import OperationRecord
 from creatidy_kernel.ports.verification import (
     ProductReviewDispatcher,
     ProductReviewStatus,
@@ -52,7 +52,11 @@ from creatidy_kernel.ports.verification import (
 class OrdinaryStore(IntakeStore, OwnershipStore, Protocol):
     def work_decision_time(self, program_id: str) -> int: ...
     def check_work_authority(self, program_id: str) -> None: ...
-    def revoke_work_budget(self, program_id: str, evidence: str) -> None: ...
+    def find_operation(self, operation_id: str) -> OperationRecord | None: ...
+    def revoke_work_budget(self, program_id: str, evidence: str, *, expected_revision: int | None = None) -> None: ...
+    def stop_ordinary_program(
+        self, program_id: str, command_key: str, actor: str, evidence: str, *, expected_revision: int | None = None
+    ) -> Program: ...
     def accept_ordinary_preparation(self, claim: WorkClaim, owner: str, subject: str) -> None: ...
     def find_ordinary_preparation(self, claim: WorkClaim) -> bool: ...
 
@@ -249,7 +253,9 @@ class OrdinaryProgram:
         if any(not item.observed_at <= now <= item.fresh_until for item in (*proposal.dependencies, *edges)):
             raise IntakeRefused("original dependency observation expired; refresh and explicitly approve")
 
-    def approve(self, proposal: OrdinaryProposal, *, decision_id: str, expires_at: int) -> OrdinaryApproval:
+    def approve(
+        self, proposal: OrdinaryProposal, *, decision_id: str, expires_at: int, expected_revision: int | None = None
+    ) -> OrdinaryApproval:
         # The caller's expiry is an upper bound. Original producer evidence may
         # expire earlier; bind that bound into the boot-clock work envelope too.
         expires_at = min(
@@ -259,6 +265,12 @@ class OrdinaryProgram:
             *(item.fresh_until for item in proposal.dependencies),
         )
         previous = self.store.find_program(proposal.program_id)
+        if expected_revision is not None:
+            if type(expected_revision) is not int or expected_revision < -1:
+                raise IntakeRefused("caller expected revision is invalid")
+            actual_revision = -1 if previous is None else previous.revision
+            if actual_revision != expected_revision:
+                raise IntakeRefused("caller expected revision is stale")
         key = f"ordinary-program:approval:{decision_id}"
         prior = self.store.find_artifact(key, "record")
         # Recovery is the same decision, not another amendment or a renewed expiry.
@@ -317,6 +329,7 @@ class OrdinaryProgram:
             amendment=amendment,
             records=((key, {"kind": "ordinary-intake-record", "version": 1, "bytes": raw.decode()}, raw),),
             validate=lambda: self.current(proposal, expires_at),
+            expected_revision=expected_revision,
         )
         return OrdinaryApproval(proposal, self.policy.digest, decision_id, expires_at, program)
 
@@ -370,17 +383,19 @@ class OrdinaryProgram:
             raise IntakeRefused("historical approval, current policy or specification differs")
         return OrdinaryApproval(proposal, self.policy.digest, decision_id, cast(int, record["expires_at"]), program)
 
-    def stop(self, approved: OrdinaryApproval, reason: str) -> None:
+    def stop(self, approved: OrdinaryApproval, reason: str, *, expected_revision: int | None = None) -> None:
         if not reason.strip() or self.recover(approved.decision_id).proposal != approved.proposal:
             raise IntakeRefused("exact owner decision and substantive STOP reason required")
         program = self.store.load(approved.program.program_id)
-        if program.status.value not in {"cancelled", "completed"}:
-            self.store.admit(
-                program.program_id,
-                "ordinary-stop:" + approved.decision_id,
-                CancelProgram(program.revision, self.owner.actor_id),
-            )
-        self.store.revoke_work_budget(program.program_id, "ordinary-owner-stop:" + approved.decision_id)
+        if expected_revision is not None and program.revision != expected_revision:
+            raise IntakeRefused("caller expected revision is stale")
+        self.store.stop_ordinary_program(
+            program.program_id,
+            "ordinary-stop:" + approved.decision_id,
+            self.owner.actor_id,
+            "ordinary-owner-stop:" + approved.decision_id,
+            expected_revision=expected_revision,
+        )
 
     def check(self, approved: OrdinaryApproval) -> None:
         key = f"ordinary-program:approval:{approved.decision_id}"
@@ -448,8 +463,17 @@ class OrdinaryWorkClient:
         self.application, self.approved, self.principal = application, approved, principal
         self.workspace, self.worker, self.control, self.reviewer = workspace, worker, control, reviewer
 
-    def request(self, command_key: str, *, lease_seconds: int, remediation_of: str | None = None) -> OrdinaryHandoff:
+    def request(
+        self,
+        command_key: str,
+        *,
+        lease_seconds: int,
+        remediation_of: str | None = None,
+        expected_revision: int | None = None,
+    ) -> OrdinaryHandoff:
         app, approved = self.application, self.approved
+        if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
+            raise IntakeRefused("caller expected revision is invalid")
         program = app.store.load(approved.program.program_id)
         # Command identity is supplied for retry, never a caller-selected Attempt,
         # fence, unit, resource, principal, budget or authority envelope.
@@ -458,6 +482,9 @@ class OrdinaryWorkClient:
         saved_revision = None
         if prior is None:
             app.check(approved)
+            program = app.store.load(approved.program.program_id)
+            if expected_revision is not None and expected_revision != program.revision:
+                raise IntakeRefused("caller expected revision is stale")
             ready = program.ready_work_units
             if not ready:
                 raise IntakeRefused("no ready obligation in the approved Program")
@@ -498,6 +525,8 @@ class OrdinaryWorkClient:
             # Claim replay compares the original expected revision, not current HEAD.
             raw = app.store.artifact(f"ordinary-client:{attempt_id}", "revision")
             revision = int(raw)
+        if expected_revision is not None and expected_revision != revision:
+            raise IntakeRefused("caller expected revision differs from original command")
         if prior is None and saved_revision is None:
             app.store.intent(
                 f"ordinary-client:{attempt_id}",
@@ -510,21 +539,31 @@ class OrdinaryWorkClient:
             return OrdinaryHandoff(attempt, claim)  # Historical result only; no authority is renewed.
         if prior is None or prior.status.value == "prepared":
             app.check(approved)
-            self.worker.check_current(claim)
-            subject = self.workspace.initialize(attempt, lambda: self.worker.check_current(claim))
+            claim_revision = None if expected_revision is None else revision + 1
+            self.worker.check_current(claim, expected_revision=claim_revision)
+            subject = self.workspace.initialize(
+                attempt, lambda: self.worker.check_current(claim, expected_revision=claim_revision)
+            )
             if self.control.observe(claim) != subject:
                 raise IntakeRefused("prepared workspace changed before owner admission")
             app.store.accept_ordinary_preparation(claim, app.owner.actor_id, subject)
         return OrdinaryHandoff(attempt, claim)
 
-    def start(self, handoff: OrdinaryHandoff) -> int | None:
+    def start(self, handoff: OrdinaryHandoff, *, expected_revision: int | None = None) -> int | None:
         app = self.application
+        if expected_revision is not None:
+            if type(expected_revision) is not int or expected_revision < 0:
+                raise IntakeRefused("caller expected revision is invalid")
+            if app.store.load(handoff.attempt.program_id).revision != expected_revision:
+                raise IntakeRefused("caller expected revision is stale")
         app.check(self.approved)
         self.control.observe(handoff.claim)
         self.workspace.restore(handoff.attempt)
         if handoff.claim.mode is HandoffMode.MANAGED:
-            self.worker.witness(handoff.claim, "start")
+            self.worker.witness(handoff.claim, "start", expected_revision=expected_revision)
         program = app.store.load(handoff.attempt.program_id)
+        if expected_revision is not None and program.revision != expected_revision:
+            raise IntakeRefused("caller expected revision changed during handoff checks")
         if program.attempt(handoff.attempt.attempt_id).status.value == "prepared":
             app.store.admit(
                 program.program_id,
@@ -569,22 +608,30 @@ class OrdinaryWorkClient:
             }
         )
 
-    def renew(self, command_key: str, handoff: OrdinaryHandoff, *, lease_seconds: int) -> int:
+    def renew(
+        self, command_key: str, handoff: OrdinaryHandoff, *, lease_seconds: int, expected_revision: int | None = None
+    ) -> int:
         self.application.check(self.approved)
-        return self.worker.renew(command_key, handoff.claim, lease_seconds=lease_seconds)
+        return self.worker.renew(
+            command_key, handoff.claim, lease_seconds=lease_seconds, expected_revision=expected_revision
+        )
 
-    def quiesce(self, handoff: OrdinaryHandoff, receipt: str | None = None) -> None:
+    def quiesce(
+        self, handoff: OrdinaryHandoff, receipt: str | None = None, *, expected_revision: int | None = None
+    ) -> None:
         if handoff.claim.mode is HandoffMode.PULL:
             self.application.check(self.approved)
             if receipt is None:
                 raise IntakeRefused("explicit authenticated cooperative quiescence receipt required")
-            self.worker.quiesce(handoff.claim, receipt)
+            self.worker.quiesce(handoff.claim, receipt, expected_revision=expected_revision)
         else:
             if receipt is not None:
                 raise IntakeRefused("managed group completion cannot be asserted by a string")
-            self.worker.witness(handoff.claim, "complete")
+            self.worker.witness(handoff.claim, "complete", expected_revision=expected_revision)
 
-    def report(self, handoff: OrdinaryHandoff, *, cooperative_receipt: str | None = None) -> str:
+    def report(
+        self, handoff: OrdinaryHandoff, *, cooperative_receipt: str | None = None, expected_revision: int | None = None
+    ) -> str:
         app, attempt, claim = self.application, handoff.attempt, handoff.claim
         historical = app.store.load(attempt.program_id)
         state = historical.state(attempt.work_unit_id)
@@ -618,18 +665,22 @@ class OrdinaryWorkClient:
                 raise IntakeRefused("retained rejection has an unsupported review status")
             return "rejected"  # Historical read only; no fresh evidence or authority.
         app.check(self.approved)
+        if expected_revision is not None and app.store.load(attempt.program_id).revision != expected_revision:
+            raise IntakeRefused("caller expected revision is stale")
         if cooperative_receipt is not None:
-            self.quiesce(handoff, cooperative_receipt)
+            self.quiesce(handoff, cooperative_receipt, expected_revision=expected_revision)
         # Changed bytes require a separate exact owner reconciliation call. A
         # worker report cannot silently attribute manual edits to its runtime.
         submitted = app.store.find_artifact(claim.operation_id, "ownership-candidate")
         if submitted is None:
-            self.worker.submit(claim)
+            self.worker.submit(claim, expected_revision=expected_revision)
         elif self.worker.observe(claim) != digest(submitted):
             raise IntakeRefused("workspace differs from the original submitted candidate")
         self.workspace.restore(attempt)
         candidate, collection = self.workspace.collect(attempt, claim)
         program = app.store.load(attempt.program_id)
+        if expected_revision is not None and program.revision != expected_revision:
+            raise IntakeRefused("caller expected revision changed during candidate collection")
         if program.attempt(attempt.attempt_id).status.value == "executing":
             program = app.store.admit(
                 program.program_id,

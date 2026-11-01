@@ -13,6 +13,53 @@ and missing receipts are in the [coverage roadmap](successor.md), governed by
 [ADR 0007](../adr/0007-shared-harness-routing-observability.md). Ports use core-owned values;
 unsupported requirements must fail closed, not through weaker fallbacks.
 
+## Local Owner-Served Contract
+
+The version-1 local contract is implemented by `ports.served.OwnerProjection` and
+`adapters.served_local`. The trusted host owns the existing exclusive SQLite connection and must call
+the handler on that same owning thread. The observer never opens the database or changes an Attempt,
+dispatches work, renews a lease or grants authority. A snapshot contains the Program revision/spec,
+work-unit and Attempt facts, recorded budget revocation, exact reservation/Operation correlations and
+per-Program served-command receipt coverage. Route identity and physical settlement remain explicitly
+unknown where no producer supplies them. Claim generation, recorded proof stages, quarantine, release,
+latest recorded workspace subject and recorded reconciliation need are journal facts, not a fresh
+filesystem scan, current lease guarantee or physical-settlement assertion. Usage values are grouped by metric, unit and provenance as
+known subtotals; unreported work remains unknown and is never counted as zero.
+
+Progress positions contain an ephemeral producer epoch, Program scope and monotonically increasing
+sequence. The bounded buffer is an observation hint, **not a durable global event log**. Because a
+snapshot sampler cannot prove it observed every intermediate mutation, a detected state change emits a
+`resync-required` hint with `gap=true`; restart, wrong producer/scope, future position and buffer
+overflow also require a fresh snapshot. Reads and reconnects cannot dispatch or renew. Positions from
+Forgejo pagination or native runtime notifications are not interchangeable with this producer position.
+
+The host creates an already-connected local `socket.socketpair()` and binds one endpoint to a
+`LocalReadChannel`, `LocalWorkerSession` or `LocalOwnerSession`; it passes only the peer descriptor to
+`creatidy-kernel-client` (`--fd N`). The host must service `serve_once()` on the SQLite owner thread
+after the descriptor becomes readable, then detach one-shot channels. Separate worker and owner
+capabilities are bound to their existing trusted `OrdinaryWorkClient` or `OrdinaryProgram` objects; a
+wire payload cannot select a `Principal`, policy, provider credential, outbox fence or review verdict.
+Closing/revoking a descriptor revokes communication only, not task authority or physical settlement.
+
+Frames use a four-byte network-order length and UTF-8 JSON version1; input is bounded to64KiB and
+output to1MiB. Read actions are `snapshot` and `events`. The worker capability accepts `claim`,
+`start`, `quiesce`, `renew`, `submit` and `report`; the owner capability accepts `approve`, `reconcile`,
+`start-managed` and `stop`. Mutations require a command ID and caller-observed expected Program revision
+(`-1` means absent for initial approval). Trusted host composition binds an exact approved proposal,
+claim and managed target where applicable; the request cannot choose them. Exact duplicate command
+inputs return their original receipt as historical evidence, not renewed permission. If an intent
+exists but its outcome receipt is missing, the response is `unknown` and no automatic repeat occurs.
+Cooperative task-scope quiescence is never represented as managed process settlement; a STOP receipt
+can prove at most its one explicitly bound original managed target, not all effects or descendants.
+
+This descriptor capability assumes a trusted local host chooses and passes the correct endpoint; it
+is not remote authentication, a named service socket, hostile same-UID isolation or a grant to expose
+the store over a network. Authentication, caller admission/revocation, exposure/origin policy and
+credential-safe diagnostics must be received before any remote transport is enabled. The CLI does not
+create a controller, open SQLite or discover a capability by itself. Installed conformance exercises
+separate observer/worker/owner client processes against the existing owner, including stale revisions,
+role injection, duplicate commands and explicit gaps; it is not a Console UI or live-provider proof.
+
 ## Current Boundary Evidence
 
 This section's original cut is historical; #54/PR92 and #90/PR93 now provide bounded durable product
