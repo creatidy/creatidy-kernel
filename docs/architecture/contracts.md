@@ -32,6 +32,12 @@ workspace, candidate and runtime identifiers and review dispositions are correla
 absent evidence remains unknown. Usage values are grouped by metric, unit and provenance as known
 subtotals; unreported work remains unknown and is never counted as zero.
 
+The status includes the original task deadline, original claim expiry and latest recorded renewal
+horizon. Its clock sample is explicitly uncommitted and display-only: `not-expired-observed` is not
+authorization, and dispatch always repeats the producer's durable clock, budget and claim checks.
+Unverifiable clocks yield `unknown`; expiration or revocation suggests reconciliation or STOP, never
+claims physical settlement, and observing status does not renew or persist a clock sample.
+
 Progress positions contain an ephemeral producer epoch, Program scope and monotonically increasing
 sequence. The bounded buffer is an observation hint, **not a durable global event log**. Because a
 snapshot sampler cannot prove it observed every intermediate mutation, a detected state change emits a

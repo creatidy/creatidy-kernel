@@ -20,6 +20,7 @@ class ServedStore(Protocol):
     def find_operation(self, operation_id: str) -> OperationRecord | None: ...
     def served_operations(self, program_id: str) -> tuple[OperationRecord, ...]: ...
     def served_operation_count(self, program_id: str) -> int: ...
+    def served_authority_horizon(self, program_id: str) -> dict[str, object]: ...
     def served_claims(self, program_id: str) -> tuple[dict[str, object], ...]: ...
     def find_artifact(self, operation_id: str, name: str) -> bytes | None: ...
 
@@ -43,6 +44,7 @@ class ServedSnapshot:
     usage_subtotals: tuple[tuple[str, str, str, str, int, int, str], ...]
     budget_configured: bool
     budget_revoked: bool | None
+    authority: dict[str, object]
     missing_usage: str
     route_identity: None
     physical_settlement: None
@@ -125,7 +127,23 @@ class OwnerProjection:
                     raise ValueError("producer returned an invalid served command receipt")
                 recorded = "recorded"
                 if action == "report":
-                    decisions.append({"source": "served-command", "command_id": key, "status": value["status"]})
+                    attempt_digest = request.get("attempt_digest")
+                    attempt_id = next(
+                        (
+                            item.attempt_id
+                            for item in (() if program is None else program.attempts)
+                            if item.spec.digest == attempt_digest
+                        ),
+                        None,
+                    )
+                    decisions.append(
+                        {
+                            "source": "served-command",
+                            "command_id": key,
+                            "attempt": attempt_id,
+                            "status": value["status"],
+                        }
+                    )
             commands.append((cast(str, key), cast(str, action), cast(str, actor), operation.status, recorded))
         command_facts = tuple(sorted(commands))
         command_total = self._store.served_operation_count(self._scope)
@@ -135,6 +153,53 @@ class OwnerProjection:
         claims = self._store.served_claims(self._scope) if program is not None else ()
         if type(claims) is not tuple or len(claims) > 4096:
             raise ValueError("producer claim projection is unavailable or exceeds its bound")
+        horizon = (
+            self._store.served_authority_horizon(self._scope)
+            if configured
+            else {"deadline": None, "observed_at": None, "clock": "unknown"}
+        )
+        deadline, observed, clock = horizon.get("deadline"), horizon.get("observed_at"), horizon.get("clock")
+        if (
+            (deadline is not None and type(deadline) is not int)
+            or (observed is not None and type(observed) is not int)
+            or clock not in {"unknown", "uncommitted-display-sample"}
+            or ((observed is None) != (clock == "unknown"))
+        ):
+            raise ValueError("producer returned invalid authority horizon")
+        cutoff = (
+            "revoked"
+            if revoked
+            else "unknown"
+            if observed is None or deadline is None
+            else "expired"
+            if observed >= deadline
+            else "not-expired-observed"
+        )
+        authority: dict[str, object] = {
+            "task_deadline": deadline,
+            "observed_at": observed,
+            "clock": clock,
+            "cutoff": cutoff,
+            "safe_next_action": "reconcile-or-stop"
+            if cutoff in {"expired", "revoked"}
+            else "check-authority-before-dispatch",
+        }
+        qualified_claims: list[dict[str, object]] = []
+        for claim in claims:
+            expiry = claim.get("recorded_expires_at")
+            if type(expiry) is not int:
+                raise ValueError("producer returned invalid claim horizon")
+            claim_cutoff = (
+                "revoked"
+                if revoked
+                else "unknown"
+                if observed is None
+                else "expired"
+                if observed >= expiry
+                else "not-expired-observed"
+            )
+            qualified_claims.append({**claim, "cutoff": claim_cutoff})
+        claims = tuple(qualified_claims)
         correlations: list[dict[str, object]] = []
         for attempt in () if program is None else program.attempts:
             operation_id = f"runtime:{attempt.attempt_id}"
@@ -227,6 +292,7 @@ class OwnerProjection:
             "usage_subtotals": usage_subtotals,
             "budget_configured": configured,
             "budget_revoked": revoked,
+            "authority": {**authority, "observed_at": None},
             "missing_usage": missing,
         }
         fingerprint = digest(encode(facts))
@@ -252,6 +318,7 @@ class OwnerProjection:
             usage_subtotals,
             configured,
             revoked,
+            authority,
             missing,
             None,
             None,

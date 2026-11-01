@@ -327,6 +327,7 @@ def run_ordinary_flow(
                 "review-remediation-tampered",
                 "review-remediation-served",
                 "served-report-decision",
+                "sdk-review-notify",
             },
             lose_first_reply=exercise in {"review-lost", "review-lost-reopen"},
         ) as (review_origin, calls),
@@ -679,6 +680,56 @@ print("Done")
                 )
                 return {"status": "approved", "native_sends": 0}
             approved = app.approve(proposal, decision_id="owner-program-v1", expires_at=int(time.time()) + 900)
+            if exercise == "served-owner-interleaved-amend":
+                amended = app.propose("everyday-program", "A revised owner-approved objective", selections)
+                binding = LocalOwnerSession(OwnerProjection(store, "everyday-program"), app, approved, proposal=amended)
+                first_owner, first_peer = socket.socketpair()
+                second_owner, second_peer = socket.socketpair()
+                with first_owner, first_peer, second_owner, second_peer:
+                    first = binding.attach(first_owner)
+                    second = binding.attach(second_owner)
+                    write_frame(
+                        second_peer,
+                        encode(
+                            {
+                                "version": 1,
+                                "action": "approve",
+                                "command_id": "amend-interleaved",
+                                "expected_revision": approved.program.revision,
+                                "decision_id": "amended-v2",
+                                "expires_at": approved.expires_at,
+                            }
+                        ),
+                        bound=65536,
+                    )
+                    second.serve_once()
+                    assert json.loads(read_frame(second_peer, bound=1024 * 1024))["result"]["status"] == "approved"
+                    binding.detach(second)
+                    write_frame(first_peer, encode({"version": 1, "action": "snapshot"}), bound=65536)
+                    first.serve_once()
+                    read_frame(first_peer, bound=1024 * 1024)
+                    binding.detach(first)
+                final_owner, final_peer = socket.socketpair()
+                with final_owner, final_peer:
+                    final = binding.attach(final_owner)
+                    write_frame(
+                        final_peer,
+                        encode(
+                            {
+                                "version": 1,
+                                "action": "stop",
+                                "command_id": "stop-interleaved",
+                                "expected_revision": store.load("everyday-program").revision,
+                                "reason": "owner stops amended program",
+                            }
+                        ),
+                        bound=65536,
+                    )
+                    final.serve_once()
+                    assert json.loads(read_frame(final_peer, bound=1024 * 1024))["result"]["status"] == "accepted"
+                    binding.detach(final)
+                assert store.load("everyday-program").status is ProgramStatus.CANCELLED
+                return {"status": "stopped", "native_sends": 0}
             if exercise == "served-owner-amend":
                 amended = app.propose("everyday-program", "A revised owner-approved objective", selections)
                 owner_socket, owner_client = socket.socketpair()
@@ -2495,6 +2546,20 @@ print("Done")
                     assert command_evidence["fresh_until"] == original_observed_at + 900
                 else:
                     outcome = client.report(handoff)
+                if exercise == "sdk-review-notify" and position == 0:
+                    assert outcome == "rejected" and not store.operations(command_prefix("everyday-program"))
+                    snapshot = OwnerProjection(store, "everyday-program").snapshot()
+                    assert any(item.get("status") == "changes_requested" for item in snapshot.decisions)
+                    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+                    with sender, receiver:
+                        notifier = LocalDecisionNotifier(sender)
+                        notifier.publish(snapshot)
+                        assert select.select([receiver], [], [], 2)[0]
+                        assert json.loads(receiver.recv(65536))["kind"] == "decision-required"
+                        notifier.publish(snapshot)
+                        assert not select.select([receiver], [], [], 0)[0]
+                    assert len(calls) == 1
+                    return {"status": "rejected", "native_sends": 0}
                 if exercise == "rename-outside" and position == 0:
                     assert outcome == "rejected"
                     assert not store.load("everyday-program").satisfactions

@@ -728,6 +728,7 @@ class SQLiteProgramStore:
         self._assert_writer_thread()
         self._validate_program_id(program_id)
         with self._gate:
+            renewals = self._work_records("ownership-renew")
             rows = self._connection.execute(
                 "SELECT request_json FROM operations WHERE operation_id LIKE 'work-budget:v1:ownership-claim:%' "
                 "AND json_extract(request_json, '$.request.program') = ? ORDER BY operation_id LIMIT 4097",
@@ -771,6 +772,17 @@ class SQLiteProgramStore:
                         "claim": claim.command_key,
                         "claimant": claim.claimant,
                         "generation": claim.generation,
+                        "original_expires_at": claim.expires_at,
+                        "recorded_expires_at": max(
+                            [
+                                claim.expires_at,
+                                *(
+                                    cast(int, item["expires_at"])
+                                    for item in renewals
+                                    if item["claim"] == claim.command_key
+                                ),
+                            ]
+                        ),
                         "mode": claim.mode.value,
                         "released_recorded": released,
                         "quarantined_recorded": self._work_record("ownership-unknown", claim.command_key) is not None,
@@ -2851,6 +2863,40 @@ class SQLiteProgramStore:
             if self._work_binding(program_id) is None:
                 return None
             return self._work_record("revoked", program_id) is not None
+
+    def served_authority_horizon(self, program_id: str) -> dict[str, object]:
+        """Sample time for display only; never persist or confer authority."""
+        self._assert_writer_thread()
+        with self._gate:
+            binding = self._work_binding(program_id)
+            if binding is None:
+                return {"deadline": None, "observed_at": None, "clock": "unknown"}
+            projection = DeadlineProjection.decode(binding["projection"])
+            row = self._connection.execute(
+                "SELECT * FROM work_clock_state WHERE program_id = ?", (program_id,)
+            ).fetchone()
+            changes = self._connection.total_changes
+            try:
+                reading = self._boot_clock()
+            except (OSError, ValueError):
+                reading = None
+            observed = None
+            if (
+                not self._closed
+                and self._connection.total_changes == changes
+                and row is not None
+                and not row["pending"]
+                and projection.verifiable(reading)
+                and reading is not None
+                and reading.wall >= row["wall"]
+                and reading.boot_ns >= row["boot_ns"]
+            ):
+                observed = projection.decision_time(reading)
+            return {
+                "deadline": projection.wall_deadline,
+                "observed_at": observed,
+                "clock": "unknown" if observed is None else "uncommitted-display-sample",
+            }
 
     def stop_ordinary_program(
         self, program_id: str, command_key: str, actor: str, evidence: str, *, expected_revision: int | None = None

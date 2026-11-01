@@ -11,6 +11,7 @@ from test_work_ownership import claim, client, workspace
 
 from creatidy_kernel.adapters.reference import reference_spec
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import ActivateProgram
 from creatidy_kernel.core.intake import digest, encode
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
@@ -288,3 +289,48 @@ def test_command_history_overflow_keeps_snapshot_and_resync_available(sqlite_tmp
         assert len(encode(asdict(current))) < 1024 * 1024
         assert projection.events(initial.position).gap is True
         assert projection.events(current.position).gap is True
+
+
+def test_snapshot_displays_claim_and_task_expiry_without_renewal(sqlite_tmp_path: Path) -> None:
+    clock = Clock()
+    with SQLiteProgramStore(sqlite_tmp_path / "horizons.db", boot_clock=clock) as store:
+        program = initialize(store)
+        tree = workspace(sqlite_tmp_path, "horizon")
+        granted = claim(store, client(store, tree), tree)
+        before_operations, before_changes = store.operations(), connection(store).total_changes
+        before = OwnerProjection(store, program.program_id).snapshot()
+        assert before.authority["task_deadline"] == 110
+        assert before.authority["cutoff"] == "not-expired-observed"
+        assert before.claims[0]["original_expires_at"] == granted.expires_at == 105
+        assert before.claims[0]["cutoff"] == "not-expired-observed"
+        clock.reading = BootClockReading(106, 7_000_000_000, "synthetic-boot-a")
+        reconnected = OwnerProjection(store, program.program_id).snapshot()
+        assert reconnected.status == "active" and reconnected.claims[0]["cutoff"] == "expired"
+        assert reconnected.authority["cutoff"] == "not-expired-observed"
+        clock.reading = BootClockReading(110, 11_000_000_000, "synthetic-boot-a")
+        expired = OwnerProjection(store, program.program_id).snapshot()
+        assert expired.authority["cutoff"] == "expired"
+        assert expired.authority["safe_next_action"] == "reconcile-or-stop"
+        assert expired.physical_settlement is None
+        assert store.operations() == before_operations and connection(store).total_changes == before_changes
+
+
+def test_snapshot_reports_original_and_renewed_horizons_with_unverifiable_clock(sqlite_tmp_path: Path) -> None:
+    clock = Clock()
+    with SQLiteProgramStore(sqlite_tmp_path / "renewed-horizon.db", boot_clock=clock) as store:
+        program = initialize(store)
+        tree = workspace(sqlite_tmp_path, "renewed-horizon")
+        worker = client(store, tree)
+        granted = claim(store, worker, tree)
+        clock.reading = BootClockReading(102, 3_000_000_000, "synthetic-boot-a")
+        assert worker.renew("renew-original", granted, lease_seconds=6) == 108
+        clock.reading = BootClockReading(106, 7_000_000_000, "synthetic-boot-a")
+        observed = OwnerProjection(store, program.program_id).snapshot()
+        assert observed.claims[0]["original_expires_at"] == 105
+        assert observed.claims[0]["recorded_expires_at"] == 108
+        assert observed.claims[0]["cutoff"] == "not-expired-observed"
+        clock.reading = BootClockReading(109, 10_000_000_000, "synthetic-boot-a")
+        assert OwnerProjection(store, program.program_id).snapshot().claims[0]["cutoff"] == "expired"
+        clock.reading = None
+        uncertain = OwnerProjection(store, program.program_id).snapshot()
+        assert uncertain.authority["clock"] == "unknown" and uncertain.claims[0]["cutoff"] == "unknown"

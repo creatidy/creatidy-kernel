@@ -194,6 +194,12 @@ def test_rejected_report_emits_one_local_decision_alert(sqlite_tmp_path: Path) -
     ) == {"status": "rejected", "native_sends": 0}
 
 
+def test_direct_sdk_review_emits_one_local_decision_alert(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "sdk-review-notify", None, mode="pull", exercise="sdk-review-notify"
+    ) == {"status": "rejected", "native_sends": 0}
+
+
 def test_worker_cannot_supply_its_own_review_verdict(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(
         sqlite_tmp_path / "served-report-forged", None, mode="pull", exercise="served-report-forged"
@@ -451,6 +457,12 @@ def test_owner_approval_rechecks_absence_after_external_validation(sqlite_tmp_pa
 def test_host_bound_approval_uses_exact_proposal_and_expected_revision(sqlite_tmp_path: Path, exercise: str) -> None:
     result = run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise)
     assert result["status"] == ("approved" if exercise == "served-owner-approve" else "refused")
+
+
+def test_interleaved_owner_channels_keep_amended_approval(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "owner-interleaved-amend", None, mode="pull", exercise="served-owner-interleaved-amend"
+    ) == {"status": "stopped", "native_sends": 0}
 
 
 def test_host_bound_amendment_preserves_original_deadline_and_replays(sqlite_tmp_path: Path) -> None:

@@ -15,6 +15,7 @@ from unittest.mock import Mock
 import pytest
 from test_sqlite_store import sqlite_tmp_path as sqlite_tmp_path
 from test_work_budget import Clock, initialize, policy
+from test_work_ownership import claim, client, workspace
 
 from creatidy_kernel.adapters.reference import reference_spec
 from creatidy_kernel.adapters.served_local import (
@@ -26,6 +27,7 @@ from creatidy_kernel.adapters.served_local import (
     write_frame,
 )
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore, WrongWriterThread
+from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import ActivateProgram
 from creatidy_kernel.core.intake import encode
 from creatidy_kernel.core.served import command_prefix
@@ -214,3 +216,30 @@ def test_claim_command_identity_is_scoped_to_program_and_actor(sqlite_tmp_path: 
         assert len(set(qualified)) == 3
         assert len(store.operations(command_prefix(first.program_id))) == 2
         assert len(store.operations(command_prefix(second.program_id))) == 1
+
+
+def test_reconnected_local_observer_receives_expired_authority(sqlite_tmp_path: Path) -> None:
+    clock = Clock()
+    with SQLiteProgramStore(sqlite_tmp_path / "observer-horizon.db", boot_clock=clock) as store:
+        program = initialize(store)
+        tree = workspace(sqlite_tmp_path, "observer-horizon")
+        claim(store, client(store, tree), tree)
+        projection = OwnerProjection(store, program.program_id)
+        observations: list[dict[str, object]] = []
+        for reading in (
+            BootClockReading(100, 1_000_000_000, "synthetic-boot-a"),
+            BootClockReading(110, 11_000_000_000, "synthetic-boot-a"),
+        ):
+            clock.reading = reading
+            owner, observer = socket.socketpair()
+            with owner, observer:
+                channel = LocalReadChannel(projection, owner)
+                write_frame(observer, encode({"version": 1, "action": "snapshot"}), bound=65536)
+                channel.serve_once()
+                observations.append(json.loads(read_frame(observer, bound=1024 * 1024))["result"])
+        first = cast(dict[str, object], observations[0]["authority"])
+        last = cast(dict[str, object], observations[1]["authority"])
+        assert first["cutoff"] == "not-expired-observed"
+        assert last["cutoff"] == "expired"
+        assert last["safe_next_action"] == "reconcile-or-stop"
+        assert observations[1]["physical_settlement"] is None

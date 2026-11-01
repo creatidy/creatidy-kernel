@@ -132,6 +132,8 @@ for exercise, expected in (
     ("served-owner-multi-client", "stopped"),
     ("served-report", "accepted"),
     ("served-report-decision", "rejected"),
+    ("sdk-review-notify", "rejected"),
+    ("served-owner-interleaved-amend", "stopped"),
     ("served-report-forged", "refused"),
     ("served-report-crash", "unknown"),
     ("served-reconcile-race", "refused"),

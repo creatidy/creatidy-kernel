@@ -53,9 +53,11 @@ class LocalDecisionNotifier:
                 "invalid",
                 "rejected",
                 "review_unknown",
+                "changes_requested",
             }:
                 continue
-            identity = digest(encode([snapshot.scope, decision]))
+            attempt = decision.get("attempt")
+            identity = digest(encode([snapshot.scope, attempt if type(attempt) is str else decision]))
             if identity in self._seen:
                 continue
             if len(self._seen) >= 4096:
@@ -532,6 +534,7 @@ class LocalOwnerChannel(LocalReadChannel):
         control: WorkOwnership | None = None,
         handoff: OrdinaryHandoff | None = None,
         managed: OrdinaryManagedRun | None = None,
+        approval_binding: list[OrdinaryApproval | None] | None = None,
     ) -> None:
         if (
             application.owner.role != "owner"
@@ -551,7 +554,8 @@ class LocalOwnerChannel(LocalReadChannel):
         ):
             raise LocalChannelRefused("owner and projection scopes differ")
         super().__init__(owner, channel)
-        self._application, self._approved = application, approved
+        self._application = application
+        self._approval_binding = [approved] if approval_binding is None else approval_binding
         self._proposal = proposal
         self._control, self._handoff = control, handoff
         self._managed = managed
@@ -559,7 +563,15 @@ class LocalOwnerChannel(LocalReadChannel):
     @property
     def approved(self) -> OrdinaryApproval | None:
         """Return the host-bound approval; it is never serialized to a client."""
-        return self._approved
+        return self._approval_binding[0]
+
+    @property
+    def _approved(self) -> OrdinaryApproval | None:
+        return self._approval_binding[0]
+
+    @_approved.setter
+    def _approved(self, value: OrdinaryApproval | None) -> None:
+        self._approval_binding[0] = value
 
     def _dispatch(self, request: dict[str, object]) -> object:
         if request.get("action") == "approve":
@@ -834,7 +846,8 @@ class LocalOwnerSession:
     ) -> None:
         if application.owner.role != "owner" or (approved is None and proposal is None):
             raise LocalChannelRefused("host-bound owner and approved work or proposal are required")
-        self._owner, self._application, self._approved = owner, application, approved
+        self._owner, self._application = owner, application
+        self._approval_binding: list[OrdinaryApproval | None] = [approved]
         self._proposal, self._control, self._handoff, self._managed = proposal, control, handoff, managed
         self._channels: list[LocalOwnerChannel] = []
         self._revoked = False
@@ -846,11 +859,12 @@ class LocalOwnerSession:
             self._owner,
             channel,
             self._application,
-            self._approved,
+            self._approval_binding[0],
             proposal=self._proposal,
             control=self._control,
             handoff=self._handoff,
             managed=self._managed,
+            approval_binding=self._approval_binding,
         )
         self._channels.append(result)
         return result
@@ -859,8 +873,6 @@ class LocalOwnerSession:
         if channel not in self._channels:
             raise LocalChannelRefused("channel is not owned by this capability")
         self._channels.remove(channel)
-        if channel.approved is not None:
-            self._approved = channel.approved
         channel.revoke()
 
     def revoke(self) -> None:

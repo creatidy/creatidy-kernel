@@ -14,7 +14,9 @@ import creatidy_kernel
 from creatidy_kernel.adapters.reference import reference_spec
 from creatidy_kernel.adapters.served_local import LocalReadChannel
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import ActivateProgram
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy
 from creatidy_kernel.ports.served import OwnerProjection
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,4 +80,22 @@ with SQLiteProgramStore(storage / "served.db") as store:
     )
     if batch["gap"] is not True or (store.history(program.program_id), store.operations()) != after_change:
         raise RuntimeError("installed observer hid a gap or mutated durable state")
+reading = [BootClockReading(100, 1_000_000_000, "installed-synthetic-boot")]
+with SQLiteProgramStore(storage / "served-horizon.db", boot_clock=lambda: reading[0]) as store:
+    program = store.create(reference_spec(), "create")
+    policy = WorkBudgetPolicy.basic(3, 1, verifications=6, retained_bytes=4096)
+    store.bind_work_budget(program.program_id, "synthetic-project", policy, policy, 110)
+    store.admit(program.program_id, "activate", ActivateProgram(program.revision, "owner"))
+    projection = OwnerProjection(store, program.program_id)
+    original = (store.history(program.program_id), store.operations())
+    before = cast(dict[str, object], request(projection, ["snapshot"])["authority"])
+    reading[0] = BootClockReading(110, 11_000_000_000, "installed-synthetic-boot")
+    after = cast(dict[str, object], request(projection, ["snapshot"])["authority"])
+    if (
+        before["cutoff"] != "not-expired-observed"
+        or after["cutoff"] != "expired"
+        or after["safe_next_action"] != "reconcile-or-stop"
+        or (store.history(program.program_id), store.operations()) != original
+    ):
+        raise RuntimeError("installed observer failed to show a display-only expired horizon")
 print("Installed host-bound local observer reads owner projection without a competing SQLite reader.")
