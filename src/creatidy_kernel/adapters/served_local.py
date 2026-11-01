@@ -69,7 +69,9 @@ class LocalDecisionNotifier:
             if len(self._seen) >= 4096:
                 self.dropped = True
                 return
-            payload = encode({"version": 1, "kind": "decision-required", "id": identity, "scope": snapshot.scope})
+            payload = encode(
+                {"version": 1, "kind": "decision-required", "id": identity, "scope": snapshot.position.scope}
+            )
             try:
                 if self._channel.send(payload, socket.MSG_DONTWAIT) != len(payload):
                     self.dropped = True
@@ -141,6 +143,14 @@ class LocalReadChannel:
             if type(page) is not int:
                 raise LocalChannelRefused("invalid snapshot page")
             snapshot = asdict(self._owner.snapshot(page=page))
+            scope_data = encode(self._owner.scope)
+            if len(scope_data) > 4096:
+                snapshot["scope"] = {
+                    "oversized": True,
+                    "index": 0,
+                    "bytes": len(scope_data),
+                    "sha256": digest(scope_data),
+                }
             for name in SNAPSHOT_COLLECTIONS:
                 items = list(cast(tuple[object, ...], snapshot[name]))
                 for number, item in enumerate(items):
@@ -165,7 +175,7 @@ class LocalReadChannel:
             name, index, offset, after = request["collection"], request["index"], request["offset"], request["after"]
             if (
                 type(name) is not str
-                or name not in SNAPSHOT_COLLECTIONS
+                or (name not in SNAPSHOT_COLLECTIONS and name != "scope")
                 or type(index) is not int
                 or index < 0
                 or index > 8_000_007
@@ -177,14 +187,19 @@ class LocalReadChannel:
             current = self._owner.snapshot()
             if cast(dict[str, object], after) != asdict(current.position):
                 raise LocalChannelRefused("snapshot changed; restart pagination")
-            page = asdict(self._owner.snapshot(page=0 if name == "commands" else index // 8))
+            if name == "scope" and index != 0:
+                raise LocalChannelRefused("snapshot record is absent")
+            page = asdict(self._owner.snapshot(page=0 if name in {"commands", "scope"} else index // 8))
             if cast(dict[str, object], after) != asdict(self._owner.snapshot().position):
                 raise LocalChannelRefused("snapshot changed; restart pagination")
-            items = cast(tuple[object, ...], page[name])
-            within_page = index if name == "commands" else index % 8
-            if within_page >= len(items):
-                raise LocalChannelRefused("snapshot record is absent")
-            raw = encode(items[within_page])
+            if name == "scope":
+                raw = encode(self._owner.scope)
+            else:
+                items = cast(tuple[object, ...], page[name])
+                within_page = index if name == "commands" else index % 8
+                if within_page >= len(items):
+                    raise LocalChannelRefused("snapshot record is absent")
+                raw = encode(items[within_page])
             if offset > len(raw):
                 raise LocalChannelRefused("snapshot record offset is invalid")
             chunk = raw[offset : offset + 8192]
@@ -408,7 +423,40 @@ class LocalWorkerChannel(LocalReadChannel):
                 subject = self._worker.worker.submit(handoff.claim, expected_revision=revision)
                 return {"version": 1, "status": "submitted", "subject": subject, "authority": "historical-only"}
             outcome = self._worker.report(handoff, expected_revision=revision)
-            return {"version": 1, "status": outcome, "settlement": "unknown", "authority": "historical-only"}
+            result: dict[str, object] = {
+                "version": 1,
+                "status": outcome,
+                "settlement": "unknown",
+                "authority": "historical-only",
+            }
+            if outcome == "review_unknown":
+                store = self._worker.application.store
+                reservations = store.work_budget_status(self._owner.scope).get("reservations", [])
+                if type(reservations) is list:
+                    matches: list[str] = []
+                    for entry in cast(list[object], reservations):
+                        if type(entry) is not dict:
+                            continue
+                        row = cast(dict[str, object], entry)
+                        operation_id = row.get("operation")
+                        if (
+                            row.get("category") != "review"
+                            or row.get("attempt") != handoff.attempt.attempt_id
+                            or type(operation_id) is not str
+                        ):
+                            continue
+                        operation = store.find_operation(operation_id)
+                        raw = store.find_artifact(operation_id, "review-request")
+                        if (
+                            operation is not None
+                            and operation.status in {"unknown", "dispatched"}
+                            and raw is not None
+                            and operation_id == "product-review:" + digest(raw)
+                        ):
+                            matches.append(operation_id)
+                    if len(matches) == 1:
+                        result["review_operation_id"] = matches[0]
+            return result
 
         result = self._recorded(request, handoff, execute)
         if request["action"] == "report" and self._notifier is not None:
@@ -519,8 +567,13 @@ class LocalWorkerChannel(LocalReadChannel):
                 and re.fullmatch(r"[0-9a-f]{64}", subject) is not None
             )
         if action == "report":
+            review_operation = result.get("review_operation_id")
             return (
-                set(result) == {"version", "status", "settlement", "authority"}
+                set(result)
+                in (
+                    {"version", "status", "settlement", "authority"},
+                    {"version", "status", "settlement", "authority", "review_operation_id"},
+                )
                 and result["version"] == 1
                 and result["status"]
                 in {
@@ -535,6 +588,14 @@ class LocalWorkerChannel(LocalReadChannel):
                 }
                 and result["settlement"] == "unknown"
                 and result["authority"] == "historical-only"
+                and (
+                    "review_operation_id" not in result
+                    or (
+                        result["status"] == "review_unknown"
+                        and type(review_operation) is str
+                        and re.fullmatch(r"product-review:[0-9a-f]{64}", review_operation) is not None
+                    )
+                )
             )
         if action == "renew":
             return (

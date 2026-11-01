@@ -13,7 +13,7 @@ class ProgressRefused(ValueError):
 
 def command_prefix(scope: str) -> str:
     """Stable per-Program namespace; it carries no caller authority."""
-    if type(scope) is not str or not scope.strip() or len(scope) > 256:
+    if type(scope) is not str or not scope.strip():
         raise ProgressRefused("invalid served command scope")
     return "served-command:" + hashlib.sha256(scope.encode()).hexdigest() + ":"
 
@@ -30,7 +30,6 @@ class ProgressPosition:
             or re.fullmatch(r"[0-9a-f]{32}", self.producer) is None
             or type(self.scope) is not str
             or not self.scope.strip()
-            or len(self.scope) > 256
             or type(self.sequence) is not int
             or self.sequence < 0
             or self.sequence > 2**63 - 1

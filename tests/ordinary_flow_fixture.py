@@ -328,8 +328,9 @@ def run_ordinary_flow(
                 "review-remediation-served",
                 "served-report-decision",
                 "sdk-review-notify",
+                "served-unknown-rejected",
             },
-            lose_first_reply=exercise in {"review-lost", "review-lost-reopen"},
+            lose_first_reply=exercise in {"review-lost", "review-lost-reopen", "served-unknown-rejected"},
         ) as (review_origin, calls),
         ExitStack() as owners,
     ):
@@ -2544,6 +2545,48 @@ print("Done")
                     command_evidence = next(item for item in accepted_result["evidence"] if item["check"] == "commands")
                     assert command_evidence["observed_at"] == original_observed_at
                     assert command_evidence["fresh_until"] == original_observed_at + 900
+                elif exercise == "served-unknown-rejected" and position == 0:
+                    owner_socket, worker_socket = socket.socketpair()
+                    with owner_socket, worker_socket:
+                        server = LocalWorkerChannel(
+                            OwnerProjection(store, "everyday-program"),
+                            owner_socket,
+                            client,
+                            handoffs={"original-claim": handoff},
+                        )
+                        report = {
+                            "version": 1,
+                            "action": "report",
+                            "command_id": "lost-report",
+                            "claim_id": "original-claim",
+                            "expected_revision": store.load("everyday-program").revision,
+                        }
+                        write_frame(worker_socket, encode(report), bound=65536)
+                        server.serve_once()
+                        historical_receipt = json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"]
+                        assert historical_receipt["status"] == "review_unknown"
+                        original_review = historical_receipt["review_operation_id"]
+                    assert len(calls) == 1
+                    time_offset[0] = 61
+                    assert client.report(handoff) == "rejected"
+                    assert len(calls) == 1
+                    snapshot = OwnerProjection(store, "everyday-program").snapshot()
+                    original = [item for item in snapshot.decisions if item.get("source") == "served-command"]
+                    assert original and original[0]["status"] == "review_unknown"
+                    assert original[0]["applicability"] == "historical"
+                    assert original[0]["review_operation_id"] == original_review
+                    assert any(
+                        item.get("status") == "changes_requested" and item.get("applicability") == "pending"
+                        for item in snapshot.decisions
+                    )
+                    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+                    with sender, receiver:
+                        notifier = LocalDecisionNotifier(sender)
+                        notifier.publish(snapshot)
+                        assert select.select([receiver], [], [], 2)[0]
+                        receiver.recv(65536)
+                        assert not select.select([receiver], [], [], 0)[0]
+                    return {"status": "rejected", "native_sends": 0}
                 else:
                     outcome = client.report(handoff)
                 if exercise == "sdk-review-notify" and position == 0:

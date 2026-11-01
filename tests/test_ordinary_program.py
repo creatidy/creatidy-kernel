@@ -200,6 +200,12 @@ def test_direct_sdk_review_emits_one_local_decision_alert(sqlite_tmp_path: Path)
     ) == {"status": "rejected", "native_sends": 0}
 
 
+def test_served_unknown_review_becomes_historical_after_rejection(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-unknown-rejected", None, mode="pull", exercise="served-unknown-rejected"
+    ) == {"status": "rejected", "native_sends": 0}
+
+
 def test_worker_cannot_supply_its_own_review_verdict(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(
         sqlite_tmp_path / "served-report-forged", None, mode="pull", exercise="served-report-forged"

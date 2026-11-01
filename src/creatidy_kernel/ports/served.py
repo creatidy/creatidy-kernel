@@ -62,7 +62,8 @@ class OwnerProjection:
     def __init__(self, store: ServedStore, program_id: str, *, capacity: int = 256) -> None:
         self._store = store
         self._scope = program_id
-        self._buffer = ProgressBuffer(uuid4().hex, program_id, capacity=capacity)
+        cursor_scope = program_id if len(encode(program_id)) <= 4096 else "sha256:" + digest(encode(program_id))
+        self._buffer = ProgressBuffer(uuid4().hex, cursor_scope, capacity=capacity)
         self._last_digest: str | None = None
 
     @property
@@ -95,6 +96,8 @@ class OwnerProjection:
             raise ValueError("producer reservation projection is unavailable or exceeds its bound")
         reservations: list[tuple[str, str, str, str | None]] = []
         decisions: list[dict[str, object]] = []
+        reviews: dict[str, list[bool]] = {}
+        review_operations: dict[str, tuple[str, bool]] = {}
         for raw in cast(list[object], raw_reservations):
             if type(raw) is not dict:
                 raise ValueError("producer returned an invalid reservation")
@@ -107,13 +110,11 @@ class OwnerProjection:
             reservations.append(
                 (cast(str, attempt), operation_id, cast(str, category), None if found is None else found.status)
             )
-            if (
-                category == "review"
-                and found is not None
-                and found.status in {"unknown", "dispatched"}
-                and self._store.find_artifact(operation_id, "review-receipt") is None
-            ):
+            if category == "review" and found is not None:
                 raw_review = self._store.find_artifact(operation_id, "review-request")
+                if raw_review is None and found.status not in {"unknown", "dispatched", "accepted"}:
+                    reviews.setdefault(cast(str, attempt), []).append(False)
+                    continue
                 if raw_review is None or operation_id != "product-review:" + digest(raw_review):
                     raise ValueError("unresolved review lacks its exact request evidence")
                 review = object_from(raw_review)
@@ -129,7 +130,14 @@ class OwnerProjection:
                     or cast(dict[str, object], subject).get("attempt_digest") != expected.spec.digest
                 ):
                     raise ValueError("unresolved review differs from its Attempt")
-                decisions.append({"source": "product-review-operation", "attempt": attempt, "status": "review_unknown"})
+                receipt = self._store.find_artifact(operation_id, "review-receipt")
+                resolved = found.status == "accepted" and receipt is not None
+                reviews.setdefault(cast(str, attempt), []).append(resolved)
+                review_operations[operation_id] = (cast(str, attempt), resolved)
+                if found.status in {"unknown", "dispatched"} and receipt is None:
+                    decisions.append(
+                        {"source": "product-review-operation", "attempt": attempt, "status": "review_unknown"}
+                    )
         retained = tuple(sorted(reservations))
         commands: list[tuple[str, str, str, str, str]] = []
         for operation in self._store.served_operations(self._scope):
@@ -167,14 +175,18 @@ class OwnerProjection:
                         ),
                         None,
                     )
-                    decisions.append(
-                        {
-                            "source": "served-command",
-                            "command_id": key,
-                            "attempt": attempt_id,
-                            "status": value["status"],
-                        }
-                    )
+                    decision = {
+                        "source": "served-command",
+                        "command_id": key,
+                        "attempt": attempt_id,
+                        "status": value["status"],
+                    }
+                    review_operation_id = value.get("review_operation_id")
+                    if review_operation_id is not None:
+                        if type(review_operation_id) is not str:
+                            raise ValueError("producer returned invalid original review identity")
+                        decision["review_operation_id"] = review_operation_id
+                    decisions.append(decision)
             commands.append((cast(str, key), cast(str, action), cast(str, actor), operation.status, recorded))
         command_facts = tuple(sorted(commands))
         command_total = self._store.served_operation_count(self._scope)
@@ -292,6 +304,16 @@ class OwnerProjection:
                 program.status.value in {"completed", "cancelled"}
                 or unit.status.value in {"satisfied", "cancelled"}
                 or attempt.spec.spec_digest != program.spec.digest
+                or (
+                    decision.get("source") == "served-command"
+                    and decision.get("status") == "review_unknown"
+                    and (
+                        review_operations.get(cast(str, decision.get("review_operation_id")))
+                        == (attempt.attempt_id, True)
+                        if decision.get("review_operation_id") is not None
+                        else reviews.get(attempt.attempt_id) == [True]
+                    )
+                )
             ):
                 applicability = "historical"
             else:

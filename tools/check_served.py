@@ -337,4 +337,67 @@ with SQLiteProgramStore(storage / "served-long-identities.db", boot_clock=lambda
             operation if collection == "reservations" else "h" * 5000
         ):
             raise RuntimeError("installed observer changed a long producer identity")
+with SQLiteProgramStore(storage / "served-long-scopes.db") as store:
+    base = reference_spec()
+    for length in (300, 10000):
+        program_id = "program-" + "p" * length
+        spec = ProgramSpec(
+            program_id,
+            base.objective,
+            base.work_units,
+            base.initial_inputs,
+            base.budget,
+            base.authority,
+            acceptance_criteria=base.acceptance_criteria,
+            policy_references=base.policy_references,
+        )
+        store.create(spec, "create-" + str(length))
+        projection = OwnerProjection(store, program_id)
+        snapshot = request(projection, ["snapshot"])
+        position = cast(dict[str, object], snapshot["position"])
+        if length == 300:
+            if snapshot["scope"] != program_id or position["scope"] != program_id:
+                raise RuntimeError("installed observer changed a valid long Program identity")
+        else:
+            if cast(dict[str, object], snapshot["scope"]).get("oversized") is not True:
+                raise RuntimeError("installed observer did not bound an oversized Program identity")
+            recovered = bytearray()
+            while True:
+                part = request(
+                    projection,
+                    [
+                        "record",
+                        "--collection",
+                        "scope",
+                        "--index",
+                        "0",
+                        "--offset",
+                        str(len(recovered)),
+                        "--producer",
+                        str(position["producer"]),
+                        "--scope",
+                        str(position["scope"]),
+                        "--sequence",
+                        str(position["sequence"]),
+                    ],
+                )
+                recovered.extend(base64.b64decode(cast(str, part["data_base64"])))
+                if part["complete"] is True:
+                    break
+            if json.loads(recovered) != program_id:
+                raise RuntimeError("installed observer failed to recover exact Program identity")
+        events = request(
+            projection,
+            [
+                "events",
+                "--producer",
+                str(position["producer"]),
+                "--scope",
+                str(position["scope"]),
+                "--sequence",
+                str(position["sequence"]),
+            ],
+        )
+        if events["gap"] is not False:
+            raise RuntimeError("installed observer failed to reconnect the original Program scope")
 print("Installed host-bound local observer reads owner projection without a competing SQLite reader.")

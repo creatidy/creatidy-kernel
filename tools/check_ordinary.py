@@ -133,6 +133,7 @@ for exercise, expected in (
     ("served-report", "accepted"),
     ("served-report-decision", "rejected"),
     ("sdk-review-notify", "rejected"),
+    ("served-unknown-rejected", "rejected"),
     ("served-owner-interleaved-amend", "stopped"),
     ("served-report-forged", "refused"),
     ("served-report-crash", "unknown"),

@@ -59,6 +59,9 @@ The position conservatively incorporates SQLite's owning-connection and external
 across every page, so unrelated database writes can also require resynchronization. A clock sample's
 exact display timestamp is not part of the durable cut; changes in task or claim expiry classifications
 do advance the position.
+Program IDs are not shortened in storage. IDs whose encoded representation exceeds 4096 bytes use
+a SHA-256 scope reference in the cursor and an oversized marker in the wire snapshot; the exact ID is
+recoverable through the position-qualified `record` operation with collection `scope` and index zero.
 
 The host creates an already-connected local `socket.socketpair()` and binds one endpoint to a
 `LocalReadChannel`, `LocalWorkerSession` or `LocalOwnerSession`; it passes only the peer descriptor to
@@ -77,6 +80,8 @@ restart, or reconnect the consumer must read the authoritative snapshot. The hos
 the session and are not a persistent service or remote notification guarantee.
 Uncertain product reviews are derived from the original review request, reservation, operation and
 receipt state, not from the transport receipt; resolving one does not issue another review prompt.
+An immutable earlier served `review_unknown` receipt remains historical after its exact original
+review operation is accepted with a recorded receipt; it does not create a second pending decision.
 
 Frames use a four-byte network-order length and UTF-8 JSON version1; input is bounded to64KiB and
 output to1MiB. Read actions are `snapshot` and `events`. The worker capability accepts `claim`,

@@ -200,8 +200,14 @@ def test_claim_command_identity_is_scoped_to_program_and_actor(sqlite_tmp_path: 
     with SQLiteProgramStore(sqlite_tmp_path / "claim-scopes.db", boot_clock=Clock()) as store:
         first = initialize(store, project=policy(active=2))
         second = initialize(store, "program-2", project=policy(active=2))
+        long_program = initialize(store, "program-" + "p" * 300, project=policy(active=2))
         qualified: list[str] = []
-        for program, actor in ((first, "worker-a"), (second, "worker-a"), (first, "worker-b")):
+        for program, actor in (
+            (first, "worker-a"),
+            (second, "worker-a"),
+            (first, "worker-b"),
+            (long_program, "worker-a"),
+        ):
             handoff = SimpleNamespace(
                 attempt=SimpleNamespace(program_id=program.program_id, attempt_id=f"attempt-{actor}"),
                 claim=SimpleNamespace(generation=1),
@@ -233,9 +239,10 @@ def test_claim_command_identity_is_scoped_to_program_and_actor(sqlite_tmp_path: 
                 channel.serve_once()
                 assert json.loads(read_frame(peer, bound=1024 * 1024))["result"]["status"] == "claimed"
             qualified.append(request_claim.call_args.args[0])
-        assert len(set(qualified)) == 3
+        assert len(set(qualified)) == 4
         assert len(store.operations(command_prefix(first.program_id))) == 2
         assert len(store.operations(command_prefix(second.program_id))) == 1
+        assert len(store.operations(command_prefix(long_program.program_id))) == 1
 
 
 def test_reconnected_local_observer_receives_expired_authority(sqlite_tmp_path: Path) -> None:
@@ -517,3 +524,61 @@ def test_real_long_attempt_and_runtime_handle_are_chunk_readable(sqlite_tmp_path
                 assert (
                     decoded[1] == operation if collection == "reservations" else decoded["runtime_handle"] == "h" * 5000
                 )
+
+
+def test_existing_program_id_longer_than_256_is_visible(sqlite_tmp_path: Path) -> None:
+    program_id = "program-" + "p" * 300
+    with SQLiteProgramStore(sqlite_tmp_path / "long-program.db", boot_clock=Clock()) as store:
+        program = initialize(store, program_id)
+        projection = OwnerProjection(store, program_id)
+        owner, peer = socket.socketpair()
+        with owner, peer:
+            channel = LocalReadChannel(projection, owner)
+            write_frame(peer, encode({"version": 1, "action": "snapshot"}), bound=65536)
+            channel.serve_once()
+            snapshot = json.loads(read_frame(peer, bound=1024 * 1024))["result"]
+            assert snapshot["scope"] == program_id and snapshot["position"]["scope"] == program_id
+            assert snapshot["program_revision"] == program.revision
+            assert command_prefix(program_id).startswith("served-command:")
+
+
+def test_oversized_program_id_has_bounded_cursor_and_exact_detail(sqlite_tmp_path: Path) -> None:
+    program_id = "program-" + "p" * 10000
+    with SQLiteProgramStore(sqlite_tmp_path / "oversized-program.db", boot_clock=Clock()) as store:
+        initialize(store, program_id)
+        projection = OwnerProjection(store, program_id)
+        owner, peer = socket.socketpair()
+        with owner, peer:
+            channel = LocalReadChannel(projection, owner)
+            write_frame(peer, encode({"version": 1, "action": "snapshot"}), bound=65536)
+            channel.serve_once()
+            snapshot = json.loads(read_frame(peer, bound=1024 * 1024))["result"]
+            assert snapshot["scope"]["oversized"] is True
+            assert snapshot["position"]["scope"].startswith("sha256:")
+            recovered = bytearray()
+            while True:
+                write_frame(
+                    peer,
+                    encode(
+                        {
+                            "version": 1,
+                            "action": "record",
+                            "collection": "scope",
+                            "index": 0,
+                            "offset": len(recovered),
+                            "after": snapshot["position"],
+                        }
+                    ),
+                    bound=65536,
+                )
+                channel.serve_once()
+                part = json.loads(read_frame(peer, bound=1024 * 1024))["result"]
+                recovered.extend(base64.b64decode(part["data_base64"]))
+                if part["complete"]:
+                    break
+            assert json.loads(recovered) == program_id
+            write_frame(
+                peer, encode({"version": 1, "action": "events", "after": snapshot["position"], "limit": 1}), bound=65536
+            )
+            channel.serve_once()
+            assert json.loads(read_frame(peer, bound=1024 * 1024))["result"]["gap"] is False
