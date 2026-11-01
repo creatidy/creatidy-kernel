@@ -2580,6 +2580,19 @@ print("Done")
                 if exercise in {"review-lost", "review-lost-reopen"} and position == 0:
                     assert outcome == "review_unknown"
                     assert len(calls) == 1
+                    snapshot = OwnerProjection(store, "everyday-program").snapshot()
+                    assert any(
+                        item.get("status") == "review_unknown" and item.get("applicability") == "pending"
+                        for item in snapshot.decisions
+                    )
+                    notification_tx, notification_rx = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+                    with notification_tx, notification_rx:
+                        notifier = LocalDecisionNotifier(notification_tx)
+                        notifier.publish(snapshot)
+                        assert select.select([notification_rx], [], [], 2)[0]
+                        notification_rx.recv(65536)
+                        notifier.publish(snapshot)
+                        assert not select.select([notification_rx], [], [], 0)[0]
                     time_offset[0] = 61
                     if exercise == "review-lost-reopen":
                         store.close()
@@ -2641,6 +2654,8 @@ print("Done")
                         )
                     outcome = client.report(handoff)
                     assert len(calls) == 1  # Reconciliation must not issue a second native prompt.
+                    recovered = OwnerProjection(store, "everyday-program").snapshot()
+                    assert not any(item.get("status") == "review_unknown" for item in recovered.decisions)
                 if bad_candidate:
                     assert outcome == "rejected", outcome
                     assert not store.load("everyday-program").satisfactions

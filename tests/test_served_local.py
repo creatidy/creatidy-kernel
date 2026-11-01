@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import base64
 import json
 import os
 import select
@@ -10,7 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from test_sqlite_store import sqlite_tmp_path as sqlite_tmp_path
@@ -28,9 +29,18 @@ from creatidy_kernel.adapters.served_local import (
 )
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore, WrongWriterThread
 from creatidy_kernel.core.deadlines import BootClockReading
-from creatidy_kernel.core.domain import ActivateProgram
+from creatidy_kernel.core.domain import (
+    ActivateProgram,
+    AttemptSpec,
+    AuthorityEnvelope,
+    BudgetPolicy,
+    CancelProgram,
+    ProgramSpec,
+    WorkUnit,
+)
 from creatidy_kernel.core.intake import encode
 from creatidy_kernel.core.served import command_prefix
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy
 from creatidy_kernel.ports.ordinary import OrdinaryWorkClient
 from creatidy_kernel.ports.served import OwnerProjection
 
@@ -252,3 +262,176 @@ def test_reconnected_local_observer_receives_expired_authority(sqlite_tmp_path: 
         assert last["cutoff"] == "expired"
         assert last["safe_next_action"] == "reconcile-or-stop"
         assert observations[1]["physical_settlement"] is None
+
+
+def test_large_claim_projection_is_paged_and_oversized_record_chunked(sqlite_tmp_path: Path) -> None:
+    clock = Clock()
+    with SQLiteProgramStore(sqlite_tmp_path / "large-paged.db", boot_clock=clock) as store:
+        program = initialize(store)
+        tree = workspace(sqlite_tmp_path, "large-paged")
+        claim(store, client(store, tree), tree)
+        original = store.served_claims(program.program_id)[0]
+        records = tuple(
+            {**original, "claim": f"synthetic-{index:04d}-" + "x" * (12000 if index == 0 else 600)}
+            for index in range(2048)
+        )
+        assert sum(len(encode(item)) for item in records) > 1024 * 1024
+
+        def sample(
+            _store: SQLiteProgramStore, _program: str, *, offset: int = 0, limit: int = 8
+        ) -> tuple[dict[str, object], ...]:
+            return records[offset : offset + limit]
+
+        with (
+            patch.object(SQLiteProgramStore, "served_claims", sample),
+            patch.object(SQLiteProgramStore, "served_claim_count", return_value=len(records)),
+        ):
+            projection = OwnerProjection(store, program.program_id)
+            owner, peer = socket.socketpair()
+            with owner, peer:
+                channel = LocalReadChannel(projection, owner)
+                write_frame(peer, encode({"version": 1, "action": "snapshot"}), bound=65536)
+                channel.serve_once()
+                first = json.loads(read_frame(peer, bound=1024 * 1024))["result"]
+                assert first["coverage"]["claims"] == [0, 2048, False]
+                assert first["claims"][0]["oversized"] is True
+                position = first["position"]
+                fragments = bytearray()
+                offset = 0
+                while True:
+                    request = {
+                        "version": 1,
+                        "action": "record",
+                        "collection": "claims",
+                        "index": 0,
+                        "offset": offset,
+                        "after": position,
+                    }
+                    write_frame(peer, encode(request), bound=65536)
+                    channel.serve_once()
+                    part = json.loads(read_frame(peer, bound=1024 * 1024))["result"]
+                    fragments.extend(base64.b64decode(part["data_base64"]))
+                    offset = len(fragments)
+                    if part["complete"]:
+                        break
+                assert json.loads(fragments)["claim"] == records[0]["claim"]
+                write_frame(peer, encode({"version": 1, "action": "snapshot", "page": 255}), bound=65536)
+                channel.serve_once()
+                final = json.loads(read_frame(peer, bound=1024 * 1024))["result"]
+                assert final["coverage"]["claims"] == [2040, 2048, True]
+                store.admit(
+                    program.program_id,
+                    "cancel-for-pagination",
+                    CancelProgram(store.load(program.program_id).revision, "owner"),
+                )
+                write_frame(
+                    peer,
+                    encode(
+                        {
+                            "version": 1,
+                            "action": "record",
+                            "collection": "claims",
+                            "index": 0,
+                            "offset": 0,
+                            "after": position,
+                        }
+                    ),
+                    bound=65536,
+                )
+                with pytest.raises(LocalChannelRefused, match="local read refused"):
+                    channel.serve_once()
+
+
+def test_real_claim_history_exceeding_frame_remains_readable(sqlite_tmp_path: Path) -> None:
+    clock = Clock()
+    with SQLiteProgramStore(sqlite_tmp_path / "real-large-history.db", boot_clock=clock) as store:
+        base = reference_spec()
+        spec = ProgramSpec(
+            "large-real",
+            "synthetic large history",
+            tuple(WorkUnit(f"unit-{index}", "bounded work", acceptance_criteria=("complete",)) for index in range(9)),
+            budget=BudgetPolicy(9, 9),
+            authority=AuthorityEnvelope("owner", max_attempts=9, delegated_actor_ids=frozenset({"worker-7"})),
+            acceptance_criteria=base.acceptance_criteria,
+            policy_references=base.policy_references,
+        )
+        program = store.create(spec, "create-large")
+        budget = WorkBudgetPolicy.basic(9, 9, verifications=9, retained_bytes=1_000_000)
+        store.bind_work_budget(program.program_id, "large-project", budget, budget, 110)
+        store.admit(program.program_id, "activate-large", ActivateProgram(program.revision, "owner"))
+        for index in range(9):
+            tree = workspace(sqlite_tmp_path, f"large-real-{index}")
+            current = store.load(program.program_id)
+            attempt = AttemptSpec(
+                f"attempt-{index}",
+                program.program_id,
+                f"unit-{index}",
+                current.spec.revision,
+                current.spec.digest,
+                current.resolved_inputs(f"unit-{index}"),
+                workspace_reference=str(tree.path),
+            )
+            client(store, tree).claim(f"claim-{index}-" + "x" * 125000, current.revision, attempt, lease_seconds=5)
+        projection = OwnerProjection(store, program.program_id)
+        owner, observer = socket.socketpair()
+        with owner, observer:
+            channel = LocalReadChannel(projection, owner)
+            write_frame(observer, encode({"version": 1, "action": "snapshot"}), bound=65536)
+            channel.serve_once()
+            first = json.loads(read_frame(observer, bound=1024 * 1024))["result"]
+            assert first["coverage"]["claims"] == [0, 9, False]
+            assert all(item["oversized"] for item in first["claims"])
+            write_frame(observer, encode({"version": 1, "action": "snapshot", "page": 1}), bound=65536)
+            channel.serve_once()
+            final = json.loads(read_frame(observer, bound=1024 * 1024))["result"]
+            assert final["coverage"]["claims"] == [8, 9, True]
+            assert first["position"] == final["position"]
+
+
+def test_separate_client_reads_position_qualified_record(sqlite_tmp_path: Path) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / "record-client.db") as store:
+        program = store.create(reference_spec(), "create")
+        projection = OwnerProjection(store, program.program_id)
+        cursor = projection.snapshot().position
+        owner, peer = socket.socketpair()
+        with owner, peer:
+            channel = LocalReadChannel(projection, owner)
+            process = subprocess.Popen(  # noqa: S603 - Local module and synthetic inherited descriptor.
+                [
+                    sys.executable,
+                    "-I",
+                    "-m",
+                    "creatidy_kernel.adapters.served_client",
+                    "--fd",
+                    str(peer.fileno()),
+                    "record",
+                    "--collection",
+                    "work_units",
+                    "--index",
+                    "0",
+                    "--offset",
+                    "0",
+                    "--producer",
+                    cursor.producer,
+                    "--scope",
+                    cursor.scope,
+                    "--sequence",
+                    str(cursor.sequence),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                pass_fds=(peer.fileno(),),
+                env={"HOME": str(sqlite_tmp_path), "PATH": os.defpath, "LANG": "C.UTF-8"},
+            )
+            try:
+                assert select.select([owner], [], [], 10)[0]
+                channel.serve_once()
+                output, error = process.communicate(timeout=10)
+                assert process.returncode == 0, error.decode(errors="replace")
+                record = json.loads(output)["result"]
+                assert json.loads(base64.b64decode(record["data_base64"]))[0] == "first"
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)

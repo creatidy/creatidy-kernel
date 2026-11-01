@@ -160,6 +160,9 @@ remediation = run_ordinary_flow(
 )
 if remediation["status"] != "completed" or remediation["satisfactions"] != 2:
     raise SystemExit("installed worker did not receive and complete original remediation context")
+managed_lost = run_ordinary_flow(storage / "managed-review-lost", None, mode="managed", exercise="review-lost")
+if managed_lost["status"] != "completed" or managed_lost["review_calls"] != 2:
+    raise SystemExit("installed managed unknown review did not recover without a second prompt")
 if run_ordinary_flow(storage / "served-managed-stop", None, mode="managed", exercise="served-managed-stop") != {
     "status": "stopped",
     "native_sends": 0,

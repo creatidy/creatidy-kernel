@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bounded descriptor-passed local read channel; it does not listen on a network socket."""
 
+import base64
 import json
 import re
 import socket
@@ -28,6 +29,9 @@ from creatidy_kernel.ports.served import OwnerProjection, ServedSnapshot
 
 MAX_REQUEST = 65536
 MAX_RESPONSE = 1024 * 1024
+SNAPSHOT_COLLECTIONS = frozenset(
+    {"work_units", "attempts", "reservations", "claims", "correlations", "decisions", "usage_subtotals"}
+)
 
 
 class LocalChannelRefused(ValueError):
@@ -129,8 +133,69 @@ class LocalReadChannel:
         self._channel.close()
 
     def _dispatch(self, request: dict[str, object]) -> object:
-        if request.get("action") == "snapshot" and set(request) == {"version", "action"}:
-            return asdict(self._owner.snapshot())
+        if request.get("action") == "snapshot" and set(request) in (
+            {"version", "action"},
+            {"version", "action", "page"},
+        ):
+            page = request.get("page", 0)
+            if type(page) is not int:
+                raise LocalChannelRefused("invalid snapshot page")
+            snapshot = asdict(self._owner.snapshot(page=page))
+            for name in SNAPSHOT_COLLECTIONS:
+                items = list(cast(tuple[object, ...], snapshot[name]))
+                for number, item in enumerate(items):
+                    raw = encode(item)
+                    if len(raw) > 4096:
+                        items[number] = {
+                            "oversized": True,
+                            "index": page * 8 + number,
+                            "bytes": len(raw),
+                            "sha256": digest(raw),
+                        }
+                snapshot[name] = items
+            return snapshot
+        if request.get("action") == "record" and set(request) == {
+            "version",
+            "action",
+            "collection",
+            "index",
+            "offset",
+            "after",
+        }:
+            name, index, offset, after = request["collection"], request["index"], request["offset"], request["after"]
+            if (
+                type(name) is not str
+                or name not in SNAPSHOT_COLLECTIONS
+                or type(index) is not int
+                or index < 0
+                or index > 8_000_007
+                or type(offset) is not int
+                or offset < 0
+                or type(after) is not dict
+            ):
+                raise LocalChannelRefused("invalid snapshot record request")
+            current = self._owner.snapshot()
+            if cast(dict[str, object], after) != asdict(current.position):
+                raise LocalChannelRefused("snapshot changed; restart pagination")
+            page = asdict(self._owner.snapshot(page=index // 8))
+            if cast(dict[str, object], after) != asdict(self._owner.snapshot().position):
+                raise LocalChannelRefused("snapshot changed; restart pagination")
+            items = cast(tuple[object, ...], page[name])
+            if index % 8 >= len(items):
+                raise LocalChannelRefused("snapshot record is absent")
+            raw = encode(items[index % 8])
+            if offset > len(raw):
+                raise LocalChannelRefused("snapshot record offset is invalid")
+            chunk = raw[offset : offset + 8192]
+            return {
+                "collection": name,
+                "index": index,
+                "offset": offset,
+                "bytes": len(raw),
+                "sha256": digest(raw),
+                "data_base64": base64.b64encode(chunk).decode("ascii"),
+                "complete": offset + len(chunk) == len(raw),
+            }
         if request.get("action") == "events" and set(request) == {"version", "action", "after", "limit"}:
             raw = request["after"]
             if type(raw) is not dict:

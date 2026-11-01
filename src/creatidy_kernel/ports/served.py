@@ -21,7 +21,8 @@ class ServedStore(Protocol):
     def served_operations(self, program_id: str) -> tuple[OperationRecord, ...]: ...
     def served_operation_count(self, program_id: str) -> int: ...
     def served_authority_horizon(self, program_id: str) -> dict[str, object]: ...
-    def served_claims(self, program_id: str) -> tuple[dict[str, object], ...]: ...
+    def served_claims(self, program_id: str, *, offset: int = 0, limit: int = 8) -> tuple[dict[str, object], ...]: ...
+    def served_claim_count(self, program_id: str) -> int: ...
     def find_artifact(self, operation_id: str, name: str) -> bytes | None: ...
 
 
@@ -48,6 +49,8 @@ class ServedSnapshot:
     missing_usage: str
     route_identity: None
     physical_settlement: None
+    page: int
+    coverage: dict[str, tuple[int, int, bool]]
     position: ProgressPosition
 
 
@@ -64,7 +67,9 @@ class OwnerProjection:
     def scope(self) -> str:
         return self._scope
 
-    def snapshot(self) -> ServedSnapshot:
+    def snapshot(self, *, page: int = 0) -> ServedSnapshot:
+        if type(page) is not int or page < 0 or page > 1_000_000:
+            raise ValueError("invalid snapshot page")
         program = self._store.find_program(self._scope)
         configured = program is not None and self._store.has_work_budget(self._scope)
         budget = self._store.work_budget_status(self._scope) if configured else {}
@@ -83,9 +88,10 @@ class OwnerProjection:
             for item in (() if program is None else program.attempts)
         )
         raw_reservations = budget.get("reservations", [])
-        if type(raw_reservations) is not list or len(cast(list[object], raw_reservations)) > 4096:
+        if type(raw_reservations) is not list:
             raise ValueError("producer reservation projection is unavailable or exceeds its bound")
         reservations: list[tuple[str, str, str, str | None]] = []
+        decisions: list[dict[str, object]] = []
         for raw in cast(list[object], raw_reservations):
             if type(raw) is not dict:
                 raise ValueError("producer returned an invalid reservation")
@@ -98,9 +104,31 @@ class OwnerProjection:
             reservations.append(
                 (cast(str, attempt), operation_id, cast(str, category), None if found is None else found.status)
             )
+            if (
+                category == "review"
+                and found is not None
+                and found.status in {"unknown", "dispatched"}
+                and self._store.find_artifact(operation_id, "review-receipt") is None
+            ):
+                raw_review = self._store.find_artifact(operation_id, "review-request")
+                if raw_review is None or operation_id != "product-review:" + digest(raw_review):
+                    raise ValueError("unresolved review lacks its exact request evidence")
+                review = object_from(raw_review)
+                expected = next(
+                    (item for item in (() if program is None else program.attempts) if item.attempt_id == attempt),
+                    None,
+                )
+                subject = review.get("subject")
+                if (
+                    expected is None
+                    or review.get("author_attempt_id") != attempt
+                    or type(subject) is not dict
+                    or cast(dict[str, object], subject).get("attempt_digest") != expected.spec.digest
+                ):
+                    raise ValueError("unresolved review differs from its Attempt")
+                decisions.append({"source": "product-review-operation", "attempt": attempt, "status": "review_unknown"})
         retained = tuple(sorted(reservations))
         commands: list[tuple[str, str, str, str, str]] = []
-        decisions: list[dict[str, object]] = []
         for operation in self._store.served_operations(self._scope):
             outer = object_from(operation.request_json.encode())
             raw_request = outer.get("request")
@@ -150,8 +178,9 @@ class OwnerProjection:
         if type(command_total) is not int or command_total < len(command_facts):
             raise ValueError("producer command coverage is inconsistent")
         command_coverage = (len(command_facts), command_total, command_total == len(command_facts))
-        claims = self._store.served_claims(self._scope) if program is not None else ()
-        if type(claims) is not tuple or len(claims) > 4096:
+        claim_count = self._store.served_claim_count(self._scope) if program is not None else 0
+        claims = self._store.served_claims(self._scope, offset=page * 8) if program is not None else ()
+        if type(claims) is not tuple:
             raise ValueError("producer claim projection is unavailable or exceeds its bound")
         horizon = (
             self._store.served_authority_horizon(self._scope)
@@ -267,7 +296,7 @@ class OwnerProjection:
             decision_facts_list.append({**decision, "applicability": applicability})
         decision_facts = tuple(decision_facts_list)
         raw_totals = budget.get("resource_totals", [])
-        if type(raw_totals) is not list or len(cast(list[object], raw_totals)) > 1024:
+        if type(raw_totals) is not list:
             raise ValueError("producer usage projection is unavailable or exceeds its bound")
         totals: list[tuple[str, str, str, str, int, int, str]] = []
         for raw in cast(list[object], raw_totals):
@@ -325,10 +354,26 @@ class OwnerProjection:
             "missing_usage": missing,
         }
         fingerprint = digest(encode(facts))
-        if self._last_digest is not None and fingerprint != self._last_digest:
+        if page == 0 and self._last_digest is not None and fingerprint != self._last_digest:
             # Polling a snapshot cannot prove that intermediate durable facts were observed.
             self._buffer.append("resync-required", 0 if program is None else program.revision)
-        self._last_digest = fingerprint
+        if page == 0:
+            self._last_digest = fingerprint
+        decision_facts = tuple(sorted(decision_facts, key=lambda item: item.get("applicability") != "pending"))
+        collections = {
+            "work_units": work_units,
+            "attempts": attempts,
+            "reservations": retained,
+            "claims": claims,
+            "correlations": correlation_facts,
+            "decisions": decision_facts,
+            "usage_subtotals": usage_subtotals,
+        }
+        offset = page * 8
+        coverage = {
+            name: (min(offset, len(items)), len(items), offset + 8 >= len(items)) for name, items in collections.items()
+        }
+        coverage["claims"] = (min(offset, claim_count), claim_count, offset + 8 >= claim_count)
         return ServedSnapshot(
             1,
             self._buffer.position.producer,
@@ -336,21 +381,23 @@ class OwnerProjection:
             None if program is None else program.revision,
             None if program is None else program.spec.digest,
             "absent" if program is None else program.status.value,
-            work_units,
-            attempts,
-            retained,
+            work_units[offset : offset + 8],
+            attempts[offset : offset + 8],
+            retained[offset : offset + 8],
             command_facts,
             command_coverage,
             claims,
-            correlation_facts,
-            decision_facts,
-            usage_subtotals,
+            correlation_facts[offset : offset + 8],
+            decision_facts[offset : offset + 8],
+            usage_subtotals[offset : offset + 8],
             configured,
             revoked,
             authority,
             missing,
             None,
             None,
+            page,
+            coverage,
             self._buffer.position,
         )
 
@@ -358,6 +405,6 @@ class OwnerProjection:
         """Read retained hints without invoking a command, dispatcher or clock renewal."""
         snapshot = self.snapshot()
         result = self._buffer.read(after, limit=limit)
-        if not snapshot.command_coverage[2]:
+        if not snapshot.command_coverage[2] or any(not item[2] for item in snapshot.coverage.values()):
             return ProgressBatch((), snapshot.position, True)
         return result

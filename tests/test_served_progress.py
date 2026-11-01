@@ -15,7 +15,6 @@ from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import ActivateProgram
 from creatidy_kernel.core.intake import digest, encode
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
-from creatidy_kernel.core.ownership import OwnershipConflict
 from creatidy_kernel.core.served import ProgressBuffer, ProgressPosition, ProgressRefused, command_prefix
 from creatidy_kernel.ports.served import OwnerProjection
 
@@ -251,7 +250,7 @@ def test_snapshot_projects_recorded_candidate_session_and_decision(sqlite_tmp_pa
         assert projection.events(before.position).gap is True
 
 
-def test_claim_projection_refuses_excess_without_affecting_other_program(sqlite_tmp_path: Path) -> None:
+def test_claim_count_is_scoped_even_for_large_history(sqlite_tmp_path: Path) -> None:
     with SQLiteProgramStore(sqlite_tmp_path / "bounded-claims.db", boot_clock=Clock()) as store:
         initialize(store)
         initialize(store, "program-2")
@@ -261,8 +260,7 @@ def test_claim_projection_refuses_excess_without_affecting_other_program(sqlite_
             'VALUES (?, ?, \'{"request":{"program":"program-1"}}\', ?)',
             ((operation, effect, "0" * 64) for operation, effect in rows),
         )
-        with pytest.raises(OwnershipConflict, match="exceeds its supported bound"):
-            store.served_claims("program-1")
+        assert store.served_claim_count("program-1") == 4097
         assert store.served_claims("program-2") == ()
 
 

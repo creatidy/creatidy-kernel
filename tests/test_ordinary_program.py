@@ -497,6 +497,11 @@ def test_completed_review_receipt_recovers_without_second_prompt(sqlite_tmp_path
     assert result["review_calls"] == 2
 
 
+def test_managed_unknown_review_is_visible_and_recovers_without_reprompt(sqlite_tmp_path: Path) -> None:
+    result = run_ordinary_flow(sqlite_tmp_path / "managed-review-lost", None, mode="managed", exercise="review-lost")
+    assert result["status"] == "completed" and result["review_calls"] == 2
+
+
 def test_diamond_dag_composes_shared_ancestor_once(sqlite_tmp_path: Path) -> None:
     result = run_ordinary_flow(sqlite_tmp_path / "diamond", None, mode="pull", exercise="diamond")
     assert result["status"] == "completed"

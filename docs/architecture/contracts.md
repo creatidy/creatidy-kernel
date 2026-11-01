@@ -48,6 +48,13 @@ overflow also require a fresh snapshot. Reads and reconnects cannot dispatch or 
 Forgejo pagination or native runtime notifications are not interchangeable with this producer position.
 While command coverage is incomplete, event reads continue to report a gap because the sampled history
 cannot prove it observed changes to omitted receipts.
+Snapshot collections are returned in pages of at most eight records each, with per-collection
+`(offset, total, at_end)` coverage. Request `snapshot --page N` and compare the producer position
+across pages; if it changes, restart from a fresh snapshot. While any collection exceeds the first
+page, event reads also report a gap. Records exceeding 4096 encoded bytes appear as a digest, byte
+count and index rather than inflating the frame; `record` reads their canonical JSON in 8192-byte
+base64 chunks, qualified by the exact producer position, collection and index. A changed position
+refuses the detail request. All of these reads preserve durable authority.
 
 The host creates an already-connected local `socket.socketpair()` and binds one endpoint to a
 `LocalReadChannel`, `LocalWorkerSession` or `LocalOwnerSession`; it passes only the peer descriptor to
@@ -64,6 +71,8 @@ lifetime. Full, closed or unavailable endpoints set `dropped` rather than retryi
 restart, or reconnect the consumer must read the authoritative snapshot. The host may also call
 `publish(snapshot)` after other owner-thread changes; notifications exist only while the host services
 the session and are not a persistent service or remote notification guarantee.
+Uncertain product reviews are derived from the original review request, reservation, operation and
+receipt state, not from the transport receipt; resolving one does not issue another review prompt.
 
 Frames use a four-byte network-order length and UTF-8 JSON version1; input is bounded to64KiB and
 output to1MiB. Read actions are `snapshot` and `events`. The worker capability accepts `claim`,

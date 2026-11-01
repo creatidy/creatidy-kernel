@@ -723,19 +723,19 @@ class SQLiteProgramStore:
             ).fetchone()
             return cast(int, row[0])
 
-    def served_claims(self, program_id: str) -> tuple[dict[str, object], ...]:
+    def served_claims(self, program_id: str, *, offset: int = 0, limit: int = 8) -> tuple[dict[str, object], ...]:
         """Project only recorded ownership facts for one Program, without sampling authority."""
         self._assert_writer_thread()
         self._validate_program_id(program_id)
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8:
+            raise OwnershipConflict("invalid claim projection page")
         with self._gate:
             renewals = self._work_records("ownership-renew")
             rows = self._connection.execute(
                 "SELECT request_json FROM operations WHERE operation_id LIKE 'work-budget:v1:ownership-claim:%' "
-                "AND json_extract(request_json, '$.request.program') = ? ORDER BY operation_id LIMIT 4097",
-                (program_id,),
+                "AND json_extract(request_json, '$.request.program') = ? ORDER BY operation_id LIMIT ? OFFSET ?",
+                (program_id, limit, offset),
             ).fetchall()
-            if len(rows) > 4096:
-                raise OwnershipConflict("served claim projection exceeds its supported bound")
             result: list[dict[str, object]] = []
             for row in rows:
                 claim = self._decode_work_claim(cast(dict[str, object], json.loads(row["request_json"])["request"]))
@@ -799,6 +799,17 @@ class SQLiteProgramStore:
                     }
                 )
             return tuple(result)
+
+    def served_claim_count(self, program_id: str) -> int:
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        with self._gate:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM operations WHERE operation_id LIKE 'work-budget:v1:ownership-claim:%' "
+                "AND json_extract(request_json, '$.request.program') = ?",
+                (program_id,),
+            ).fetchone()
+            return cast(int, row[0])
 
     def operations(self, prefix: str = "") -> tuple[OperationRecord, ...]:
         """Return stable operation identities for bounded application recovery/export."""

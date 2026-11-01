@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise the installed local observer without a second SQLite reader."""
 
+import base64
 import json
 import os
 import select
@@ -9,14 +10,26 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 
 import creatidy_kernel
+from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
 from creatidy_kernel.adapters.reference import reference_spec
 from creatidy_kernel.adapters.served_local import LocalReadChannel
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.deadlines import BootClockReading
-from creatidy_kernel.core.domain import ActivateProgram
+from creatidy_kernel.core.domain import (
+    ActivateProgram,
+    AttemptSpec,
+    AuthorityEnvelope,
+    BudgetPolicy,
+    ProgramSpec,
+    WorkUnit,
+)
+from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy
+from creatidy_kernel.ports.ownership import WorkOwnership
 from creatidy_kernel.ports.served import OwnerProjection
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,4 +111,139 @@ with SQLiteProgramStore(storage / "served-horizon.db", boot_clock=lambda: readin
         or (store.history(program.program_id), store.operations()) != original
     ):
         raise RuntimeError("installed observer failed to show a display-only expired horizon")
+    records: tuple[dict[str, object], ...] = tuple(
+        {"claim": f"synthetic-{index:04d}-" + "x" * (12000 if index == 0 else 600), "recorded_expires_at": 105}
+        for index in range(2048)
+    )
+
+    def sample(
+        _store: SQLiteProgramStore, _program: str, *, offset: int = 0, limit: int = 8
+    ) -> tuple[dict[str, object], ...]:
+        return records[offset : offset + limit]
+
+    with (
+        patch.object(SQLiteProgramStore, "served_claims", sample),
+        patch.object(SQLiteProgramStore, "served_claim_count", return_value=len(records)),
+    ):
+        first = request(projection, ["snapshot"])
+        coverage = cast(dict[str, object], first["coverage"])
+        claims = cast(list[dict[str, object]], first["claims"])
+        if coverage["claims"] != [0, 2048, False] or claims[0].get("oversized") is not True:
+            raise RuntimeError("installed observer did not bound oversized claim history")
+        position = cast(dict[str, object], first["position"])
+        recovered = bytearray()
+        while True:
+            part = request(
+                projection,
+                [
+                    "record",
+                    "--collection",
+                    "claims",
+                    "--index",
+                    "0",
+                    "--offset",
+                    str(len(recovered)),
+                    "--producer",
+                    str(position["producer"]),
+                    "--scope",
+                    str(position["scope"]),
+                    "--sequence",
+                    str(position["sequence"]),
+                ],
+            )
+            recovered.extend(base64.b64decode(cast(str, part["data_base64"])))
+            if part["complete"] is True:
+                break
+        if json.loads(recovered)["claim"] != records[0]["claim"]:
+            raise RuntimeError("installed observer could not recover a chunked claim")
+        last = request(projection, ["snapshot", "--page", "255"])
+        if cast(dict[str, object], last["coverage"])["claims"] != [2040, 2048, True]:
+            raise RuntimeError("installed observer did not reach the final claim page")
+parent = storage / "real-claim-workspaces"
+parent.mkdir(mode=0o700)
+with SQLiteProgramStore(storage / "served-real-history.db", boot_clock=lambda: reading[0]) as store:
+    reading[0] = BootClockReading(100, 1_000_000_000, "installed-synthetic-boot")
+    base = reference_spec()
+    spec = ProgramSpec(
+        "served-real-history",
+        "synthetic large history",
+        tuple(WorkUnit(f"unit-{index}", "bounded work", acceptance_criteria=("complete",)) for index in range(9)),
+        budget=BudgetPolicy(9, 9),
+        authority=AuthorityEnvelope("owner", max_attempts=9, delegated_actor_ids=frozenset({"worker"})),
+        acceptance_criteria=base.acceptance_criteria,
+        policy_references=base.policy_references,
+    )
+    program = store.create(spec, "create-real-history")
+    budget = WorkBudgetPolicy.basic(9, 9, verifications=9, retained_bytes=1_000_000)
+    store.bind_work_budget(program.program_id, "real-history-project", budget, budget, 110)
+    store.admit(program.program_id, "activate-real-history", ActivateProgram(program.revision, "owner"))
+    for index in range(9):
+        tree = LocalOwnedWorkspace(parent, f"tree-{index}", create=True)
+        worker = WorkOwnership(
+            store, Principal("worker", "worker"), tree, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
+        )
+        current = store.load(program.program_id)
+        attempt = AttemptSpec(
+            f"attempt-{index}",
+            program.program_id,
+            f"unit-{index}",
+            current.spec.revision,
+            current.spec.digest,
+            current.resolved_inputs(f"unit-{index}"),
+            workspace_reference=str(tree.path),
+        )
+        worker.claim(f"claim-{index}-" + "x" * 125000, current.revision, attempt, lease_seconds=5)
+    projection = OwnerProjection(store, program.program_id)
+    before = (store.history(program.program_id), store.operations())
+    first = request(projection, ["snapshot"])
+    last = request(projection, ["snapshot", "--page", "1"])
+    if (
+        cast(dict[str, object], first["coverage"])["claims"] != [0, 9, False]
+        or cast(dict[str, object], last["coverage"])["claims"] != [8, 9, True]
+        or first["position"] != last["position"]
+        or (store.history(program.program_id), store.operations()) != before
+    ):
+        raise RuntimeError("installed observer failed to resync real large durable claims")
+    position = cast(dict[str, object], first["position"])
+    events = request(
+        projection,
+        [
+            "events",
+            "--producer",
+            str(position["producer"]),
+            "--scope",
+            str(position["scope"]),
+            "--sequence",
+            str(position["sequence"]),
+        ],
+    )
+    if events["gap"] is not True:
+        raise RuntimeError("installed observer hid incomplete real claim history")
+    recovered = bytearray()
+    while True:
+        part = request(
+            projection,
+            [
+                "record",
+                "--collection",
+                "claims",
+                "--index",
+                "0",
+                "--offset",
+                str(len(recovered)),
+                "--producer",
+                str(position["producer"]),
+                "--scope",
+                str(position["scope"]),
+                "--sequence",
+                str(position["sequence"]),
+            ],
+        )
+        recovered.extend(base64.b64decode(cast(str, part["data_base64"])))
+        if part["complete"] is True:
+            break
+    if not cast(str, json.loads(recovered)["claim"]).startswith("claim-"):
+        raise RuntimeError("installed observer lost the original real claim identity")
+    if (store.history(program.program_id), store.operations()) != before:
+        raise RuntimeError("installed resync or detail reads mutated durable authority")
 print("Installed host-bound local observer reads owner projection without a competing SQLite reader.")

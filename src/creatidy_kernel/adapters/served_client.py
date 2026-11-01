@@ -23,6 +23,7 @@ def main(argv: list[str] | None = None) -> int:
         "action",
         choices=(
             "snapshot",
+            "record",
             "events",
             "claim",
             "context",
@@ -41,6 +42,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scope")
     parser.add_argument("--sequence", type=int)
     parser.add_argument("--limit", type=int, default=256)
+    parser.add_argument("--page", type=int)
+    parser.add_argument("--collection")
+    parser.add_argument("--index", type=int)
+    parser.add_argument("--offset", type=int)
     parser.add_argument("--command-id")
     parser.add_argument("--expected-revision", type=int)
     parser.add_argument("--lease-seconds", type=int)
@@ -56,12 +61,32 @@ def main(argv: list[str] | None = None) -> int:
     if args.fd < 3:
         parser.error("a preconnected descriptor >= 3 is required")
     request: dict[str, object] = {"version": 1, "action": args.action}
+    if args.action == "snapshot" and args.page is not None:
+        request["page"] = args.page
+    elif args.action != "snapshot" and args.page is not None:
+        parser.error("--page is only valid for snapshot")
+    if args.action == "record":
+        if any(
+            value is None
+            for value in (args.collection, args.index, args.offset, args.producer, args.scope, args.sequence)
+        ):
+            parser.error("record requires --collection, --index, --offset, --producer, --scope and --sequence")
+        request.update(
+            {
+                "collection": args.collection,
+                "index": args.index,
+                "offset": args.offset,
+                "after": {"producer": args.producer, "scope": args.scope, "sequence": args.sequence},
+            }
+        )
+    elif any(value is not None for value in (args.collection, args.index, args.offset)):
+        parser.error("--collection, --index and --offset are only valid for record")
     if args.action == "events":
         if args.producer is None or args.scope is None or args.sequence is None:
             parser.error("events requires --producer, --scope and --sequence")
         request["after"] = {"producer": args.producer, "scope": args.scope, "sequence": args.sequence}
         request["limit"] = args.limit
-    elif args.producer is not None or args.scope is not None or args.sequence is not None:
+    elif args.action != "record" and (args.producer is not None or args.scope is not None or args.sequence is not None):
         parser.error("snapshot does not accept a position")
     if args.action != "approve" and (args.decision_id is not None or args.expires_at is not None):
         parser.error("only approve accepts --decision-id and --expires-at")
