@@ -196,6 +196,54 @@ def test_claim_projection_isolates_programs(sqlite_tmp_path: Path) -> None:
         assert [item["claim"] for item in store.served_claims("program-2")] == [second.command_key]
 
 
+def test_repeated_workspace_subject_does_not_fabricate_last_observation(sqlite_tmp_path: Path) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / "revisited.db", boot_clock=Clock()) as store:
+        program = initialize(store)
+        tree = workspace(sqlite_tmp_path, "revisited")
+        granted = claim(store, client(store, tree), tree)
+        control = client(store, tree, owner=True)
+        initial = control.observe(granted)
+        initial_snapshot = tree.capture()[1]
+        (tree.path / "manual.txt").write_text("changed")
+        assert control.observe(granted) != initial
+        store.observe_claim_workspace(granted, initial, initial_snapshot, owner="owner")
+        recorded = OwnerProjection(store, program.program_id).snapshot().claims[0]
+        assert recorded["latest_recorded_subject"] is None
+        assert recorded["recorded_owner_reconciliation_needed"] is None
+
+
+def test_snapshot_projects_recorded_candidate_session_and_decision(sqlite_tmp_path: Path) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / "decisions.db", boot_clock=Clock()) as store:
+        program = initialize(store)
+        tree = workspace(sqlite_tmp_path, "decision")
+        granted = claim(store, client(store, tree), tree)
+        projection = OwnerProjection(store, program.program_id)
+        before = projection.snapshot()
+        store.finalize_artifact(
+            granted.operation_id,
+            "ordinary-candidate",
+            encode({"version": 1, "head": "a" * 40, "scope": "b" * 64, "paths": []}),
+        )
+        store.finalize_artifact(granted.operation_id, "runtime-receipt", encode({"version": 2, "handle": "session-1"}))
+        rejection = f"rejection:{granted.attempt.attempt_id}"
+        store.intent(rejection, rejection, {"product_review_status": "owner_decision_needed"})
+        store.finalize_artifact(rejection, "rejected-result", b"synthetic rejection")
+        current = projection.snapshot()
+        assert current.correlations == (
+            {
+                "attempt": granted.attempt.attempt_id,
+                "workspace_reference": str(tree.path),
+                "candidate_head": "a" * 40,
+                "candidate_scope": "b" * 64,
+                "runtime_handle": "session-1",
+            },
+        )
+        assert current.decisions == (
+            {"source": "product-review", "attempt": granted.attempt.attempt_id, "status": "owner_decision_needed"},
+        )
+        assert projection.events(before.position).gap is True
+
+
 def test_claim_projection_refuses_excess_without_affecting_other_program(sqlite_tmp_path: Path) -> None:
     with SQLiteProgramStore(sqlite_tmp_path / "bounded-claims.db", boot_clock=Clock()) as store:
         initialize(store)

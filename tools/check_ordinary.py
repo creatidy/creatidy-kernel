@@ -131,6 +131,7 @@ for exercise, expected in (
     ("served-owner-amend", "amended"),
     ("served-owner-multi-client", "stopped"),
     ("served-report", "accepted"),
+    ("served-report-decision", "rejected"),
     ("served-report-forged", "refused"),
     ("served-report-crash", "unknown"),
     ("served-reconcile-race", "refused"),
@@ -141,6 +142,9 @@ for exercise, expected in (
     ("quiesce-revision-race", "refused"),
     ("renew-revision-race", "refused"),
     ("report-revision-race", "refused"),
+    ("report-verification-revision-race", "refused"),
+    ("report-review-revision-race", "unknown"),
+    ("served-cross-action-id", "refused"),
     ("approve-revision-race", "refused"),
     ("stop-atomic-failure", "refused"),
 ):

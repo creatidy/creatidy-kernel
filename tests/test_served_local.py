@@ -6,15 +6,30 @@ import socket
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
+from unittest.mock import Mock
 
 import pytest
 from test_sqlite_store import sqlite_tmp_path as sqlite_tmp_path
+from test_work_budget import Clock, initialize, policy
 
 from creatidy_kernel.adapters.reference import reference_spec
-from creatidy_kernel.adapters.served_local import LocalChannelRefused, LocalReadChannel, read_frame, write_frame
+from creatidy_kernel.adapters.served_local import (
+    LocalChannelRefused,
+    LocalDecisionNotifier,
+    LocalReadChannel,
+    LocalWorkerChannel,
+    read_frame,
+    write_frame,
+)
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore, WrongWriterThread
 from creatidy_kernel.core.domain import ActivateProgram
+from creatidy_kernel.core.intake import encode
+from creatidy_kernel.core.served import command_prefix
+from creatidy_kernel.ports.ordinary import OrdinaryWorkClient
 from creatidy_kernel.ports.served import OwnerProjection
 
 
@@ -135,3 +150,67 @@ def test_host_can_revoke_read_capability_without_mutating_program(sqlite_tmp_pat
             server.revoke()
             assert observer.recv(1) == b""
         assert (store.history(program.program_id), store.operations()) == before
+
+
+def test_decision_notification_is_bounded_deduplicated_and_best_effort(sqlite_tmp_path: Path) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / "notification.db") as store:
+        program = store.create(reference_spec(), "create")
+        before = (store.history(program.program_id), store.operations())
+        snapshot = replace(
+            OwnerProjection(store, program.program_id).snapshot(),
+            decisions=({"source": "product-review", "attempt": "a", "status": "owner_decision_needed"},),
+        )
+        owner, observer = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        with owner, observer:
+            notifier = LocalDecisionNotifier(owner)
+            notifier.publish(snapshot)
+            notification = json.loads(observer.recv(65536))
+            assert notification["kind"] == "decision-required" and notification["scope"] == program.program_id
+            notifier.publish(snapshot)
+            assert not select.select([observer], [], [], 0)[0]
+            observer.close()
+            notifier.publish(replace(snapshot, decisions=({"status": "comment", "attempt": "b"},)))
+            assert notifier.dropped is True
+        assert (store.history(program.program_id), store.operations()) == before
+
+
+def test_claim_command_identity_is_scoped_to_program_and_actor(sqlite_tmp_path: Path) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / "claim-scopes.db", boot_clock=Clock()) as store:
+        first = initialize(store, project=policy(active=2))
+        second = initialize(store, "program-2", project=policy(active=2))
+        qualified: list[str] = []
+        for program, actor in ((first, "worker-a"), (second, "worker-a"), (first, "worker-b")):
+            handoff = SimpleNamespace(
+                attempt=SimpleNamespace(program_id=program.program_id, attempt_id=f"attempt-{actor}"),
+                claim=SimpleNamespace(generation=1),
+            )
+            request_claim = Mock(return_value=handoff)
+            worker = cast(
+                OrdinaryWorkClient,
+                SimpleNamespace(
+                    approved=SimpleNamespace(program=program),
+                    principal=SimpleNamespace(actor_id=actor),
+                    application=SimpleNamespace(store=store, check=Mock()),
+                    request=request_claim,
+                ),
+            )
+            owner, peer = socket.socketpair()
+            with owner, peer:
+                channel = LocalWorkerChannel(OwnerProjection(store, program.program_id), owner, worker)
+                wire = encode(
+                    {
+                        "version": 1,
+                        "action": "claim",
+                        "command_id": "shared-id",
+                        "expected_revision": program.revision,
+                        "lease_seconds": 30,
+                        "remediation_of": None,
+                    }
+                )
+                write_frame(peer, wire, bound=65536)
+                channel.serve_once()
+                assert json.loads(read_frame(peer, bound=1024 * 1024))["result"]["status"] == "claimed"
+            qualified.append(request_claim.call_args.args[0])
+        assert len(set(qualified)) == 3
+        assert len(store.operations(command_prefix(first.program_id))) == 2
+        assert len(store.operations(command_prefix(second.program_id))) == 1

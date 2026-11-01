@@ -47,6 +47,7 @@ from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
 from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.served_local import (
     LocalChannelRefused,
+    LocalDecisionNotifier,
     LocalOwnerChannel,
     LocalOwnerSession,
     LocalWorkerChannel,
@@ -80,7 +81,8 @@ from creatidy_kernel.core.intake import (
     encode,
 )
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, WorkClaim
-from creatidy_kernel.core.verification import EvidenceSubject, VerificationPolicy
+from creatidy_kernel.core.served import command_prefix
+from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.intake import OrdinaryIntake
 from creatidy_kernel.ports.ordinary import OrdinaryApproval, OrdinaryHandoff, OrdinaryProgram
@@ -319,7 +321,7 @@ def run_ordinary_flow(
         review_peer(
             root / "native",
             native_binary,
-            reject_first=exercise in {"review-remediation", "review-remediation-tampered"},
+            reject_first=exercise in {"review-remediation", "review-remediation-tampered", "served-report-decision"},
             lose_first_reply=exercise in {"review-lost", "review-lost-reopen"},
         ) as (review_origin, calls),
         ExitStack() as owners,
@@ -1022,11 +1024,13 @@ print("Done")
                 if exercise in {
                     "served-claim",
                     "served-claim-process",
+                    "served-cross-action-id",
                     "served-start",
                     "served-start-crash",
                     "served-start-expired",
                     "served-quiesce",
                     "served-report",
+                    "served-report-decision",
                     "served-report-forged",
                     "served-report-crash",
                     "served-reconcile-race",
@@ -1036,7 +1040,16 @@ print("Done")
                     revision = store.load("everyday-program").revision
                     owner_socket, worker_socket = socket.socketpair()
                     with owner_socket, worker_socket:
-                        server = LocalWorkerChannel(OwnerProjection(store, "everyday-program"), owner_socket, client)
+                        notification_rx = None
+                        notifier = None
+                        if exercise == "served-report-decision":
+                            notification_tx, notification_rx = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+                            owners.enter_context(notification_tx)
+                            owners.enter_context(notification_rx)
+                            notifier = LocalDecisionNotifier(notification_tx)
+                        server = LocalWorkerChannel(
+                            OwnerProjection(store, "everyday-program"), owner_socket, client, notifier=notifier
+                        )
                         request = {
                             "version": 1,
                             "action": "claim",
@@ -1085,12 +1098,30 @@ print("Done")
                             first = json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"]
                         assert first["program_id"] == "everyday-program"
                         assert len(store.load("everyday-program").attempts) == 1
+                        if exercise == "served-cross-action-id":
+                            start = {
+                                "version": 1,
+                                "action": "start",
+                                "command_id": command_key,
+                                "claim_id": command_key,
+                                "expected_revision": store.load("everyday-program").revision,
+                            }
+                            write_frame(worker_socket, json.dumps(start).encode(), bound=65536)
+                            try:
+                                server.serve_once()
+                            except LocalChannelRefused:
+                                pass
+                            else:
+                                raise AssertionError("claim command identity was reused for start")
+                            assert store.load("everyday-program").attempts[0].status.value == "prepared"
+                            return {"status": "refused", "native_sends": 0}
                         if exercise in {
                             "served-start",
                             "served-start-crash",
                             "served-start-expired",
                             "served-quiesce",
                             "served-report",
+                            "served-report-decision",
                             "served-report-forged",
                             "served-report-crash",
                             "served-reconcile-race",
@@ -1260,6 +1291,7 @@ print("Done")
                                 return {"status": "checked", "native_sends": 0}
                             if exercise in {
                                 "served-report",
+                                "served-report-decision",
                                 "served-report-forged",
                                 "served-report-crash",
                                 "served-reconcile-race",
@@ -1280,7 +1312,10 @@ print("Done")
                                     == "cooperative-task-scope"
                                 )
                                 original_handoff = client.request(
-                                    command_key, lease_seconds=300, expected_revision=revision
+                                    command_prefix("everyday-program")
+                                    + digest(encode([client.principal.actor_id, command_key])),
+                                    lease_seconds=300,
+                                    expected_revision=revision,
                                 )
                                 changed_subject = control.observe(original_handoff.claim)
                                 reconcile_owner, reconcile_client = socket.socketpair()
@@ -1377,6 +1412,22 @@ print("Done")
                                     return {"status": "refused", "native_sends": 0}
                                 report_wire = json.dumps(report, sort_keys=True).encode()
                                 write_frame(worker_socket, report_wire, bound=65536)
+                                if exercise == "served-report-decision":
+                                    server.serve_once()
+                                    result = json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"]
+                                    assert result["status"] == "rejected"
+                                    assert notification_rx is not None
+                                    assert select.select([notification_rx], [], [], 2)[0]
+                                    notification = json.loads(notification_rx.recv(65536))
+                                    assert notification["kind"] == "decision-required"
+                                    decisions = OwnerProjection(store, "everyday-program").snapshot().decisions
+                                    assert any(item.get("status") == "changes_requested" for item in decisions)
+                                    write_frame(worker_socket, report_wire, bound=65536)
+                                    server.serve_once()
+                                    assert json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"] == result
+                                    assert not select.select([notification_rx], [], [], 0)[0]
+                                    assert len(calls) == 1
+                                    return {"status": "rejected", "native_sends": 0}
                                 if exercise == "served-report-crash":
                                     finalize = SQLiteProgramStore.finalize_artifact
 
@@ -2132,6 +2183,63 @@ print("Done")
                     control.observe(handoff.claim),
                     evidence="owner receives exact task-owned bytes after qualified task-scope quiescence",
                 )
+                if exercise == "report-verification-revision-race":
+                    revision = store.load("everyday-program").revision
+                    original_check = OrdinaryGitWorkspace.check
+                    changed = [False]
+
+                    def pause_before_verification(
+                        target: OrdinaryGitWorkspace,
+                        name: str,
+                        subject: EvidenceSubject,
+                        flag: list[bool] = changed,
+                        target_store: SQLiteProgramStore = store,
+                        original: Callable[
+                            [OrdinaryGitWorkspace, str, EvidenceSubject], Evidence | None
+                        ] = original_check,
+                    ) -> Evidence | None:
+                        if name == "commands" and not flag[0]:
+                            flag[0] = True
+                            current = target_store.load("everyday-program")
+                            paused = target_store.admit(
+                                current.program_id, "pause-before-verification", PauseProgram(current.revision, "owner")
+                            )
+                            target_store.admit(
+                                paused.program_id, "resume-before-verification", ResumeProgram(paused.revision, "owner")
+                            )
+                        return original(target, name, subject)
+
+                    with patch.object(OrdinaryGitWorkspace, "check", pause_before_verification):
+                        try:
+                            client.report(handoff, expected_revision=revision)
+                        except ValueError:
+                            pass
+                    assert changed[0]
+                    assert not store.operations("ordinary-command:") and not calls
+                    return {"status": "refused", "native_sends": 0}
+                if exercise == "report-review-revision-race":
+                    revision = store.load("everyday-program").revision
+                    authorizations = [0]
+
+                    def pause_during_review_authorization(
+                        count: list[int] = authorizations, target_store: SQLiteProgramStore = store
+                    ) -> str:
+                        count[0] += 1
+                        if count[0] == 2:
+                            current = target_store.load("everyday-program")
+                            paused = target_store.admit(
+                                current.program_id, "pause-before-review-send", PauseProgram(current.revision, "owner")
+                            )
+                            target_store.admit(
+                                paused.program_id, "resume-before-review-send", ResumeProgram(paused.revision, "owner")
+                            )
+                        return ""
+
+                    reviewer.authorization = pause_during_review_authorization
+                    result = client.report(handoff, expected_revision=revision)
+                    assert authorizations[0] == 2 and result == "review_unknown"
+                    assert not calls and not native_state["sends"]
+                    return {"status": "unknown", "native_sends": 0}
                 if (
                     exercise in {"command-evidence-crash", "command-evidence-no-witness", "command-evidence-partial"}
                     and position == 0

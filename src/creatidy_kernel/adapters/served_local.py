@@ -24,7 +24,7 @@ from creatidy_kernel.ports.ordinary import (
     OrdinaryWorkClient,
 )
 from creatidy_kernel.ports.ownership import WorkOwnership
-from creatidy_kernel.ports.served import OwnerProjection
+from creatidy_kernel.ports.served import OwnerProjection, ServedSnapshot
 
 MAX_REQUEST = 65536
 MAX_RESPONSE = 1024 * 1024
@@ -32,6 +32,44 @@ MAX_RESPONSE = 1024 * 1024
 
 class LocalChannelRefused(ValueError):
     """The local capability received an invalid or incomplete frame."""
+
+
+class LocalDecisionNotifier:
+    """Best-effort datagrams; authoritative decisions remain in the owner snapshot."""
+
+    def __init__(self, channel: socket.socket) -> None:
+        if channel.family != socket.AF_UNIX or channel.type & socket.SOCK_DGRAM != socket.SOCK_DGRAM:
+            raise LocalChannelRefused("a connected local datagram capability is required")
+        channel.getpeername()
+        self._channel = channel
+        self._seen: set[str] = set()
+        self.dropped = False
+
+    def publish(self, snapshot: ServedSnapshot) -> None:
+        for decision in snapshot.decisions:
+            if decision.get("status") not in {
+                "owner_decision_needed",
+                "comment",
+                "invalid",
+                "rejected",
+                "review_unknown",
+            }:
+                continue
+            identity = digest(encode([snapshot.scope, decision]))
+            if identity in self._seen:
+                continue
+            if len(self._seen) >= 4096:
+                self.dropped = True
+                return
+            payload = encode({"version": 1, "kind": "decision-required", "id": identity, "scope": snapshot.scope})
+            try:
+                if self._channel.send(payload, socket.MSG_DONTWAIT) != len(payload):
+                    self.dropped = True
+                    return
+            except OSError:
+                self.dropped = True
+                return
+            self._seen.add(identity)
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -133,12 +171,14 @@ class LocalWorkerChannel(LocalReadChannel):
         worker: OrdinaryWorkClient,
         *,
         handoffs: dict[str, OrdinaryHandoff] | None = None,
+        notifier: LocalDecisionNotifier | None = None,
     ) -> None:
         if worker.approved.program.program_id != owner.scope:
             raise LocalChannelRefused("worker and projection scopes differ")
         super().__init__(owner, channel)
         self._worker = worker
         self._handoffs = {} if handoffs is None else handoffs
+        self._notifier = notifier
 
     def _dispatch(self, request: dict[str, object]) -> object:
         if request.get("action") == "start":
@@ -172,16 +212,39 @@ class LocalWorkerChannel(LocalReadChannel):
             raise LocalChannelRefused("invalid work request values")
         if command_id not in self._handoffs and len(self._handoffs) >= 4096:
             raise LocalChannelRefused("worker capability handoff limit reached")
+        store = self._worker.application.store
+        operation_id = command_prefix(self._owner.scope) + digest(encode([self._worker.principal.actor_id, command_id]))
+        exact = {**request, "scope": self._owner.scope, "actor": self._worker.principal.actor_id}
+        prior = store.find_operation(operation_id)
+        receipt = None
+        if prior is not None:
+            if prior.effect_key != operation_id or object_from(prior.request_json.encode()).get("request") != exact:
+                raise LocalChannelRefused("command identity already has different input")
+            receipt = store.find_artifact(operation_id, "receipt")
+            if receipt is None:
+                return {"status": "unknown", "settlement": "unknown"}
+        else:
+            self._worker.application.check(self._worker.approved)
+            if store.load(self._owner.scope).revision != revision:
+                raise LocalChannelRefused("caller expected revision is stale")
+            store.intent(operation_id, operation_id, exact)
         handoff = self._worker.request(
-            command_id, lease_seconds=lease, remediation_of=remediation, expected_revision=revision
+            operation_id, lease_seconds=lease, remediation_of=remediation, expected_revision=revision
         )
-        self._handoffs[command_id] = handoff
-        return {
+        result: dict[str, object] = {
+            "version": 1,
+            "status": "claimed",
             "program_id": handoff.attempt.program_id,
             "attempt_id": handoff.attempt.attempt_id,
             "claim_generation": handoff.claim.generation,
             "receipt": "recorded; current authority is checked at each later action",
         }
+        if receipt is None:
+            store.finalize_artifact(operation_id, "receipt", encode(result))
+        elif object_from(receipt) != result:
+            raise LocalChannelRefused("recorded claim receipt differs from original handoff")
+        self._handoffs[command_id] = handoff
+        return result
 
     def _start(self, request: dict[str, object]) -> object:
         if set(request) != {"version", "action", "command_id", "expected_revision", "claim_id"}:
@@ -265,7 +328,10 @@ class LocalWorkerChannel(LocalReadChannel):
             outcome = self._worker.report(handoff, expected_revision=revision)
             return {"version": 1, "status": outcome, "settlement": "unknown", "authority": "historical-only"}
 
-        return self._recorded(request, handoff, execute)
+        result = self._recorded(request, handoff, execute)
+        if request["action"] == "report" and self._notifier is not None:
+            self._notifier.publish(self._owner.snapshot())
+        return result
 
     def _renew(self, request: dict[str, object]) -> object:
         if set(request) != {"version", "action", "command_id", "expected_revision", "claim_id", "lease_seconds"}:
@@ -291,7 +357,10 @@ class LocalWorkerChannel(LocalReadChannel):
         handoff = self._handoffs[claim_id]
 
         def execute() -> dict[str, object]:
-            expires_at = self._worker.renew(command_id, handoff, lease_seconds=lease, expected_revision=revision)
+            qualified = command_prefix(self._owner.scope) + digest(
+                encode([self._worker.principal.actor_id, command_id])
+            )
+            expires_at = self._worker.renew(qualified, handoff, lease_seconds=lease, expected_revision=revision)
             return {"version": 1, "status": "recorded", "expires_at": expires_at, "authority": "historical-only"}
 
         return self._recorded(request, handoff, execute)
@@ -400,10 +469,13 @@ class LocalWorkerChannel(LocalReadChannel):
 class LocalWorkerSession:
     """Trusted host binds a worker once and may pass separate one-shot client descriptors."""
 
-    def __init__(self, owner: OwnerProjection, worker: OrdinaryWorkClient) -> None:
+    def __init__(
+        self, owner: OwnerProjection, worker: OrdinaryWorkClient, *, notifier: LocalDecisionNotifier | None = None
+    ) -> None:
         if worker.approved.program.program_id != owner.scope:
             raise LocalChannelRefused("worker and projection scopes differ")
         self._owner, self._worker = owner, worker
+        self._notifier = notifier
         self._handoffs: dict[str, OrdinaryHandoff] = {}
         self._channels: list[LocalWorkerChannel] = []
         self._revoked = False
@@ -413,7 +485,9 @@ class LocalWorkerSession:
             raise LocalChannelRefused("worker capability was revoked")
         if len(self._channels) >= 64:
             raise LocalChannelRefused("worker capability channel limit reached")
-        result = LocalWorkerChannel(self._owner, channel, self._worker, handoffs=self._handoffs)
+        result = LocalWorkerChannel(
+            self._owner, channel, self._worker, handoffs=self._handoffs, notifier=self._notifier
+        )
         self._channels.append(result)
         return result
 

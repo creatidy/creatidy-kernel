@@ -115,6 +115,12 @@ def test_host_bound_local_worker_claim_deduplicates_exact_request(sqlite_tmp_pat
     }
 
 
+def test_worker_claim_identity_cannot_be_reused_for_start(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-cross-action-id", None, mode="pull", exercise="served-cross-action-id"
+    ) == {"status": "refused", "native_sends": 0}
+
+
 def test_owner_channel_starts_managed_once_then_stops_original_target(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(
         sqlite_tmp_path / "served-managed-start", None, mode="managed", exercise="served-managed-start"
@@ -176,6 +182,12 @@ def test_host_bound_submit_and_report_use_trusted_verification(sqlite_tmp_path: 
     }
 
 
+def test_rejected_report_emits_one_local_decision_alert(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-report-decision", None, mode="pull", exercise="served-report-decision"
+    ) == {"status": "rejected", "native_sends": 0}
+
+
 def test_worker_cannot_supply_its_own_review_verdict(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(
         sqlite_tmp_path / "served-report-forged", None, mode="pull", exercise="served-report-forged"
@@ -185,6 +197,21 @@ def test_worker_cannot_supply_its_own_review_verdict(sqlite_tmp_path: Path) -> N
 def test_lost_report_receipt_is_unknown_without_new_review(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(
         sqlite_tmp_path / "served-report-crash", None, mode="pull", exercise="served-report-crash"
+    ) == {"status": "unknown", "native_sends": 0}
+
+
+def test_report_revision_fences_verification_after_owner_change(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "report-verification-revision-race",
+        None,
+        mode="pull",
+        exercise="report-verification-revision-race",
+    ) == {"status": "refused", "native_sends": 0}
+
+
+def test_report_revision_fences_review_after_authorization_callback(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "report-review-revision-race", None, mode="pull", exercise="report-review-revision-race"
     ) == {"status": "unknown", "native_sends": 0}
 
 

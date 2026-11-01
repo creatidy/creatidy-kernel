@@ -251,6 +251,7 @@ class SQLiteProgramStore:
         self._owner_thread_token = object()
         self._owner_thread_local.store_token = self._owner_thread_token
         self._gate = threading.RLock()
+        self._report_revision: tuple[str, int] | None = None
         self._busy_timeout_ms = busy_timeout_ms
         self._boot_clock = boot_clock
         self._clock_watermarks: dict[str, BootClockReading] = {}
@@ -727,24 +728,32 @@ class SQLiteProgramStore:
             result: list[dict[str, object]] = []
             for row in rows:
                 claim = self._decode_work_claim(cast(dict[str, object], json.loads(row["request_json"])["request"]))
-                observation = self._connection.execute(
+                observations = self._connection.execute(
                     "SELECT request_json FROM operations "
                     "WHERE operation_id LIKE 'work-budget:v1:ownership-observation:%' "
                     "AND json_extract(request_json, '$.request.claim') = ? "
-                    "ORDER BY json_extract(request_json, '$.request.order') DESC LIMIT 1",
+                    "ORDER BY json_extract(request_json, '$.request.order') DESC LIMIT 2",
                     (claim.command_key,),
-                ).fetchone()
+                ).fetchall()
+                # The old journal stores each subject only once, not each visit.
+                # Multiple subjects cannot establish which was observed last.
                 latest = (
                     claim.workspace_subject
-                    if observation is None
-                    else cast(str, json.loads(observation["request_json"])["request"]["subject"])
+                    if not observations
+                    else cast(str, json.loads(observations[0]["request_json"])["request"]["subject"])
+                    if len(observations) == 1
+                    else None
                 )
                 candidate = self._work_record("ownership-candidate", claim.command_key)
                 released = self._work_record("ownership-release", claim.command_key) is not None
                 reconciled = (
-                    latest == claim.workspace_subject
-                    or self._work_record("ownership-prepared", f"{claim.command_key}:{latest}") is not None
-                    or self._work_record("ownership-reconcile", f"{claim.command_key}:{latest}") is not None
+                    None
+                    if latest is None
+                    else (
+                        latest == claim.workspace_subject
+                        or self._work_record("ownership-prepared", f"{claim.command_key}:{latest}") is not None
+                        or self._work_record("ownership-reconcile", f"{claim.command_key}:{latest}") is not None
+                    )
                 )
                 result.append(
                     {
@@ -757,7 +766,9 @@ class SQLiteProgramStore:
                         "quarantined_recorded": self._work_record("ownership-unknown", claim.command_key) is not None,
                         "latest_recorded_subject": latest,
                         "candidate_recorded_subject": None if candidate is None else candidate["subject"],
-                        "recorded_owner_reconciliation_needed": not released and not reconciled,
+                        "recorded_owner_reconciliation_needed": (
+                            False if released else None if reconciled is None else not reconciled
+                        ),
                         "recorded_proofs": tuple(
                             stage
                             for stage in ("start", "complete", "stop")
@@ -780,6 +791,24 @@ class SQLiteProgramStore:
     def claim_owned_operation(self, claim: WorkClaim, operation_id: str, subject: str, lease_seconds: int) -> int:
         return self._claim_operation(operation_id, now=0, lease_seconds=lease_seconds, ownership=(claim, subject))
 
+    @contextmanager
+    def report_revision_guard(self, program_id: str, revision: int) -> Generator[None, None, None]:
+        """Fence new report effects to the revision admitted after FinishAttempt."""
+        self._assert_writer_thread()
+        if self._report_revision is not None or type(revision) is not int or revision < 0:
+            raise OwnershipConflict("invalid or nested report revision guard")
+        self._report_revision = (program_id, revision)
+        try:
+            self._check_report_revision(program_id)
+            yield
+        finally:
+            self._report_revision = None
+
+    def _check_report_revision(self, program_id: str) -> None:
+        if self._report_revision is not None and self._report_revision[0] == program_id:
+            if self._load_head(program_id).revision != self._report_revision[1]:
+                raise OwnershipConflict("caller report revision changed before effect")
+
     def _claim_operation(
         self,
         operation_id: str,
@@ -801,6 +830,8 @@ class SQLiteProgramStore:
         ):
             op = self.operation(operation_id)
             reservation = self._work_record("reservation", operation_id)
+            if reservation is not None:
+                self._check_report_revision(cast(str, reservation["program"]))
             if ownership is not None and (
                 reservation is None
                 or (reservation["program"], reservation["attempt"])
@@ -2917,6 +2948,7 @@ class SQLiteProgramStore:
         if reservation is None:
             raise BudgetRefused("dispatch lacks original work reservation")
         program_id, attempt_id = cast(str, reservation["program"]), cast(str, reservation["attempt"])
+        self._check_report_revision(program_id)
         self.check_work_authority(program_id)
         program = self._load_head(program_id)
         try:
@@ -3169,6 +3201,7 @@ class SQLiteProgramStore:
             ) as readings,
             self._transaction(readings),
         ):
+            self._check_report_revision(program_id)
             existed = self._work_record("reservation", operation_id) is not None
             fresh = (
                 not existed

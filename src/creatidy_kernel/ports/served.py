@@ -36,6 +36,8 @@ class ServedSnapshot:
     reservations: tuple[tuple[str, str, str, str | None], ...]
     commands: tuple[tuple[str, str, str, str, str], ...]
     claims: tuple[dict[str, object], ...]
+    correlations: tuple[dict[str, object], ...]
+    decisions: tuple[dict[str, object], ...]
     usage_subtotals: tuple[tuple[str, str, str, str, int, int, str], ...]
     budget_configured: bool
     budget_revoked: bool | None
@@ -94,6 +96,7 @@ class OwnerProjection:
             )
         retained = tuple(sorted(reservations))
         commands: list[tuple[str, str, str, str, str]] = []
+        decisions: list[dict[str, object]] = []
         for operation in self._store.served_operations(self._scope):
             outer = object_from(operation.request_json.encode())
             raw_request = outer.get("request")
@@ -119,11 +122,50 @@ class OwnerProjection:
                 ):
                     raise ValueError("producer returned an invalid served command receipt")
                 recorded = "recorded"
+                if action == "report":
+                    decisions.append({"source": "served-command", "command_id": key, "status": value["status"]})
             commands.append((cast(str, key), cast(str, action), cast(str, actor), operation.status, recorded))
         command_facts = tuple(sorted(commands))
         claims = self._store.served_claims(self._scope) if program is not None else ()
         if type(claims) is not tuple or len(claims) > 4096:
             raise ValueError("producer claim projection is unavailable or exceeds its bound")
+        correlations: list[dict[str, object]] = []
+        for attempt in () if program is None else program.attempts:
+            operation_id = f"runtime:{attempt.attempt_id}"
+            candidate_raw = self._store.find_artifact(operation_id, "ordinary-candidate")
+            runtime_raw = self._store.find_artifact(operation_id, "runtime-receipt")
+            candidate = None if candidate_raw is None else object_from(candidate_raw)
+            runtime = None if runtime_raw is None else object_from(runtime_raw)
+            head = None if candidate is None else candidate.get("head")
+            subject = None if candidate is None else candidate.get("scope")
+            handle = None if runtime is None else runtime.get("handle")
+            if any(item is not None and (type(item) is not str or len(item) > 512) for item in (head, subject, handle)):
+                raise ValueError("producer returned invalid candidate or session identity")
+            correlations.append(
+                {
+                    "attempt": attempt.attempt_id,
+                    "workspace_reference": attempt.spec.workspace_reference,
+                    "candidate_head": head,
+                    "candidate_scope": subject,
+                    "runtime_handle": handle,
+                }
+            )
+            rejection_id = f"rejection:{attempt.attempt_id}"
+            if self._store.find_artifact(rejection_id, "rejected-result") is not None:
+                rejection = self._store.find_operation(rejection_id)
+                if rejection is None:
+                    raise ValueError("rejection artifact has no originating operation")
+                raw = object_from(rejection.request_json.encode()).get("request")
+                if type(raw) is not dict:
+                    raise ValueError("producer returned an invalid rejection")
+                status = cast(dict[str, object], raw).get("product_review_status")
+                if status not in {None, "changes_requested", "owner_decision_needed", "comment", "invalid"}:
+                    raise ValueError("producer returned an invalid review disposition")
+                decisions.append(
+                    {"source": "product-review", "attempt": attempt.attempt_id, "status": status or "rejected"}
+                )
+        correlation_facts = tuple(correlations)
+        decision_facts = tuple(decisions)
         raw_totals = budget.get("resource_totals", [])
         if type(raw_totals) is not list or len(cast(list[object], raw_totals)) > 1024:
             raise ValueError("producer usage projection is unavailable or exceeds its bound")
@@ -173,6 +215,8 @@ class OwnerProjection:
             "reservations": retained,
             "commands": command_facts,
             "claims": claims,
+            "correlations": correlation_facts,
+            "decisions": decision_facts,
             "usage_subtotals": usage_subtotals,
             "budget_configured": configured,
             "budget_revoked": revoked,
@@ -195,6 +239,8 @@ class OwnerProjection:
             retained,
             command_facts,
             claims,
+            correlation_facts,
+            decision_facts,
             usage_subtotals,
             configured,
             revoked,

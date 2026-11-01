@@ -7,6 +7,7 @@ Attempt/Operation. There is no hidden planner, alternate scheduler or model loop
 """
 
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Protocol, cast
 
@@ -50,6 +51,7 @@ from creatidy_kernel.ports.verification import (
 
 
 class OrdinaryStore(IntakeStore, OwnershipStore, Protocol):
+    def report_revision_guard(self, program_id: str, revision: int) -> AbstractContextManager[None]: ...
     def work_decision_time(self, program_id: str) -> int: ...
     def check_work_authority(self, program_id: str) -> None: ...
     def find_operation(self, operation_id: str) -> OperationRecord | None: ...
@@ -737,19 +739,25 @@ class OrdinaryWorkClient:
             app.check(self.approved)
             self.control.candidate_subject(claim)
 
-        return receive_candidate(
-            app.store,
-            program,
-            attempt.attempt_id,
-            candidate,
-            collection,
-            app.verification,
-            now=app.store.work_decision_time(attempt.program_id),
-            clock=lambda: app.store.work_decision_time(attempt.program_id),
-            artifact_path="candidate.patch",
-            product_reviewer=self.reviewer,
-            deadline=self.approved.expires_at,
-            current_subject=current,
-            review_delivery=lambda operation, lease: self.control.dispatch(claim, operation, lease_seconds=lease),
-            admitted_checks=collection.checks,
+        guard = (
+            nullcontext()
+            if expected_revision is None
+            else app.store.report_revision_guard(program.program_id, program.revision)
         )
+        with guard:
+            return receive_candidate(
+                app.store,
+                program,
+                attempt.attempt_id,
+                candidate,
+                collection,
+                app.verification,
+                now=app.store.work_decision_time(attempt.program_id),
+                clock=lambda: app.store.work_decision_time(attempt.program_id),
+                artifact_path="candidate.patch",
+                product_reviewer=self.reviewer,
+                deadline=self.approved.expires_at,
+                current_subject=current,
+                review_delivery=lambda operation, lease: self.control.dispatch(claim, operation, lease_seconds=lease),
+                admitted_checks=collection.checks,
+            )

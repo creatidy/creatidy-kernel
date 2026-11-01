@@ -22,9 +22,12 @@ dispatches work, renews a lease or grants authority. A snapshot contains the Pro
 work-unit and Attempt facts, recorded budget revocation, exact reservation/Operation correlations and
 per-Program served-command receipt coverage. Route identity and physical settlement remain explicitly
 unknown where no producer supplies them. Claim generation, recorded proof stages, quarantine, release,
-latest recorded workspace subject and recorded reconciliation need are journal facts, not a fresh
-filesystem scan, current lease guarantee or physical-settlement assertion. Usage values are grouped by metric, unit and provenance as
-known subtotals; unreported work remains unknown and is never counted as zero.
+recorded workspace subject and recorded reconciliation need are journal facts, not a fresh
+filesystem scan, current lease guarantee or physical-settlement assertion. When multiple subjects were
+observed, the legacy journal cannot establish their last visit, so these fields are unknown. Recorded
+workspace, candidate and runtime identifiers and review dispositions are correlated to their Attempt;
+absent evidence remains unknown. Usage values are grouped by metric, unit and provenance as known
+subtotals; unreported work remains unknown and is never counted as zero.
 
 Progress positions contain an ephemeral producer epoch, Program scope and monotonically increasing
 sequence. The bounded buffer is an observation hint, **not a durable global event log**. Because a
@@ -40,6 +43,14 @@ after the descriptor becomes readable, then detach one-shot channels. Separate w
 capabilities are bound to their existing trusted `OrdinaryWorkClient` or `OrdinaryProgram` objects; a
 wire payload cannot select a `Principal`, policy, provider credential, outbox fence or review verdict.
 Closing/revoking a descriptor revokes communication only, not task authority or physical settlement.
+
+For optional local alerts the host may bind a connected `AF_UNIX` datagram endpoint to
+`LocalDecisionNotifier` and supply it to a `LocalWorkerSession`. A completed served report publishes
+bounded `decision-required` hints without blocking and deduplicates each decision within that notifier's
+lifetime. Full, closed or unavailable endpoints set `dropped` rather than retrying work; after loss,
+restart, or reconnect the consumer must read the authoritative snapshot. The host may also call
+`publish(snapshot)` after other owner-thread changes; notifications exist only while the host services
+the session and are not a persistent service or remote notification guarantee.
 
 Frames use a four-byte network-order length and UTF-8 JSON version1; input is bounded to64KiB and
 output to1MiB. Read actions are `snapshot` and `events`. The worker capability accepts `claim`,
