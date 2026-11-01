@@ -232,16 +232,16 @@ class OrdinaryGitWorkspace:
             path = raw_path.decode()
             if kind != b"blob" or mode not in {b"100644", b"100755"}:
                 raise IntakeRefused("ordinary profile requires regular source files; no symlink/submodule adoption")
-            target = self.workspace.path / path
-            check_current()
-            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             contents = self._git("cat-file", "blob", oid.decode())
             expected_files[path] = (mode, contents)
             expected_directories.update(str(parent) for parent in Path(path).parents if str(parent) != ".")
-            check_current()
-            target.write_bytes(contents)
-            check_current()
-            target.chmod(0o755 if mode == b"100755" else 0o644)
+        self.workspace.materialize(
+            tuple(
+                (path, content, 0o755 if mode == b"100755" else 0o644)
+                for path, (mode, content) in expected_files.items()
+            ),
+            check_current,
+        )
         self._attempt = attempt
         subject, captured = self.workspace.capture()
         entries = cast(list[dict[str, object]], object_from(captured)["entries"])

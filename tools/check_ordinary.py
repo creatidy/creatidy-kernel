@@ -119,6 +119,12 @@ for exercise in ("claim-expired", "claim-expired-reopen", "claim-revoked", "clai
         "native_sends": 0,
     }:
         raise SystemExit("installed preparation used historical claim authority")
+for exercise in ("injected-file", "injected-symlink", "injected-hardlink"):
+    if run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise) != {
+        "status": "refused",
+        "native_sends": 0,
+    }:
+        raise SystemExit("installed materialization accepted an unexpected existing entry")
 if run_ordinary_flow(
     storage / "claim-revoked-during-preparation", None, mode="pull", exercise="claim-revoked-during-preparation"
 ) != {"status": "refused", "native_sends": 0}:

@@ -9,6 +9,7 @@ from ordinary_flow_fixture import run_ordinary_flow
 from test_sqlite_store import sqlite_tmp_path as sqlite_tmp_path
 
 from creatidy_kernel.adapters.ordinary_workspace import OrdinaryGitWorkspace
+from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.domain import AttemptSpec
 from creatidy_kernel.core.intake import IntakeRefused
@@ -66,6 +67,112 @@ def test_revocation_during_preparation_stops_before_next_git_mutation(sqlite_tmp
         mode="pull",
         exercise="claim-revoked-during-preparation",
     ) == {"status": "refused", "native_sends": 0}
+
+
+@pytest.mark.parametrize("exercise", ["injected-file", "injected-symlink", "injected-hardlink"])
+def test_preparation_preserves_late_manual_entry_without_following_links(sqlite_tmp_path: Path, exercise: str) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise) == {
+        "status": "refused",
+        "native_sends": 0,
+    }
+
+
+@pytest.mark.parametrize("kind", ["file", "symlink", "hardlink", "directory"])
+def test_materialization_exclusive_create_blocks_last_moment_insertion(sqlite_tmp_path: Path, kind: str) -> None:
+    parent = sqlite_tmp_path / "owned"
+    parent.mkdir(mode=0o700)
+    workspace = LocalOwnedWorkspace(parent, "leaf", create=True)
+    external = sqlite_tmp_path / "external"
+    external.write_bytes(b"original manual data\n")
+    external.chmod(0o640)
+    calls = 0
+
+    def check_current() -> None:
+        nonlocal calls
+        calls += 1
+        if calls != 2:
+            return
+        target = workspace.path / ("directory" if kind == "directory" else "file")
+        if kind == "file":
+            target.write_bytes(b"original manual data\n")
+            target.chmod(0o640)
+        elif kind == "symlink":
+            target.symlink_to(external)
+        elif kind == "hardlink":
+            os.link(external, target)
+        else:
+            target.mkdir()
+            (target / "manual").write_bytes(b"original manual data\n")
+
+    relative = "directory/file" if kind == "directory" else "file"
+    with pytest.raises(OwnershipConflict):
+        workspace.materialize(((relative, b"controller data\n", 0o755),), check_current)
+    preserved = workspace.path / "file" if kind == "file" else external
+    assert preserved.read_bytes() == b"original manual data\n"
+    assert preserved.stat().st_mode & 0o777 == 0o640
+    if kind == "directory":
+        assert (workspace.path / "directory/manual").read_bytes() == b"original manual data\n"
+
+
+def test_materialization_refuses_renamed_open_file_without_following_replacement(sqlite_tmp_path: Path) -> None:
+    parent = sqlite_tmp_path / "owned"
+    parent.mkdir(mode=0o700)
+    workspace = LocalOwnedWorkspace(parent, "leaf", create=True)
+    external = sqlite_tmp_path / "external"
+    external.write_bytes(b"outside data\n")
+    external.chmod(0o640)
+    calls = 0
+
+    def check_current() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            (workspace.path / "file").rename(workspace.path / "controller-file")
+            (workspace.path / "file").symlink_to(external)
+
+    with pytest.raises(OwnershipConflict):
+        workspace.materialize((("file", b"controller data\n", 0o755),), check_current)
+    assert external.read_bytes() == b"outside data\n"
+    assert external.stat().st_mode & 0o777 == 0o640
+
+
+def test_materialization_preserves_partial_file_when_authority_is_revoked(sqlite_tmp_path: Path) -> None:
+    parent = sqlite_tmp_path / "owned"
+    parent.mkdir(mode=0o700)
+    workspace = LocalOwnedWorkspace(parent, "leaf", create=True)
+    calls = 0
+
+    def check_current() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise OwnershipConflict("synthetic authority revocation")
+
+    with pytest.raises(OwnershipConflict, match="revocation"):
+        workspace.materialize((("file", b"controller data\n", 0o755),), check_current)
+    assert (workspace.path / "file").read_bytes() == b""
+
+
+def test_materialization_refuses_replaced_directory_without_following_link(sqlite_tmp_path: Path) -> None:
+    parent = sqlite_tmp_path / "owned"
+    parent.mkdir(mode=0o700)
+    workspace = LocalOwnedWorkspace(parent, "leaf", create=True)
+    external = sqlite_tmp_path / "outside"
+    external.mkdir()
+    (external / "b").write_bytes(b"outside bytes\n")
+    calls = 0
+
+    def check_current() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 5:
+            (workspace.path / "directory").rename(workspace.path / "retained-directory")
+            (workspace.path / "directory").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(OwnershipConflict):
+        workspace.materialize((("directory/a", b"first\n", 0o644), ("directory/b", b"second\n", 0o644)), check_current)
+    assert (external / "b").read_bytes() == b"outside bytes\n"
+    assert (workspace.path / "retained-directory/a").read_bytes() == b"first\n"
 
 
 def test_changed_preparation_is_preserved_and_not_auto_attributed(

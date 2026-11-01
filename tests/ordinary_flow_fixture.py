@@ -616,6 +616,51 @@ print("Done")
                 )
                 client = app.client(approved, Principal("worker", "worker"), workspace, worker, control, reviewer)
                 command_key = "owner-assignment-" + leaf
+                if exercise in {"injected-file", "injected-symlink", "injected-hardlink"}:
+                    original_git = cast(Callable[..., bytes], inspect.getattr_static(OrdinaryGitWorkspace, "_git"))
+                    external = root / "manual-external"
+                    external.write_bytes(b"preserve original manual bytes\n")
+                    external.chmod(0o640)
+                    target = tree.path / "alpha.py"
+                    inserted = [False]
+
+                    def inject_after_tree(
+                        workspace_arg: OrdinaryGitWorkspace,
+                        *arguments: str,
+                        index: Path | None = None,
+                        source: Path | None = None,
+                        original: Callable[..., bytes] = original_git,
+                        flag: list[bool] = inserted,
+                        destination: Path = target,
+                        outside: Path = external,
+                    ) -> bytes:
+                        result = original(workspace_arg, *arguments, index=index, source=source)
+                        if arguments[0] == "ls-tree" and not flag[0]:
+                            flag[0] = True
+                            if exercise == "injected-file":
+                                destination.write_bytes(b"preserve original manual bytes\n")
+                                destination.chmod(0o640)
+                            elif exercise == "injected-symlink":
+                                destination.symlink_to(outside)
+                            else:
+                                os.link(outside, destination)
+                        return result
+
+                    with patch.object(OrdinaryGitWorkspace, "_git", inject_after_tree):
+                        try:
+                            client.request(command_key, lease_seconds=300)
+                        except (ValueError, OSError):
+                            pass
+                        else:
+                            raise AssertionError("unexpected manually inserted workspace entry was accepted")
+                    assert inserted[0]
+                    original = target if exercise == "injected-file" else external
+                    assert original.read_bytes() == b"preserve original manual bytes\n"
+                    assert original.stat().st_mode & 0o777 == 0o640
+                    assert not native_state["sends"]
+                    assert store.operations("work-budget:v1:ownership-claim:")
+                    assert not store.operations("work-budget:v1:ownership-release:")
+                    return {"status": "refused", "native_sends": 0}
                 if exercise == "claim-revoked-during-preparation":
                     git_call = cast(Callable[..., bytes], inspect.getattr_static(OrdinaryGitWorkspace, "_git"))
                     observed: list[str] = []
