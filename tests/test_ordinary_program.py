@@ -227,6 +227,13 @@ def test_separate_local_work_client_uses_host_bound_claim_capability(sqlite_tmp_
     ) == {"status": "checked", "native_sends": 0}
 
 
+def test_separate_client_reads_original_remediation_context(sqlite_tmp_path: Path) -> None:
+    result = run_ordinary_flow(
+        sqlite_tmp_path / "review-remediation-served", None, mode="pull", exercise="review-remediation-served"
+    )
+    assert result["status"] == "completed"
+
+
 def test_separate_client_invocations_share_host_bound_worker_session(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(
         sqlite_tmp_path / "served-multi-client", None, mode="pull", exercise="served-multi-client"

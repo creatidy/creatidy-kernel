@@ -699,19 +699,29 @@ class SQLiteProgramStore:
             return None if row is None else self.operation(operation_id)
 
     def served_operations(self, program_id: str) -> tuple[OperationRecord, ...]:
-        """Read one bounded Program-specific command namespace, not a global event log."""
+        """Read a bounded sample of one Program's command namespace."""
         self._assert_writer_thread()
         self._validate_program_id(program_id)
         prefix = command_prefix(program_id)
         with self._gate:
             rows = self._connection.execute(
                 "SELECT operation_id FROM operations WHERE operation_id >= ? AND operation_id < ? "
-                "ORDER BY operation_id LIMIT 4097",
+                "ORDER BY operation_id LIMIT 64",
                 (prefix, prefix + "\U0010ffff"),
             ).fetchall()
-            if len(rows) > 4096:
-                raise OperationConflict("served command projection exceeds its supported bound")
             return tuple(self.operation(cast(str, row["operation_id"])) for row in rows)
+
+    def served_operation_count(self, program_id: str) -> int:
+        """Count durable commands without materializing unbounded history."""
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        prefix = command_prefix(program_id)
+        with self._gate:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM operations WHERE operation_id >= ? AND operation_id < ?",
+                (prefix, prefix + "\U0010ffff"),
+            ).fetchone()
+            return cast(int, row[0])
 
     def served_claims(self, program_id: str) -> tuple[dict[str, object], ...]:
         """Project only recorded ownership facts for one Program, without sampling authority."""

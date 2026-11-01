@@ -25,6 +25,7 @@ def main(argv: list[str] | None = None) -> int:
             "snapshot",
             "events",
             "claim",
+            "context",
             "start",
             "quiesce",
             "renew",
@@ -79,6 +80,22 @@ def main(argv: list[str] | None = None) -> int:
                 "remediation_of": args.remediation_of,
             }
         )
+    elif args.action == "context":
+        if args.claim_id is None:
+            parser.error("context requires --claim-id")
+        if any(
+            value is not None
+            for value in (
+                args.command_id,
+                args.expected_revision,
+                args.lease_seconds,
+                args.remediation_of,
+                args.receipt,
+                args.reason,
+            )
+        ):
+            parser.error("context accepts only --claim-id")
+        request["claim_id"] = args.claim_id
     elif args.action in {"start", "quiesce", "renew", "submit", "report"}:
         if args.command_id is None or args.expected_revision is None or args.claim_id is None:
             parser.error("action requires --command-id, --expected-revision and --claim-id")

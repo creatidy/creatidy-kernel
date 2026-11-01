@@ -153,6 +153,11 @@ for exercise, expected in (
         "native_sends": 0,
     }:
         raise SystemExit("installed role-bound command did not preserve its authority boundary")
+remediation = run_ordinary_flow(
+    storage / "review-remediation-served", None, mode="pull", exercise="review-remediation-served"
+)
+if remediation["status"] != "completed" or remediation["satisfactions"] != 2:
+    raise SystemExit("installed worker did not receive and complete original remediation context")
 if run_ordinary_flow(storage / "served-managed-stop", None, mode="managed", exercise="served-managed-stop") != {
     "status": "stopped",
     "native_sends": 0,

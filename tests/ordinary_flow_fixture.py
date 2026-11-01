@@ -321,7 +321,13 @@ def run_ordinary_flow(
         review_peer(
             root / "native",
             native_binary,
-            reject_first=exercise in {"review-remediation", "review-remediation-tampered", "served-report-decision"},
+            reject_first=exercise
+            in {
+                "review-remediation",
+                "review-remediation-tampered",
+                "review-remediation-served",
+                "served-report-decision",
+            },
             lose_first_reply=exercise in {"review-lost", "review-lost-reopen"},
         ) as (review_origin, calls),
         ExitStack() as owners,
@@ -780,7 +786,8 @@ print("Done")
             rejected_attempt: str | None = None
             for position, unit in enumerate(
                 ("alpha", "alpha", "beta")
-                if exercise in {"remediation", "review-remediation", "review-remediation-tampered"}
+                if exercise
+                in {"remediation", "review-remediation", "review-remediation-tampered", "review-remediation-served"}
                 else units
             ):
                 ordinal = units.index(unit)
@@ -1098,6 +1105,39 @@ print("Done")
                             first = json.loads(read_frame(worker_socket, bound=1024 * 1024))["result"]
                         assert first["program_id"] == "everyday-program"
                         assert len(store.load("everyday-program").attempts) == 1
+                        if exercise == "served-claim-process":
+                            process = subprocess.Popen(  # noqa: S603 - Installed module with a host-bound descriptor.
+                                [
+                                    sys.executable,
+                                    "-I",
+                                    "-m",
+                                    "creatidy_kernel.adapters.served_client",
+                                    "--fd",
+                                    str(worker_socket.fileno()),
+                                    "context",
+                                    "--claim-id",
+                                    command_key,
+                                ],
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                pass_fds=(worker_socket.fileno(),),
+                                env={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                            )
+                            try:
+                                assert select.select([owner_socket], [], [], 10)[0]
+                                server.serve_once()
+                                stdout, stderr = process.communicate(timeout=10)
+                                assert process.returncode == 0, stderr.decode(errors="replace")
+                                context = json.loads(stdout)["result"]
+                                assert context["work_unit"] == unit
+                                assert context["approved"] == json.loads(encode(proposal.payload))
+                                assert isinstance(context["inputs"], list)
+                                assert context["remediation"] is None
+                            finally:
+                                if process.poll() is None:
+                                    process.kill()
+                                    process.wait(timeout=10)
                         if exercise == "served-cross-action-id":
                             start = {
                                 "version": 1,
@@ -1880,6 +1920,50 @@ print("Done")
                     assert remediation["findings"][0]["finding_id"] == "msg_synthetic_result:0"
                     assert remediation["findings"][0]["fingerprint"] == "edge-case"
                     assert remediation["findings"][0]["reason"] == "Implement the approved edge case."
+                if exercise == "review-remediation-served" and position == 1:
+                    owner_socket, worker_socket = socket.socketpair()
+                    with owner_socket, worker_socket:
+                        server = LocalWorkerChannel(
+                            OwnerProjection(store, "everyday-program"),
+                            owner_socket,
+                            client,
+                            handoffs={"remediation-claim": handoff},
+                        )
+                        process = subprocess.Popen(  # noqa: S603 - Installed client and trusted local descriptor.
+                            [
+                                sys.executable,
+                                "-I",
+                                "-m",
+                                "creatidy_kernel.adapters.served_client",
+                                "--fd",
+                                str(worker_socket.fileno()),
+                                "context",
+                                "--claim-id",
+                                "remediation-claim",
+                            ],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            pass_fds=(worker_socket.fileno(),),
+                            env={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                        )
+                        try:
+                            assert select.select([owner_socket], [], [], 10)[0]
+                            server.serve_once()
+                            stdout, stderr = process.communicate(timeout=10)
+                            assert process.returncode == 0, stderr.decode(errors="replace")
+                            context = json.loads(stdout)["result"]
+                            assert context["approved"] == json.loads(encode(proposal.payload))
+                            assert context["work_unit"] == unit and isinstance(context["inputs"], list)
+                            assert context["remediation"]["attempt"] == rejected_attempt
+                            assert (
+                                context["remediation"]["findings"][0]["reason"] == "Implement the approved edge case."
+                            )
+                            unit = cast(str, context["work_unit"])
+                        finally:
+                            if process.poll() is None:
+                                process.kill()
+                                process.wait(timeout=10)
                 if exercise == "reopen" and ordinal == 0:
                     store.close()
                     store = owners.enter_context(SQLiteProgramStore(root / "state.db", boot_clock=boot_clock))
@@ -2385,7 +2469,10 @@ print("Done")
                     assert not (tree.path / "base.py").exists()
                     assert (tree.path / "renamed.py").read_text() == "BASELINE = True\n"
                     return {"status": "rejected", "native_sends": 0}
-                if exercise in {"review-remediation", "review-remediation-tampered"} and position == 0:
+                if (
+                    exercise in {"review-remediation", "review-remediation-tampered", "review-remediation-served"}
+                    and position == 0
+                ):
                     assert outcome == "rejected"
                     assert not store.load("everyday-program").satisfactions and not native_state["sends"]
                     control.release(handoff.claim, evidence="owner reconciled the reviewed original workspace")

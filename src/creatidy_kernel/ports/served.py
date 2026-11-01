@@ -19,6 +19,7 @@ class ServedStore(Protocol):
     def work_budget_revoked(self, program_id: str) -> bool | None: ...
     def find_operation(self, operation_id: str) -> OperationRecord | None: ...
     def served_operations(self, program_id: str) -> tuple[OperationRecord, ...]: ...
+    def served_operation_count(self, program_id: str) -> int: ...
     def served_claims(self, program_id: str) -> tuple[dict[str, object], ...]: ...
     def find_artifact(self, operation_id: str, name: str) -> bytes | None: ...
 
@@ -35,6 +36,7 @@ class ServedSnapshot:
     attempts: tuple[tuple[str, str, str, str], ...]
     reservations: tuple[tuple[str, str, str, str | None], ...]
     commands: tuple[tuple[str, str, str, str, str], ...]
+    command_coverage: tuple[int, int, bool]
     claims: tuple[dict[str, object], ...]
     correlations: tuple[dict[str, object], ...]
     decisions: tuple[dict[str, object], ...]
@@ -126,6 +128,10 @@ class OwnerProjection:
                     decisions.append({"source": "served-command", "command_id": key, "status": value["status"]})
             commands.append((cast(str, key), cast(str, action), cast(str, actor), operation.status, recorded))
         command_facts = tuple(sorted(commands))
+        command_total = self._store.served_operation_count(self._scope)
+        if type(command_total) is not int or command_total < len(command_facts):
+            raise ValueError("producer command coverage is inconsistent")
+        command_coverage = (len(command_facts), command_total, command_total == len(command_facts))
         claims = self._store.served_claims(self._scope) if program is not None else ()
         if type(claims) is not tuple or len(claims) > 4096:
             raise ValueError("producer claim projection is unavailable or exceeds its bound")
@@ -214,6 +220,7 @@ class OwnerProjection:
             "attempts": attempts,
             "reservations": retained,
             "commands": command_facts,
+            "command_coverage": command_coverage,
             "claims": claims,
             "correlations": correlation_facts,
             "decisions": decision_facts,
@@ -238,6 +245,7 @@ class OwnerProjection:
             attempts,
             retained,
             command_facts,
+            command_coverage,
             claims,
             correlation_facts,
             decision_facts,
@@ -252,5 +260,8 @@ class OwnerProjection:
 
     def events(self, after: ProgressPosition, *, limit: int = 256) -> ProgressBatch:
         """Read retained hints without invoking a command, dispatcher or clock renewal."""
-        self.snapshot()
-        return self._buffer.read(after, limit=limit)
+        snapshot = self.snapshot()
+        result = self._buffer.read(after, limit=limit)
+        if not snapshot.command_coverage[2]:
+            return ProgressBatch((), snapshot.position, True)
+        return result

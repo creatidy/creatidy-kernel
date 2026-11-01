@@ -181,6 +181,16 @@ class LocalWorkerChannel(LocalReadChannel):
         self._notifier = notifier
 
     def _dispatch(self, request: dict[str, object]) -> object:
+        if request.get("action") == "context":
+            if set(request) != {"version", "action", "claim_id"}:
+                raise LocalChannelRefused("invalid context request")
+            claim_id = request["claim_id"]
+            if type(claim_id) is not str or claim_id not in self._handoffs:
+                raise LocalChannelRefused("context requires the original bound handoff")
+            context = self._worker.context(self._handoffs[claim_id])
+            if len(context) > MAX_RESPONSE // 2:
+                raise LocalChannelRefused("work context exceeds its supported bound")
+            return object_from(context)
         if request.get("action") == "start":
             return self._start(request)
         if request.get("action") == "quiesce":

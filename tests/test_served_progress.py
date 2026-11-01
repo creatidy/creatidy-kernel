@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
 
@@ -257,3 +258,33 @@ def test_claim_projection_refuses_excess_without_affecting_other_program(sqlite_
         with pytest.raises(OwnershipConflict, match="exceeds its supported bound"):
             store.served_claims("program-1")
         assert store.served_claims("program-2") == ()
+
+
+def test_command_history_overflow_keeps_snapshot_and_resync_available(sqlite_tmp_path: Path) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / "command-history.db", boot_clock=Clock()) as store:
+        program = initialize(store)
+        projection = OwnerProjection(store, program.program_id)
+        initial = projection.snapshot()
+        prefix = command_prefix(program.program_id)
+        rows: list[tuple[str, str, str, str]] = []
+        for index in range(4097):
+            command_id = f"{index:05d}" + "x" * 251
+            operation = prefix + digest(encode(["worker", command_id]))
+            request = {
+                "request": {
+                    "command_id": command_id,
+                    "action": "renew",
+                    "scope": program.program_id,
+                    "actor": "worker",
+                }
+            }
+            rows.append((operation, operation, encode(request).decode(), "0" * 64))
+        connection(store).executemany(
+            "INSERT INTO operations (operation_id, effect_key, request_json, request_digest) VALUES (?, ?, ?, ?)", rows
+        )
+        current = projection.snapshot()
+        assert current.command_coverage == (64, 4097, False)
+        assert len(current.commands) == 64
+        assert len(encode(asdict(current))) < 1024 * 1024
+        assert projection.events(initial.position).gap is True
+        assert projection.events(current.position).gap is True

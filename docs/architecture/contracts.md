@@ -20,7 +20,10 @@ The version-1 local contract is implemented by `ports.served.OwnerProjection` an
 the handler on that same owning thread. The observer never opens the database or changes an Attempt,
 dispatches work, renews a lease or grants authority. A snapshot contains the Program revision/spec,
 work-unit and Attempt facts, recorded budget revocation, exact reservation/Operation correlations and
-per-Program served-command receipt coverage. Route identity and physical settlement remain explicitly
+per-Program served-command receipt coverage. Command history is a deterministic sample of at most 64
+records, with `(sampled, total, complete)` coverage; when incomplete there is no history continuation
+API, but a caller can replay a known exact command ID to read its own historical receipt. It is not a
+complete event log. Route identity and physical settlement remain explicitly
 unknown where no producer supplies them. Claim generation, recorded proof stages, quarantine, release,
 recorded workspace subject and recorded reconciliation need are journal facts, not a fresh
 filesystem scan, current lease guarantee or physical-settlement assertion. When multiple subjects were
@@ -35,6 +38,8 @@ snapshot sampler cannot prove it observed every intermediate mutation, a detecte
 `resync-required` hint with `gap=true`; restart, wrong producer/scope, future position and buffer
 overflow also require a fresh snapshot. Reads and reconnects cannot dispatch or renew. Positions from
 Forgejo pagination or native runtime notifications are not interchangeable with this producer position.
+While command coverage is incomplete, event reads continue to report a gap because the sampled history
+cannot prove it observed changes to omitted receipts.
 
 The host creates an already-connected local `socket.socketpair()` and binds one endpoint to a
 `LocalReadChannel`, `LocalWorkerSession` or `LocalOwnerSession`; it passes only the peer descriptor to
@@ -54,7 +59,10 @@ the session and are not a persistent service or remote notification guarantee.
 
 Frames use a four-byte network-order length and UTF-8 JSON version1; input is bounded to64KiB and
 output to1MiB. Read actions are `snapshot` and `events`. The worker capability accepts `claim`,
-`start`, `quiesce`, `renew`, `submit` and `report`; the owner capability accepts `approve`, `reconcile`,
+`context`, `start`, `quiesce`, `renew`, `submit` and `report`; `context` is bounded and uses the bound
+original claim's existing authorization and workspace-observation handler to supply the approved
+declaration, effective inputs and any original remediation findings. It is not a historical grant of
+authority and can be refused after expiry or revocation. The owner capability accepts `approve`, `reconcile`,
 `start-managed` and `stop`. Mutations require a command ID and caller-observed expected Program revision
 (`-1` means absent for initial approval). Trusted host composition binds an exact approved proposal,
 claim and managed target where applicable; the request cannot choose them. Exact duplicate command
