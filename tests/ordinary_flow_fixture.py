@@ -2043,8 +2043,41 @@ print("Done")
                             managed = OrdinaryManagedRun(client, workspace, connection)
                     else:
                         managed = OrdinaryManagedRun(client, workspace, connection)
-                    if exercise in {"served-managed-start", "served-managed-start-race"}:
+                    if exercise in {"served-managed-start", "served-managed-start-race", "served-managed-worker-start"}:
                         initial = store.load("everyday-program")
+                        if exercise == "served-managed-worker-start":
+                            before_operation = store.operation(handoff.claim.operation_id)
+                            before_commands = store.operations(command_prefix("everyday-program"))
+                            worker_owner, worker_peer = socket.socketpair()
+                            with worker_owner, worker_peer:
+                                worker_channel = LocalWorkerChannel(
+                                    OwnerProjection(store, "everyday-program"),
+                                    worker_owner,
+                                    client,
+                                    handoffs={"managed-claim": handoff},
+                                )
+                                write_frame(
+                                    worker_peer,
+                                    encode(
+                                        {
+                                            "version": 1,
+                                            "action": "start",
+                                            "command_id": "worker-managed-start",
+                                            "expected_revision": initial.revision,
+                                            "claim_id": "managed-claim",
+                                        }
+                                    ),
+                                    bound=65536,
+                                )
+                                try:
+                                    worker_channel.serve_once()
+                                except LocalChannelRefused:
+                                    pass
+                                else:
+                                    raise AssertionError("worker started a managed handoff")
+                            assert store.load("everyday-program") == initial
+                            assert store.operation(handoff.claim.operation_id) == before_operation
+                            assert store.operations(command_prefix("everyday-program")) == before_commands
                         owner_socket, owner_client = socket.socketpair()
                         with owner_socket, owner_client:
                             owner_channel = LocalOwnerChannel(

@@ -70,6 +70,8 @@ inputs return their original receipt as historical evidence, not renewed permiss
 exists but its outcome receipt is missing, the response is `unknown` and no automatic repeat occurs.
 Cooperative task-scope quiescence is never represented as managed process settlement; a STOP receipt
 can prove at most its one explicitly bound original managed target, not all effects or descendants.
+Worker `start` is limited to pull handoffs; a managed handoff can start only through the original owner's
+`start-managed` capability.
 
 This descriptor capability assumes a trusted local host chooses and passes the correct endpoint; it
 is not remote authentication, a named service socket, hostile same-UID isolation or a grant to expose

@@ -271,6 +271,8 @@ class LocalWorkerChannel(LocalReadChannel):
         ):
             raise LocalChannelRefused("invalid start values or unbound handoff")
         handoff = self._handoffs[claim_id]
+        if handoff.claim.mode is not HandoffMode.PULL:
+            raise LocalChannelRefused("managed starts require the original owner capability")
 
         def execute() -> dict[str, object]:
             self._worker.start(handoff, expected_revision=revision)

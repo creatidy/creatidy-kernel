@@ -127,6 +127,12 @@ def test_owner_channel_starts_managed_once_then_stops_original_target(sqlite_tmp
     ) == {"status": "stopped", "native_sends": 0}
 
 
+def test_worker_cannot_start_managed_handoff_before_owner(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "managed-worker-start", None, mode="managed", exercise="served-managed-worker-start"
+    ) == {"status": "stopped", "native_sends": 0}
+
+
 def test_separate_owner_client_stops_only_original_managed_target(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(
         sqlite_tmp_path / "served-managed-stop-cli", None, mode="managed", exercise="served-managed-stop-cli"

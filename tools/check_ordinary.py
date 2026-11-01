@@ -174,6 +174,10 @@ if run_ordinary_flow(storage / "served-managed-start", None, mode="managed", exe
 }:
     raise SystemExit("installed managed start/replay/STOP did not retain the original target")
 if run_ordinary_flow(
+    storage / "served-managed-worker-start", None, mode="managed", exercise="served-managed-worker-start"
+) != {"status": "stopped", "native_sends": 0}:
+    raise SystemExit("installed managed worker start consumed or stranded the owner target")
+if run_ordinary_flow(
     storage / "served-managed-start-race", None, mode="managed", exercise="served-managed-start-race"
 ) != {"status": "refused", "native_sends": 0}:
     raise SystemExit("installed managed start failed to fence a stale caller revision")
