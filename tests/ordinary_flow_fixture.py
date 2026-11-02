@@ -74,6 +74,7 @@ from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.intake import (
     Declaration,
     Disposition,
+    IntakeEvidence,
     IntakeRefused,
     IssueSubject,
     OwnerPolicy,
@@ -2250,7 +2251,31 @@ print("Done")
                             )
                         assert not native_state["sends"]
                         return {"status": "stopped", "native_sends": 0}
-                    managed.start(handoff)
+                    if exercise == "review-remediation":
+                        intake_observations: list[IntakeEvidence] = []
+                        read_evidence = OwnerReviewedForgejoEvidence.read
+
+                        def capture_evidence(
+                            target: OwnerReviewedForgejoEvidence,
+                            subject: IssueSubject,
+                            declaration: Declaration,
+                            original: Callable[
+                                [OwnerReviewedForgejoEvidence, IssueSubject, Declaration], IntakeEvidence
+                            ] = read_evidence,
+                            results: list[IntakeEvidence] = intake_observations,
+                        ) -> IntakeEvidence:
+                            evidence = original(target, subject, declaration)
+                            results.append(evidence)
+                            return evidence
+
+                        try:
+                            with patch.object(OwnerReviewedForgejoEvidence, "read", capture_evidence):
+                                managed.start(handoff)
+                        except IntakeRefused as error:
+                            proof = [item.payload() for item in intake_observations]
+                            raise AssertionError(f"synthetic managed intake observations: {proof!r}") from error
+                    else:
+                        managed.start(handoff)
                     if exercise == "served-managed-stop-cli":
                         before = store.load("everyday-program")
                         binding = LocalOwnerSession(
