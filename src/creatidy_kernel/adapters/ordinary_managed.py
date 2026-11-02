@@ -52,6 +52,7 @@ class OrdinaryManagedRun:
         self.request: ExecutionRequest | None = None
         self.handle: str | None = None
         self.fence: int | None = None
+        self.start_revision: int | None = None
 
     def inputs(self, request: ExecutionRequest) -> CodexInputs:
         if self.handoff is None or request != self.request:
@@ -72,7 +73,12 @@ class OrdinaryManagedRun:
         if request != self.request or self.fence is None:
             return False
         self.client.application.check(self.client.approved)
-        self.client.application.store.check_operation_delivery(request.operation.operation_id, self.fence)
+        if self.start_revision is None:
+            self.client.application.store.check_operation_delivery(request.operation.operation_id, self.fence)
+        else:
+            self.client.application.store.check_operation_delivery(
+                request.operation.operation_id, self.fence, expected_revision=self.start_revision
+            )
         return True
 
     def candidate(self, request: ExecutionRequest):
@@ -80,7 +86,7 @@ class OrdinaryManagedRun:
             raise IntakeRefused("original native candidate request required")
         return self.workspace.collect(request.attempt, self.handoff.claim)[0]
 
-    def start(self, handoff: OrdinaryHandoff) -> str:
+    def start(self, handoff: OrdinaryHandoff, *, expected_revision: int | None = None) -> str:
         app = self.client.application
         self.handoff = handoff
         original = app.store.operation(handoff.claim.operation_id)
@@ -90,7 +96,12 @@ class OrdinaryManagedRun:
             self.fence = original.fence
             self.workspace.restore(handoff.attempt)
         else:
-            self.fence = self.client.start(handoff)
+            self.fence = self.client.start(handoff, expected_revision=expected_revision)
+            if expected_revision is not None:
+                current_revision = app.store.load(handoff.attempt.program_id).revision
+                if current_revision != expected_revision + 1:
+                    raise IntakeRefused("caller expected revision changed during managed start")
+                self.start_revision = current_revision
         if self.fence is None:
             raise IntakeRefused("cooperative pull claim cannot dispatch managed Runtime")
         operation = app.store.operation(handoff.claim.operation_id)

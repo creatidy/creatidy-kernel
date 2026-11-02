@@ -104,6 +104,91 @@ for exercise in ("managed-program-stop", "managed-budget-revoke"):
         "native_sends": 0,
     }:
         raise SystemExit("installed managed reconciliation failed to retire the original target")
+if run_ordinary_flow(storage / "served-claim-process", None, mode="pull", exercise="served-claim-process") != {
+    "status": "checked",
+    "native_sends": 0,
+}:
+    raise SystemExit("installed capability-bound work client failed its exact claim and replay")
+if run_ordinary_flow(storage / "served-multi-client", None, mode="pull", exercise="served-multi-client") != {
+    "status": "checked",
+    "native_sends": 0,
+}:
+    raise SystemExit("installed one-shot clients did not share the host-bound worker session")
+for exercise, expected in (("served-start", "checked"), ("served-start-crash", "unknown")):
+    if run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise) != {
+        "status": expected,
+        "native_sends": 0,
+    }:
+        raise SystemExit("installed capability-bound start did not preserve its receipt or unknown outcome")
+for exercise, expected in (
+    ("served-quiesce", "checked"),
+    ("served-owner-stop", "stopped"),
+    ("served-owner-stale", "refused"),
+    ("served-worker-stop", "refused"),
+    ("served-worker-approve", "refused"),
+    ("served-owner-approve", "approved"),
+    ("served-owner-approve-stale", "refused"),
+    ("served-owner-amend", "amended"),
+    ("served-owner-multi-client", "stopped"),
+    ("served-report", "accepted"),
+    ("served-report-decision", "rejected"),
+    ("sdk-review-notify", "rejected"),
+    ("served-unknown-rejected", "rejected"),
+    ("claim-final-observe-race", "refused"),
+    ("claim-final-observe-replay-race", "refused"),
+    ("served-owner-interleaved-amend", "stopped"),
+    ("served-report-forged", "refused"),
+    ("served-report-crash", "unknown"),
+    ("served-reconcile-race", "refused"),
+    ("served-renew", "checked"),
+    ("served-renew-expired", "checked"),
+    ("served-start-expired", "refused"),
+    ("start-revision-race", "refused"),
+    ("quiesce-revision-race", "refused"),
+    ("renew-revision-race", "refused"),
+    ("report-revision-race", "refused"),
+    ("report-verification-revision-race", "refused"),
+    ("report-review-revision-race", "unknown"),
+    ("served-cross-action-id", "refused"),
+    ("approve-revision-race", "refused"),
+    ("stop-atomic-failure", "refused"),
+):
+    if run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise) != {
+        "status": expected,
+        "native_sends": 0,
+    }:
+        raise SystemExit("installed role-bound command did not preserve its authority boundary")
+remediation = run_ordinary_flow(
+    storage / "review-remediation-served", None, mode="pull", exercise="review-remediation-served"
+)
+if remediation["status"] != "completed" or remediation["satisfactions"] != 2:
+    raise SystemExit("installed worker did not receive and complete original remediation context")
+managed_lost = run_ordinary_flow(storage / "managed-review-lost", None, mode="managed", exercise="review-lost")
+if managed_lost["status"] != "completed" or managed_lost["review_calls"] != 2:
+    raise SystemExit("installed managed unknown review did not recover without a second prompt")
+if run_ordinary_flow(storage / "served-managed-stop", None, mode="managed", exercise="served-managed-stop") != {
+    "status": "stopped",
+    "native_sends": 0,
+}:
+    raise SystemExit("installed owner STOP did not settle the original managed target")
+if run_ordinary_flow(storage / "served-managed-stop-cli", None, mode="managed", exercise="served-managed-stop-cli") != {
+    "status": "stopped",
+    "native_sends": 0,
+}:
+    raise SystemExit("installed owner CLI failed to stop its original managed target")
+if run_ordinary_flow(storage / "served-managed-start", None, mode="managed", exercise="served-managed-start") != {
+    "status": "stopped",
+    "native_sends": 0,
+}:
+    raise SystemExit("installed managed start/replay/STOP did not retain the original target")
+if run_ordinary_flow(
+    storage / "served-managed-worker-start", None, mode="managed", exercise="served-managed-worker-start"
+) != {"status": "stopped", "native_sends": 0}:
+    raise SystemExit("installed managed worker start consumed or stranded the owner target")
+if run_ordinary_flow(
+    storage / "served-managed-start-race", None, mode="managed", exercise="served-managed-start-race"
+) != {"status": "refused", "native_sends": 0}:
+    raise SystemExit("installed managed start failed to fence a stale caller revision")
 for exercise in ("baseline-pending", "baseline-unsupported", "baseline-failure", "baseline-error"):
     result = run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise)
     expected = "refused" if exercise in {"baseline-pending", "baseline-unsupported"} else "approved"
@@ -113,7 +198,14 @@ for exercise in ("rejected-replay", "rejected-replay-reopen"):
     result = run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise)
     if result["status"] != "rejected":
         raise SystemExit("installed original rejected result did not replay")
-for exercise in ("claim-expired", "claim-expired-reopen", "claim-revoked", "claim-stale", "claim-generation"):
+for exercise in (
+    "claim-expired",
+    "claim-expired-reopen",
+    "claim-revoked",
+    "claim-stale",
+    "claim-generation",
+    "claim-revision-stale",
+):
     if run_ordinary_flow(storage / exercise, None, mode="pull", exercise=exercise) != {
         "status": "refused",
         "native_sends": 0,

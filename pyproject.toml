@@ -24,6 +24,7 @@ Mirror = "https://github.com/creatidy/creatidy-kernel"
 
 [project.scripts]
 creatidy-kernel = "creatidy_kernel.adapters.cli:main"
+creatidy-kernel-client = "creatidy_kernel.adapters.served_client:main"
 
 [dependency-groups]
 dev = [

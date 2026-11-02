@@ -13,6 +13,100 @@ and missing receipts are in the [coverage roadmap](successor.md), governed by
 [ADR 0007](../adr/0007-shared-harness-routing-observability.md). Ports use core-owned values;
 unsupported requirements must fail closed, not through weaker fallbacks.
 
+## Local Owner-Served Contract
+
+The version-1 local contract is implemented by `ports.served.OwnerProjection` and
+`adapters.served_local`. The trusted host owns the existing exclusive SQLite connection and must call
+the handler on that same owning thread. The observer never opens the database or changes an Attempt,
+dispatches work, renews a lease or grants authority. A snapshot contains the Program revision/spec,
+work-unit and Attempt facts, recorded budget revocation, exact reservation/Operation correlations and
+per-Program served-command receipt coverage. Command history is a deterministic sample of at most 64
+records, with `(sampled, total, complete)` coverage; when incomplete there is no history continuation
+API, but a caller can replay a known exact command ID to read its own historical receipt. It is not a
+complete event log. Route identity and physical settlement remain explicitly
+unknown where no producer supplies them. Claim generation, recorded proof stages, quarantine, release,
+recorded workspace subject and recorded reconciliation need are journal facts, not a fresh
+filesystem scan, current lease guarantee or physical-settlement assertion. When multiple subjects were
+observed, the legacy journal cannot establish their last visit, so these fields are unknown. Recorded
+workspace, candidate and runtime identifiers and review dispositions are correlated to their Attempt;
+absent evidence remains unknown. Decision applicability is `pending`, `historical` or `unknown` based
+on the current Program, WorkUnit and Attempt specification; resolved or superseded decisions remain
+in history but do not generate new action-required alerts. Usage values are grouped by metric, unit and provenance as known
+subtotals; unreported work remains unknown and is never counted as zero.
+
+The status includes the original task deadline, original claim expiry and latest recorded renewal
+horizon. Its clock sample is explicitly uncommitted and display-only: `not-expired-observed` is not
+authorization, and dispatch always repeats the producer's durable clock, budget and claim checks.
+Unverifiable clocks yield `unknown`; expiration or revocation suggests reconciliation or STOP, never
+claims physical settlement, and observing status does not renew or persist a clock sample.
+
+Progress positions contain an ephemeral producer epoch, Program scope and monotonically increasing
+sequence. The bounded buffer is an observation hint, **not a durable global event log**. Because a
+snapshot sampler cannot prove it observed every intermediate mutation, a detected state change emits a
+`resync-required` hint with `gap=true`; restart, wrong producer/scope, future position and buffer
+overflow also require a fresh snapshot. Reads and reconnects cannot dispatch or renew. Positions from
+Forgejo pagination or native runtime notifications are not interchangeable with this producer position.
+While command coverage is incomplete, event reads continue to report a gap because the sampled history
+cannot prove it observed changes to omitted receipts.
+Snapshot collections are returned in pages of at most eight records each, with per-collection
+`(offset, total, at_end)` coverage. Request `snapshot --page N` and compare the producer position
+across pages; if it changes, restart from a fresh snapshot. While any collection exceeds the first
+page, event reads also report a gap. Records exceeding 4096 encoded bytes appear as a digest, byte
+count and index rather than inflating the frame; `record` reads their canonical JSON in 8192-byte
+base64 chunks, qualified by the exact producer position, collection and index. A changed position
+refuses the detail request. All of these reads preserve durable authority.
+The position conservatively incorporates SQLite's owning-connection and external change counters
+across every page, so unrelated database writes can also require resynchronization. A clock sample's
+exact display timestamp is not part of the durable cut; changes in task or claim expiry classifications
+do advance the position.
+Program IDs are not shortened in storage. IDs whose encoded representation exceeds 4096 bytes use
+a SHA-256 scope reference in the cursor and an oversized marker in the wire snapshot; the exact ID is
+recoverable through the position-qualified `record` operation with collection `scope` and index zero.
+
+The host creates an already-connected local `socket.socketpair()` and binds one endpoint to a
+`LocalReadChannel`, `LocalWorkerSession` or `LocalOwnerSession`; it passes only the peer descriptor to
+`creatidy-kernel-client` (`--fd N`). The host must service `serve_once()` on the SQLite owner thread
+after the descriptor becomes readable, then detach one-shot channels. Separate worker and owner
+capabilities are bound to their existing trusted `OrdinaryWorkClient` or `OrdinaryProgram` objects; a
+wire payload cannot select a `Principal`, policy, provider credential, outbox fence or review verdict.
+Closing/revoking a descriptor revokes communication only, not task authority or physical settlement.
+
+For optional local alerts the host may bind a connected `AF_UNIX` datagram endpoint to
+`LocalDecisionNotifier` and supply it to a `LocalWorkerSession`. A completed served report publishes
+bounded `decision-required` hints without blocking and deduplicates each decision within that notifier's
+lifetime. Full, closed or unavailable endpoints set `dropped` rather than retrying work; after loss,
+restart, or reconnect the consumer must read the authoritative snapshot. The host may also call
+`publish(snapshot)` after other owner-thread changes; notifications exist only while the host services
+the session and are not a persistent service or remote notification guarantee.
+Uncertain product reviews are derived from the original review request, reservation, operation and
+receipt state, not from the transport receipt; resolving one does not issue another review prompt.
+An immutable earlier served `review_unknown` receipt remains historical after its exact original
+review operation is accepted with a recorded receipt; it does not create a second pending decision.
+
+Frames use a four-byte network-order length and UTF-8 JSON version1; input is bounded to64KiB and
+output to1MiB. Read actions are `snapshot` and `events`. The worker capability accepts `claim`,
+`context`, `start`, `quiesce`, `renew`, `submit` and `report`; `context` is bounded and uses the bound
+original claim's existing authorization and workspace-observation handler to supply the approved
+declaration, effective inputs and any original remediation findings. It is not a historical grant of
+authority and can be refused after expiry or revocation. The owner capability accepts `approve`, `reconcile`,
+`start-managed` and `stop`. Mutations require a command ID and caller-observed expected Program revision
+(`-1` means absent for initial approval). Trusted host composition binds an exact approved proposal,
+claim and managed target where applicable; the request cannot choose them. Exact duplicate command
+inputs return their original receipt as historical evidence, not renewed permission. If an intent
+exists but its outcome receipt is missing, the response is `unknown` and no automatic repeat occurs.
+Cooperative task-scope quiescence is never represented as managed process settlement; a STOP receipt
+can prove at most its one explicitly bound original managed target, not all effects or descendants.
+Worker `start` is limited to pull handoffs; a managed handoff can start only through the original owner's
+`start-managed` capability.
+
+This descriptor capability assumes a trusted local host chooses and passes the correct endpoint; it
+is not remote authentication, a named service socket, hostile same-UID isolation or a grant to expose
+the store over a network. Authentication, caller admission/revocation, exposure/origin policy and
+credential-safe diagnostics must be received before any remote transport is enabled. The CLI does not
+create a controller, open SQLite or discover a capability by itself. Installed conformance exercises
+separate observer/worker/owner client processes against the existing owner, including stale revisions,
+role injection, duplicate commands and explicit gaps; it is not a Console UI or live-provider proof.
+
 ## Current Boundary Evidence
 
 This section's original cut is historical; #54/PR92 and #90/PR93 now provide bounded durable product

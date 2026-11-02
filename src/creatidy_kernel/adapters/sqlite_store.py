@@ -40,6 +40,7 @@ from creatidy_kernel.core.domain import (
     AmendProgramSpec,
     AttemptSpec,
     AttemptStatus,
+    CancelProgram,
     DomainCommandType,
     FinishAttempt,
     PrepareAttempt,
@@ -59,6 +60,7 @@ from creatidy_kernel.core.ownership import (
     ResourceScope,
     WorkClaim,
 )
+from creatidy_kernel.core.served import command_prefix
 from creatidy_kernel.core.work_budget import COUNT_ONLY_WORK, BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
 
@@ -249,6 +251,7 @@ class SQLiteProgramStore:
         self._owner_thread_token = object()
         self._owner_thread_local.store_token = self._owner_thread_token
         self._gate = threading.RLock()
+        self._report_revision: tuple[str, int] | None = None
         self._busy_timeout_ms = busy_timeout_ms
         self._boot_clock = boot_clock
         self._clock_watermarks: dict[str, BootClockReading] = {}
@@ -685,6 +688,154 @@ class SQLiteProgramStore:
                 )
             )
 
+    def find_operation(self, operation_id: str) -> OperationRecord | None:
+        """Return one exact operation, treating only a missing row as absent."""
+        self._assert_writer_thread()
+        self._validate_command_key(operation_id)
+        with self._gate:
+            row = self._connection.execute(
+                "SELECT 1 FROM operations WHERE operation_id = ?", (operation_id,)
+            ).fetchone()
+            return None if row is None else self.operation(operation_id)
+
+    def served_operations(self, program_id: str) -> tuple[OperationRecord, ...]:
+        """Read a bounded sample of one Program's command namespace."""
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        prefix = command_prefix(program_id)
+        with self._gate:
+            rows = self._connection.execute(
+                "SELECT operation_id FROM operations WHERE operation_id >= ? AND operation_id < ? "
+                "ORDER BY operation_id LIMIT 64",
+                (prefix, prefix + "\U0010ffff"),
+            ).fetchall()
+            return tuple(self.operation(cast(str, row["operation_id"])) for row in rows)
+
+    def served_operation_count(self, program_id: str) -> int:
+        """Count durable commands without materializing unbounded history."""
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        prefix = command_prefix(program_id)
+        with self._gate:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM operations WHERE operation_id >= ? AND operation_id < ?",
+                (prefix, prefix + "\U0010ffff"),
+            ).fetchone()
+            return cast(int, row[0])
+
+    def served_change_token(self) -> tuple[int, int]:
+        """Read conservative connection-local and external SQLite change counters."""
+        self._assert_writer_thread()
+        with self._gate:
+            row = self._connection.execute("PRAGMA data_version").fetchone()
+            return (self._connection.total_changes, cast(int, row[0]))
+
+    def served_claims(self, program_id: str, *, offset: int = 0, limit: int = 8) -> tuple[dict[str, object], ...]:
+        """Project only recorded ownership facts for one Program, without sampling authority."""
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8:
+            raise OwnershipConflict("invalid claim projection page")
+        with self._gate:
+            renewals = self._work_records("ownership-renew")
+            rows = self._connection.execute(
+                "SELECT request_json FROM operations WHERE operation_id LIKE 'work-budget:v1:ownership-claim:%' "
+                "AND json_extract(request_json, '$.request.program') = ? ORDER BY operation_id LIMIT ? OFFSET ?",
+                (program_id, limit, offset),
+            ).fetchall()
+            result: list[dict[str, object]] = []
+            for row in rows:
+                claim = self._decode_work_claim(cast(dict[str, object], json.loads(row["request_json"])["request"]))
+                observations = self._connection.execute(
+                    "SELECT request_json FROM operations "
+                    "WHERE operation_id LIKE 'work-budget:v1:ownership-observation:%' "
+                    "AND json_extract(request_json, '$.request.claim') = ? "
+                    "ORDER BY json_extract(request_json, '$.request.order') DESC LIMIT 2",
+                    (claim.command_key,),
+                ).fetchall()
+                # The old journal stores each subject only once, not each visit.
+                # Multiple subjects cannot establish which was observed last.
+                latest = (
+                    claim.workspace_subject
+                    if not observations
+                    else cast(str, json.loads(observations[0]["request_json"])["request"]["subject"])
+                    if len(observations) == 1
+                    else None
+                )
+                candidate = self._work_record("ownership-candidate", claim.command_key)
+                released = self._work_record("ownership-release", claim.command_key) is not None
+                reconciled = (
+                    None
+                    if latest is None
+                    else (
+                        latest == claim.workspace_subject
+                        or self._work_record("ownership-prepared", f"{claim.command_key}:{latest}") is not None
+                        or self._work_record("ownership-reconcile", f"{claim.command_key}:{latest}") is not None
+                    )
+                )
+                result.append(
+                    {
+                        "attempt": claim.attempt.attempt_id,
+                        "claim": claim.command_key,
+                        "claimant": claim.claimant,
+                        "generation": claim.generation,
+                        "original_expires_at": claim.expires_at,
+                        "recorded_expires_at": max(
+                            [
+                                claim.expires_at,
+                                *(
+                                    cast(int, item["expires_at"])
+                                    for item in renewals
+                                    if item["claim"] == claim.command_key
+                                ),
+                            ]
+                        ),
+                        "mode": claim.mode.value,
+                        "released_recorded": released,
+                        "quarantined_recorded": self._work_record("ownership-unknown", claim.command_key) is not None,
+                        "latest_recorded_subject": latest,
+                        "candidate_recorded_subject": None if candidate is None else candidate["subject"],
+                        "recorded_owner_reconciliation_needed": (
+                            False if released else None if reconciled is None else not reconciled
+                        ),
+                        "recorded_proofs": tuple(
+                            stage
+                            for stage in ("start", "complete", "stop")
+                            if self._work_record("ownership-proof", f"{claim.command_key}:{stage}") is not None
+                        ),
+                    }
+                )
+            return tuple(result)
+
+    def served_claim_count(self, program_id: str) -> int:
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        with self._gate:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM operations WHERE operation_id LIKE 'work-budget:v1:ownership-claim:%' "
+                "AND json_extract(request_json, '$.request.program') = ?",
+                (program_id,),
+            ).fetchone()
+            return cast(int, row[0])
+
+    def served_expired_claim_count(self, program_id: str, observed_at: int) -> int:
+        """Count displayed claim cutoffs using original claims and recorded renewals."""
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        if type(observed_at) is not int or observed_at < 0:
+            raise ValueError("invalid display clock observation")
+        with self._gate:
+            renewals = self._work_records("ownership-renew")
+            expiries: dict[str, int] = {}
+            for item in renewals:
+                key, expiry = cast(str, item["claim"]), cast(int, item["expires_at"])
+                expiries[key] = max(expiries.get(key, expiry), expiry)
+            return sum(
+                max(cast(int, item["expires_at"]), expiries.get(cast(str, item["command"]), 0)) <= observed_at
+                for item in self._work_records("ownership-claim")
+                if item["program"] == program_id
+            )
+
     def operations(self, prefix: str = "") -> tuple[OperationRecord, ...]:
         """Return stable operation identities for bounded application recovery/export."""
         self._assert_writer_thread()
@@ -697,6 +848,24 @@ class SQLiteProgramStore:
 
     def claim_owned_operation(self, claim: WorkClaim, operation_id: str, subject: str, lease_seconds: int) -> int:
         return self._claim_operation(operation_id, now=0, lease_seconds=lease_seconds, ownership=(claim, subject))
+
+    @contextmanager
+    def report_revision_guard(self, program_id: str, revision: int) -> Generator[None, None, None]:
+        """Fence new report effects to the revision admitted after FinishAttempt."""
+        self._assert_writer_thread()
+        if self._report_revision is not None or type(revision) is not int or revision < 0:
+            raise OwnershipConflict("invalid or nested report revision guard")
+        self._report_revision = (program_id, revision)
+        try:
+            self._check_report_revision(program_id)
+            yield
+        finally:
+            self._report_revision = None
+
+    def _check_report_revision(self, program_id: str) -> None:
+        if self._report_revision is not None and self._report_revision[0] == program_id:
+            if self._load_head(program_id).revision != self._report_revision[1]:
+                raise OwnershipConflict("caller report revision changed before effect")
 
     def _claim_operation(
         self,
@@ -719,6 +888,8 @@ class SQLiteProgramStore:
         ):
             op = self.operation(operation_id)
             reservation = self._work_record("reservation", operation_id)
+            if reservation is not None:
+                self._check_report_revision(cast(str, reservation["program"]))
             if ownership is not None and (
                 reservation is None
                 or (reservation["program"], reservation["attempt"])
@@ -1247,7 +1418,9 @@ class SQLiteProgramStore:
                     ):
                         raise OwnershipConflict("unreconciled effect retains conflicting resources")
 
-    def check_work_claim(self, claim: WorkClaim, *, settled: bool = False) -> None:
+    def check_work_claim(
+        self, claim: WorkClaim, *, settled: bool = False, expected_revision: int | None = None
+    ) -> None:
         self._assert_writer_thread()
         with (
             self._gate,
@@ -1255,8 +1428,15 @@ class SQLiteProgramStore:
             self._transaction(readings),
         ):
             self._check_work_claim(claim, settled=settled, retirement_receipt=settled)
+            if (
+                expected_revision is not None
+                and self._load_head(claim.attempt.program_id).revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before claim authority check")
 
-    def renew_work_claim(self, command_key: str, claim: WorkClaim, lease_seconds: int) -> int:
+    def renew_work_claim(
+        self, command_key: str, claim: WorkClaim, lease_seconds: int, *, expected_revision: int | None = None
+    ) -> int:
         self._assert_writer_thread()
         if type(lease_seconds) is not int or lease_seconds <= 0:
             raise OwnershipConflict("renewal needs a positive bounded duration")
@@ -1265,6 +1445,11 @@ class SQLiteProgramStore:
             self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
             self._transaction(readings),
         ):
+            if (
+                expected_revision is not None
+                and self._load_head(claim.attempt.program_id).revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before renewal")
             previous = self._work_record("ownership-renew", command_key)
             if previous is not None:
                 if (previous["claim"], previous["claimant"], previous["lease_seconds"]) != (
@@ -1293,7 +1478,14 @@ class SQLiteProgramStore:
             )
             return expiry
 
-    def record_claim_proof(self, claim: WorkClaim, proof: HandoffProof, *, worker_report: bool = False) -> None:
+    def record_claim_proof(
+        self,
+        claim: WorkClaim,
+        proof: HandoffProof,
+        *,
+        worker_report: bool = False,
+        expected_revision: int | None = None,
+    ) -> None:
         self._assert_writer_thread()
         proof.check(claim, proof.stage)
         with (
@@ -1304,6 +1496,11 @@ class SQLiteProgramStore:
             # Exact trusted reconciliation is allowed after revoke/expiry, unlike
             # worker renewal, candidate reports, acceptance or publication.
             self._check_work_claim(claim, authority=worker_report or proof.stage == "start")
+            if (
+                expected_revision is not None
+                and self._load_head(claim.attempt.program_id).revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before proof admission")
             if claim.mode is HandoffMode.MANAGED and proof.stage != "start":
                 started = self._work_record("ownership-proof", f"{claim.command_key}:start")
                 if started is None:
@@ -1361,7 +1558,9 @@ class SQLiteProgramStore:
                 )
             self._finalize_artifact(claim.operation_id, f"workspace:{subject}", snapshot)
 
-    def reconcile_claim_workspace(self, claim: WorkClaim, owner: str, subject: str, evidence: str) -> None:
+    def reconcile_claim_workspace(
+        self, claim: WorkClaim, owner: str, subject: str, evidence: str, *, expected_revision: int | None = None
+    ) -> None:
         self._assert_writer_thread()
         if not evidence.strip():
             raise OwnershipConflict("explicit reconciliation evidence required")
@@ -1371,6 +1570,11 @@ class SQLiteProgramStore:
             self._transaction(readings),
         ):
             self._check_work_claim(claim, authority=False, settled=True)
+            if (
+                expected_revision is not None
+                and self._load_head(claim.attempt.program_id).revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before reconciliation")
             if self._claim_owner(claim) != owner:
                 raise OwnershipConflict("only original owner can reconcile workspace changes")
             self._check_current_workspace_subject(claim, subject)
@@ -1387,7 +1591,9 @@ class SQLiteProgramStore:
                 },
             )
 
-    def accept_ordinary_preparation(self, claim: WorkClaim, owner: str, subject: str) -> None:
+    def accept_ordinary_preparation(
+        self, claim: WorkClaim, owner: str, subject: str, *, expected_revision: int | None = None
+    ) -> None:
         """Admit exact controller materialization before any worker dispatch, without claiming settlement."""
         self._assert_writer_thread()
         prepared_key = f"ordinary-workspace:{claim.attempt.attempt_id}"
@@ -1401,7 +1607,12 @@ class SQLiteProgramStore:
         ):
             self._check_work_claim(claim)
             operation = self.operation(claim.operation_id)
-            attempt = self._load_head(claim.attempt.program_id).attempt(claim.attempt.attempt_id)
+            program = self._load_head(claim.attempt.program_id)
+            if expected_revision is not None and (
+                type(expected_revision) is not int or expected_revision < 0 or program.revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before preparation acceptance")
+            attempt = program.attempt(claim.attempt.attempt_id)
             artifact = self._connection.execute(
                 "SELECT digest, size FROM artifact_references WHERE operation_id = ? AND name = ?",
                 (prepared_key, "prepared"),
@@ -1494,7 +1705,9 @@ class SQLiteProgramStore:
             self._check_work_claim(claim, settled=True)
             self._check_claim_candidate(claim, subject)
 
-    def submit_claim_candidate(self, claim: WorkClaim, subject: str, snapshot: bytes) -> str:
+    def submit_claim_candidate(
+        self, claim: WorkClaim, subject: str, snapshot: bytes, *, expected_revision: int | None = None
+    ) -> str:
         self._assert_writer_thread()
         if hashlib.sha256(snapshot).hexdigest() != subject:
             raise OwnershipConflict("candidate snapshot digest differs")
@@ -1508,6 +1721,11 @@ class SQLiteProgramStore:
             self._transaction(readings),
         ):
             self._check_work_claim(claim, settled=True)
+            if (
+                expected_revision is not None
+                and self._load_head(claim.attempt.program_id).revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before candidate submission")
             self._check_workspace_subject(claim, subject, fresh=True)
             self._write_work_record(
                 "ownership-candidate", claim.command_key, {"claim": claim.command_key, "subject": subject}
@@ -2367,6 +2585,7 @@ class SQLiteProgramStore:
         amendment: AmendProgramSpec | None = None,
         records: tuple[tuple[str, dict[str, object], bytes | None], ...] = (),
         validate: Callable[[], None] | None = None,
+        expected_revision: int | None = None,
     ) -> Program:
         """Publish one budgeted Program decision, its inert records and binding atomically.
 
@@ -2383,6 +2602,8 @@ class SQLiteProgramStore:
             readings = self._prepare_work_clocks()
             changes = self._connection.total_changes
             current = self.find_program(spec.program_id)
+            if expected_revision is not None and (-1 if current is None else current.revision) != expected_revision:
+                raise ProgramReadChanged("caller expected revision changed before approval admission")
             existing = self._work_binding(spec.program_id)
             origin = self.pending_work_projection(spec)
             if existing is not None or origin is not None:
@@ -2669,12 +2890,73 @@ class SQLiteProgramStore:
             return result
         return result
 
-    def revoke_work_budget(self, program_id: str, evidence: str) -> None:
+    def revoke_work_budget(self, program_id: str, evidence: str, *, expected_revision: int | None = None) -> None:
         self._assert_writer_thread()
         self._validate_command_key(evidence)
         with self._gate, self._transaction():
+            if expected_revision is not None and self._load_head(program_id).revision != expected_revision:
+                raise OwnershipConflict("caller expected revision changed before budget revocation")
             if self._work_record("revoked", program_id) is None:
                 self._write_work_record("revoked", program_id, {"program": program_id, "evidence": evidence})
+
+    def work_budget_revoked(self, program_id: str) -> bool | None:
+        """Read recorded revocation without sampling clocks or granting authority."""
+        self._assert_writer_thread()
+        with self._gate:
+            if self._work_binding(program_id) is None:
+                return None
+            return self._work_record("revoked", program_id) is not None
+
+    def served_authority_horizon(self, program_id: str) -> dict[str, object]:
+        """Sample time for display only; never persist or confer authority."""
+        self._assert_writer_thread()
+        with self._gate:
+            binding = self._work_binding(program_id)
+            if binding is None:
+                return {"deadline": None, "observed_at": None, "clock": "unknown"}
+            projection = DeadlineProjection.decode(binding["projection"])
+            row = self._connection.execute(
+                "SELECT * FROM work_clock_state WHERE program_id = ?", (program_id,)
+            ).fetchone()
+            changes = self._connection.total_changes
+            try:
+                reading = self._boot_clock()
+            except (OSError, ValueError):
+                reading = None
+            observed = None
+            if (
+                not self._closed
+                and self._connection.total_changes == changes
+                and row is not None
+                and not row["pending"]
+                and projection.verifiable(reading)
+                and reading is not None
+                and reading.wall >= row["wall"]
+                and reading.boot_ns >= row["boot_ns"]
+            ):
+                observed = projection.decision_time(reading)
+            return {
+                "deadline": projection.wall_deadline,
+                "observed_at": observed,
+                "clock": "unknown" if observed is None else "uncommitted-display-sample",
+            }
+
+    def stop_ordinary_program(
+        self, program_id: str, command_key: str, actor: str, evidence: str, *, expected_revision: int | None = None
+    ) -> Program:
+        """Atomically cancel nonterminal work and revoke its remaining budget authority."""
+        self._assert_writer_thread()
+        self._validate_command_key(command_key)
+        self._validate_command_key(evidence)
+        with self._gate, self._transaction():
+            program = self._load_head(program_id)
+            if expected_revision is not None and program.revision != expected_revision:
+                raise OwnershipConflict("caller expected revision changed before STOP")
+            if program.status not in {ProgramStatus.CANCELLED, ProgramStatus.COMPLETED}:
+                program = self._admit_decision(program_id, command_key, CancelProgram(program.revision, actor), None)
+            if self._work_record("revoked", program_id) is None:
+                self._write_work_record("revoked", program_id, {"program": program_id, "evidence": evidence})
+            return program
 
     def _bind_work_dispatch(self, program_id: str, attempt_id: str, operation_id: str) -> None:
         attempt = self._load_head(program_id).attempt(attempt_id).spec
@@ -2709,7 +2991,9 @@ class SQLiteProgramStore:
         ):
             self._check_work_dispatch(operation_id)
 
-    def check_operation_delivery(self, operation_id: str, fence: int, *, deadline: int | None = None) -> None:
+    def check_operation_delivery(
+        self, operation_id: str, fence: int, *, deadline: int | None = None, expected_revision: int | None = None
+    ) -> None:
         """Final send cut after credentials/input callbacks, not a cached admission.
 
         The transport must invoke this after all potentially reentrant preparation
@@ -2729,6 +3013,11 @@ class SQLiteProgramStore:
             reservation = self._work_record("reservation", operation_id)
             if reservation is None:
                 raise BudgetRefused("delivery lacks original reservation")
+            if (
+                expected_revision is not None
+                and self._load_head(cast(str, reservation["program"])).revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before delivery")
             now = self.work_decision_time(cast(str, reservation["program"]))
             if deadline is not None and (type(deadline) is not int or now >= deadline):
                 raise BudgetRefused("original delivery consent deadline expired or invalid")
@@ -2758,6 +3047,7 @@ class SQLiteProgramStore:
         if reservation is None:
             raise BudgetRefused("dispatch lacks original work reservation")
         program_id, attempt_id = cast(str, reservation["program"]), cast(str, reservation["attempt"])
+        self._check_report_revision(program_id)
         self.check_work_authority(program_id)
         program = self._load_head(program_id)
         try:
@@ -3010,6 +3300,7 @@ class SQLiteProgramStore:
             ) as readings,
             self._transaction(readings),
         ):
+            self._check_report_revision(program_id)
             existed = self._work_record("reservation", operation_id) is not None
             fresh = (
                 not existed

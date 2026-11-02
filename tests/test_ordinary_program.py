@@ -43,8 +43,247 @@ def test_materialization_cannot_precede_atomic_claim(sqlite_tmp_path: Path, monk
     run_ordinary_flow(sqlite_tmp_path / "claimed-before-materialization", None, mode="pull")
 
 
+def test_work_request_uses_callers_exact_revision_and_replay_identity(sqlite_tmp_path: Path) -> None:
+    result = run_ordinary_flow(sqlite_tmp_path / "expected-revision", None, mode="pull", exercise="expected-revision")
+    assert result == {
+        "status": "checked",
+        "native_sends": 0,
+    }
+
+
+def test_work_request_rechecks_caller_revision_after_blocking_check(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "revision-race", None, mode="pull", exercise="expected-revision-race"
+    ) == {"status": "checked", "native_sends": 0}
+
+
+def test_stop_domain_and_budget_revocation_rollback_together(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / "stop-failure", None, mode="pull", exercise="stop-atomic-failure") == {
+        "status": "refused",
+        "native_sends": 0,
+    }
+
+
+@pytest.mark.parametrize("exercise", ["served-owner-stop", "served-owner-stale"])
+def test_host_bound_owner_stop_is_scoped_and_revision_checked(sqlite_tmp_path: Path, exercise: str) -> None:
+    result = run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise)
+    assert result["status"] == ("stopped" if exercise == "served-owner-stop" else "refused")
+
+
+@pytest.mark.parametrize("exercise", ["served-worker-stop", "served-worker-approve"])
+def test_worker_capability_cannot_issue_owner_commands(sqlite_tmp_path: Path, exercise: str) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise) == {
+        "status": "refused",
+        "native_sends": 0,
+    }
+
+
+def test_owner_channel_stops_only_its_original_managed_target(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-managed-stop", None, mode="managed", exercise="served-managed-stop"
+    ) == {"status": "stopped", "native_sends": 0}
+
+
+def test_start_rechecks_caller_revision_after_workspace_observation(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "start-revision-race", None, mode="pull", exercise="start-revision-race"
+    ) == {"status": "refused", "native_sends": 0}
+
+
+def test_quiescence_rechecks_caller_revision_at_proof_commit(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "quiesce-revision-race", None, mode="pull", exercise="quiesce-revision-race"
+    ) == {"status": "refused", "native_sends": 0}
+
+
+def test_renewal_rechecks_caller_revision_after_observation(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "renew-revision-race", None, mode="pull", exercise="renew-revision-race"
+    ) == {"status": "refused", "native_sends": 0}
+
+
+def test_report_rechecks_caller_revision_at_candidate_commit(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "report-revision-race", None, mode="pull", exercise="report-revision-race"
+    ) == {"status": "refused", "native_sends": 0}
+
+
+def test_host_bound_local_worker_claim_deduplicates_exact_request(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / "served-claim", None, mode="pull", exercise="served-claim") == {
+        "status": "checked",
+        "native_sends": 0,
+    }
+
+
+@pytest.mark.parametrize("exercise", ["claim-final-observe-race", "claim-final-observe-replay-race"])
+def test_stale_revision_during_final_preparation_observation(sqlite_tmp_path: Path, exercise: str) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise) == {
+        "status": "refused",
+        "native_sends": 0,
+    }
+
+
+def test_worker_claim_identity_cannot_be_reused_for_start(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-cross-action-id", None, mode="pull", exercise="served-cross-action-id"
+    ) == {"status": "refused", "native_sends": 0}
+
+
+def test_owner_channel_starts_managed_once_then_stops_original_target(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-managed-start", None, mode="managed", exercise="served-managed-start"
+    ) == {"status": "stopped", "native_sends": 0}
+
+
+def test_worker_cannot_start_managed_handoff_before_owner(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "managed-worker-start", None, mode="managed", exercise="served-managed-worker-start"
+    ) == {"status": "stopped", "native_sends": 0}
+
+
+def test_separate_owner_client_stops_only_original_managed_target(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-managed-stop-cli", None, mode="managed", exercise="served-managed-stop-cli"
+    ) == {"status": "stopped", "native_sends": 0}
+
+
+def test_host_bound_start_replays_receipt_without_redispatch(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / "served-start", None, mode="pull", exercise="served-start") == {
+        "status": "checked",
+        "native_sends": 0,
+    }
+
+
+def test_managed_start_rechecks_revision_after_native_input_preparation(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-managed-start-race", None, mode="managed", exercise="served-managed-start-race"
+    ) == {"status": "refused", "native_sends": 0}
+
+
+def test_lost_start_receipt_returns_unknown_without_redispatch(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-start-crash", None, mode="pull", exercise="served-start-crash"
+    ) == {"status": "unknown", "native_sends": 0}
+
+
+def test_host_bound_quiescence_replays_cooperative_receipt_without_physical_claim(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / "served-quiesce", None, mode="pull", exercise="served-quiesce") == {
+        "status": "checked",
+        "native_sends": 0,
+    }
+
+
+def test_host_bound_renewal_replays_original_expiry_without_renewing_twice(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / "served-renew", None, mode="pull", exercise="served-renew") == {
+        "status": "checked",
+        "native_sends": 0,
+    }
+
+
+def test_expired_worker_cannot_start_but_can_read_original_renewal_receipt(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-start-expired", None, mode="pull", exercise="served-start-expired"
+    ) == {"status": "refused", "native_sends": 0}
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-renew-expired", None, mode="pull", exercise="served-renew-expired"
+    ) == {"status": "checked", "native_sends": 0}
+
+
+def test_host_bound_submit_and_report_use_trusted_verification(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / "served-report", None, mode="pull", exercise="served-report") == {
+        "status": "accepted",
+        "native_sends": 0,
+    }
+
+
+def test_rejected_report_emits_one_local_decision_alert(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-report-decision", None, mode="pull", exercise="served-report-decision"
+    ) == {"status": "rejected", "native_sends": 0}
+
+
+def test_direct_sdk_review_emits_one_local_decision_alert(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "sdk-review-notify", None, mode="pull", exercise="sdk-review-notify"
+    ) == {"status": "rejected", "native_sends": 0}
+
+
+def test_served_unknown_review_becomes_historical_after_rejection(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-unknown-rejected", None, mode="pull", exercise="served-unknown-rejected"
+    ) == {"status": "rejected", "native_sends": 0}
+
+
+def test_worker_cannot_supply_its_own_review_verdict(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-report-forged", None, mode="pull", exercise="served-report-forged"
+    ) == {"status": "refused", "native_sends": 0}
+
+
+def test_lost_report_receipt_is_unknown_without_new_review(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-report-crash", None, mode="pull", exercise="served-report-crash"
+    ) == {"status": "unknown", "native_sends": 0}
+
+
+def test_report_revision_fences_verification_after_owner_change(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "report-verification-revision-race",
+        None,
+        mode="pull",
+        exercise="report-verification-revision-race",
+    ) == {"status": "refused", "native_sends": 0}
+
+
+def test_report_revision_fences_review_after_authorization_callback(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "report-review-revision-race", None, mode="pull", exercise="report-review-revision-race"
+    ) == {"status": "unknown", "native_sends": 0}
+
+
+def test_owner_reconciliation_rechecks_revision_after_capture(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-reconcile-race", None, mode="pull", exercise="served-reconcile-race"
+    ) == {"status": "refused", "native_sends": 0}
+
+
+def test_separate_local_work_client_uses_host_bound_claim_capability(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-claim-process", None, mode="pull", exercise="served-claim-process"
+    ) == {"status": "checked", "native_sends": 0}
+
+
+def test_separate_client_reads_original_remediation_context(sqlite_tmp_path: Path) -> None:
+    result = run_ordinary_flow(
+        sqlite_tmp_path / "review-remediation-served", None, mode="pull", exercise="review-remediation-served"
+    )
+    assert result["status"] == "completed"
+
+
+def test_separate_client_invocations_share_host_bound_worker_session(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-multi-client", None, mode="pull", exercise="served-multi-client"
+    ) == {"status": "checked", "native_sends": 0}
+
+
+@pytest.mark.parametrize("exercise", ["served-stale", "served-role-injection"])
+def test_local_work_capability_refuses_stale_or_forged_identity(sqlite_tmp_path: Path, exercise: str) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise) == {
+        "status": "refused",
+        "native_sends": 0,
+    }
+
+
 @pytest.mark.parametrize(
-    "exercise", ["claim-expired", "claim-expired-reopen", "claim-revoked", "claim-stale", "claim-generation"]
+    "exercise",
+    [
+        "claim-expired",
+        "claim-expired-reopen",
+        "claim-revoked",
+        "claim-stale",
+        "claim-generation",
+        "claim-revision-stale",
+    ],
 )
 def test_historical_claim_without_authority_cannot_begin_preparation(sqlite_tmp_path: Path, exercise: str) -> None:
     assert run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise) == {
@@ -215,6 +454,37 @@ def test_owner_source_judgement_is_bound_to_exact_declaration(sqlite_tmp_path: P
     }
 
 
+def test_owner_approval_checks_caller_expectation_for_absent_program(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / "approve-expected", None, mode="pull", exercise="approve-expected") == {
+        "status": "approved",
+        "native_sends": 0,
+    }
+
+
+def test_owner_approval_rechecks_absence_after_external_validation(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "approve-revision-race", None, mode="pull", exercise="approve-revision-race"
+    ) == {"status": "refused", "native_sends": 0}
+
+
+@pytest.mark.parametrize("exercise", ["served-owner-approve", "served-owner-approve-stale"])
+def test_host_bound_approval_uses_exact_proposal_and_expected_revision(sqlite_tmp_path: Path, exercise: str) -> None:
+    result = run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise)
+    assert result["status"] == ("approved" if exercise == "served-owner-approve" else "refused")
+
+
+def test_interleaved_owner_channels_keep_amended_approval(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "owner-interleaved-amend", None, mode="pull", exercise="served-owner-interleaved-amend"
+    ) == {"status": "stopped", "native_sends": 0}
+
+
+def test_host_bound_amendment_preserves_original_deadline_and_replays(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-owner-amend", None, mode="pull", exercise="served-owner-amend"
+    ) == {"status": "amended", "native_sends": 0}
+
+
 def test_lost_agit_reply_ignores_unrelated_branch_pr_without_duplicate_write(sqlite_tmp_path: Path) -> None:
     result = run_ordinary_flow(sqlite_tmp_path / "branch-pr", None, mode="pull", exercise="branch-pr")
     assert result["status"] == "completed"
@@ -228,11 +498,22 @@ def test_copied_marker_on_unrelated_branch_is_unknown_without_retry(sqlite_tmp_p
     }
 
 
+def test_separate_owner_clients_share_host_bound_approval(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-owner-multi-client", None, mode="pull", exercise="served-owner-multi-client"
+    ) == {"status": "stopped", "native_sends": 0}
+
+
 @pytest.mark.parametrize("exercise", ["review-lost", "review-lost-reopen"])
 def test_completed_review_receipt_recovers_without_second_prompt(sqlite_tmp_path: Path, exercise: str) -> None:
     result = run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise)
     assert result["status"] == "completed"
     assert result["review_calls"] == 2
+
+
+def test_managed_unknown_review_is_visible_and_recovers_without_reprompt(sqlite_tmp_path: Path) -> None:
+    result = run_ordinary_flow(sqlite_tmp_path / "managed-review-lost", None, mode="managed", exercise="review-lost")
+    assert result["status"] == "completed" and result["review_calls"] == 2
 
 
 def test_diamond_dag_composes_shared_ancestor_once(sqlite_tmp_path: Path) -> None:
