@@ -1591,7 +1591,9 @@ class SQLiteProgramStore:
                 },
             )
 
-    def accept_ordinary_preparation(self, claim: WorkClaim, owner: str, subject: str) -> None:
+    def accept_ordinary_preparation(
+        self, claim: WorkClaim, owner: str, subject: str, *, expected_revision: int | None = None
+    ) -> None:
         """Admit exact controller materialization before any worker dispatch, without claiming settlement."""
         self._assert_writer_thread()
         prepared_key = f"ordinary-workspace:{claim.attempt.attempt_id}"
@@ -1605,7 +1607,12 @@ class SQLiteProgramStore:
         ):
             self._check_work_claim(claim)
             operation = self.operation(claim.operation_id)
-            attempt = self._load_head(claim.attempt.program_id).attempt(claim.attempt.attempt_id)
+            program = self._load_head(claim.attempt.program_id)
+            if expected_revision is not None and (
+                type(expected_revision) is not int or expected_revision < 0 or program.revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before preparation acceptance")
+            attempt = program.attempt(claim.attempt.attempt_id)
             artifact = self._connection.execute(
                 "SELECT digest, size FROM artifact_references WHERE operation_id = ? AND name = ?",
                 (prepared_key, "prepared"),

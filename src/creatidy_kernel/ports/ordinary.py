@@ -60,7 +60,9 @@ class OrdinaryStore(IntakeStore, OwnershipStore, Protocol):
     def stop_ordinary_program(
         self, program_id: str, command_key: str, actor: str, evidence: str, *, expected_revision: int | None = None
     ) -> Program: ...
-    def accept_ordinary_preparation(self, claim: WorkClaim, owner: str, subject: str) -> None: ...
+    def accept_ordinary_preparation(
+        self, claim: WorkClaim, owner: str, subject: str, *, expected_revision: int | None = None
+    ) -> None: ...
     def find_ordinary_preparation(self, claim: WorkClaim) -> bool: ...
 
 
@@ -549,7 +551,7 @@ class OrdinaryWorkClient:
             )
             if self.control.observe(claim) != subject:
                 raise IntakeRefused("prepared workspace changed before owner admission")
-            app.store.accept_ordinary_preparation(claim, app.owner.actor_id, subject)
+            app.store.accept_ordinary_preparation(claim, app.owner.actor_id, subject, expected_revision=claim_revision)
         return OrdinaryHandoff(attempt, claim)
 
     def start(self, handoff: OrdinaryHandoff, *, expected_revision: int | None = None) -> int | None:

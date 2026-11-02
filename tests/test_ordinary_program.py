@@ -115,6 +115,14 @@ def test_host_bound_local_worker_claim_deduplicates_exact_request(sqlite_tmp_pat
     }
 
 
+@pytest.mark.parametrize("exercise", ["claim-final-observe-race", "claim-final-observe-replay-race"])
+def test_stale_revision_during_final_preparation_observation(sqlite_tmp_path: Path, exercise: str) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise) == {
+        "status": "refused",
+        "native_sends": 0,
+    }
+
+
 def test_worker_claim_identity_cannot_be_reused_for_start(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(
         sqlite_tmp_path / "served-cross-action-id", None, mode="pull", exercise="served-cross-action-id"

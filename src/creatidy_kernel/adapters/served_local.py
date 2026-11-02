@@ -63,7 +63,20 @@ class LocalDecisionNotifier:
             }:
                 continue
             attempt = decision.get("attempt")
-            identity = digest(encode([snapshot.scope, attempt if type(attempt) is str else decision]))
+            decision_id = decision.get("decision_id")
+            identity = digest(
+                encode(
+                    [
+                        snapshot.scope,
+                        decision_id if type(decision_id) is str else attempt if type(attempt) is str else decision,
+                        "review_unknown"
+                        if decision.get("status") == "review_unknown"
+                        else "action_required"
+                        if type(decision_id) is str
+                        else decision.get("status"),
+                    ]
+                )
+            )
             if identity in self._seen:
                 continue
             if len(self._seen) >= 4096:

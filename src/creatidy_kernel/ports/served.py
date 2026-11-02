@@ -136,7 +136,12 @@ class OwnerProjection:
                 review_operations[operation_id] = (cast(str, attempt), resolved)
                 if found.status in {"unknown", "dispatched"} and receipt is None:
                     decisions.append(
-                        {"source": "product-review-operation", "attempt": attempt, "status": "review_unknown"}
+                        {
+                            "source": "product-review-operation",
+                            "attempt": attempt,
+                            "status": "review_unknown",
+                            "decision_id": operation_id,
+                        }
                     )
         retained = tuple(sorted(reservations))
         commands: list[tuple[str, str, str, str, str]] = []
@@ -186,6 +191,20 @@ class OwnerProjection:
                         if type(review_operation_id) is not str:
                             raise ValueError("producer returned invalid original review identity")
                         decision["review_operation_id"] = review_operation_id
+                    if value["status"] == "review_unknown" and type(review_operation_id) is str:
+                        decision["decision_id"] = review_operation_id
+                    elif value["status"] == "review_unknown" and attempt_id is not None:
+                        matching_reviews = [
+                            operation_id
+                            for operation_id, (review_attempt, _) in review_operations.items()
+                            if review_attempt == attempt_id
+                        ]
+                        if len(matching_reviews) == 1:
+                            decision["decision_id"] = matching_reviews[0]
+                    elif value["status"] == "rejected" and attempt_id is not None:
+                        rejection_id = f"rejection:{attempt_id}"
+                        if self._store.find_artifact(rejection_id, "rejected-result") is not None:
+                            decision["decision_id"] = rejection_id
                     decisions.append(decision)
             commands.append((cast(str, key), cast(str, action), cast(str, actor), operation.status, recorded))
         command_facts = tuple(sorted(commands))
@@ -277,7 +296,12 @@ class OwnerProjection:
                 if status not in {None, "changes_requested", "owner_decision_needed", "comment", "invalid"}:
                     raise ValueError("producer returned an invalid review disposition")
                 decisions.append(
-                    {"source": "product-review", "attempt": attempt.attempt_id, "status": status or "rejected"}
+                    {
+                        "source": "product-review",
+                        "attempt": attempt.attempt_id,
+                        "status": status or "rejected",
+                        "decision_id": rejection_id,
+                    }
                 )
         correlation_facts = tuple(correlations)
         decision_facts_list: list[dict[str, object]] = []

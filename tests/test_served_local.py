@@ -196,6 +196,54 @@ def test_decision_notification_is_bounded_deduplicated_and_best_effort(sqlite_tm
         assert (store.history(program.program_id), store.operations()) == before
 
 
+def test_distinct_decisions_for_one_attempt_are_not_suppressed(sqlite_tmp_path: Path) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / "notification-transition.db") as store:
+        program = store.create(reference_spec(), "create")
+        snapshot = OwnerProjection(store, program.program_id).snapshot()
+        sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        with sender, receiver:
+            notifier = LocalDecisionNotifier(sender)
+            unknown = replace(
+                snapshot,
+                decisions=(
+                    {"attempt": "a", "decision_id": "review:1", "status": "review_unknown", "applicability": "pending"},
+                ),
+            )
+            resolved = replace(
+                snapshot,
+                decisions=(
+                    {
+                        "attempt": "a",
+                        "decision_id": "rejection:a",
+                        "status": "owner_decision_needed",
+                        "applicability": "pending",
+                    },
+                ),
+            )
+            notifier.publish(unknown)
+            first = json.loads(receiver.recv(65536))
+            notifier.publish(unknown)
+            assert not select.select([receiver], [], [], 0)[0]
+            notifier.publish(resolved)
+            second = json.loads(receiver.recv(65536))
+            assert first["id"] != second["id"]
+            notifier.publish(resolved)
+            notifier.publish(
+                replace(
+                    resolved,
+                    decisions=(
+                        {
+                            "attempt": "a",
+                            "decision_id": "rejection:a",
+                            "status": "owner_decision_needed",
+                            "applicability": "historical",
+                        },
+                    ),
+                )
+            )
+            assert not select.select([receiver], [], [], 0)[0]
+
+
 def test_claim_command_identity_is_scoped_to_program_and_actor(sqlite_tmp_path: Path) -> None:
     with SQLiteProgramStore(sqlite_tmp_path / "claim-scopes.db", boot_clock=Clock()) as store:
         first = initialize(store, project=policy(active=2))

@@ -134,6 +134,8 @@ for exercise, expected in (
     ("served-report-decision", "rejected"),
     ("sdk-review-notify", "rejected"),
     ("served-unknown-rejected", "rejected"),
+    ("claim-final-observe-race", "refused"),
+    ("claim-final-observe-replay-race", "refused"),
     ("served-owner-interleaved-amend", "stopped"),
     ("served-report-forged", "refused"),
     ("served-report-crash", "unknown"),

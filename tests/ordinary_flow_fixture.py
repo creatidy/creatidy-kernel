@@ -1869,6 +1869,72 @@ print("Done")
                     assert json.loads(tree.capture()[1])["entries"] == []
                     assert not native_state["sends"]
                     return {"status": "refused", "native_sends": 0}
+                if exercise in {"claim-final-observe-race", "claim-final-observe-replay-race"}:
+                    caller_revision = store.load("everyday-program").revision
+                    if exercise == "claim-final-observe-replay-race":
+                        with patch.object(OrdinaryGitWorkspace, "initialize", side_effect=RuntimeError("interrupted")):
+                            try:
+                                client.request(command_key, lease_seconds=600, expected_revision=caller_revision)
+                            except RuntimeError:
+                                pass
+                            else:
+                                raise AssertionError("original claim was not interrupted")
+                    original_observe = WorkOwnership.observe
+                    original_capture = LocalOwnedWorkspace.capture
+                    changed = [False]
+
+                    def capture_race(
+                        target: LocalOwnedWorkspace,
+                        original: Callable[[LocalOwnedWorkspace], tuple[str, bytes]] = original_capture,
+                        flag: list[bool] = changed,
+                        target_store: SQLiteProgramStore = store,
+                    ) -> tuple[str, bytes]:
+                        result = original(target)
+                        if not flag[0]:
+                            flag[0] = True
+                            current = target_store.load("everyday-program")
+                            paused = target_store.admit(
+                                current.program_id, "pause-final-observe", PauseProgram(current.revision, "owner")
+                            )
+                            target_store.admit(
+                                paused.program_id, "resume-final-observe", ResumeProgram(paused.revision, "owner")
+                            )
+                        return result
+
+                    def observe_race(
+                        target: WorkOwnership,
+                        claim: WorkClaim,
+                        owner_control: WorkOwnership = control,
+                        original: Callable[[WorkOwnership, WorkClaim], str] = original_observe,
+                    ) -> str:
+                        if target is owner_control:
+                            with patch.object(LocalOwnedWorkspace, "capture", capture_race):
+                                return original(target, claim)
+                        return original(target, claim)
+
+                    with patch.object(WorkOwnership, "observe", observe_race):
+                        try:
+                            client.request(command_key, lease_seconds=600, expected_revision=caller_revision)
+                        except ValueError:
+                            pass
+                        else:
+                            raise AssertionError("stale final observation accepted preparation")
+                    assert changed[0]
+                    attempt = store.load("everyday-program").attempts[-1].spec
+                    original_claim = worker.claim(command_key, caller_revision, attempt, lease_seconds=600)
+                    assert not store.find_ordinary_preparation(original_claim)
+                    prepared = json.loads(store.artifact(f"ordinary-workspace:{attempt.attempt_id}", "prepared"))
+                    try:
+                        store.accept_ordinary_preparation(
+                            original_claim, "owner", prepared["prepared_subject"], expected_revision=caller_revision + 1
+                        )
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError("store accepted a stale preparation revision")
+                    assert not store.find_ordinary_preparation(original_claim)
+                    assert workspace.objects.exists() and not native_state["sends"]
+                    return {"status": "refused", "native_sends": 0}
                 handoff = client.request(
                     command_key, lease_seconds=600, remediation_of=rejected_attempt if unit == "alpha" else None
                 )
@@ -2567,6 +2633,16 @@ print("Done")
                         assert historical_receipt["status"] == "review_unknown"
                         original_review = historical_receipt["review_operation_id"]
                     assert len(calls) == 1
+                    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+                    owners.enter_context(sender)
+                    owners.enter_context(receiver)
+                    notifier = LocalDecisionNotifier(sender)
+                    unknown_snapshot = OwnerProjection(store, "everyday-program").snapshot()
+                    notifier.publish(unknown_snapshot)
+                    assert select.select([receiver], [], [], 2)[0]
+                    receiver.recv(65536)
+                    notifier.publish(unknown_snapshot)
+                    assert not select.select([receiver], [], [], 0)[0]
                     time_offset[0] = 61
                     assert client.report(handoff) == "rejected"
                     assert len(calls) == 1
@@ -2579,13 +2655,11 @@ print("Done")
                         item.get("status") == "changes_requested" and item.get("applicability") == "pending"
                         for item in snapshot.decisions
                     )
-                    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
-                    with sender, receiver:
-                        notifier = LocalDecisionNotifier(sender)
-                        notifier.publish(snapshot)
-                        assert select.select([receiver], [], [], 2)[0]
-                        receiver.recv(65536)
-                        assert not select.select([receiver], [], [], 0)[0]
+                    notifier.publish(snapshot)
+                    assert select.select([receiver], [], [], 2)[0]
+                    receiver.recv(65536)
+                    notifier.publish(snapshot)
+                    assert not select.select([receiver], [], [], 0)[0]
                     return {"status": "rejected", "native_sends": 0}
                 else:
                     outcome = client.report(handoff)
