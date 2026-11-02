@@ -221,7 +221,8 @@ def _decode_subject(value: object) -> EvidenceSubject:
     )
 
 
-def _decode_receipt(data: bytes) -> ProductReviewReceipt:
+def decode_product_review_receipt(data: bytes) -> ProductReviewReceipt:
+    """Decode the original durable substantive-review receipt without dispatch."""
     value: object = json.loads(data)
     expected = {
         "findings",
@@ -368,7 +369,7 @@ def dispatch_product_review(
     receipt_bytes = store.find_artifact(operation_id, "review-receipt")
     operation = store.operation(operation_id)
     if receipt_bytes is not None:
-        receipt = _decode_receipt(receipt_bytes)
+        receipt = decode_product_review_receipt(receipt_bytes)
         _validate_review_receipt(request, receipt)
         if operation.status in {"dispatched", "unknown"}:
             operation = store.observe(

@@ -107,6 +107,34 @@ create a controller, open SQLite or discover a capability by itself. Installed c
 separate observer/worker/owner client processes against the existing owner, including stale revisions,
 role injection, duplicate commands and explicit gaps; it is not a Console UI or live-provider proof.
 
+## Private Outcome Export
+
+`export_private_outcome` reads one owner-thread Program cut from the existing durable store using the
+explicit `private-metadata-v1` policy. It exports a versioned local-only projection of Program/spec,
+WorkUnit, Attempt, claim, original Operation and delivery observations, exact-subject check and review
+evidence, satisfaction references, predecessor and remediation edges, and source-qualified usage
+observations including correction links. Recorded check/review freshness is not reevaluated during
+export, and a recorded PASS or APPROVE is conditional evidence, not causal model quality. Its references
+are HMAC pseudonyms; the default fresh key is discarded, so links remain valid only within that export.
+An owner may provide the same separately held 32-byte key when cross-export correlation is intended.
+The key is never put in the document; pseudonymization is not anonymization or sharing permission.
+
+Only enumerated non-content metric and unit labels are emitted verbatim. Other labels are represented
+by pseudonymous references with null labels, not guessed or silently changed. Reported, measured,
+estimated and owner-record provenance remain distinct. Known subtotals are separated by exact
+source/metric/unit/provenance; cross-source and complete totals, hidden external work, route/call identity and physical
+settlement remain unknown where no producer supplies them. Original source contents, prompts,
+free-form findings, workspace paths, native handles and raw identifiers are not emitted. Source rights
+are not established by provenance; no source content, upload, MI intake, third-party consent or Router
+learning authority is granted by local creation. Unsupported owner policies and invalid required
+producer records are refused; an unverifiable review receipt has no inferred verdict. A changing
+durable cut is refused rather than mixed.
+
+`write_private_outcome` publishes only this policy's result into an already-open owner-owned private
+directory using a new 0600 file and never replaces an existing name. A failure before publication may
+leave only a private temporary orphan; a failure after publication is uncertain and requires inspection,
+not automatic retry or deletion. It is local cooperative custody, not a hostile-same-user sandbox.
+
 ## Current Boundary Evidence
 
 This section's original cut is historical; #54/PR92 and #90/PR93 now provide bounded durable product

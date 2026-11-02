@@ -34,6 +34,10 @@ if preparation_only:
     print("Installed ordinary preparation fixture passed.")
     raise SystemExit(0)
 for mode in ("pull", "managed"):
+    result = run_ordinary_flow(storage / f"private-outcome-{mode}", None, mode=mode, exercise="private-outcome-export")
+    if result["status"] != "completed" or result["satisfactions"] != 2:
+        raise SystemExit("installed private outcome export did not preserve original producers")
+for mode in ("pull", "managed"):
     result = run_ordinary_flow(storage / f"{mode}-stop", None, mode=mode, exercise="stop")
     if result["status"] != "stopped" or result["native_sends"] != 0:
         raise SystemExit(f"installed ordinary {mode} STOP did not revoke authority")

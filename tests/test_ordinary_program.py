@@ -29,6 +29,14 @@ def test_ordinary_installed_handlers_with_synthetic_external_peers(
     assert result["native_kilo"] is False
 
 
+@pytest.mark.parametrize("mode", ["pull", "managed"])
+def test_private_outcome_export_uses_actual_shared_producers(sqlite_tmp_path: Path, mode: str) -> None:
+    result = run_ordinary_flow(
+        sqlite_tmp_path / f"private-outcome-{mode}", None, mode=mode, exercise="private-outcome-export"
+    )
+    assert result["status"] == "completed" and result["satisfactions"] == 2
+
+
 def test_materialization_cannot_precede_atomic_claim(sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     initialize = OrdinaryGitWorkspace.initialize
 

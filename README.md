@@ -468,11 +468,10 @@ explicit uncertain cleanup targets; receipt recovery never accepts a candidate o
 `task export` is a thin persisted task/Allocation/candidate/acceptance/PR summary, not the richer
 reference export or a task-integrated `core.outcomes` pipeline. It lacks full requested/resolved/observed
 identity, provenance, usage, review/remediation and cancellation history. A stored PR receipt is
-historical evidence, not current remote state. [#58](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/58)
-covers versioned private full-path outcome/cost export, preserving unknowns and causal limits.
-Current status/export open SQLite themselves and are not concurrent views of an active exclusive
-controller. [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) owns the served
-snapshot/events/command/notification contract; no future API/flag is asserted here.
+historical evidence, not current remote state. The separate private outcome SDK below reads the
+owner's existing store rather than upgrading the `task export` contract. Current task status/export
+open SQLite themselves and are not concurrent views of an active exclusive controller. The served
+snapshot/events/command/notification contract is separate from both exports.
 
 ## Ordinary Forgejo SDK
 
@@ -519,6 +518,23 @@ global event log. Historical command receipts do not renew authority. Closing a 
 does not cancel an Attempt or prove physical settlement. The trusted host must authenticate and bind
 callers before passing a descriptor; this is not a remote authentication or hostile same-UID isolation
 scheme, and no remote listener is enabled by this contract.
+
+## Private Outcome SDK
+
+On the SQLite owner thread, `ports.outcome_export.export_private_outcome` reads a versioned local-only
+Program outcome using the explicit `private-metadata-v1` owner policy. The installed
+`adapters.outcome_file.write_private_outcome` can publish that result as a new 0600 file in a
+previously opened owner-private directory descriptor; it never replaces an existing name. It is an SDK,
+not a new CLI or remote service. The default ephemeral HMAC key links references within one export;
+an owner may separately retain and explicitly supply a 32-byte key for cross-export correlation.
+
+Raw identifiers, source content, prompts, workspace paths and free-form findings are excluded; unknown
+source rights are not treated as sharing permission. Resource subtotals remain separated by source,
+unit and provenance
+where the private policy permits their labels, while omitted labels and missing costs remain explicit.
+This is not complete billing, current remote state, approval to share, or evidence of causal model
+quality. The [private outcome contract](docs/architecture/contracts.md#private-outcome-export) defines
+publication uncertainty and producer-coverage limits.
 
 ## Ordinary Preparation
 

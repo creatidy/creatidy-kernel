@@ -87,6 +87,7 @@ from creatidy_kernel.core.verification import Evidence, EvidenceSubject, Verific
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.intake import OrdinaryIntake
 from creatidy_kernel.ports.ordinary import OrdinaryApproval, OrdinaryHandoff, OrdinaryProgram
+from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.ownership import WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
 from creatidy_kernel.ports.served import OwnerProjection
@@ -3026,6 +3027,63 @@ print("Done")
                 item.startswith("ses_") and item != "ses_fixture" for item in sessions
             )
             assert calls
+            if exercise in {"private-outcome-export", "review-remediation"}:
+                before = store.served_change_token()
+                outcome_export = export_private_outcome(
+                    store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+                )
+                assert store.served_change_token() == before
+                assert cast(dict[str, object], outcome_export["program"])["status"] == "completed"
+                projected_attempts = cast(list[dict[str, object]], outcome_export["attempts"])
+                assert len(projected_attempts) == (3 if exercise == "review-remediation" else 2)
+                satisfactions = cast(list[dict[str, object]], outcome_export["satisfactions"])
+                assert len(satisfactions) == 2
+                attempt_refs = {item["id"] for item in projected_attempts}
+                satisfaction_refs = {item["id"] for item in satisfactions}
+                assert all(item["attempt"] in attempt_refs for item in satisfactions)
+                assert all(
+                    item["attempt"] in attempt_refs
+                    for item in cast(list[dict[str, object]], outcome_export["usage_history"])
+                )
+                assert any(
+                    binding["source_kind"] == "predecessor" and binding["satisfaction"] in satisfaction_refs
+                    for item in projected_attempts
+                    for binding in cast(list[dict[str, object]], item["inputs"])
+                )
+                reviews = cast(list[dict[str, object]], outcome_export["reviews"])
+                assert len(reviews) == (3 if exercise == "review-remediation" else 2)
+                assert sum(item["verdict"] == "approve" for item in reviews) == 2
+                checks = cast(list[dict[str, object]], outcome_export["checks"])
+                assert checks and all(item["attempt"] in attempt_refs for item in checks)
+                assert all(type(item["passed"]) is bool and item["freshness"] == "not-evaluated" for item in checks)
+                effects = cast(list[dict[str, object]], outcome_export["effects"])
+                assert any(item["category"] == "verification" for item in effects)
+                assert all(item["category"] is not None for item in effects)
+                claims = cast(list[dict[str, object]], outcome_export["claims"])
+                assert len(claims) == len(projected_attempts)
+                assert all(item["resources"] and item["handoff_proofs"] for item in claims)
+                for item in claims:
+                    if item["mode"] == "managed":
+                        stages = {proof["stage"] for proof in cast(list[dict[str, object]], item["handoff_proofs"])}
+                        assert "start" in stages and "complete" in stages
+                review_sessions = {
+                    item["reviewer_session"] for item in reviews if item.get("reviewer_session") is not None
+                }
+                assert all(
+                    item["reviewer_session"] in review_sessions
+                    for item in checks
+                    if item["reviewer_session"] is not None
+                )
+                assert all(item["candidate"] in {review["candidate"] for review in reviews} for item in checks)
+                if exercise == "review-remediation":
+                    assert any(item["verdict"] == "request_changes" for item in reviews)
+                    assert any(item["remediation_of"] in attempt_refs for item in projected_attempts)
+                    decisions = cast(list[dict[str, object]], outcome_export["decisions"])
+                    assert decisions[0]["review_status"] == "changes_requested"
+                    assert decisions[0]["review_operation"] in {item["operation"] for item in reviews}
+                    assert b"Implement the approved edge case." not in encode(outcome_export)
+                assert cast(dict[str, object], outcome_export["coverage"])["complete_cost"] is None
+                assert b"A tightly bounded useful edit" not in encode(outcome_export)
             if exercise == "review-remediation-served":
                 snapshot = OwnerProjection(store, "everyday-program").snapshot()
                 prior = [item for item in snapshot.decisions if item.get("status") == "changes_requested"]
