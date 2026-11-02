@@ -128,6 +128,20 @@ def test_absent_budget_does_not_imply_no_work_or_cost(sqlite_tmp_path: Path) -> 
         assert coverage["complete_cost"] is None and result["work_budget"] is None
 
 
+def test_other_program_does_not_adopt_pre_attempt_task_cancellation(sqlite_tmp_path: Path) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / "foreign-cancel.sqlite3") as store:
+        program = store.create(reference_spec(), "create")
+        store.intent(
+            "cancel:task_execution:change",
+            "cancel:task_execution:change",
+            {"operation": "runtime:task_execution:change", "descendants": "unproven"},
+        )
+        exported = export_private_outcome(
+            store, program.program_id, owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        assert exported["cancellations"] == [] and exported["attempts"] == []
+
+
 def test_private_export_reopens_same_durable_evidence_without_mutation(sqlite_tmp_path: Path) -> None:
     path = sqlite_tmp_path / "reopen.sqlite3"
     with SQLiteProgramStore(path, boot_clock=Clock()) as store:

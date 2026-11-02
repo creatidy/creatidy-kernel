@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import itertools
 import json
 import os
 import subprocess
@@ -18,18 +19,49 @@ import creatidy_kernel
 from creatidy_kernel.adapters.fake_forge import SyntheticForgeTransport
 from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.outcome_file import write_private_outcome
+from creatidy_kernel.adapters.reference import POLICY as REFERENCE_POLICY
 from creatidy_kernel.adapters.reference import reference_commit, reference_git, reference_spec, run_reference
 from creatidy_kernel.adapters.reference_live import run_live_reference
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
-from creatidy_kernel.adapters.task_execution import TaskSpec, VerificationCommand, run_task, scarcity_router_143_task
+from creatidy_kernel.adapters.task_execution import (
+    TaskInterrupted,
+    TaskSpec,
+    VerificationCommand,
+    run_task,
+    scarcity_router_143_task,
+)
 from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import ActivateProgram, AttemptSpec, PrepareAttempt, ProgramSpec
-from creatidy_kernel.core.execution import RuntimeIdentity
+from creatidy_kernel.core.execution import (
+    Activity,
+    Artifact,
+    ArtifactManifest,
+    Candidate,
+    ExecutionRequest,
+    Lookup,
+    OperationKey,
+    Presence,
+    RuntimeIdentity,
+    RuntimeObservation,
+    TrustMode,
+    WorkspaceHandle,
+    WorkspaceSpec,
+)
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
-from creatidy_kernel.core.resources import Allocation
+from creatidy_kernel.core.resources import Allocation, ResourceRequest
+from creatidy_kernel.core.verification import (
+    Evidence,
+    EvidenceSubject,
+    ProductReviewReceipt,
+    ProductReviewRequest,
+    ProductReviewVerdict,
+    VerificationPolicy,
+)
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
+from creatidy_kernel.ports.application import Collection, advance_work_unit
 from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
+from creatidy_kernel.ports.verification import ReviewLookup, ReviewLookupStatus
 
 root = Path(__file__).resolve().parents[1]
 if root in Path(creatidy_kernel.__file__).resolve().parents:
@@ -442,33 +474,43 @@ for qualified in (False, True):
     if (connection.starts, connection.interrupts) != before_counts:
         raise SystemExit("installed reference export touched the original native connection")
 task_source_module = ast.parse((root / "tests/test_task_execution.py").read_text())
-baseline = next(
-    (
-        ast.literal_eval(item.value)
-        for item in task_source_module.body
-        if isinstance(item, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "BASE_TEST_FILE" for target in item.targets)
-    ),
-    None,
-)
-if type(baseline) is not str:
-    raise SystemExit("synthetic bounded-task baseline is unavailable")
-for qualified in (False, True):
-    root = storage / f"actual-task-{qualified}"
-    root.mkdir(mode=0o700)
-    source = root / "source"
+
+
+def task_literal(name: str) -> str:
+    value = next(
+        (
+            ast.literal_eval(item.value)
+            for item in task_source_module.body
+            if isinstance(item, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == name for target in item.targets)
+        ),
+        None,
+    )
+    if type(value) is not str:
+        raise ValueError("synthetic bounded-task source fixture is unavailable")
+    return value
+
+
+baseline, racy_block, fixed_block = (task_literal(name) for name in ("BASE_TEST_FILE", "RACY_BLOCK", "DEFLAKED_BLOCK"))
+
+
+def synthetic_task_source(label: str, task_id: str) -> tuple[Path, Path, TaskSpec]:
+    task_root = storage / label
+    task_root.mkdir(mode=0o700)
+    source = task_root / "source"
     source.mkdir(mode=0o700)
     reference_git(source, "init", "--initial-branch=develop")
     reference_git(source, "remote", "add", "origin", "https://forge.invalid/synthetic/task")
     (source / "tests").mkdir()
     (source / "tests" / "__init__.py").write_text("")
     (source / "tests" / "test_e2e_execution.py").write_text(baseline)
-    reference_git(source, "add", "tests")
+    (source / ".gitignore").write_text("__pycache__/\n*.pyc\n")
+    reference_git(source, "add", "tests", ".gitignore")
     reference_git(
         source, "-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid", "commit", "-m", "fixture"
     )
     task = TaskSpec(
-        task_id="synthetic-task",
+        task_id=task_id,
         forge_repository="forgejo:synthetic/task",
         repository_url="https://forge.invalid/synthetic/task",
         base_branch="develop",
@@ -480,6 +522,11 @@ for qualified in (False, True):
         ),
         structural=scarcity_router_143_task().structural,
     )
+    return task_root, source, task
+
+
+for qualified in (False, True):
+    root, source, task = synthetic_task_source(f"actual-task-{qualified}", "synthetic-task")
     connection = SyntheticOriginalConnection(root, qualified=qualified)
     control = root / "control"
 
@@ -535,6 +582,296 @@ for qualified in (False, True):
             raise SystemExit("installed task outcome inferred current state or dispatched work")
     if (connection.starts, connection.interrupts) != calls:
         raise SystemExit("installed task export touched the native connection")
+
+
+def pre_attempt_clock() -> BootClockReading:
+    return BootClockReading(100, 1_000_000_000, "synthetic-task-boot")
+
+
+for before_allocation, qualified in itertools.product((False, True), repeat=2):
+    root, source, task = synthetic_task_source(
+        f"actual-task-pre-attempt-{before_allocation}-{qualified}", "synthetic-pre-attempt"
+    )
+    requested = [before_allocation]
+    connection = SyntheticOriginalConnection(root, qualified=qualified)
+    control = root / "control"
+    allocation = Allocation("codex", "provider", "model", frozenset({"reference"}), 128, "synthetic owner")
+
+    class StopAllocator:
+        def select(
+            self, request: object, flag: list[bool] = requested, selected: Allocation = allocation
+        ) -> Allocation:
+            del request
+            flag[0] = True
+            return selected
+
+    with patch("creatidy_kernel.adapters.task_execution.time.time", return_value=100):
+        stopped = run_task(
+            control,
+            task=task,
+            source_repository=source,
+            owner_approved=True,
+            trusted_development_acknowledged=True,
+            connection=connection,
+            version=connection.version,
+            deadline=110,
+            allocation=None,
+            allocator=StopAllocator(),
+            boot_clock=pre_attempt_clock,
+            cancellation_requested=lambda flag=requested: flag[0],
+        )
+    if stopped["condition"] not in {"cancelled_no_dispatch", "cancel_uncertain"} or connection.starts != 0:
+        raise SystemExit("installed task did not preserve pre-Attempt cancellation")
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = store.operations()
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        cancellations = cast(list[dict[str, object]], exported["cancellations"])
+        if (
+            exported["attempts"]
+            or len(cancellations) != 1
+            or cancellations[0]["attempt"] is not None
+            or cancellations[0]["runtime_operation_recorded"] is not False
+            or cancellations[0]["no_dispatch_observed"] is not True
+            or cancellations[0]["settlement_recorded"] is not True
+            or cancellations[0]["qualified_original_no_dispatch_group"] is not qualified
+            or store.operations() != before
+        ):
+            raise SystemExit("installed reopened outcome invented an Attempt or lost pre-dispatch cancellation")
+
+root, source, task = synthetic_task_source("actual-task-pre-attempt-crash", "synthetic-pre-attempt-crash")
+connection = SyntheticOriginalConnection(root, qualified=True)
+control = root / "control"
+allocation = Allocation("codex", "provider", "model", frozenset({"reference"}), 128, "synthetic owner")
+with patch("creatidy_kernel.adapters.task_execution.time.time", return_value=100):
+    try:
+        run_task(
+            control,
+            task=task,
+            source_repository=source,
+            owner_approved=True,
+            trusted_development_acknowledged=True,
+            connection=connection,
+            version=connection.version,
+            deadline=110,
+            allocation=allocation,
+            boot_clock=pre_attempt_clock,
+            cancel_requested=True,
+            fault="cancel-claim",
+        )
+    except TaskInterrupted:
+        pass
+    else:
+        raise SystemExit("installed pre-Attempt cancellation cut was not reached")
+with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+    before = store.operations()
+    exported = export_private_outcome(store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+    cancellations = cast(list[dict[str, object]], exported["cancellations"])
+    if (
+        exported["attempts"]
+        or len(cancellations) != 1
+        or cancellations[0]["operation_status"] != "dispatched"
+        or cancellations[0]["settlement_recorded"] is not False
+        or cancellations[0]["qualified_original_no_dispatch_group"] is not None
+        or store.operations() != before
+        or connection.starts != 0
+    ):
+        raise SystemExit("installed pre-Attempt crash changed or fabricated original cancellation evidence")
+
+
+class SyntheticCompletingTaskConnection(SyntheticOriginalConnection):
+    def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+        if method == "turn/start":
+            if self.cwd is None:
+                raise AssertionError("synthetic worker was not started")
+            target = Path(self.cwd) / "tests/test_e2e_execution.py"
+            original = target.read_text()
+            if racy_block not in original:
+                raise AssertionError("synthetic baseline differs from frozen task")
+            target.write_text(original.replace(racy_block, fixed_block))
+            return {"turn": {"id": "synthetic-turn", "status": "completed"}}
+        if method == "thread/read":
+            return {"thread": {"id": params["threadId"], "turns": [{"id": "synthetic-turn", "status": "completed"}]}}
+        return super().request(method, params)
+
+
+for fault in (None, "pr-send"):
+    root, source, task = synthetic_task_source(
+        "actual-task-publication" if fault is None else "actual-task-unknown-publication", "synthetic-publication"
+    )
+    transport = SyntheticForgeTransport(Reference(task.forge_repository))
+    transport.branches["develop"] = reference_git(source, "rev-parse", "refs/heads/develop")
+    forge = ForgejoForge(transport, transport, lambda _: True)
+    connection = SyntheticCompletingTaskConnection(root, qualified=True)
+    control = root / "control"
+    allocation = Allocation("codex", "provider", "model", frozenset({"reference"}), 128, "synthetic owner")
+
+    def task_clock() -> BootClockReading:
+        return BootClockReading(100, 1_000_000_000, "synthetic-task-boot")
+
+    with patch("creatidy_kernel.adapters.task_execution.time.time", return_value=100):
+        try:
+            completed = run_task(
+                control,
+                task=task,
+                source_repository=source,
+                owner_approved=True,
+                trusted_development_acknowledged=True,
+                connection=connection,
+                version=connection.version,
+                deadline=110,
+                allocation=allocation,
+                boot_clock=task_clock,
+                forge_factory=lambda _directory, original=forge: original,
+                fault=fault,
+            )
+        except TaskInterrupted:
+            if fault != "pr-send":
+                raise
+        else:
+            if fault is not None or completed["condition"] != "accepted":
+                raise SystemExit(
+                    f"installed synthetic task publication condition: {completed.get('condition')}; "
+                    f"synthetic verification: {completed.get('verification')!r}"
+                )
+    before_calls = (connection.starts, connection.interrupts, transport.pushes, transport.posts)
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = store.operations()
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        native = cast(list[dict[str, object]], exported["native_effects"])
+        if len(native) != 1 or native[0]["driver"] != "task-pr-v1" or native[0]["current_remote_state"] is not None:
+            raise SystemExit("installed task publication lineage was lost or treated as current remote state")
+        if native[0]["receipt_recorded"] is not (fault is None) or store.operations() != before:
+            raise SystemExit("installed task publication guessed a receipt or changed original evidence")
+    if (connection.starts, connection.interrupts, transport.pushes, transport.posts) != before_calls:
+        raise SystemExit("installed task publication export reissued a native effect")
+
+
+class SyntheticReviewRuntime:
+    request_value: ExecutionRequest | None = None
+
+    def start(self, request: ExecutionRequest) -> str:
+        self.request_value = request
+        return "synthetic-review-runtime"
+
+    def observe(self, handle: str, *, now: int) -> RuntimeObservation:
+        if self.request_value is None:
+            raise ValueError("synthetic request is missing")
+        identity = replace(
+            self.request_value.identity,
+            resolved=self.request_value.identity.requested,
+            observed=self.request_value.identity.requested,
+            resolved_provider=self.request_value.identity.requested_provider,
+            observed_provider=self.request_value.identity.requested_provider,
+        )
+        return RuntimeObservation(handle, Activity.TERMINAL, now, now + 1000, identity, False)
+
+    def reconcile(self, operation: OperationKey, handle: str | None = None) -> Lookup:
+        del operation
+        return Lookup(Presence.FOUND, handle or "synthetic-review-runtime")
+
+    def candidate(self, handle: str) -> Candidate:
+        del handle
+        if self.request_value is None:
+            raise ValueError("synthetic request is missing")
+        return Candidate(
+            self.request_value.attempt.attempt_id,
+            self.request_value.attempt.digest,
+            ArtifactManifest(self.request_value.workspace.key, (Artifact("result.txt", "sha256:" + "0" * 64),)),
+        )
+
+    def cancel(self, handle: str) -> RuntimeObservation:
+        return self.observe(handle, now=10)
+
+
+class SyntheticExpiringCheck:
+    def check(self, name: str, subject: EvidenceSubject) -> Evidence:
+        return Evidence("synthetic-check", name, subject, "synthetic-checker", "v1", "sha256:check", 10, 100, True)
+
+
+class SyntheticReviewCollector:
+    def collect(self, request: ExecutionRequest, candidate: Candidate, *, now: int) -> Collection:
+        del request, now
+        return Collection(
+            candidate.artifacts, "synthetic-repository", "synthetic-base", "synthetic-head", SyntheticExpiringCheck()
+        )
+
+
+class SyntheticReviewAllocator:
+    def select(self, request: ResourceRequest) -> Allocation:
+        del request
+        return Allocation("fixture", "provider", "model", frozenset({"reference"}), 128, "synthetic")
+
+
+review_clock = [10]
+
+
+class SyntheticApprovingReview:
+    def dispatch(self, operation: OperationKey, request: ProductReviewRequest, *, fence: int) -> ProductReviewReceipt:
+        if not operation.operation_id.startswith("product-review:") or fence < 1:
+            raise ValueError("invalid synthetic review operation")
+        review_clock[0] = 101
+        return ProductReviewReceipt(
+            "synthetic-review",
+            request.input_digest,
+            request.subject,
+            "independent-reviewer",
+            "cold-synthetic-session",
+            ProductReviewVerdict.APPROVE,
+            (),
+            10,
+            1000,
+        )
+
+    def reconcile(self, operation: OperationKey, request_digest: str) -> ReviewLookup:
+        del operation, request_digest
+        return ReviewLookup(ReviewLookupStatus.ABSENT)
+
+
+stale_review_path = storage / "approved-review-stale-check.sqlite3"
+with SQLiteProgramStore(
+    stale_review_path, boot_clock=lambda: BootClockReading(10, 1_000_000_000, "synthetic-review-boot")
+) as store:
+    program = store.create(reference_spec(), "create-stale-review")
+    budget = WorkBudgetPolicy.basic(3, 1, verifications=6, retained_bytes=65536)
+    store.bind_work_budget(program.program_id, "synthetic-review-project", budget, budget, 110)
+    program = store.admit(program.program_id, "activate-stale-review", ActivateProgram(program.revision, "owner"))
+    workspace = WorkspaceHandle(
+        "workspace:first",
+        WorkspaceSpec("fixture", "base-revision", (), "tools:v1", "synthetic", TrustMode.TRUSTED_DEVELOPMENT),
+    )
+    outcome = advance_work_unit(
+        store,
+        program,
+        "first",
+        allocator=SyntheticReviewAllocator(),
+        runtime=SyntheticReviewRuntime(),
+        workspace=workspace,
+        collector=SyntheticReviewCollector(),
+        policy=VerificationPolicy(REFERENCE_POLICY.reference, ("exact-content",), True),
+        now=10,
+        clock=lambda: review_clock[0],
+        product_reviewer=SyntheticApprovingReview(),
+    )
+    if outcome != "rejected" or store.load(program.program_id).satisfactions:
+        raise SystemExit("installed synthetic stale prerequisite did not reject the candidate")
+with SQLiteProgramStore(
+    stale_review_path, boot_clock=lambda: BootClockReading(10, 1_000_000_000, "synthetic-review-boot")
+) as store:
+    exported = export_private_outcome(store, "reference", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+    reviews = cast(list[dict[str, object]], exported["reviews"])
+    decisions = cast(list[dict[str, object]], exported["decisions"])
+    if (
+        len(reviews) != 1
+        or reviews[0]["verdict"] != "approve"
+        or len(decisions) != 1
+        or decisions[0]["review_status"] != "approved"
+        or exported["satisfactions"]
+    ):
+        raise SystemExit("installed outcome conflated historical approval with rejected candidate acceptance")
 print(
     "Installed private outcome SDK: correction, unknown coverage, private custody and interrupted publication passed."
 )

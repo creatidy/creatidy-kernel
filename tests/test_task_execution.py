@@ -773,6 +773,17 @@ def test_cancel_before_attempt_is_stable_without_dispatch(sqlite_tmp_path: Path,
     assert first["runtime_operation_absent"] is True
     assert first["attempts"] == []
     assert "cancellation" in first
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = store.operations()
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        assert exported["attempts"] == []
+        cancellations = cast(list[dict[str, object]], exported["cancellations"])
+        assert len(cancellations) == 1 and cancellations[0]["attempt"] is None
+        assert cancellations[0]["runtime_operation_recorded"] is False
+        assert cancellations[0]["no_dispatch_observed"] is True and cancellations[0]["current_activity"] is None
+        assert store.operations() == before
     requested[0] = False
     for _ in range(2):
         restored = run(control, source, connection, allocation=None, allocator=allocator)
@@ -784,6 +795,29 @@ def test_cancel_before_attempt_is_stable_without_dispatch(sqlite_tmp_path: Path,
     assert task_status(control)["condition"] == "cancelled_no_dispatch"
     assert allocator.calls == (0 if before_allocation else 1)
     assert connection.starts == 0
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        reopened = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        assert reopened["attempts"] == [] and len(cast(list[object], reopened["cancellations"])) == 1
+
+
+def test_pre_attempt_cancellation_crash_stays_unsettled_without_dispatch(sqlite_tmp_path: Path) -> None:
+    source, control = make_source(sqlite_tmp_path), sqlite_tmp_path / "pre-attempt-crash"
+    connection = FixtureConnection(deflake_edit)
+    with pytest.raises(TaskInterrupted):
+        run(control, source, connection, cancel_requested=True, fault="cancel-claim")
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = store.operations()
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        cancellation = cast(list[dict[str, object]], exported["cancellations"])[0]
+        assert exported["attempts"] == [] and cancellation["attempt"] is None
+        assert cancellation["operation_status"] == "dispatched" and cancellation["settlement_recorded"] is False
+        assert cancellation["qualified_original_no_dispatch_group"] is None
+        assert cancellation["no_dispatch_observed"] is True and cancellation["current_activity"] is None
+        assert store.operations() == before and connection.starts == 0 and connection.interrupts == 0
 
 
 def test_cancellation_after_terminal_verification_is_durable(sqlite_tmp_path: Path) -> None:
@@ -1543,6 +1577,18 @@ def test_pr_delivery_recovery_never_creates_a_second_pr(sqlite_tmp_path: Path, f
     assert transport.posts <= 1
     pr = cast(dict[str, object], result["pr"])
     assert pr["status"] in {"accepted", "unknown"}
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = store.operations()
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        native = cast(list[dict[str, object]], exported["native_effects"])
+        assert len(native) == 1 and native[0]["driver"] == "task-pr-v1"
+        assert native[0]["attempt"] == cast(list[dict[str, object]], exported["attempts"])[0]["id"]
+        assert native[0]["current_remote_state"] is None and native[0]["receipt_recorded"] is (
+            pr["status"] == "accepted"
+        )
+        assert store.operations() == before
     if fault == "pr-send":
         # No durable reference was retained: delivery stays unknown and is never re-pushed.
         assert pr["status"] == "unknown"

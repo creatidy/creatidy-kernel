@@ -137,6 +137,12 @@ revoked. Ordinary native publication and the reference PR driver retain pseudony
 issue/repository, operation, acceptance and receipt lineage when producer records exist; a retained
 receipt is historical, not current Forge state. Finding IDs and fingerprints are pseudonymized and
 linked to the original review, rejection and remediation Attempt; finding prose is omitted.
+The bounded-task `task-pr-v1` publication uses its own original task/Program binding and the same
+historical-receipt rule. When an approving review is followed by an expired prerequisite, its approval
+is retained as historical review evidence without claiming the rejected candidate was accepted.
+An original bounded-task cancellation recorded before any Attempt is represented separately as
+pre-Attempt evidence; an absent runtime Operation does not fabricate an Attempt, runtime handle or
+proof about escaped descendants.
 Original candidate metadata, terminal candidate dispositions, standalone check results and retained
 verification manifests remain visible even if the controller stopped before accepting or rejecting the
 Attempt. A recorded missing check is unknown, not a passing result; overlapping standalone and

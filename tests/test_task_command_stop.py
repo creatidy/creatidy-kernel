@@ -50,6 +50,47 @@ class OwnedRuntime(FixtureConnection):
             self.process.wait(timeout=5)
 
 
+def test_pre_attempt_original_group_settlement_is_exported(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(task_execution.time, "time", lambda: 100)
+    source, control = make_source(sqlite_tmp_path), sqlite_tmp_path / "pre-attempt-control"
+    runtime = OwnedRuntime()
+    try:
+        stopped = task_execution.run_task(
+            control,
+            task=fixture_task(repeats=1),
+            source_repository=source,
+            owner_approved=True,
+            trusted_development_acknowledged=True,
+            connection=runtime,
+            version=runtime.version,
+            allocation=ALLOCATION,
+            deadline=110,
+            boot_clock=Clock(),
+            cancel_requested=True,
+        )
+        assert stopped["condition"] == "cancelled_no_dispatch" and runtime.starts == 0
+        with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+            exported = export_private_outcome(
+                store, task_execution.PROGRAM_ID, owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+            )
+            assert exported["attempts"] == []
+            cancellation = cast(list[dict[str, object]], exported["cancellations"])[0]
+            assert cancellation["attempt"] is None and cancellation["no_dispatch_observed"] is True
+            assert cancellation["settlement_recorded"] is True
+            assert cancellation["qualified_original_no_dispatch_group"] is True
+            assert cancellation["settlement_evidence"] is not None
+            assert (
+                cancellation["owned_group"] == cancellation["expected_group"]
+                and cancellation["owned_group"] is not None
+            )
+            assert cancellation["result_reconciled"] is True and cancellation["transport_succeeded"] is True
+            assert cancellation["current_activity"] is None and cancellation["physical_settlement"] is None
+    finally:
+        runtime.retire_fixture()
+
+
 @pytest.mark.parametrize("trigger", ["stop", "boot-expiry"])
 @pytest.mark.parametrize("stage", ["reopen", "same-invocation"])
 @pytest.mark.parametrize("runtime_running", [False, True])

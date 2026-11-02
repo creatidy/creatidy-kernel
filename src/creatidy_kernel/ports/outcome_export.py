@@ -372,7 +372,7 @@ def export_private_outcome(
                         "current_remote_state": None,
                     }
                 )
-            elif native_request.get("schema") == "reference-pr-v1":
+            elif native_request.get("schema") in {"reference-pr-v1", "task-pr-v1"}:
                 attempt = attempt_by_id.get(attempt_id)
                 acceptance = store.find_operation(f"acceptance:{attempt_id}")
                 if attempt is None or acceptance is None:
@@ -384,6 +384,30 @@ def export_private_outcome(
                     or native_request.get("mode") not in {"synthetic", "live"}
                 ):
                     raise ValueError("reference publication differs from original acceptance")
+                if native_request.get("schema") == "task-pr-v1":
+                    mode_operation = store.find_operation("task_execution:mode")
+                    mode = (
+                        None
+                        if mode_operation is None
+                        else _mapping(_mapping(json.loads(mode_operation.request_json)).get("request"))
+                    )
+                    task_digest = None if mode is None else mode.get("task_digest")
+                    if (
+                        program_id != "task_execution"
+                        or operation_id != "task_execution:pr"
+                        or mode_operation is None
+                        or mode_operation.effect_key != "task_execution:mode"
+                        or type(task_digest) is not str
+                        or not task_digest
+                        or not any(
+                            item.name == "task" and item.reference == "task_execution:task:" + task_digest
+                            for item in program.spec.initial_inputs
+                        )
+                        or mode is None
+                        or native_request.get("repository") != mode.get("repository")
+                        or native_request.get("mode") != mode.get("mode")
+                    ):
+                        raise ValueError("task publication differs from original bounded task")
                 known_data = store.find_artifact(operation_id, "known-reference")
                 known_reference = None if known_data is None else known_data.decode("utf-8")
                 if (
@@ -394,7 +418,7 @@ def export_private_outcome(
                     raise ValueError("reference publication receipt differs from original effect")
                 native_effects.append(
                     {
-                        "driver": "reference-pr-v1",
+                        "driver": native_request["schema"],
                         "action": "pr",
                         "transport_mode": native_request["mode"],
                         "operation": ref("operation", operation_id),
@@ -781,7 +805,7 @@ def export_private_outcome(
             request = _mapping(_mapping(json.loads(rejection.request_json)).get("request"))
             verification_data, verification_reference = artifact, request.get("manifest")
             status = request.get("product_review_status")
-            if status not in {None, "changes_requested", "owner_decision_needed", "comment", "invalid"}:
+            if status not in {None, "approved", "changes_requested", "owner_decision_needed", "comment", "invalid"}:
                 raise ValueError("invalid recorded review decision")
             decisions.append(
                 {
@@ -964,6 +988,99 @@ def export_private_outcome(
                 }
             )
     cancellations: list[dict[str, object]] = []
+    if program_id == "task_execution" and all(item.attempt_id != "task_execution:change" for item in program.attempts):
+        mode_operation = store.find_operation("task_execution:mode")
+        pre_attempt = store.find_operation("cancel:task_execution:change")
+        if pre_attempt is not None:
+            mode = (
+                None
+                if mode_operation is None
+                else _mapping(_mapping(json.loads(mode_operation.request_json)).get("request"))
+            )
+            request = _mapping(_mapping(json.loads(pre_attempt.request_json)).get("request"))
+            task_digest = None if mode is None else mode.get("task_digest")
+            if (
+                mode_operation is None
+                or mode_operation.effect_key != "task_execution:mode"
+                or type(task_digest) is not str
+                or not task_digest
+                or not any(
+                    item.name == "task" and item.reference == "task_execution:task:" + task_digest
+                    for item in program.spec.initial_inputs
+                )
+                or not any(item.work_unit_id == "change" for item in program.spec.work_units)
+                or pre_attempt.effect_key != "cancel:task_execution:change"
+                or request != {"operation": "runtime:task_execution:change", "descendants": "unproven"}
+            ):
+                raise ValueError("pre-Attempt cancellation differs from original bounded task")
+            runtime = store.find_operation("runtime:task_execution:change")
+            settlement_data = store.find_artifact(pre_attempt.operation_id, "owned-group-settlement")
+            settlement = None if settlement_data is None else _mapping(json.loads(settlement_data))
+            qualified: bool | None = None
+            if settlement is not None:
+                if (
+                    settlement.get("version") != 1
+                    or settlement.get("attempt_id") != "task_execution:change"
+                    or settlement.get("operation_id") != "runtime:task_execution:change"
+                    or settlement.get("handle") is not None
+                    or settlement.get("runtime_fence") is not None
+                    or type(settlement.get("cancellation_fence")) is not int
+                    or type(settlement.get("transport_succeeded")) is not bool
+                    or type(settlement.get("result_reconciled")) is not bool
+                    or (
+                        settlement.get("owned_group_settled") is not None
+                        and type(settlement.get("owned_group_settled")) is not bool
+                    )
+                    or settlement.get("descendants") != "unproven"
+                ):
+                    raise ValueError("invalid original pre-Attempt settlement")
+                group = settlement.get("owned_group_reference")
+                expected_group = settlement.get("expected_group_reference")
+                qualified = bool(
+                    runtime is None
+                    and pre_attempt.status == "accepted"
+                    and settlement.get("cancellation_fence") == pre_attempt.fence
+                    and type(group) is str
+                    and bool(group)
+                    and group == expected_group
+                    and settlement.get("owned_group_settled") is True
+                    and settlement.get("result_reconciled") is True
+                    and settlement.get("transport_succeeded") is True
+                )
+            cancellations.append(
+                {
+                    "driver": "bounded-task-pre-attempt",
+                    "attempt": None,
+                    "planned_attempt": ref("attempt", "task_execution:change"),
+                    "operation": ref("operation", pre_attempt.operation_id),
+                    "runtime_operation": ref("operation", "runtime:task_execution:change"),
+                    "runtime_operation_recorded": runtime is not None,
+                    "no_dispatch_observed": runtime is None,
+                    "request_recorded": True,
+                    "operation_status": pre_attempt.status,
+                    "cancellation_fence": pre_attempt.fence,
+                    "settlement_recorded": settlement_data is not None,
+                    "settlement_evidence": None
+                    if settlement_data is None
+                    else ref("artifact", "sha256:" + hashlib.sha256(settlement_data).hexdigest()),
+                    "settlement_fence": None if settlement is None else settlement.get("cancellation_fence"),
+                    "owned_group": None
+                    if settlement is None
+                    else ref("runtime-group", settlement.get("owned_group_reference")),
+                    "expected_group": None
+                    if settlement is None
+                    else ref("runtime-group", settlement.get("expected_group_reference")),
+                    "reported_owned_group_settled": None
+                    if settlement is None
+                    else settlement.get("owned_group_settled"),
+                    "result_reconciled": None if settlement is None else settlement.get("result_reconciled"),
+                    "transport_succeeded": None if settlement is None else settlement.get("transport_succeeded"),
+                    "qualified_original_no_dispatch_group": qualified,
+                    "current_activity": None,
+                    "physical_settlement": None,
+                    "descendants": "unproven",
+                }
+            )
     for attempt in program.attempts:
         operation_id = f"ordinary-cancel:{attempt.attempt_id}"
         operation = store.find_operation(operation_id)
