@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import select
+import socket
 from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
@@ -10,6 +12,7 @@ from test_work_budget import Clock, initialize, policy, prepare
 from test_work_ownership import claim, client, workspace
 
 from creatidy_kernel.adapters.reference import reference_spec
+from creatidy_kernel.adapters.served_local import LocalDecisionNotifier
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import ActivateProgram
@@ -249,6 +252,65 @@ def test_snapshot_projects_recorded_candidate_session_and_decision(sqlite_tmp_pa
             },
         )
         assert projection.events(before.position).gap is True
+
+
+@pytest.mark.parametrize("status", ["owner_decision_needed", "comment", "invalid"])
+@pytest.mark.parametrize("sdk_first", [False, True])
+def test_rejection_aliases_emit_one_decision_alert(sqlite_tmp_path: Path, status: str, sdk_first: bool) -> None:
+    with SQLiteProgramStore(sqlite_tmp_path / f"{status}-{sdk_first}.db", boot_clock=Clock()) as store:
+        program = initialize(store)
+        tree = workspace(sqlite_tmp_path, f"tree-{status}-{sdk_first}")
+        granted = claim(store, client(store, tree), tree)
+        rejection = f"rejection:{granted.attempt.attempt_id}"
+        store.intent(
+            rejection,
+            rejection,
+            {
+                "manifest": "sha256:synthetic",
+                "product_review_status": status,
+                "reason": "synthetic bounded review",
+                "review_operation_id": "product-review:synthetic",
+            },
+        )
+        store.finalize_artifact(rejection, "rejected-result", b"synthetic rejection")
+        projection = OwnerProjection(store, program.program_id)
+        sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        with sender, receiver:
+            notifier = LocalDecisionNotifier(sender)
+            if sdk_first:
+                notifier.publish(projection.snapshot())
+                assert select.select([receiver], [], [], 2)[0]
+                receiver.recv(65536)
+            actor, key = "worker-7", "report-one"
+            operation = command_prefix(program.program_id) + digest(encode([actor, key]))
+            store.intent(
+                operation,
+                operation,
+                {
+                    "version": 1,
+                    "action": "report",
+                    "command_id": key,
+                    "expected_revision": program.revision,
+                    "claim_id": granted.command_key,
+                    "scope": program.program_id,
+                    "actor": actor,
+                    "attempt_digest": granted.attempt.digest,
+                    "claim_generation": granted.generation,
+                },
+            )
+            store.finalize_artifact(
+                operation,
+                "receipt",
+                encode({"version": 1, "status": status, "settlement": "unknown", "authority": "historical-only"}),
+            )
+            snapshot = projection.snapshot()
+            notifier.publish(snapshot)
+            if not sdk_first:
+                assert select.select([receiver], [], [], 2)[0]
+                receiver.recv(65536)
+            assert not select.select([receiver], [], [], 0)[0]
+            notifier.publish(snapshot)
+            assert not select.select([receiver], [], [], 0)[0]
 
 
 def test_claim_count_is_scoped_even_for_large_history(sqlite_tmp_path: Path) -> None:

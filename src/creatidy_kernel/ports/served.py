@@ -201,7 +201,10 @@ class OwnerProjection:
                         ]
                         if len(matching_reviews) == 1:
                             decision["decision_id"] = matching_reviews[0]
-                    elif value["status"] == "rejected" and attempt_id is not None:
+                    elif (
+                        value["status"] in {"rejected", "owner_decision_needed", "comment", "invalid"}
+                        and attempt_id is not None
+                    ):
                         rejection_id = f"rejection:{attempt_id}"
                         if self._store.find_artifact(rejection_id, "rejected-result") is not None:
                             decision["decision_id"] = rejection_id
