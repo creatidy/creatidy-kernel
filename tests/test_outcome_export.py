@@ -65,6 +65,9 @@ def test_private_export_preserves_correction_and_unknown_coverage(sqlite_tmp_pat
         assert result["schema"] == "creatidy.outcome.private/1"
         usage = cast(list[dict[str, object]], result["usage_history"])
         assert len(usage) == 4
+        exported_attempt = cast(list[dict[str, object]], result["attempts"])[0]["id"]
+        assert all(item["attempt"] == exported_attempt and item["attempt_binding"] == "recorded" for item in usage)
+        assert cast(dict[str, object], result["coverage"])["unattributed_usage_observations"] == 0
         assert sorted(
             cast(str, item["quantity"]) for item in usage if item["effective"] and item["quantity"] is not None
         ) == ["3", "4"]
@@ -79,6 +82,11 @@ def test_private_export_preserves_correction_and_unknown_coverage(sqlite_tmp_pat
         assert {item["known_subtotal"] for item in totals if item["unit"] == "USD"} == {"3", "4"}
         assert all(item["quantity"] is None and item["complete"] is False for item in totals)
         assert cast(dict[str, object], result["coverage"])["complete_cost"] is None
+        budget = cast(dict[str, object], result["work_budget"])
+        deadline = cast(dict[str, object], budget["original_deadline"])
+        assert deadline["wall_deadline"] == 110 and deadline["wall_anchor"] == 100
+        assert deadline["boot_deadline_ns"] == 11_000_000_000
+        assert deadline["boot_id"] != "synthetic-boot-a" and "synthetic-boot-a" not in json.dumps(result)
         assert (
             store.load(program.program_id),
             store.operations(),
@@ -508,8 +516,45 @@ def test_completed_independent_reference_driver_exports_actual_lineage(sqlite_tm
         assert result["reviews"] == [] and coverage["complete_cost"] is None
         checks = cast(list[dict[str, object]], result["checks"])
         assert checks and all(item["passed"] is True and item["freshness"] == "not-evaluated" for item in checks)
+        native = cast(list[dict[str, object]], result["native_effects"])
+        assert len(native) == 1 and native[0]["driver"] == "reference-pr-v1" and native[0]["action"] == "pr"
+        assert native[0]["transport_mode"] == "synthetic" and native[0]["current_remote_state"] is None
         assert coverage["strict_inference_profile"] is False and coverage["route_and_call_identity"] is None
         assert store.served_change_token() == before
+
+
+def test_reference_publication_unknown_remains_historical_without_retry(sqlite_tmp_path: Path) -> None:
+    interrupted = run_reference(sqlite_tmp_path, owner_approved=True, fault="pr-send")
+    assert cast(dict[str, object], interrupted["pr"])["status"] == "unknown"
+    with SQLiteProgramStore(sqlite_tmp_path / "kernel.sqlite3") as store:
+        before = store.operation("reference:pr")
+        result = export_private_outcome(store, "reference", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+        native = cast(list[dict[str, object]], result["native_effects"])
+        assert len(native) == 1 and native[0]["driver"] == "reference-pr-v1"
+        assert native[0]["receipt_recorded"] is False and native[0]["current_remote_state"] is None
+        assert store.operation("reference:pr") == before and before.attempts == 1
+
+
+def test_review_findings_remain_linked_after_reopen(sqlite_tmp_path: Path) -> None:
+    root = sqlite_tmp_path / "reopened-review-findings"
+    assert run_ordinary_flow(root, None, mode="pull", exercise="review-remediation")["status"] == "completed"
+    with SQLiteProgramStore(root / "state.db") as store:
+        result = export_private_outcome(
+            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        review = next(
+            item for item in cast(list[dict[str, object]], result["reviews"]) if item["verdict"] == "request_changes"
+        )
+        remediation = next(
+            item
+            for item in cast(list[dict[str, object]], result["attempts"])
+            if item["remediation_of"] == review["attempt"]
+        )
+        findings = cast(list[dict[str, object]], review["findings"])
+        assert findings and all(
+            item in cast(list[dict[str, object]], remediation["remediation_findings"]) for item in findings
+        )
+        assert "Implement the approved edge case." not in json.dumps(result)
 
 
 @pytest.mark.parametrize("damage", ["subject", "reviewer"])
@@ -555,6 +600,30 @@ def test_corrupt_verification_artifact_refuses_export(sqlite_tmp_path: Path) -> 
         with patch.object(SQLiteProgramStore, "find_artifact", altered):
             with pytest.raises(ValueError, match="verification evidence reference mismatch"):
                 export_private_outcome(store, "reference", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+
+
+def test_native_receipt_from_different_original_effect_is_refused(sqlite_tmp_path: Path) -> None:
+    root = sqlite_tmp_path / "native-receipt-mismatch"
+    assert run_ordinary_flow(root, None, mode="pull")["status"] == "completed"
+    with SQLiteProgramStore(root / "state.db") as store:
+        operation = next(
+            item.operation_id for item in store.operations("ordinary-publish:") if item.operation_id.endswith(":pr")
+        )
+        original = SQLiteProgramStore.find_artifact
+
+        def altered(target: SQLiteProgramStore, operation_id: str, name: str) -> bytes | None:
+            data = original(target, operation_id, name)
+            if operation_id == operation and name == "native-receipt" and data is not None:
+                record = json.loads(data)
+                record["reference"] = "forgejo:synthetic/wrong-receipt"
+                return json.dumps(record).encode()
+            return data
+
+        with patch.object(SQLiteProgramStore, "find_artifact", altered):
+            with pytest.raises(ValueError, match="native receipt differs"):
+                export_private_outcome(
+                    store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+                )
 
 
 @pytest.mark.parametrize("payload", [b"not-json", b'{"version":99}'])

@@ -10,6 +10,7 @@ from typing import cast
 import creatidy_kernel
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.intake import IntakeRefused
+from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 
 ROOT = Path(__file__).resolve().parents[1]
 if Path(creatidy_kernel.__file__).resolve().is_relative_to(ROOT):
@@ -33,6 +34,16 @@ for mode in ("pull", "managed", "mixed"):
 if preparation_only:
     print("Installed ordinary preparation fixture passed.")
     raise SystemExit(0)
+if run_ordinary_flow(storage / "private-stop-uncertain", None, mode="managed", exercise="private-stop-uncertain") != {
+    "status": "stopped-unknown",
+    "native_sends": 0,
+}:
+    raise SystemExit("installed outcome export concealed uncertain managed cancellation")
+with SQLiteProgramStore(storage / "private-stop-uncertain" / "state.db") as store:
+    exported = export_private_outcome(store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+    cancellations = cast(list[dict[str, object]], exported["cancellations"])
+    if len(cancellations) != 1 or cancellations[0]["settlement_recorded"] is not False:
+        raise SystemExit("installed reopened export misstated uncertain original cancellation")
 for mode in ("pull", "managed"):
     result = run_ordinary_flow(storage / f"private-outcome-{mode}", None, mode=mode, exercise="private-outcome-export")
     if result["status"] != "completed" or result["satisfactions"] != 2:
@@ -46,6 +57,19 @@ for mode in ("pull", "managed"):
     result = run_ordinary_flow(storage / f"{mode}-review-remediation", None, mode=mode, exercise="review-remediation")
     if result["status"] != "completed" or result["satisfactions"] != 2:
         raise SystemExit(f"installed ordinary {mode} failed to deliver substantive review findings")
+    with SQLiteProgramStore(storage / f"{mode}-review-remediation" / "state.db") as store:
+        exported = export_private_outcome(
+            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        reviews = cast(list[dict[str, object]], exported["reviews"])
+        attempts = cast(list[dict[str, object]], exported["attempts"])
+        review = next(item for item in reviews if item["verdict"] == "request_changes")
+        remediation = next(item for item in attempts if item["remediation_of"] == review["attempt"])
+        original_findings = cast(list[dict[str, object]], review["findings"])
+        if not original_findings or not all(
+            item in cast(list[dict[str, object]], remediation["remediation_findings"]) for item in original_findings
+        ):
+            raise SystemExit("installed reopened export lost exact review finding lineage")
 if run_ordinary_flow(
     storage / "review-remediation-tampered", None, mode="pull", exercise="review-remediation-tampered"
 ) != {"status": "refused", "native_sends": 0}:
@@ -102,6 +126,10 @@ if run_ordinary_flow(storage / "stop-completed", None, mode="pull", exercise="st
     "native_sends": 0,
 }:
     raise SystemExit("installed STOP changed completion or allowed later publication")
+with SQLiteProgramStore(storage / "stop-completed" / "state.db") as store:
+    exported = export_private_outcome(store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+    if cast(dict[str, object], exported["coverage"])["work_revocation_recorded"] is not True:
+        raise SystemExit("installed reopened export lost completed-Program revocation")
 for exercise in ("managed-program-stop", "managed-budget-revoke"):
     if run_ordinary_flow(storage / exercise, None, mode="managed", exercise=exercise) != {
         "status": "stopped",

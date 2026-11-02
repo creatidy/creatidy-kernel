@@ -799,6 +799,7 @@ class SQLiteProgramStore:
                 proofs.append(proof.payload())
             return {
                 "profile": claim.profile,
+                "original_claim": asdict(claim),
                 "resources": [asdict(item) for item in claim.resources],
                 "proofs": proofs,
                 "quarantine": self._work_record("ownership-unknown", command_key),
@@ -813,6 +814,13 @@ class SQLiteProgramStore:
                     ).fetchall()
                 ],
             }
+
+    def outcome_revocation(self, program_id: str) -> dict[str, object] | None:
+        """Return recorded original revocation without clock or authority sampling."""
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        with self._gate:
+            return self._work_record("revoked", program_id)
 
     def served_claims(self, program_id: str, *, offset: int = 0, limit: int = 8) -> tuple[dict[str, object], ...]:
         """Project only recorded ownership facts for one Program, without sampling authority."""

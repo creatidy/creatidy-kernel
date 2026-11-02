@@ -15,11 +15,13 @@ from dataclasses import asdict
 from decimal import Decimal, InvalidOperation, localcontext
 from typing import Protocol, cast
 
+from creatidy_kernel.core.deadlines import DeadlineProjection
 from creatidy_kernel.core.domain import Program
 from creatidy_kernel.core.execution import RuntimeIdentity
 from creatidy_kernel.core.outcomes import Provenance
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.allocation import decode_identity, decode_runtime_receipt_with_group, load_allocation
+from creatidy_kernel.ports.intake import draft_from
 from creatidy_kernel.ports.program_store import ApplicationStore, OperationRecord
 from creatidy_kernel.ports.verification import decode_product_review_receipt
 
@@ -42,6 +44,7 @@ class OutcomeExportStore(ApplicationStore, Protocol):
     def served_change_token(self) -> tuple[int, int]: ...
     def outcome_effect_evidence(self, program_id: str, operation_id: str) -> dict[str, object]: ...
     def outcome_claim_evidence(self, program_id: str, command_key: str) -> dict[str, object]: ...
+    def outcome_revocation(self, program_id: str) -> dict[str, object] | None: ...
 
 
 def _mapping(value: object) -> dict[str, object]:
@@ -104,10 +107,57 @@ def export_private_outcome(
     budget = store.work_budget_status(program_id) if configured else {}
     binding = _mapping(budget["binding"]) if configured else None
     budget_policy = WorkBudgetPolicy.decode(binding["policy"]) if binding is not None else None
+    deadline = DeadlineProjection.decode(binding["projection"]) if binding is not None else None
+    revocation = store.outcome_revocation(program_id)
+    if revocation is not None and revocation.get("program") != program_id:
+        raise ValueError("recorded revocation differs from selected Program")
     reservations = _items(budget.get("reservations", []))
     history = _items(budget.get("usage_history", []))
     effective = _items(budget.get("effective_usage", []))
     attempt_by_id = {item.attempt_id: item for item in program.attempts}
+    native_subjects: dict[str, dict[str, object]] = {}
+    native_subject_output: list[dict[str, object]] = []
+    for attempt in program.attempts:
+        context_reference = attempt.spec.context_reference
+        if context_reference is None or not context_reference.startswith("ordinary-proposal:"):
+            continue
+        proposal_digest = context_reference.removeprefix("ordinary-proposal:")
+        raw = store.find_artifact(f"ordinary-program:proposal:{proposal_digest}", "record")
+        if raw is None or hashlib.sha256(raw).hexdigest() != proposal_digest:
+            raise ValueError("original ordinary proposal evidence is missing or inconsistent")
+        proposal = _mapping(json.loads(raw))
+        drafts = _items(proposal.get("drafts"))
+        if (
+            proposal.get("version") != 1
+            or proposal.get("kind") != "ordinary-program-proposal"
+            or proposal.get("program") != program_id
+        ):
+            raise ValueError("original ordinary proposal belongs to another Program")
+        matches = [
+            draft_from(json.dumps(item, sort_keys=True, separators=(",", ":")).encode())
+            for item in drafts
+            if item.get("task_id") == attempt.spec.work_unit_id
+        ]
+        if len(matches) != 1:
+            raise ValueError("original ordinary WorkUnit has no unique native subject")
+        subject = matches[0].evidence.subject
+        subject_key = json.dumps(
+            [subject.origin, subject.repository, subject.issue], ensure_ascii=True, separators=(",", ":")
+        )
+        native_subjects[attempt.attempt_id] = subject.payload()
+        native_subject_output.append(
+            {
+                "attempt": ref("attempt", attempt.attempt_id),
+                "work_unit": ref("work-unit", attempt.spec.work_unit_id),
+                "driver": "ordinary-proposal-v1",
+                "issue": ref("native-issue", subject_key),
+                "origin": ref("origin", subject.origin),
+                "repository": ref("native-repository", subject.repository),
+                "branch": ref("branch", subject.branch),
+                "base": ref("revision", subject.base),
+                "current_remote_state": None,
+            }
+        )
     grouped: dict[tuple[str, str, str, str], Decimal | None] = {}
     for item in effective:
         source, metric, unit, provenance = (
@@ -170,8 +220,8 @@ def export_private_outcome(
         observations.append(
             {
                 "observation": observation_ref(item.get("observation_id")),
-                "attempt": ref("attempt", item.get("attempt")),
-                "attempt_binding": "recorded" if item.get("attempt") in attempt_by_id else "unknown",
+                "attempt": ref("attempt", item.get("attempt_id")),
+                "attempt_binding": "recorded" if item.get("attempt_id") in attempt_by_id else "unknown",
                 "operation": ref("operation", item.get("operation")),
                 "receipt": ref("usage-receipt", receipt_identity),
                 "source": ref("source", source),
@@ -189,6 +239,8 @@ def export_private_outcome(
 
     effects: list[dict[str, object]] = []
     reviews: list[dict[str, object]] = []
+    findings: list[dict[str, object]] = []
+    native_effects: list[dict[str, object]] = []
     for item in reservations:
         operation_id, attempt_id, category = item.get("operation"), item.get("attempt"), item.get("category")
         if type(operation_id) is not str or type(attempt_id) is not str or type(category) is not str:
@@ -245,6 +297,114 @@ def export_private_outcome(
                 ],
             }
         )
+        if operation is not None:
+            native_request = _mapping(_mapping(json.loads(operation.request_json)).get("request"))
+            if native_request.get("kind") == "ordinary-publication":
+                attempt = attempt_by_id.get(attempt_id)
+                native = native_subjects.get(attempt_id)
+                accepted = _mapping(native_request.get("accepted"))
+                subject = _mapping(native_request.get("subject"))
+                action = native_request.get("action")
+                satisfaction = next(
+                    (item for item in program.satisfactions if item.reference_id == accepted.get("satisfaction")), None
+                )
+                if (
+                    attempt is None
+                    or native is None
+                    or action not in {"pr", "receipt"}
+                    or satisfaction is None
+                    or satisfaction.source_attempt_id != attempt_id
+                    or accepted.get("attempt") != attempt.spec.digest
+                    or accepted.get("program") != program_id
+                    or accepted.get("unit") != attempt.spec.work_unit_id
+                    or accepted.get("spec") != attempt.spec.spec_digest
+                    or accepted.get("issue") != native.get("issue")
+                    or native_request.get("origin") != native.get("origin")
+                    or subject.get("attempt_digest") != attempt.spec.digest
+                    or subject.get("spec_digest") != attempt.spec.spec_digest
+                    or subject.get("candidate_digest") != accepted.get("candidate")
+                    or subject.get("base_revision") != accepted.get("base")
+                    or subject.get("head_revision") != accepted.get("head")
+                ):
+                    raise ValueError("ordinary publication differs from its original accepted subject")
+                receipt_data = store.find_artifact(operation_id, "native-receipt")
+                receipt_reference = None
+                if receipt_data is not None:
+                    receipt = _mapping(json.loads(receipt_data))
+                    identity = _mapping(receipt.get("operation"))
+                    if (
+                        receipt.get("profile") != "forgejo-native-readback:v1"
+                        or receipt.get("action") != action
+                        or receipt.get("accepted") != accepted
+                        or identity
+                        != {
+                            "operation_id": operation.operation_id,
+                            "effect_key": operation.effect_key,
+                            "request_digest": operation.request_digest,
+                        }
+                        or type(receipt.get("reference")) is not str
+                        or (operation.status == "accepted" and receipt.get("reference") != operation.accepted_reference)
+                    ):
+                        raise ValueError("native receipt differs from its original publication")
+                    receipt_reference = receipt["reference"]
+                subject_key = json.dumps(
+                    [native["origin"], native["repository"], native["issue"]], ensure_ascii=True, separators=(",", ":")
+                )
+                native_effects.append(
+                    {
+                        "driver": "ordinary-forgejo",
+                        "action": action,
+                        "operation": ref("operation", operation_id),
+                        "attempt": ref("attempt", attempt_id),
+                        "work_unit": ref("work-unit", attempt.spec.work_unit_id),
+                        "issue": ref("native-issue", subject_key),
+                        "origin": ref("origin", native["origin"]),
+                        "repository": ref("native-repository", native["repository"]),
+                        "candidate": ref("candidate", accepted.get("candidate")),
+                        "satisfaction": ref("satisfaction", accepted.get("satisfaction")),
+                        "receipt_recorded": receipt_data is not None,
+                        "receipt": ref("native-record", receipt_reference),
+                        "receipt_profile": None if receipt_data is None else "forgejo-native-readback:v1",
+                        "current_remote_state": None,
+                    }
+                )
+            elif native_request.get("schema") == "reference-pr-v1":
+                attempt = attempt_by_id.get(attempt_id)
+                acceptance = store.find_operation(f"acceptance:{attempt_id}")
+                if attempt is None or acceptance is None:
+                    raise ValueError("reference publication lacks original accepted Attempt")
+                accepted = _mapping(_mapping(json.loads(acceptance.request_json)).get("request"))
+                if (
+                    native_request.get("acceptance_reference") != accepted.get("manifest")
+                    or native_request.get("head") != accepted.get("head")
+                    or native_request.get("mode") not in {"synthetic", "live"}
+                ):
+                    raise ValueError("reference publication differs from original acceptance")
+                known_data = store.find_artifact(operation_id, "known-reference")
+                known_reference = None if known_data is None else known_data.decode("utf-8")
+                if (
+                    known_reference is not None
+                    and operation.accepted_reference is not None
+                    and known_reference != operation.accepted_reference
+                ):
+                    raise ValueError("reference publication receipt differs from original effect")
+                native_effects.append(
+                    {
+                        "driver": "reference-pr-v1",
+                        "action": "pr",
+                        "transport_mode": native_request["mode"],
+                        "operation": ref("operation", operation_id),
+                        "attempt": ref("attempt", attempt_id),
+                        "work_unit": ref("work-unit", attempt.spec.work_unit_id),
+                        "repository": ref("native-repository", native_request.get("repository")),
+                        "base_branch": ref("branch", native_request.get("base_branch")),
+                        "head": ref("revision", native_request.get("head")),
+                        "acceptance_manifest": ref("artifact", native_request.get("acceptance_reference")),
+                        "receipt": ref("native-record", operation.accepted_reference or known_reference),
+                        "receipt_recorded": operation.accepted_reference is not None or known_reference is not None,
+                        "current_remote_state": None,
+                    }
+                )
         if category == "review" and operation_id.startswith("product-review:") and operation is not None:
             request_data = store.find_artifact(operation_id, "review-request")
             receipt_data = store.find_artifact(operation_id, "review-receipt")
@@ -293,6 +453,7 @@ def export_private_outcome(
             reviewer_session = None
             observed_at = None
             fresh_until = None
+            review_findings: list[dict[str, object]] = []
             if receipt_data is not None:
                 try:
                     receipt = decode_product_review_receipt(receipt_data)
@@ -308,6 +469,22 @@ def export_private_outcome(
                     reviewer = ref("actor", receipt.reviewer_id)
                     reviewer_session = ref("runtime-handle", receipt.reviewer_session)
                     observed_at, fresh_until = receipt.observed_at, receipt.fresh_until
+                    review_findings = [
+                        {
+                            "id": ref("finding", finding.finding_id),
+                            "fingerprint": ref("finding-fingerprint", finding.fingerprint),
+                        }
+                        for finding in receipt.findings
+                    ]
+                    findings.extend(
+                        {
+                            **item,
+                            "attempt": ref("attempt", attempt_id),
+                            "review_operation": ref("operation", operation_id),
+                            "source": "product-review",
+                        }
+                        for item in review_findings
+                    )
                 except (TypeError, ValueError, json.JSONDecodeError):
                     # An invalid receipt is evidence of neither approval nor a verdict.
                     verdict = None
@@ -328,6 +505,7 @@ def export_private_outcome(
                     "reviewer": reviewer,
                     "reviewer_session": reviewer_session,
                     "verdict": verdict,
+                    "findings": review_findings,
                     "observed_at": observed_at,
                     "fresh_until": fresh_until,
                     "freshness": "not-evaluated",
@@ -450,6 +628,26 @@ def export_private_outcome(
                         "freshness": "not-evaluated",
                     }
                 )
+            if "findings" in manifest:
+                for finding in _items(manifest["findings"]):
+                    if (
+                        finding.get("subject") != subject
+                        or type(finding.get("finding_id")) is not str
+                        or not finding.get("finding_id")
+                        or type(finding.get("fingerprint")) is not str
+                        or not finding.get("fingerprint")
+                    ):
+                        raise ValueError("finding differs from original verification subject")
+                    findings.append(
+                        {
+                            "id": ref("finding", finding.get("finding_id")),
+                            "fingerprint": ref("finding-fingerprint", finding.get("fingerprint")),
+                            "attempt": ref("attempt", attempt.attempt_id),
+                            "manifest": ref("artifact", verification_reference),
+                            "candidate": ref("candidate", subject.get("candidate_digest")),
+                            "source": "verification-manifest",
+                        }
+                    )
         attempts.append(
             {
                 "id": ref("attempt", attempt.attempt_id),
@@ -507,6 +705,7 @@ def export_private_outcome(
         )
 
     claims: list[dict[str, object]] = []
+    original_claims: dict[str, tuple[dict[str, object], list[dict[str, object]]]] = {}
     count = store.served_claim_count(program_id)
     for offset in range(0, count, 8):
         for item in store.served_claims(program_id, offset=offset):
@@ -514,6 +713,15 @@ def export_private_outcome(
             if type(command) is not str:
                 raise ValueError("invalid durable claim identity")
             evidence = store.outcome_claim_evidence(program_id, command)
+            original_claim = _mapping(evidence.get("original_claim"))
+            claim_attempt = _mapping(original_claim.get("attempt"))
+            claim_attempt_id = claim_attempt.get("attempt_id")
+            if type(claim_attempt_id) is not str or claim_attempt_id != item.get("attempt"):
+                raise ValueError("claim differs from original Attempt")
+            proofs = _items(evidence.get("proofs"))
+            if claim_attempt_id in original_claims:
+                raise ValueError("Attempt has competing original claims")
+            original_claims[claim_attempt_id] = (original_claim, proofs)
             mode = item.get("mode")
             quarantine = None if evidence.get("quarantine") is None else _mapping(evidence["quarantine"])
             release = None if evidence.get("release") is None else _mapping(evidence["release"])
@@ -541,7 +749,7 @@ def export_private_outcome(
                             ),
                             "generation": proof.get("generation"),
                         }
-                        for proof in _items(evidence.get("proofs"))
+                        for proof in proofs
                     ],
                     "quarantine_evidence": None if quarantine is None else ref("evidence", quarantine.get("evidence")),
                     "release_evidence": None if release is None else ref("evidence", release.get("evidence")),
@@ -562,8 +770,62 @@ def export_private_outcome(
                     "physical_settlement": None,
                 }
             )
+    cancellations: list[dict[str, object]] = []
+    for attempt in program.attempts:
+        operation_id = f"ordinary-cancel:{attempt.attempt_id}"
+        operation = store.find_operation(operation_id)
+        if operation is None:
+            continue
+        request = _mapping(_mapping(json.loads(operation.request_json)).get("request"))
+        original = original_claims.get(attempt.attempt_id)
+        if (
+            request.get("kind") != "ordinary-cancellation"
+            or original is None
+            or request.get("claim") != json.loads(json.dumps(original[0]))
+            or original[0].get("mode") != "managed"
+        ):
+            raise ValueError("cancellation differs from original managed claim")
+        settlement_data = store.find_artifact(operation_id, "settlement")
+        group = None
+        if settlement_data is not None:
+            settlement = _mapping(json.loads(settlement_data))
+            stop = [item for item in original[1] if item.get("stage") == "stop"]
+            if (
+                set(settlement) != {"claim", "profile", "group"}
+                or settlement.get("claim") != request.get("claim")
+                or settlement.get("profile") != original[0].get("profile")
+                or len(stop) != 1
+                or stop[0].get("reference") != settlement.get("group")
+            ):
+                raise ValueError("cancellation settlement differs from original target")
+            group = settlement.get("group")
+        cancellations.append(
+            {
+                "attempt": ref("attempt", attempt.attempt_id),
+                "claim": ref("claim", original[0].get("command_key")),
+                "operation": ref("operation", operation_id),
+                "request_recorded": True,
+                "reason": ref("evidence", request.get("reason")),
+                "settlement_recorded": settlement_data is not None,
+                "settled_original_group": ref("runtime-group", group),
+                "terminal_observed": None,
+                "physical_settlement": None,
+            }
+        )
     if len(claims) != count or store.served_change_token() != token:
         raise ValueError("durable outcome changed during export")
+    for attempt in attempts:
+        original = attempt["remediation_of"]
+        linked = {
+            (cast(str, finding["id"]), cast(str, finding["fingerprint"]))
+            for finding in findings
+            if finding.get("attempt") == original
+        }
+        attempt["remediation_findings"] = (
+            [{"id": identity, "fingerprint": fingerprint} for identity, fingerprint in sorted(linked)]
+            if original is not None and linked
+            else None
+        )
     return {
         "schema": "creatidy.outcome.private/1",
         "policy": PRIVATE_METADATA,
@@ -606,9 +868,13 @@ def export_private_outcome(
         ],
         "claims": claims,
         "effects": effects,
+        "native_subjects": native_subject_output,
+        "native_effects": native_effects,
         "reviews": reviews,
         "checks": checks,
+        "findings": findings,
         "decisions": decisions,
+        "cancellations": cancellations,
         "work_budget": None
         if budget_policy is None or binding is None
         else {
@@ -627,6 +893,16 @@ def export_private_outcome(
                 for item in budget_policy.resources
             ],
             "strict_inference": budget_policy.strict_inference,
+            "original_deadline": None
+            if deadline is None
+            else {
+                "wall_deadline": deadline.wall_deadline,
+                "wall_anchor": deadline.wall_anchor,
+                "boot_anchor_ns": deadline.boot_anchor_ns,
+                "boot_deadline_ns": deadline.boot_deadline_ns,
+                "boot_id": ref("boot", deadline.boot_id),
+                "clock": deadline.clock,
+            },
         },
         "usage_history": observations,
         "usage_totals": [
@@ -645,6 +921,8 @@ def export_private_outcome(
         ],
         "coverage": {
             "budget_configured": configured,
+            "work_revocation_recorded": revocation is not None,
+            "revocation_evidence": None if revocation is None else ref("evidence", revocation.get("evidence")),
             "strict_inference_profile": None if budget_policy is None else budget_policy.strict_inference,
             "hard_inference_cap": budget.get("hard_inference_cap") if configured else None,
             "effect_inventory": "recorded-reservations-only" if configured else "unknown-budget-not-bound",
@@ -653,6 +931,6 @@ def export_private_outcome(
             "route_and_call_identity": None,
             "complete_cost": None,
             "usage_total_scope": "per-source-known-subtotal-not-lineage-or-cross-source-total",
-            "unattributed_usage_observations": sum(item.get("attempt") not in attempt_by_id for item in history),
+            "unattributed_usage_observations": sum(item.get("attempt_id") not in attempt_by_id for item in history),
         },
     }

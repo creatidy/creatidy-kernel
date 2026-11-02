@@ -130,6 +130,14 @@ learning authority is granted by local creation. Unsupported owner policies and 
 producer records are refused; an unverifiable review receipt has no inferred verdict. A changing
 durable cut is refused rather than mixed.
 
+The projection retains the original deadline/boot projection, recorded work revocation, exact managed
+cancellation intent and any qualified original-target settlement evidence without asserting the current
+physical process state. A completed Program can retain its completion while remaining authority is
+revoked. Ordinary native publication and the reference PR driver retain pseudonymous original
+issue/repository, operation, acceptance and receipt lineage when producer records exist; a retained
+receipt is historical, not current Forge state. Finding IDs and fingerprints are pseudonymized and
+linked to the original review, rejection and remediation Attempt; finding prose is omitted.
+
 `write_private_outcome` publishes only this policy's result into an already-open owner-owned private
 directory using a new 0600 file and never replaces an existing name. A failure before publication may
 leave only a private temporary orphan; a failure after publication is uncertain and requires inspection,

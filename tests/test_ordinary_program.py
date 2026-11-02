@@ -3,6 +3,7 @@ import os
 from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
+from typing import cast
 
 import pytest
 from ordinary_flow_fixture import run_ordinary_flow
@@ -14,6 +15,7 @@ from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.domain import AttemptSpec
 from creatidy_kernel.core.intake import IntakeRefused
 from creatidy_kernel.core.ownership import OwnershipConflict
+from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.ownership import WorkOwnership
 
 
@@ -35,6 +37,35 @@ def test_private_outcome_export_uses_actual_shared_producers(sqlite_tmp_path: Pa
         sqlite_tmp_path / f"private-outcome-{mode}", None, mode=mode, exercise="private-outcome-export"
     )
     assert result["status"] == "completed" and result["satisfactions"] == 2
+
+
+def test_private_outcome_reopens_uncertain_managed_stop(sqlite_tmp_path: Path) -> None:
+    root = sqlite_tmp_path / "private-stop-uncertain"
+    assert run_ordinary_flow(root, None, mode="managed", exercise="private-stop-uncertain") == {
+        "status": "stopped-unknown",
+        "native_sends": 0,
+    }
+    with SQLiteProgramStore(root / "state.db") as store:
+        exported = export_private_outcome(
+            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        cancellations = cast(list[dict[str, object]], exported["cancellations"])
+        assert len(cancellations) == 1 and cancellations[0]["settlement_recorded"] is False
+        assert cancellations[0]["terminal_observed"] is None and cancellations[0]["physical_settlement"] is None
+
+
+def test_private_outcome_reopens_qualified_original_managed_stop(sqlite_tmp_path: Path) -> None:
+    root = sqlite_tmp_path / "private-stop-qualified"
+    result = run_ordinary_flow(root, None, mode="managed", exercise="stop")
+    assert result["status"] == "stopped" and result["settled"] == "cancelled"
+    with SQLiteProgramStore(root / "state.db") as store:
+        exported = export_private_outcome(
+            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        cancellations = cast(list[dict[str, object]], exported["cancellations"])
+        assert len(cancellations) == 1 and cancellations[0]["settlement_recorded"] is True
+        assert cancellations[0]["settled_original_group"] is not None
+        assert cancellations[0]["terminal_observed"] is None and cancellations[0]["physical_settlement"] is None
 
 
 def test_materialization_cannot_precede_atomic_claim(sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

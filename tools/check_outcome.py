@@ -220,6 +220,9 @@ with SQLiteProgramStore(reference_dir / "kernel.sqlite3") as store:
         raise SystemExit("installed reference outcome omitted original allocations")
     if len(cast(list[object], result["satisfactions"])) != 2 or result["reviews"] != []:
         raise SystemExit("installed reference outcome misrepresented independent review evidence")
+    native = cast(list[dict[str, object]], result["native_effects"])
+    if len(native) != 1 or native[0]["driver"] != "reference-pr-v1" or native[0]["current_remote_state"] is not None:
+        raise SystemExit("installed reference outcome lost historical native publication lineage")
 print(
     "Installed private outcome SDK: correction, unknown coverage, private custody and interrupted publication passed."
 )
