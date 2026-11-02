@@ -68,6 +68,27 @@ def test_private_outcome_reopens_qualified_original_managed_stop(sqlite_tmp_path
         assert cancellations[0]["terminal_observed"] is None and cancellations[0]["physical_settlement"] is None
 
 
+@pytest.mark.parametrize("exercise", ["outcome-candidate-cut", "outcome-check-cut", "outcome-manifest-stop-cut"])
+def test_partial_outcome_evidence_survives_reopen(sqlite_tmp_path: Path, exercise: str) -> None:
+    root = sqlite_tmp_path / exercise
+    assert run_ordinary_flow(root, None, mode="pull", exercise=exercise) == {"status": "retained", "native_sends": 0}
+    with SQLiteProgramStore(root / "state.db") as store:
+        before = (store.history("everyday-program"), store.operations())
+        exported = export_private_outcome(
+            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        assert len(cast(list[object], exported["candidates"])) == 1
+        assert not cast(list[object], exported["satisfactions"])
+        if exercise == "outcome-check-cut":
+            assert cast(list[object], exported["checks"]) and not cast(list[object], exported["verification_manifests"])
+        if exercise == "outcome-manifest-stop-cut":
+            assert all(
+                item["decision"] is None for item in cast(list[dict[str, object]], exported["verification_manifests"])
+            )
+            assert cast(dict[str, object], exported["coverage"])["work_revocation_recorded"] is True
+        assert (store.history("everyday-program"), store.operations()) == before
+
+
 def test_materialization_cannot_precede_atomic_claim(sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     initialize = OrdinaryGitWorkspace.initialize
 

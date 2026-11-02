@@ -61,6 +61,7 @@ from creatidy_kernel.adapters.task_execution import VerificationCommand
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import (
+    AttemptSpec,
     AuthorityEnvelope,
     BudgetPolicy,
     DomainAction,
@@ -70,7 +71,7 @@ from creatidy_kernel.core.domain import (
     ProgramStatus,
     ResumeProgram,
 )
-from creatidy_kernel.core.execution import ExecutionRequest
+from creatidy_kernel.core.execution import Candidate, ExecutionRequest
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.intake import (
     Declaration,
@@ -87,6 +88,7 @@ from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, Wor
 from creatidy_kernel.core.served import command_prefix
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
+from creatidy_kernel.ports.application import Collection
 from creatidy_kernel.ports.intake import OrdinaryIntake
 from creatidy_kernel.ports.ordinary import OrdinaryApproval, OrdinaryHandoff, OrdinaryProgram
 from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
@@ -2472,6 +2474,77 @@ print("Done")
                     control.observe(handoff.claim),
                     evidence="owner receives exact task-owned bytes after qualified task-scope quiescence",
                 )
+                if exercise in {"outcome-candidate-cut", "outcome-check-cut", "outcome-manifest-stop-cut"}:
+                    original_collect = OrdinaryGitWorkspace.collect
+                    original_finalize = SQLiteProgramStore.finalize_artifact
+                    hit = [False]
+
+                    def interrupt_collect(
+                        target: OrdinaryGitWorkspace,
+                        original_attempt: AttemptSpec,
+                        original_claim: WorkClaim,
+                        original: Callable[
+                            [OrdinaryGitWorkspace, AttemptSpec, WorkClaim], tuple[Candidate, Collection]
+                        ] = original_collect,
+                        flag: list[bool] = hit,
+                    ) -> tuple[Candidate, Collection]:
+                        original(target, original_attempt, original_claim)
+                        flag[0] = True
+                        raise RuntimeError("synthetic candidate cut")
+
+                    def interrupt_artifact(
+                        target: SQLiteProgramStore,
+                        operation_id: str,
+                        name: str,
+                        data: bytes,
+                        original: Callable[[SQLiteProgramStore, str, str, bytes], str] = original_finalize,
+                        flag: list[bool] = hit,
+                    ) -> str:
+                        result = original(target, operation_id, name, data)
+                        if (
+                            exercise == "outcome-check-cut"
+                            and operation_id.startswith("verification:")
+                            and name == "result"
+                        ) or (
+                            exercise == "outcome-manifest-stop-cut"
+                            and operation_id.startswith("runtime:")
+                            and name.startswith("verification:")
+                        ):
+                            flag[0] = True
+                            raise RuntimeError("synthetic verification cut")
+                        return result
+
+                    with (
+                        patch.object(OrdinaryGitWorkspace, "collect", interrupt_collect)
+                        if exercise == "outcome-candidate-cut"
+                        else patch.object(SQLiteProgramStore, "finalize_artifact", interrupt_artifact)
+                    ):
+                        try:
+                            client.report(handoff)
+                        except RuntimeError as error:
+                            assert str(error).startswith("synthetic ")
+                        else:
+                            raise AssertionError("requested outcome crash cut was not reached")
+                    assert hit[0]
+                    if exercise == "outcome-manifest-stop-cut":
+                        app.stop(approved, "synthetic outcome STOP")
+                    before = store.served_change_token()
+                    result = export_private_outcome(
+                        store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+                    )
+                    assert store.served_change_token() == before
+                    assert len(cast(list[object], result["candidates"])) == 1
+                    assert not cast(list[object], result["satisfactions"])
+                    if exercise == "outcome-candidate-cut":
+                        assert not cast(list[object], result["checks"])
+                    elif exercise == "outcome-check-cut":
+                        assert cast(list[object], result["checks"])
+                        assert not cast(list[object], result["verification_manifests"])
+                    else:
+                        manifests = cast(list[dict[str, object]], result["verification_manifests"])
+                        assert manifests and all(item["decision"] is None for item in manifests)
+                        assert cast(dict[str, object], result["coverage"])["work_revocation_recorded"] is True
+                    return {"status": "retained", "native_sends": 0}
                 if exercise == "report-verification-revision-race":
                     revision = store.load("everyday-program").revision
                     original_check = OrdinaryGitWorkspace.check
@@ -3139,7 +3212,12 @@ print("Done")
                 assert sum(item["verdict"] == "approve" for item in reviews) == 2
                 checks = cast(list[dict[str, object]], outcome_export["checks"])
                 assert checks and all(item["attempt"] in attempt_refs for item in checks)
+                candidates = cast(list[dict[str, object]], outcome_export["candidates"])
+                assert len(candidates) == len(projected_attempts)
+                assert all(item["candidate"] in {candidate["candidate"] for candidate in candidates} for item in checks)
                 assert all(type(item["passed"]) is bool and item["freshness"] == "not-evaluated" for item in checks)
+                assert len({(item["attempt"], item["evidence"]) for item in checks}) == len(checks)
+                assert any(item["operations"] and item["manifests"] for item in checks)
                 effects = cast(list[dict[str, object]], outcome_export["effects"])
                 assert any(item["category"] == "verification" for item in effects)
                 assert all(item["category"] is not None for item in effects)

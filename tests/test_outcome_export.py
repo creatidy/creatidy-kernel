@@ -21,8 +21,11 @@ from test_work_ownership import claim, client, workspace
 from creatidy_kernel.adapters.outcome_file import write_private_outcome
 from creatidy_kernel.adapters.reference import ReferenceInterrupted, reference_spec, run_reference
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.core.domain import FinishAttempt, StartAttempt
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
+from creatidy_kernel.core.verification import Evidence, EvidenceSubject
 from creatidy_kernel.core.work_budget import WorkKind
+from creatidy_kernel.ports.application import BudgetedChecks
 from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 
 
@@ -389,6 +392,39 @@ def test_original_effect_evidence_is_scoped_and_separate_from_transport(sqlite_t
             store.outcome_effect_evidence("different-program", operation)
 
 
+def test_recorded_missing_check_is_not_invented_as_pass_or_failure(sqlite_tmp_path: Path) -> None:
+    class NoEvidence:
+        def check(self, name: str, subject: EvidenceSubject) -> Evidence | None:
+            assert name == "synthetic-check" and subject.attempt_digest
+            return None
+
+    with SQLiteProgramStore(sqlite_tmp_path / "missing-check.sqlite3", boot_clock=Clock()) as store:
+        program = prepare(store, initialize(store), "a1")
+        original = program.attempt("a1")
+        program = store.admit(program.program_id, "start-a1", StartAttempt(program.revision, "owner", "a1"))
+        program = store.admit(program.program_id, "finish-a1", FinishAttempt(program.revision, "owner", "a1"))
+        subject = EvidenceSubject(
+            "0" * 64,
+            original.spec.digest,
+            original.spec.spec_digest,
+            "1" * 64,
+            "synthetic-private-repository",
+            "2" * 40,
+            "3" * 40,
+        )
+        assert (
+            BudgetedChecks(store, NoEvidence(), program.program_id, "a1", lambda: 100).check("synthetic-check", subject)
+            is None
+        )
+        result = export_private_outcome(
+            store, program.program_id, owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        records = cast(list[dict[str, object]], result["check_results"])
+        assert len(records) == 1 and records[0]["result_recorded"] is True and records[0]["evidence_recorded"] is False
+        assert result["checks"] == [] and not result["satisfactions"]
+        assert "synthetic-private-repository" not in json.dumps(result)
+
+
 def test_uncertain_effect_and_reconciliation_remain_historical_without_retry(sqlite_tmp_path: Path) -> None:
     with SQLiteProgramStore(sqlite_tmp_path / "uncertain-effect.sqlite3", boot_clock=Clock()) as store:
         program = prepare(store, initialize(store), "a1")
@@ -504,6 +540,7 @@ def test_completed_independent_reference_driver_exports_actual_lineage(sqlite_tm
         satisfactions = cast(list[dict[str, object]], result["satisfactions"])
         assert len(attempts) == len(satisfactions) == 2
         assert all(item["allocation"] is not None for item in attempts)
+        assert all(cast(dict[str, object], item["terminal_outcome"])["candidate"] == "present" for item in attempts)
         assert all(cast(dict[str, object], item["allocation"])["route"] is None for item in attempts)
         assert all(item["runtime_receipt_recorded"] is True for item in attempts)
         source = satisfactions[0]

@@ -137,6 +137,15 @@ revoked. Ordinary native publication and the reference PR driver retain pseudony
 issue/repository, operation, acceptance and receipt lineage when producer records exist; a retained
 receipt is historical, not current Forge state. Finding IDs and fingerprints are pseudonymized and
 linked to the original review, rejection and remediation Attempt; finding prose is omitted.
+Original candidate metadata, terminal candidate dispositions, standalone check results and retained
+verification manifests remain visible even if the controller stopped before accepting or rejecting the
+Attempt. A recorded missing check is unknown, not a passing result; overlapping standalone and
+manifest evidence is deduplicated while retaining both references. Candidate patch contents are never
+read into the export: their retained digest is reported as a recorded reference, not fresh content
+verification. Independent reference and bounded-task cancellation intents and their original-handle,
+fence, transport, observation and owned-group settlement records remain historical evidence, including
+uncertainty and mismatched/unqualified observations; they are not redispatched or adopted as a current
+process or proof about escaped descendants.
 
 `write_private_outcome` publishes only this policy's result into an already-open owner-owned private
 directory using a new 0600 file and never replaces an existing name. A failure before publication may

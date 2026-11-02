@@ -18,6 +18,7 @@ from test_work_budget import Clock
 from creatidy_kernel.adapters import task_execution
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.deadlines import BootClockReading
+from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 
 pytest_plugins = ["test_sqlite_store"]
 
@@ -183,6 +184,22 @@ def test_unknown_command_does_not_preempt_original_runtime_cleanup(
             )
             assert settlement["owned_group_settled"] is settlement["result_reconciled"] is True
             assert cancellation.status == "accepted" and operation.status == "terminal"
+            exported = export_private_outcome(
+                store, task_execution.PROGRAM_ID, owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+            )
+            cancel_export = cast(list[dict[str, object]], exported["cancellations"])[0]
+            assert cancel_export["driver"] == "independent-runtime-cancellation"
+            attempt_export = cast(list[dict[str, object]], exported["attempts"])[0]
+            assert (
+                cancel_export["attempt"] == attempt_export["id"]
+                and cancel_export["handle"] == attempt_export["runtime_handle"]
+            )
+            assert cancel_export["runtime_fence"] == operation.fence
+            assert any(
+                item["qualified_original_group"] is True
+                for item in cast(list[dict[str, object]], cancel_export["settlement_proofs"])
+            )
+            assert cancel_export["current_activity"] is None and cancel_export["physical_settlement"] is None
             original_binding = store.artifact(task_execution.OPERATION_ID, f"command-owner:{key}")
             original_result = store.find_artifact(task_execution.OPERATION_ID, key)
             assert not store.operations("acceptance:") and not store.operations(task_execution.PR_OPERATION)

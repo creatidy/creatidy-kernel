@@ -736,7 +736,22 @@ class SQLiteProgramStore:
         with self._gate:
             reservation = self._work_record("reservation", operation_id)
             if reservation is None or reservation.get("program") != program_id:
-                raise ValueError("effect is not reserved by the selected Program")
+                if not operation_id.startswith("cancel:"):
+                    raise ValueError("effect is not reserved by the selected Program")
+                program = self._load_head(program_id)
+                cancellation_attempt = next(
+                    (item for item in program.attempts if operation_id == f"cancel:{item.attempt_id}"), None
+                )
+                operation = self.find_operation(operation_id)
+                request = None if operation is None else json.loads(operation.request_json).get("request")
+                if (
+                    cancellation_attempt is None
+                    or operation is None
+                    or operation.effect_key != operation_id
+                    or type(request) is not dict
+                    or cast(dict[str, object], request).get("operation") != f"runtime:{cancellation_attempt.attempt_id}"
+                ):
+                    raise ValueError("effect is not reserved by the selected Program")
             return {
                 "deliveries": [
                     dict(row)
@@ -821,6 +836,31 @@ class SQLiteProgramStore:
         self._validate_program_id(program_id)
         with self._gate:
             return self._work_record("revoked", program_id)
+
+    def outcome_artifact_metadata(
+        self, program_id: str, operation_id: str, prefix: str
+    ) -> tuple[dict[str, object], ...]:
+        """List retained artifact metadata only for an original scoped producer operation."""
+        self._assert_writer_thread()
+        if prefix not in {"candidate.patch", "verification:", "observation:", "owned-observation:", "stop-uncertain:"}:
+            raise ValueError("unsupported outcome artifact prefix")
+        with self._gate:
+            program = self._load_head(program_id)
+            allowed = any(
+                operation_id in {f"runtime:{item.attempt_id}", f"cancel:{item.attempt_id}"} for item in program.attempts
+            )
+            reservation = self._work_record("reservation", operation_id)
+            if not allowed and (reservation is None or reservation.get("program") != program_id):
+                raise ValueError("artifact operation is not owned by the selected Program")
+            pattern = prefix if prefix == "candidate.patch" else prefix + "%"
+            return tuple(
+                dict(row)
+                for row in self._connection.execute(
+                    "SELECT name, digest, size FROM artifact_references "
+                    "WHERE operation_id = ? AND name LIKE ? ORDER BY name",
+                    (operation_id, pattern),
+                ).fetchall()
+            )
 
     def served_claims(self, program_id: str, *, offset: int = 0, limit: int = 8) -> tuple[dict[str, object], ...]:
         """Project only recorded ownership facts for one Program, without sampling authority."""

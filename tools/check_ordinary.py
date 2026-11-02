@@ -39,6 +39,20 @@ if run_ordinary_flow(storage / "private-stop-uncertain", None, mode="managed", e
     "native_sends": 0,
 }:
     raise SystemExit("installed outcome export concealed uncertain managed cancellation")
+for exercise in ("outcome-candidate-cut", "outcome-check-cut", "outcome-manifest-stop-cut"):
+    root = storage / exercise
+    if run_ordinary_flow(root, None, mode="pull", exercise=exercise) != {"status": "retained", "native_sends": 0}:
+        raise SystemExit("installed partial outcome cut did not preserve its original evidence")
+    with SQLiteProgramStore(root / "state.db") as store:
+        exported = export_private_outcome(
+            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        if len(cast(list[object], exported["candidates"])) != 1 or exported["satisfactions"]:
+            raise SystemExit("installed reopened partial outcome misrepresented candidate acceptance")
+        if exercise == "outcome-check-cut" and not exported["checks"]:
+            raise SystemExit("installed reopened partial outcome lost a recorded check")
+        if exercise == "outcome-manifest-stop-cut" and not exported["verification_manifests"]:
+            raise SystemExit("installed reopened partial outcome lost the pre-decision manifest")
 with SQLiteProgramStore(storage / "private-stop-uncertain" / "state.db") as store:
     exported = export_private_outcome(store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
     cancellations = cast(list[dict[str, object]], exported["cancellations"])

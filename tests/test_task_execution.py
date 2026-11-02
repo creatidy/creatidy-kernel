@@ -49,6 +49,7 @@ from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject
 from creatidy_kernel.ports.forge import Forge
+from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.program_store import OperationRecord
 from creatidy_kernel.ports.resources import ResourceAllocator
 
@@ -484,6 +485,11 @@ def test_receipt_only_terminal_without_resolution_finishes_without_redispatch(
         assert store.find_artifact(operation.operation_id, "identity") is None
         assert find(store, operation.operation_id, "runtime-receipt") == receipt
         assert json.loads(store.artifact(operation.operation_id, "terminal-outcome"))["candidate"] == "absent"
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        terminal = cast(dict[str, object], cast(list[dict[str, object]], exported["attempts"])[0]["terminal_outcome"])
+        assert terminal["candidate"] == "absent" and terminal["current_activity"] is None
     assert original.starts == 1 and recovered.starts == 0
 
 
@@ -507,6 +513,11 @@ def test_lost_terminal_candidate_read_remains_recoverable(sqlite_tmp_path: Path)
     with SQLiteProgramStore(control / "kernel.sqlite3") as store:
         original = store.artifact("runtime:task_execution:change", "terminal-outcome")
         assert json.loads(original)["candidate"] == "unknown"
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        terminal = cast(dict[str, object], cast(list[dict[str, object]], exported["attempts"])[0]["terminal_outcome"])
+        assert terminal["candidate"] == "unknown" and terminal["current_activity"] is None
     assert run(control, source, connection)["condition"] == "accepted"
     assert connection.starts == 1
     with SQLiteProgramStore(control / "kernel.sqlite3") as store:
@@ -998,6 +1009,17 @@ def test_expiry_journals_interrupt_once_even_after_lost_reply(
             assert store.find_artifact(cancellation.operation_id, "receipt") is None
         else:
             assert store.find_artifact(cancellation.operation_id, "receipt") is not None
+        before_operations = store.operations()
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        original = cast(list[dict[str, object]], exported["cancellations"])[0]
+        assert original["driver"] == "independent-runtime-cancellation"
+        assert (
+            original["operation_status"] == cancellation.status and original["cancellation_fence"] == cancellation.fence
+        )
+        assert original["current_activity"] is None and original["physical_settlement"] is None
+        assert store.operations() == before_operations and cancellation.attempts == 1
 
 
 def test_long_verification_cannot_extend_original_deadline(

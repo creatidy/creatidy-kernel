@@ -17,8 +17,9 @@ from typing import Protocol, cast
 
 from creatidy_kernel.core.deadlines import DeadlineProjection
 from creatidy_kernel.core.domain import Program
-from creatidy_kernel.core.execution import RuntimeIdentity
+from creatidy_kernel.core.execution import Artifact, ArtifactManifest, Candidate, RuntimeIdentity
 from creatidy_kernel.core.outcomes import Provenance
+from creatidy_kernel.core.verification import CandidateResult
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.allocation import decode_identity, decode_runtime_receipt_with_group, load_allocation
 from creatidy_kernel.ports.intake import draft_from
@@ -45,6 +46,9 @@ class OutcomeExportStore(ApplicationStore, Protocol):
     def outcome_effect_evidence(self, program_id: str, operation_id: str) -> dict[str, object]: ...
     def outcome_claim_evidence(self, program_id: str, command_key: str) -> dict[str, object]: ...
     def outcome_revocation(self, program_id: str) -> dict[str, object] | None: ...
+    def outcome_artifact_metadata(
+        self, program_id: str, operation_id: str, prefix: str
+    ) -> tuple[dict[str, object], ...]: ...
 
 
 def _mapping(value: object) -> dict[str, object]:
@@ -515,6 +519,157 @@ def export_private_outcome(
     attempts: list[dict[str, object]] = []
     decisions: list[dict[str, object]] = []
     checks: list[dict[str, object]] = []
+    check_results: list[dict[str, object]] = []
+    manifests: list[dict[str, object]] = []
+    candidates: list[dict[str, object]] = []
+    for item in reservations:
+        operation_id, attempt_id = item.get("operation"), item.get("attempt")
+        if item.get("category") != "verification" or type(operation_id) is not str or type(attempt_id) is not str:
+            continue
+        prefix = f"verification:{attempt_id}:"
+        if not operation_id.startswith(prefix):
+            continue
+        operation = store.find_operation(operation_id)
+        original_attempt = attempt_by_id.get(attempt_id)
+        if operation is None or original_attempt is None:
+            raise ValueError("verification reservation lacks original Attempt or operation")
+        request = _mapping(_mapping(json.loads(operation.request_json)).get("request"))
+        subject, check = _mapping(request.get("subject")), request.get("check")
+        if type(check) is not str or not check:
+            raise ValueError("invalid original verification check")
+        expected = hashlib.sha256(
+            json.dumps([check, subject], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if (
+            operation_id != prefix + expected
+            or subject.get("attempt_digest") != original_attempt.spec.digest
+            or subject.get("spec_digest") != original_attempt.spec.spec_digest
+        ):
+            raise ValueError("verification operation differs from original Attempt or subject")
+        data = store.find_artifact(operation_id, "result")
+        value = None if data is None else json.loads(data)
+        check_results.append(
+            {
+                "attempt": ref("attempt", attempt_id),
+                "operation": ref("operation", operation_id),
+                "check": ref("check", check),
+                "result_recorded": data is not None,
+                "evidence_recorded": value is not None,
+                "candidate": ref("candidate", subject.get("candidate_digest")),
+            }
+        )
+        if value is None:
+            continue
+        observation = _mapping(value)
+        if (
+            observation.get("subject") != subject
+            or observation.get("check") != check
+            or type(observation.get("passed")) is not bool
+            or type(observation.get("observed_at")) is not int
+            or type(observation.get("fresh_until")) is not int
+            or any(
+                type(observation.get(name)) is not str or not observation.get(name)
+                for name in ("evidence_id", "producer", "tool_version", "artifact_reference")
+            )
+        ):
+            raise ValueError("invalid original verification result")
+        checks.append(
+            {
+                "attempt": ref("attempt", attempt_id),
+                "manifest": None,
+                "operation": ref("operation", operation_id),
+                "evidence": ref("evidence", observation.get("evidence_id")),
+                "check": ref("check", check),
+                "producer": ref("actor", observation.get("producer")),
+                "tool_version": ref("tool-version", observation.get("tool_version")),
+                "artifact": ref("artifact", observation.get("artifact_reference")),
+                "reviewer_session": ref("runtime-handle", observation.get("reviewer_session")),
+                "candidate": ref("candidate", subject.get("candidate_digest")),
+                "policy": ref("policy", subject.get("policy_digest")),
+                "repository": ref("repository", subject.get("repository")),
+                "base": ref("revision", subject.get("base_revision")),
+                "head": ref("revision", subject.get("head_revision")),
+                "observed_at": observation["observed_at"],
+                "fresh_until": observation["fresh_until"],
+                "passed": observation["passed"],
+                "freshness": "not-evaluated",
+            }
+        )
+
+    def record_manifest(
+        attempt_id: str, spec_digest: str, original_spec: str, data: bytes, reference: str, decision: str | None
+    ) -> None:
+        if reference != "sha256:" + hashlib.sha256(data).hexdigest():
+            raise ValueError("verification evidence reference mismatch")
+        manifest = _mapping(json.loads(data))
+        subject = _mapping(manifest.get("subject"))
+        evidence = _items(manifest.get("evidence"))
+        if subject.get("attempt_digest") != spec_digest or subject.get("spec_digest") != original_spec:
+            raise ValueError("verification evidence differs from original Attempt")
+        manifests.append(
+            {
+                "attempt": ref("attempt", attempt_id),
+                "manifest": ref("artifact", reference),
+                "candidate": ref("candidate", subject.get("candidate_digest")),
+                "decision": decision,
+                "freshness": "not-evaluated",
+            }
+        )
+        for observation in evidence:
+            if (
+                observation.get("subject") != subject
+                or type(observation.get("passed")) is not bool
+                or type(observation.get("observed_at")) is not int
+                or type(observation.get("fresh_until")) is not int
+                or any(
+                    type(observation.get(name)) is not str or not observation.get(name)
+                    for name in ("evidence_id", "check", "producer", "tool_version", "artifact_reference")
+                )
+            ):
+                raise ValueError("invalid exact-subject check evidence")
+            checks.append(
+                {
+                    "attempt": ref("attempt", attempt_id),
+                    "manifest": ref("artifact", reference),
+                    "operation": None,
+                    "evidence": ref("evidence", observation.get("evidence_id")),
+                    "check": ref("check", observation.get("check")),
+                    "producer": ref("actor", observation.get("producer")),
+                    "tool_version": ref("tool-version", observation.get("tool_version")),
+                    "artifact": ref("artifact", observation.get("artifact_reference")),
+                    "reviewer_session": ref("runtime-handle", observation.get("reviewer_session")),
+                    "candidate": ref("candidate", subject.get("candidate_digest")),
+                    "policy": ref("policy", subject.get("policy_digest")),
+                    "repository": ref("repository", subject.get("repository")),
+                    "base": ref("revision", subject.get("base_revision")),
+                    "head": ref("revision", subject.get("head_revision")),
+                    "observed_at": observation["observed_at"],
+                    "fresh_until": observation["fresh_until"],
+                    "passed": observation["passed"],
+                    "freshness": "not-evaluated",
+                }
+            )
+        if "findings" in manifest:
+            for finding in _items(manifest["findings"]):
+                if (
+                    finding.get("subject") != subject
+                    or type(finding.get("finding_id")) is not str
+                    or not finding.get("finding_id")
+                    or type(finding.get("fingerprint")) is not str
+                    or not finding.get("fingerprint")
+                ):
+                    raise ValueError("finding differs from original verification subject")
+                findings.append(
+                    {
+                        "id": ref("finding", finding.get("finding_id")),
+                        "fingerprint": ref("finding-fingerprint", finding.get("fingerprint")),
+                        "attempt": ref("attempt", attempt_id),
+                        "manifest": ref("artifact", reference),
+                        "candidate": ref("candidate", subject.get("candidate_digest")),
+                        "source": "verification-manifest",
+                    }
+                )
+
     for attempt in program.attempts:
         spec = attempt.spec
         runtime_id = f"runtime:{attempt.attempt_id}"
@@ -529,6 +684,63 @@ def export_private_outcome(
         if receipt_data is not None:
             runtime_handle, runtime_fence, receipt_identity, runtime_group = decode_runtime_receipt_with_group(
                 receipt_data
+            )
+        terminal_data = store.find_artifact(runtime_id, "terminal-outcome") if operation is not None else None
+        terminal = None if terminal_data is None else _mapping(json.loads(terminal_data))
+        if terminal is not None and (
+            terminal.get("version") != 1
+            or terminal.get("attempt") != spec.digest
+            or terminal.get("candidate") not in {"present", "absent", "unknown", "not_requested"}
+            or type(terminal.get("fence")) is not int
+            or type(terminal.get("handle")) is not str
+            or (
+                operation is not None
+                and (cast(int, terminal["fence"]) < 1 or cast(int, terminal["fence"]) > operation.fence)
+            )
+            or (
+                operation is not None
+                and operation.accepted_reference is not None
+                and terminal.get("handle") != operation.accepted_reference
+            )
+        ):
+            raise ValueError("terminal outcome differs from original runtime Attempt")
+        ordinary_data = store.find_artifact(runtime_id, "ordinary-candidate") if operation is not None else None
+        if ordinary_data is not None:
+            original = _mapping(json.loads(ordinary_data))
+            patches = store.outcome_artifact_metadata(program_id, runtime_id, "candidate.patch")
+            original_spec = next((item for item in program.spec_history if item.digest == spec.spec_digest), None)
+            if (
+                original.get("version") != 1
+                or type(original.get("head")) is not str
+                or type(original.get("scope")) is not str
+                or type(original.get("paths")) is not list
+                or len(patches) != 1
+                or type(patches[0].get("digest")) is not str
+                or spec.workspace_reference is None
+                or original_spec is None
+            ):
+                raise ValueError("ordinary candidate lacks its original immutable metadata")
+            artifact = Artifact("candidate.patch", "sha256:" + cast(str, patches[0]["digest"]))
+            candidate = Candidate(
+                attempt.attempt_id, spec.digest, ArtifactManifest(spec.workspace_reference, (artifact,))
+            )
+            unit = original_spec.work_unit(spec.work_unit_id)
+            candidate_digest = CandidateResult(
+                f"candidate:{attempt.attempt_id}",
+                candidate,
+                tuple((name, "candidate.patch") for name in sorted(unit.outputs)),
+            ).digest
+            candidates.append(
+                {
+                    "attempt": ref("attempt", attempt.attempt_id),
+                    "candidate": ref("candidate", candidate_digest),
+                    "source": "ordinary-candidate-v1",
+                    "head": ref("revision", original.get("head")),
+                    "workspace_subject": ref("workspace-subject", original.get("scope")),
+                    "patch": ref("artifact", artifact.digest),
+                    "patch_integrity": "recorded-digest-only-not-read",
+                    "current_remote_state": None,
+                }
             )
 
         def identity_view(value: RuntimeIdentity | None) -> dict[str, str | None] | None:
@@ -591,63 +803,36 @@ def export_private_outcome(
             verification_reference = request.get("manifest")
             if verification_data is None:
                 raise ValueError("accepted verification evidence is missing")
+        recorded_manifests: dict[str, bytes] = {}
         if verification_data is not None:
-            if verification_reference != "sha256:" + hashlib.sha256(verification_data).hexdigest():
-                raise ValueError("verification evidence reference mismatch")
-            manifest = _mapping(json.loads(verification_data))
-            subject = _mapping(manifest.get("subject"))
-            evidence = _items(manifest.get("evidence"))
-            if subject.get("attempt_digest") != spec.digest or subject.get("spec_digest") != spec.spec_digest:
-                raise ValueError("verification evidence differs from original Attempt")
-            for observation in evidence:
-                if (
-                    observation.get("subject") != subject
-                    or type(observation.get("passed")) is not bool
-                    or type(observation.get("observed_at")) is not int
-                    or type(observation.get("fresh_until")) is not int
-                ):
-                    raise ValueError("invalid exact-subject check evidence")
-                checks.append(
-                    {
-                        "attempt": ref("attempt", attempt.attempt_id),
-                        "manifest": ref("artifact", verification_reference),
-                        "evidence": ref("evidence", observation.get("evidence_id")),
-                        "check": ref("check", observation.get("check")),
-                        "producer": ref("actor", observation.get("producer")),
-                        "tool_version": ref("tool-version", observation.get("tool_version")),
-                        "artifact": ref("artifact", observation.get("artifact_reference")),
-                        "reviewer_session": ref("runtime-handle", observation.get("reviewer_session")),
-                        "candidate": ref("candidate", subject.get("candidate_digest")),
-                        "policy": ref("policy", subject.get("policy_digest")),
-                        "repository": ref("repository", subject.get("repository")),
-                        "base": ref("revision", subject.get("base_revision")),
-                        "head": ref("revision", subject.get("head_revision")),
-                        "observed_at": observation["observed_at"],
-                        "fresh_until": observation["fresh_until"],
-                        "passed": observation["passed"],
-                        "freshness": "not-evaluated",
-                    }
+            if type(verification_reference) is not str:
+                raise ValueError("verification reference is missing")
+            recorded_manifests[verification_reference] = verification_data
+        if operation is not None:
+            for metadata in store.outcome_artifact_metadata(program_id, runtime_id, "verification:"):
+                name, checksum = metadata.get("name"), metadata.get("digest")
+                if type(name) is not str or type(checksum) is not str or name != "verification:" + checksum:
+                    raise ValueError("invalid retained verification artifact identity")
+                data = store.find_artifact(runtime_id, name)
+                if data is None:
+                    raise ValueError("retained verification artifact is missing")
+                reference = "sha256:" + checksum
+                if reference in recorded_manifests and recorded_manifests[reference] != data:
+                    raise ValueError("conflicting original verification artifacts")
+                recorded_manifests[reference] = data
+        for reference, data in sorted(recorded_manifests.items()):
+            decision = (
+                (
+                    "accepted"
+                    if acceptance is not None
+                    else "rejected"
+                    if rejection is not None and verification_data is not None
+                    else None
                 )
-            if "findings" in manifest:
-                for finding in _items(manifest["findings"]):
-                    if (
-                        finding.get("subject") != subject
-                        or type(finding.get("finding_id")) is not str
-                        or not finding.get("finding_id")
-                        or type(finding.get("fingerprint")) is not str
-                        or not finding.get("fingerprint")
-                    ):
-                        raise ValueError("finding differs from original verification subject")
-                    findings.append(
-                        {
-                            "id": ref("finding", finding.get("finding_id")),
-                            "fingerprint": ref("finding-fingerprint", finding.get("fingerprint")),
-                            "attempt": ref("attempt", attempt.attempt_id),
-                            "manifest": ref("artifact", verification_reference),
-                            "candidate": ref("candidate", subject.get("candidate_digest")),
-                            "source": "verification-manifest",
-                        }
-                    )
+                if reference == verification_reference
+                else None
+            )
+            record_manifest(attempt.attempt_id, spec.digest, spec.spec_digest, data, reference, decision)
         attempts.append(
             {
                 "id": ref("attempt", attempt.attempt_id),
@@ -700,6 +885,14 @@ def export_private_outcome(
                 "runtime_receipt_fence": runtime_fence,
                 "runtime_handle": ref("runtime-handle", runtime_handle),
                 "runtime_group": ref("runtime-group", runtime_group),
+                "terminal_outcome": None
+                if terminal is None
+                else {
+                    "candidate": terminal["candidate"],
+                    "runtime_fence": terminal["fence"],
+                    "handle": ref("runtime-handle", terminal["handle"]),
+                    "current_activity": None,
+                },
                 "call_identity": None,
             }
         )
@@ -812,8 +1005,186 @@ def export_private_outcome(
                 "physical_settlement": None,
             }
         )
+    for attempt in program.attempts:
+        operation_id = f"cancel:{attempt.attempt_id}"
+        cancellation = store.find_operation(operation_id)
+        if cancellation is None:
+            continue
+        runtime_id = f"runtime:{attempt.attempt_id}"
+        runtime = store.find_operation(runtime_id)
+        request = _mapping(_mapping(json.loads(cancellation.request_json)).get("request"))
+        if cancellation.effect_key != operation_id or request.get("operation") != runtime_id:
+            raise ValueError("independent cancellation differs from original runtime")
+        handle = None if runtime is None else runtime.accepted_reference
+        if request.get("handle") is not None and request.get("handle") != handle:
+            raise ValueError("independent cancellation differs from original runtime handle")
+        receipt_data = None if runtime is None else store.find_artifact(runtime_id, "runtime-receipt")
+        receipt_handle = None
+        receipt_fence = None
+        expected_group = None
+        if receipt_data is not None:
+            try:
+                receipt_handle, receipt_fence, _, expected_group = decode_runtime_receipt_with_group(receipt_data)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        receipt_bound = (
+            runtime is not None and receipt_handle == handle and receipt_fence == runtime.fence and handle is not None
+        )
+        evidence = store.outcome_effect_evidence(program_id, operation_id)
+        runtime_observations: list[dict[str, object]] = []
+        for metadata in store.outcome_artifact_metadata(program_id, operation_id, "observation:"):
+            name, checksum = metadata.get("name"), metadata.get("digest")
+            if type(name) is not str or type(checksum) is not str or name != "observation:" + checksum:
+                raise ValueError("invalid original cancellation observation identity")
+            raw = store.find_artifact(operation_id, name)
+            if raw is None or hashlib.sha256(raw).hexdigest() != checksum:
+                raise ValueError("missing original cancellation observation")
+            value = _mapping(json.loads(raw))
+            if (
+                value.get("activity") not in {"running", "waiting", "terminal", "unknown"}
+                or type(value.get("handle")) is not str
+                or type(value.get("observed_at")) is not int
+                or type(value.get("fresh_until")) is not int
+            ):
+                raise ValueError("invalid original cancellation observation")
+            runtime_observations.append(
+                {
+                    "record": ref("artifact", "sha256:" + checksum),
+                    "handle": ref("runtime-handle", value.get("handle")),
+                    "matches_original_handle": handle is not None and value.get("handle") == handle,
+                    "activity": value["activity"],
+                    "observed_at": value.get("observed_at"),
+                    "fresh_until": value.get("fresh_until"),
+                    "current_activity": None,
+                }
+            )
+        proof_records: list[dict[str, object]] = []
+        named: list[tuple[str, bytes]] = []
+        for metadata in store.outcome_artifact_metadata(program_id, operation_id, "owned-observation:"):
+            name, checksum = metadata.get("name"), metadata.get("digest")
+            if type(name) is not str or type(checksum) is not str or name != "owned-observation:" + checksum:
+                raise ValueError("invalid original cancellation proof identity")
+            data = store.find_artifact(operation_id, name)
+            if data is None or hashlib.sha256(data).hexdigest() != checksum:
+                raise ValueError("missing original cancellation proof")
+            named.append(("sha256:" + checksum, data))
+        settlement = store.find_artifact(operation_id, "owned-group-settlement")
+        if settlement is not None:
+            settlement_reference = "sha256:" + hashlib.sha256(settlement).hexdigest()
+            if all(reference != settlement_reference for reference, _ in named):
+                named.append((settlement_reference, settlement))
+        for reference, data in named:
+            proof = _mapping(json.loads(data))
+            if proof.get("version") != 1:
+                raise ValueError("unsupported original cancellation proof")
+            if "attempt_id" in proof:
+                proof_bound = (
+                    proof.get("attempt_id") == attempt.attempt_id
+                    and proof.get("operation_id") == runtime_id
+                    and proof.get("handle") == handle
+                    and proof.get("runtime_fence") == (None if runtime is None else runtime.fence)
+                    and proof.get("cancellation_fence") == cancellation.fence
+                )
+                group = proof.get("owned_group_reference")
+                group_bound = (
+                    expected_group is not None
+                    and group == expected_group
+                    and proof.get("expected_group_reference") == expected_group
+                )
+                transport = proof.get("transport_succeeded")
+            else:
+                proof_bound = (
+                    runtime is not None
+                    and proof.get("attempt") == attempt.spec.digest
+                    and proof.get("operation") == runtime_id
+                    and proof.get("effect_key") == runtime.effect_key
+                    and proof.get("request_digest") == runtime.request_digest
+                    and proof.get("runtime_fence") == runtime.fence
+                    and proof.get("cancellation_fence") == cancellation.fence
+                    and proof.get("handle") == handle
+                )
+                group = proof.get("owned_group_reference")
+                group_bound = expected_group is not None and group == expected_group
+                transport = None
+            settled, reconciled = proof.get("owned_group_settled"), proof.get("result_reconciled")
+            if (
+                (settled is not None and type(settled) is not bool)
+                or type(reconciled) is not bool
+                or (transport is not None and type(transport) is not bool)
+                or proof.get("descendants") != "unproven"
+            ):
+                raise ValueError("invalid original cancellation settlement")
+            qualified = bool(
+                proof_bound
+                and receipt_bound
+                and group_bound
+                and settled is True
+                and reconciled is True
+                and (transport is not False)
+            )
+            proof_records.append(
+                {
+                    "record": ref("artifact", reference),
+                    "binding_verified": bool(proof_bound and receipt_bound),
+                    "owned_group": ref("runtime-group", group),
+                    "original_group_matches": group_bound,
+                    "reported_owned_group_settled": settled,
+                    "result_reconciled": reconciled,
+                    "transport_succeeded": transport,
+                    "qualified_original_group": qualified,
+                    "descendants": "unproven",
+                    "current_activity": None,
+                }
+            )
+        cancellations.append(
+            {
+                "driver": "independent-runtime-cancellation",
+                "attempt": ref("attempt", attempt.attempt_id),
+                "operation": ref("operation", operation_id),
+                "runtime_operation": ref("operation", runtime_id),
+                "runtime_fence": None if runtime is None else runtime.fence,
+                "cancellation_fence": cancellation.fence,
+                "handle": ref("runtime-handle", handle),
+                "request_recorded": True,
+                "runtime_receipt_bound": receipt_bound,
+                "settlement_recorded": settlement is not None,
+                "operation_status": cancellation.status,
+                "deliveries": [
+                    {"fence": row["fence"], "claimed_at": row["claimed_at"], "lease_until": row["lease_until"]}
+                    for row in _items(evidence.get("deliveries"))
+                ],
+                "transports": [
+                    {"fence": row["fence"], "succeeded": bool(row["succeeded"])}
+                    for row in _items(evidence.get("transports"))
+                ],
+                "operation_observations": [
+                    {
+                        "id": ref("effect-observation", row["observation_id"]),
+                        "fence": row["fence"],
+                        "kind": row["kind"],
+                        "reference": ref("effect-receipt", row["reference"]),
+                    }
+                    for row in _items(evidence.get("observations"))
+                ],
+                "runtime_observations": runtime_observations,
+                "settlement_proofs": proof_records,
+                "current_activity": None,
+                "physical_settlement": None,
+            }
+        )
     if len(claims) != count or store.served_change_token() != token:
         raise ValueError("durable outcome changed during export")
+    deduplicated_checks: dict[str, dict[str, object]] = {}
+    for observation in checks:
+        comparable = {key: value for key, value in observation.items() if key not in {"manifest", "operation"}}
+        identity = json.dumps(comparable, sort_keys=True, separators=(",", ":"))
+        current = deduplicated_checks.setdefault(identity, {**comparable, "manifests": [], "operations": []})
+        for source, field in (("manifest", "manifests"), ("operation", "operations")):
+            value = observation.get(source)
+            values = cast(list[str], current[field])
+            if type(value) is str and value not in values:
+                values.append(value)
+    checks = list(deduplicated_checks.values())
     for attempt in attempts:
         original = attempt["remediation_of"]
         linked = {
@@ -872,6 +1243,9 @@ def export_private_outcome(
         "native_effects": native_effects,
         "reviews": reviews,
         "checks": checks,
+        "check_results": check_results,
+        "verification_manifests": manifests,
+        "candidates": candidates,
         "findings": findings,
         "decisions": decisions,
         "cancellations": cancellations,
