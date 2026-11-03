@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bounded task composition proof: real Git fixtures, native-shaped fakes, no paid calls."""
 
+import hashlib
+import hmac
 import inspect
 import json
 import os
@@ -10,8 +12,9 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 
 import pytest
 
@@ -29,6 +32,7 @@ from creatidy_kernel.adapters.task_execution import (
     LiveTaskComponents,
     OwnedVerificationCommand,
     TaskChecks,
+    TaskCollector,
     TaskInterrupted,
     TaskRuntimeConfig,
     TaskSpec,
@@ -44,10 +48,10 @@ from creatidy_kernel.adapters.task_execution import (
 from creatidy_kernel.adapters.task_execution import git_text as task_git
 from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import DomainCommandType, FinishAttempt, Program
-from creatidy_kernel.core.execution import UnsupportedExecution
+from creatidy_kernel.core.execution import Candidate, ExecutionRequest, UnsupportedExecution
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
-from creatidy_kernel.core.verification import Evidence, EvidenceSubject
+from creatidy_kernel.core.verification import CandidateResult, Evidence, EvidenceSubject
 from creatidy_kernel.ports.forge import Forge
 from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.program_store import OperationRecord
@@ -800,6 +804,102 @@ def test_cancel_before_attempt_is_stable_without_dispatch(sqlite_tmp_path: Path,
             store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
         )
         assert reopened["attempts"] == [] and len(cast(list[object], reopened["cancellations"])) == 1
+
+
+@pytest.mark.parametrize("stop_after_cut", [False, True])
+def test_private_outcome_reopens_original_task_candidate_before_verification(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop_after_cut: bool
+) -> None:
+    source, control = make_source(sqlite_tmp_path), sqlite_tmp_path / "candidate-cut"
+    connection = FixtureConnection(deflake_edit)
+    original = TaskCollector.collect
+    captured: list[Candidate] = []
+
+    def interrupt(target: TaskCollector, request: ExecutionRequest, candidate: Candidate, *, now: int) -> NoReturn:
+        original(target, request, candidate, now=now)
+        captured.append(candidate)
+        raise TaskInterrupted("synthetic after-collection cut")
+
+    with monkeypatch.context() as context:
+        context.setattr(TaskCollector, "collect", interrupt)
+        with pytest.raises(TaskInterrupted, match="after-collection"):
+            run(control, source, connection, task=fixture_task(repeats=1))
+    assert len(captured) == 1 and connection.starts == 1
+    if stop_after_cut:
+        stopped = run(control, source, connection, task=fixture_task(repeats=1), cancel_requested=True)
+        assert stopped["condition"] in {"cancelled", "cancel_uncertain"} and connection.starts == 1
+    expected = CandidateResult("candidate:task_execution:change", captured[0], (("change", "candidate.patch"),)).digest
+
+    def reference(kind: str, value: str) -> str:
+        payload = json.dumps([kind, value], ensure_ascii=True, separators=(",", ":")).encode()
+        return "hmac-sha256:" + hmac.new(b"k" * 32, payload, hashlib.sha256).hexdigest()
+
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = (store.history("task_execution"), store.operations())
+        candidate_operation = store.operation("candidate:task_execution:change")
+        original_record = json.loads(candidate_operation.request_json)["request"]
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        candidates = cast(list[dict[str, object]], exported["candidates"])
+        assert len(candidates) == 1 and candidates[0]["candidate"] == reference("candidate", expected)
+        assert candidates[0]["head"] == reference("revision", original_record["head"])
+        assert candidates[0]["base"] == reference("revision", original_record["base"])
+        assert candidates[0]["tree"] == reference("revision", original_record["tree"])
+        assert candidates[0]["patch_integrity"] == "recorded-digest-only-not-read"
+        assert (
+            candidates[0]["candidate_binding"]
+            == "reconstructed-from-recorded-output; runtime-candidate-match-not-proven"
+        )
+        assert cast(int, candidates[0]["patch_bytes"]) > 0
+        assert exported["checks"] == [] and exported["verification_manifests"] == [] and exported["satisfactions"] == []
+        assert (store.history("task_execution"), store.operations()) == before and connection.starts == 1
+        original_lookup = SQLiteProgramStore.find_operation
+
+        def mismatched(target: SQLiteProgramStore, operation_id: str) -> OperationRecord | None:
+            record = original_lookup(target, operation_id)
+            if record is None or operation_id != "candidate:task_execution:change":
+                return record
+            raw = json.loads(record.request_json)
+            raw["request"]["base"] = "0" * 40
+            return replace(record, request_json=json.dumps(raw))
+
+        with monkeypatch.context() as context:
+            context.setattr(SQLiteProgramStore, "find_operation", mismatched)
+            with pytest.raises(ValueError, match="task candidate differs"):
+                export_private_outcome(store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+
+
+def test_private_outcome_preserves_task_candidate_before_output_publication(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, control = make_source(sqlite_tmp_path), sqlite_tmp_path / "candidate-before-output"
+    connection = FixtureConnection(deflake_edit)
+    original = SQLiteProgramStore.finalize_artifact
+
+    def interrupt(store: SQLiteProgramStore, operation_id: str, name: str, data: bytes) -> str:
+        if operation_id == "runtime:task_execution:change" and name == "output":
+            raise TaskInterrupted("synthetic before-output cut")
+        return original(store, operation_id, name, data)
+
+    with monkeypatch.context() as context:
+        context.setattr(SQLiteProgramStore, "finalize_artifact", interrupt)
+        with pytest.raises(TaskInterrupted, match="before-output"):
+            run(control, source, connection, task=fixture_task(repeats=1))
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = (store.history("task_execution"), store.operations())
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        candidate = cast(list[dict[str, object]], exported["candidates"])[0]
+        assert candidate["source"] == "task-candidate-v1" and candidate["head"] is not None
+        assert candidate["base"] is not None and candidate["tree"] is not None
+        assert candidate["patch_recorded"] is False and candidate["candidate"] is None and candidate["patch"] is None
+        assert candidate["patch_bytes"] is None
+        assert candidate["patch_integrity"] == "not-recorded"
+        assert candidate["candidate_binding"] == "unknown-output-not-recorded"
+        assert not exported["checks"] and not exported["satisfactions"]
+        assert (store.history("task_execution"), store.operations()) == before and connection.starts == 1
 
 
 def test_pre_attempt_cancellation_crash_stays_unsettled_without_dispatch(sqlite_tmp_path: Path) -> None:

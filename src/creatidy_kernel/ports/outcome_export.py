@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import secrets
 from dataclasses import asdict
 from decimal import Decimal, InvalidOperation, localcontext
@@ -766,6 +767,89 @@ def export_private_outcome(
                     "current_remote_state": None,
                 }
             )
+        if program_id == "task_execution" and attempt.attempt_id == "task_execution:change":
+            task_candidate = store.find_operation("candidate:task_execution:change")
+            if task_candidate is not None:
+                mode_operation = store.find_operation("task_execution:mode")
+                base_operation = store.find_operation("task_execution:base")
+                if mode_operation is None or base_operation is None:
+                    raise ValueError("task candidate lacks its original task or base")
+                mode = _mapping(_mapping(json.loads(mode_operation.request_json)).get("request"))
+                base_record = _mapping(_mapping(json.loads(base_operation.request_json)).get("request"))
+                original = _mapping(_mapping(json.loads(task_candidate.request_json)).get("request"))
+                task_digest = mode.get("task_digest")
+                original_spec = next((item for item in program.spec_history if item.digest == spec.spec_digest), None)
+                if (
+                    task_candidate.effect_key != "candidate:task_execution:change"
+                    or mode_operation.effect_key != "task_execution:mode"
+                    or base_operation.effect_key != "task_execution:base"
+                    or set(original) != {"task", "base", "tree", "head"}
+                    or type(task_digest) is not str
+                    or not task_digest
+                    or type(mode.get("task")) is not str
+                    or not mode.get("task")
+                    or original_spec is None
+                    or not any(
+                        item.name == "task" and item.reference == "task_execution:task:" + task_digest
+                        for item in original_spec.initial_inputs
+                    )
+                    or original.get("task") != mode.get("task")
+                    or original.get("task") != base_record.get("task")
+                    or original.get("base") != base_record.get("base")
+                    or any(
+                        type(original.get(name)) is not str
+                        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", cast(str, original.get(name))) is None
+                        for name in ("base", "tree", "head")
+                    )
+                ):
+                    raise ValueError("task candidate differs from its original task, Attempt or base")
+                outputs = store.outcome_artifact_metadata(program_id, runtime_id, "output")
+                if len(outputs) > 1 or (
+                    outputs
+                    and (
+                        type(outputs[0].get("digest")) is not str
+                        or re.fullmatch(r"[0-9a-f]{64}", cast(str, outputs[0].get("digest"))) is None
+                        or type(outputs[0].get("size")) is not int
+                        or cast(int, outputs[0]["size"]) < 0
+                    )
+                ):
+                    raise ValueError("invalid retained task candidate output metadata")
+                candidate_digest = None
+                patch_digest = None
+                if outputs:
+                    if spec.workspace_reference is None:
+                        raise ValueError("task candidate lacks its original workspace reference")
+                    patch_digest = "sha256:" + cast(str, outputs[0]["digest"])
+                    artifact = Artifact("candidate.patch", patch_digest)
+                    candidate = Candidate(
+                        attempt.attempt_id, spec.digest, ArtifactManifest(spec.workspace_reference, (artifact,))
+                    )
+                    unit = original_spec.work_unit(spec.work_unit_id)
+                    candidate_digest = CandidateResult(
+                        f"candidate:{attempt.attempt_id}",
+                        candidate,
+                        tuple((name, "candidate.patch") for name in sorted(unit.outputs)),
+                    ).digest
+                candidates.append(
+                    {
+                        "attempt": ref("attempt", attempt.attempt_id),
+                        "candidate": ref("candidate", candidate_digest),
+                        "source": "task-candidate-v1",
+                        "operation": ref("operation", task_candidate.operation_id),
+                        "task": ref("task", original.get("task")),
+                        "base": ref("revision", original.get("base")),
+                        "tree": ref("revision", original.get("tree")),
+                        "head": ref("revision", original.get("head")),
+                        "patch": ref("artifact", patch_digest),
+                        "patch_recorded": bool(outputs),
+                        "patch_bytes": None if not outputs else outputs[0]["size"],
+                        "candidate_binding": "reconstructed-from-recorded-output; runtime-candidate-match-not-proven"
+                        if outputs
+                        else "unknown-output-not-recorded",
+                        "patch_integrity": "recorded-digest-only-not-read" if outputs else "not-recorded",
+                        "current_remote_state": None,
+                    }
+                )
 
         def identity_view(value: RuntimeIdentity | None) -> dict[str, str | None] | None:
             if value is None:

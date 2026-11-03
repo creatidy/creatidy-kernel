@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import hmac
 import itertools
 import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 from unittest.mock import patch
 
 import creatidy_kernel
@@ -24,6 +27,7 @@ from creatidy_kernel.adapters.reference import reference_commit, reference_git, 
 from creatidy_kernel.adapters.reference_live import run_live_reference
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.task_execution import (
+    TaskCollector,
     TaskInterrupted,
     TaskSpec,
     VerificationCommand,
@@ -51,6 +55,7 @@ from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.resources import Allocation, ResourceRequest
 from creatidy_kernel.core.verification import (
+    CandidateResult,
     Evidence,
     EvidenceSubject,
     ProductReviewReceipt,
@@ -748,6 +753,112 @@ for fault in (None, "pr-send"):
             raise SystemExit("installed task publication guessed a receipt or changed original evidence")
     if (connection.starts, connection.interrupts, transport.pushes, transport.posts) != before_calls:
         raise SystemExit("installed task publication export reissued a native effect")
+
+for cut in ("before-output", "after-collection", "after-collection-stop"):
+    root, source, task = synthetic_task_source(f"actual-task-candidate-{cut}", "synthetic-candidate-cut")
+    connection = SyntheticCompletingTaskConnection(root, qualified=True)
+    control = root / "control"
+    allocation = Allocation("codex", "provider", "model", frozenset({"reference"}), 128, "synthetic owner")
+    original_collect = TaskCollector.collect
+    original_finalize = SQLiteProgramStore.finalize_artifact
+    captured_candidates: list[Candidate] = []
+
+    def interrupt_collect(
+        target: TaskCollector,
+        request: ExecutionRequest,
+        candidate: Candidate,
+        *,
+        now: int,
+        original: Callable[..., Collection] = original_collect,
+        captured: list[Candidate] = captured_candidates,
+    ) -> NoReturn:
+        original(target, request, candidate, now=now)
+        captured.append(candidate)
+        raise TaskInterrupted("synthetic after-collection cut")
+
+    def interrupt_output(
+        store: SQLiteProgramStore,
+        operation_id: str,
+        name: str,
+        data: bytes,
+        original: Callable[[SQLiteProgramStore, str, str, bytes], str] = original_finalize,
+    ) -> str:
+        if operation_id == "runtime:task_execution:change" and name == "output":
+            raise TaskInterrupted("synthetic before-output cut")
+        return original(store, operation_id, name, data)
+
+    with patch("creatidy_kernel.adapters.task_execution.time.time", return_value=100):
+        override = (
+            patch.object(TaskCollector, "collect", interrupt_collect)
+            if cut != "before-output"
+            else patch.object(SQLiteProgramStore, "finalize_artifact", interrupt_output)
+        )
+        with override:
+            try:
+                run_task(
+                    control,
+                    task=task,
+                    source_repository=source,
+                    owner_approved=True,
+                    trusted_development_acknowledged=True,
+                    connection=connection,
+                    version=connection.version,
+                    deadline=110,
+                    allocation=allocation,
+                    boot_clock=pre_attempt_clock,
+                )
+            except TaskInterrupted:
+                pass
+            else:
+                raise SystemExit("installed task candidate interruption cut was not reached")
+        if cut == "after-collection-stop":
+            stopped = run_task(
+                control,
+                task=task,
+                source_repository=source,
+                owner_approved=True,
+                trusted_development_acknowledged=True,
+                connection=connection,
+                version=connection.version,
+                deadline=110,
+                allocation=allocation,
+                boot_clock=pre_attempt_clock,
+                cancel_requested=True,
+            )
+            if stopped["condition"] not in {"cancelled", "cancel_uncertain"} or connection.starts != 1:
+                raise SystemExit("installed post-collection STOP did not retain the original target")
+    calls = (connection.starts, connection.interrupts)
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = store.operations()
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        candidates = cast(list[dict[str, object]], exported["candidates"])
+        if (
+            len(candidates) != 1
+            or candidates[0]["source"] != "task-candidate-v1"
+            or candidates[0]["head"] is None
+            or candidates[0]["base"] is None
+            or candidates[0]["tree"] is None
+            or candidates[0]["patch_recorded"] is not (cut != "before-output")
+            or (candidates[0]["candidate"] is not None) is not (cut != "before-output")
+            or exported["checks"]
+            or exported["satisfactions"]
+            or store.operations() != before
+        ):
+            raise SystemExit("installed reopened task outcome lost or fabricated original candidate evidence")
+        if cut != "before-output":
+            if len(captured_candidates) != 1:
+                raise SystemExit("installed task fixture lost original producer candidate")
+            expected = CandidateResult(
+                "candidate:task_execution:change", captured_candidates[0], (("change", "candidate.patch"),)
+            ).digest
+            message = json.dumps(["candidate", expected], ensure_ascii=True, separators=(",", ":")).encode()
+            expected_ref = "hmac-sha256:" + hmac.new(b"k" * 32, message, hashlib.sha256).hexdigest()
+            if candidates[0]["candidate"] != expected_ref:
+                raise SystemExit("installed outcome changed the original task candidate identity")
+    if (connection.starts, connection.interrupts) != calls:
+        raise SystemExit("installed task candidate export reissued native work")
 
 
 class SyntheticReviewRuntime:

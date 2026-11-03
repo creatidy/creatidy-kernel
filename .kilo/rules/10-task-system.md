@@ -2,6 +2,14 @@
 
 <!-- Adapted from Model Intelligence for Kernel identity and issue-quality rules; see NOTICE. -->
 
+- Start each major issue in a new primary Kilo session. Use one active primary
+  continuation per delivery; do not duplicate or overlap continuations, or schedule
+  delayed/background primary continuation while review or mutation may be active.
+  If continuation is necessary, terminate the previous invocation first and identify
+  the next turn as a continuation. Start the next major issue in a new session.
+- Run independent reviews sequentially as foreground tasks, awaiting each result
+  before mutation or another review. Preserve all review ordinals across sessions.
+  These are operating rules, not a runtime-enforced mutex.
 - Outside an explicit owner `/loop`, start implementation only when Adrian selects one Forgejo issue by
   number, URL or unambiguous title. Fetch the actual issue via MCP before planning
   or editing. Summarize title, goal, scope, acceptance criteria, constraints, links

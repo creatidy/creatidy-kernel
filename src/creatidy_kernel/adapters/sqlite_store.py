@@ -842,7 +842,14 @@ class SQLiteProgramStore:
     ) -> tuple[dict[str, object], ...]:
         """List retained artifact metadata only for an original scoped producer operation."""
         self._assert_writer_thread()
-        if prefix not in {"candidate.patch", "verification:", "observation:", "owned-observation:", "stop-uncertain:"}:
+        if prefix not in {
+            "candidate.patch",
+            "output",
+            "verification:",
+            "observation:",
+            "owned-observation:",
+            "stop-uncertain:",
+        }:
             raise ValueError("unsupported outcome artifact prefix")
         with self._gate:
             program = self._load_head(program_id)
@@ -852,7 +859,7 @@ class SQLiteProgramStore:
             reservation = self._work_record("reservation", operation_id)
             if not allowed and (reservation is None or reservation.get("program") != program_id):
                 raise ValueError("artifact operation is not owned by the selected Program")
-            pattern = prefix if prefix == "candidate.patch" else prefix + "%"
+            pattern = prefix if prefix in {"candidate.patch", "output"} else prefix + "%"
             return tuple(
                 dict(row)
                 for row in self._connection.execute(

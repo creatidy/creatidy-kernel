@@ -148,7 +148,10 @@ verification manifests remain visible even if the controller stopped before acce
 Attempt. A recorded missing check is unknown, not a passing result; overlapping standalone and
 manifest evidence is deduplicated while retaining both references. Candidate patch contents are never
 read into the export: their retained digest is reported as a recorded reference, not fresh content
-verification. Independent reference and bounded-task cancellation intents and their original-handle,
+verification. The bounded-task candidate preserves its original task, base, tree and head from the
+task-bound journal. If its output artifact is not yet recorded, the candidate digest remains unknown;
+when it is recorded, the exported digest is reconstructed from that metadata and does not by itself
+prove the runtime candidate matched it. Independent reference and bounded-task cancellation intents and their original-handle,
 fence, transport, observation and owned-group settlement records remain historical evidence, including
 uncertainty and mismatched/unqualified observations; they are not redispatched or adopted as a current
 process or proof about escaped descendants.
