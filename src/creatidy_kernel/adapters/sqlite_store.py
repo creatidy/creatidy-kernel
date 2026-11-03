@@ -846,6 +846,7 @@ class SQLiteProgramStore:
             "candidate.patch",
             "output",
             "verification:",
+            "command-evidence:",
             "observation:",
             "owned-observation:",
             "stop-uncertain:",

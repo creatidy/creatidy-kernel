@@ -397,7 +397,8 @@ print("Done")
         boot_clock = lambda: BootClockReading(  # noqa: E731 - Controlled fixture clock.
             int(time.time()) + time_offset[0], time.monotonic_ns() + time_offset[0] * 10**9, "ordinary-fixture-boot"
         )
-        with SQLiteProgramStore(root / "state.db", boot_clock=boot_clock) as store:
+        with SQLiteProgramStore(root / "state.db", boot_clock=boot_clock) as initial_store:
+            store: SQLiteProgramStore = initial_store
             reader = OwnerReviewedForgejoEvidence(
                 store,
                 Principal("owner", "owner"),
@@ -848,6 +849,7 @@ print("Done")
                 in {"remediation", "review-remediation", "review-remediation-tampered", "review-remediation-served"}
                 else units
             ):
+                store = cast(SQLiteProgramStore, store)  # pyright: ignore[reportUnnecessaryCast]
                 ordinal = units.index(unit)
                 bad_candidate = (
                     exercise in {"remediation", "rejected-replay", "rejected-replay-reopen"} and position == 0
@@ -862,7 +864,9 @@ print("Done")
                         sys.executable,
                         "-B",
                         "-c",
-                        "from pathlib import Path; assert Path("
+                        "print('synthetic-private-command-output'); raise SystemExit(7)"
+                        if exercise == "command-export-failed"
+                        else "from pathlib import Path; assert Path("
                         + repr(unit + ".py")
                         + ").read_text() == "
                         + repr("VALUE = " + str(ordinal + 1) + "\n"),
@@ -2603,7 +2607,14 @@ print("Done")
                     assert not calls and not native_state["sends"]
                     return {"status": "unknown", "native_sends": 0}
                 if (
-                    exercise in {"command-evidence-crash", "command-evidence-no-witness", "command-evidence-partial"}
+                    exercise
+                    in {
+                        "command-evidence-crash",
+                        "command-evidence-no-witness",
+                        "command-evidence-partial",
+                        "command-export-crash",
+                        "command-export-failed",
+                    }
                     and position == 0
                 ):
                     finalize = SQLiteProgramStore.finalize_artifact
@@ -2632,6 +2643,8 @@ print("Done")
                     original_observed_at = original_result["observed_at"]
                     time_offset[0] = 10
                     store.close()
+                    if exercise in {"command-export-crash", "command-export-failed"}:
+                        return {"status": "interrupted", "native_sends": 0}
                     store = owners.enter_context(SQLiteProgramStore(root / "state.db", boot_clock=boot_clock))
                     reader = OwnerReviewedForgejoEvidence(
                         store,

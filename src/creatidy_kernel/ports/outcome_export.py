@@ -19,6 +19,7 @@ from typing import Protocol, cast
 from creatidy_kernel.core.deadlines import DeadlineProjection
 from creatidy_kernel.core.domain import Program
 from creatidy_kernel.core.execution import Artifact, ArtifactManifest, Candidate, RuntimeIdentity
+from creatidy_kernel.core.intake import encode
 from creatidy_kernel.core.outcomes import Provenance
 from creatidy_kernel.core.verification import CandidateResult
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
@@ -40,6 +41,7 @@ class OutcomeExportStore(ApplicationStore, Protocol):
 
     def work_budget_revoked(self, program_id: str) -> bool | None: ...
     def find_operation(self, operation_id: str) -> OperationRecord | None: ...
+    def operations(self, prefix: str = "") -> tuple[OperationRecord, ...]: ...
     def work_budget_status(self, program_id: str) -> dict[str, object]: ...
     def served_claim_count(self, program_id: str) -> int: ...
     def served_claims(self, program_id: str, *, offset: int = 0, limit: int = 8) -> tuple[dict[str, object], ...]: ...
@@ -545,8 +547,114 @@ def export_private_outcome(
     decisions: list[dict[str, object]] = []
     checks: list[dict[str, object]] = []
     check_results: list[dict[str, object]] = []
+    command_results: list[dict[str, object]] = []
     manifests: list[dict[str, object]] = []
     candidates: list[dict[str, object]] = []
+    for item in reservations:
+        operation_id, attempt_id = item.get("operation"), item.get("attempt")
+        if type(operation_id) is not str or not operation_id.startswith("ordinary-command:"):
+            continue
+        attempt = attempt_by_id.get(cast(str, attempt_id))
+        operation = store.find_operation(operation_id)
+        if attempt is None or operation is None or item.get("category") != "tool":
+            raise ValueError("ordinary command lacks original Attempt or operation")
+        request = _mapping(_mapping(json.loads(operation.request_json)).get("request"))
+        subject = _mapping(request.get("subject"))
+        candidate = subject.get("candidate_digest")
+        prefix = f"ordinary-command:{attempt.attempt_id}:{candidate}:"
+        suffix = operation_id.removeprefix(prefix)
+        parts = suffix.split(":")
+        if (
+            operation.effect_key != operation_id
+            or type(candidate) is not str
+            or not candidate
+            or not operation_id.startswith(prefix)
+            or len(parts) != 2
+            or any(not part.isdecimal() for part in parts)
+            or request.get("repeat") != int(parts[1])
+            or subject.get("attempt_digest") != attempt.spec.digest
+            or subject.get("spec_digest") != attempt.spec.spec_digest
+        ):
+            raise ValueError("ordinary command differs from original Attempt or subject")
+        owner_data = store.find_artifact(operation_id, "owner")
+        owner = None if owner_data is None else _mapping(json.loads(owner_data))
+        owner_bound = owner is not None and (
+            owner.get("version") == 1
+            and owner.get("operation") == operation_id
+            and owner.get("effect_key") == operation.effect_key
+            and owner.get("request_digest") == operation.request_digest
+            and owner.get("fence") == operation.fence
+            and type(owner.get("group_reference")) is str
+            and owner.get("profile") == "trusted-development:owned-verification-group"
+        )
+        result_data = store.find_artifact(operation_id, "result")
+        runtime_data = store.find_artifact(f"runtime:{attempt_id}", operation_id)
+        receipt = None if result_data is None else _mapping(json.loads(result_data))
+        receipt_result = None if receipt is None else receipt.get("result")
+        runtime_result = None if runtime_data is None else _mapping(json.loads(runtime_data))
+        raw_result = (
+            runtime_result
+            if runtime_result is not None
+            else (cast(dict[str, object], receipt_result) if type(receipt_result) is dict else None)
+        )
+        result_matches = runtime_result is not None and receipt_result == runtime_result
+        witness_qualified = False
+        if owner_bound and raw_result is not None:
+            for fact in store.operations(f"command-settlement:{operation_id}:"):
+                witness_request = _mapping(_mapping(json.loads(fact.request_json)).get("request"))
+                if type(witness_request.get("witness")) is not dict:
+                    continue
+                witness = _mapping(witness_request.get("witness"))
+                witness_raw = encode(witness)
+                if (
+                    fact.operation_id == f"command-settlement:{operation_id}:{hashlib.sha256(witness_raw).hexdigest()}"
+                    and all(witness.get(name) == value for name, value in cast(dict[str, object], owner).items())
+                    and witness.get("owned_group_settled") is True
+                    and witness.get("result_reconciled") is True
+                    and witness.get("result_digest") == "sha256:" + hashlib.sha256(encode(raw_result)).hexdigest()
+                ):
+                    witness_qualified = True
+        complete = (
+            raw_result is not None
+            and (type(raw_result.get("exit_code")) is int or raw_result.get("exit_code") is None)
+            and type(raw_result.get("observed_at")) is int
+            and all(type(raw_result.get(name)) is bool for name in ("timed_out", "authority_lost", "output_exhausted"))
+        )
+        command_results.append(
+            {
+                "attempt": ref("attempt", attempt_id),
+                "operation": ref("operation", operation_id),
+                "candidate": ref("candidate", candidate),
+                "policy": ref("policy", subject.get("policy_digest")),
+                "repository": ref("repository", subject.get("repository")),
+                "base": ref("revision", subject.get("base_revision")),
+                "head": ref("revision", subject.get("head_revision")),
+                "ordinal": int(parts[0]),
+                "repeat": int(parts[1]),
+                "fence": operation.fence,
+                "owner": ref("runtime-handle", owner.get("group_reference") if owner_bound and owner else None),
+                "owner_binding": "recorded" if owner_bound else "unknown",
+                "result_recorded": raw_result is not None,
+                "runtime_result_recorded": runtime_result is not None,
+                "result_receipt_recorded": receipt is not None,
+                "result_consistent": result_matches if receipt is not None and runtime_result is not None else None,
+                "workspace_subject": ref("workspace-subject", receipt.get("scope"))
+                if receipt is not None and type(receipt.get("scope")) is str and receipt.get("scope")
+                else None,
+                "integrity": "recorded"
+                if result_matches
+                and receipt is not None
+                and receipt.get("head") == subject.get("head_revision")
+                and type(receipt.get("scope")) is str
+                else "unknown",
+                "settlement": "witnessed" if witness_qualified else "unknown",
+                "exit_code": raw_result.get("exit_code") if complete and raw_result is not None else None,
+                "observed_at": raw_result.get("observed_at") if complete and raw_result is not None else None,
+                "timed_out": raw_result.get("timed_out") if complete and raw_result is not None else None,
+                "authority_lost": raw_result.get("authority_lost") if complete and raw_result is not None else None,
+                "output_exhausted": raw_result.get("output_exhausted") if complete and raw_result is not None else None,
+            }
+        )
     for item in reservations:
         operation_id, attempt_id = item.get("operation"), item.get("attempt")
         if item.get("category") != "verification" or type(operation_id) is not str or type(attempt_id) is not str:
@@ -941,6 +1049,52 @@ def export_private_outcome(
                 else None
             )
             record_manifest(attempt.attempt_id, spec.digest, spec.spec_digest, data, reference, decision)
+        if operation is not None:
+            for metadata in store.outcome_artifact_metadata(program_id, runtime_id, "command-evidence:"):
+                name = metadata.get("name")
+                if type(name) is not str:
+                    raise ValueError("invalid retained command evidence identity")
+                data = store.find_artifact(runtime_id, name)
+                if data is None:
+                    raise ValueError("retained command evidence is missing")
+                observation = _mapping(json.loads(data))
+                subject = _mapping(observation.get("subject"))
+                if (
+                    name != "command-evidence:" + hashlib.sha256(encode(subject)).hexdigest()
+                    or subject.get("attempt_digest") != spec.digest
+                    or subject.get("spec_digest") != spec.spec_digest
+                    or observation.get("check") != "commands"
+                    or type(observation.get("passed")) is not bool
+                    or type(observation.get("observed_at")) is not int
+                    or type(observation.get("fresh_until")) is not int
+                    or any(
+                        type(observation.get(field)) is not str or not observation.get(field)
+                        for field in ("evidence_id", "producer", "tool_version", "artifact_reference")
+                    )
+                ):
+                    raise ValueError("invalid retained command evidence")
+                checks.append(
+                    {
+                        "attempt": ref("attempt", attempt.attempt_id),
+                        "manifest": None,
+                        "operation": None,
+                        "evidence": ref("evidence", observation.get("evidence_id")),
+                        "check": ref("check", "commands"),
+                        "producer": ref("actor", observation.get("producer")),
+                        "tool_version": ref("tool-version", observation.get("tool_version")),
+                        "artifact": ref("artifact", observation.get("artifact_reference")),
+                        "reviewer_session": ref("runtime-handle", observation.get("reviewer_session")),
+                        "candidate": ref("candidate", subject.get("candidate_digest")),
+                        "policy": ref("policy", subject.get("policy_digest")),
+                        "repository": ref("repository", subject.get("repository")),
+                        "base": ref("revision", subject.get("base_revision")),
+                        "head": ref("revision", subject.get("head_revision")),
+                        "observed_at": observation["observed_at"],
+                        "fresh_until": observation["fresh_until"],
+                        "passed": observation["passed"],
+                        "freshness": "not-evaluated",
+                    }
+                )
         attempts.append(
             {
                 "id": ref("attempt", attempt.attempt_id),
@@ -1375,6 +1529,18 @@ def export_private_outcome(
         )
     if len(claims) != count or store.served_change_token() != token:
         raise ValueError("durable outcome changed during export")
+    for command in command_results:
+        matching = [
+            candidate
+            for candidate in candidates
+            if candidate.get("source") == "ordinary-candidate-v1"
+            and candidate.get("attempt") == command["attempt"]
+            and candidate.get("candidate") == command["candidate"]
+            and candidate.get("head") == command["head"]
+        ]
+        command["candidate_binding"] = "recorded" if matching else "unknown"
+        if not matching or command["workspace_subject"] != matching[0].get("workspace_subject"):
+            command["integrity"] = "unknown"
     deduplicated_checks: dict[str, dict[str, object]] = {}
     for observation in checks:
         comparable = {key: value for key, value in observation.items() if key not in {"manifest", "operation"}}
@@ -1445,6 +1611,7 @@ def export_private_outcome(
         "reviews": reviews,
         "checks": checks,
         "check_results": check_results,
+        "command_results": command_results,
         "verification_manifests": manifests,
         "candidates": candidates,
         "findings": findings,

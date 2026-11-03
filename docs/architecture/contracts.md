@@ -130,6 +130,12 @@ learning authority is granted by local creation. Unsupported owner policies and 
 producer records are refused; an unverifiable review receipt has no inferred verdict. A changing
 durable cut is refused rather than mixed.
 
+`command_results` contains one historical record per reserved ordinary command operation, including
+its pseudonymous exact subject and owner, fence, typed result fields and independently qualified
+settlement witness. Missing or inconsistent result, owner, integrity or witness remains unknown;
+command completion is not a verification decision. Raw command arguments and output are excluded.
+Retained aggregate command Evidence is projected in `checks` and deduplicated with manifest evidence.
+
 The projection retains the original deadline/boot projection, recorded work revocation, exact managed
 cancellation intent and any qualified original-target settlement evidence without asserting the current
 physical process state. A completed Program can retain its completion while remaining authority is

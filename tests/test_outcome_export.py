@@ -27,6 +27,7 @@ from creatidy_kernel.core.verification import Evidence, EvidenceSubject
 from creatidy_kernel.core.work_budget import WorkKind
 from creatidy_kernel.ports.application import BudgetedChecks
 from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
+from creatidy_kernel.ports.program_store import OperationRecord
 
 
 def test_private_export_preserves_correction_and_unknown_coverage(sqlite_tmp_path: Path) -> None:
@@ -675,6 +676,65 @@ def test_native_receipt_from_different_original_effect_is_refused(sqlite_tmp_pat
                 export_private_outcome(
                     store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
                 )
+
+
+@pytest.mark.parametrize(("exercise", "exit_code"), [("command-export-crash", 0), ("command-export-failed", 7)])
+def test_command_result_survives_interrupted_aggregate_and_reopen(
+    sqlite_tmp_path: Path, exercise: str, exit_code: int
+) -> None:
+    root = sqlite_tmp_path / exercise
+    assert run_ordinary_flow(root, None, mode="pull", exercise=exercise)["status"] == "interrupted"
+    with SQLiteProgramStore(root / "state.db") as store:
+        before = (store.served_change_token(), store.operations())
+        with patch("subprocess.Popen", side_effect=AssertionError("export dispatched a subprocess")):
+            result = export_private_outcome(
+                store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+            )
+        assert (store.served_change_token(), store.operations()) == before
+        commands = cast(list[dict[str, object]], result["command_results"])
+        assert len(commands) == 1 and commands[0]["exit_code"] == exit_code
+        assert commands[0]["settlement"] == "witnessed" and commands[0]["integrity"] == "recorded"
+        assert "synthetic-private-command-output" not in json.dumps(result)
+        assert result["satisfactions"] == []
+        operations = SQLiteProgramStore.operations
+
+        def hide_witness(target: SQLiteProgramStore, prefix: str = "") -> tuple[OperationRecord, ...]:
+            return () if prefix.startswith("command-settlement:") else operations(target, prefix)
+
+        with patch.object(SQLiteProgramStore, "operations", hide_witness):
+            incomplete = export_private_outcome(
+                store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+            )
+        assert cast(list[dict[str, object]], incomplete["command_results"])[0]["settlement"] == "unknown"
+        original_find = SQLiteProgramStore.find_artifact
+
+        def hide_result(target: SQLiteProgramStore, operation: str, name: str) -> bytes | None:
+            if operation.startswith("ordinary-command:") and name == "result":
+                return None
+            return original_find(target, operation, name)
+
+        with patch.object(SQLiteProgramStore, "find_artifact", hide_result):
+            incomplete = export_private_outcome(
+                store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+            )
+        partial = cast(list[dict[str, object]], incomplete["command_results"])[0]
+        assert partial["result_recorded"] is True and partial["integrity"] == "unknown"
+        store.create(reference_spec(), "another-program")
+        other = export_private_outcome(store, "reference", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+        assert other["command_results"] == []
+
+
+def test_command_evidence_and_manifest_are_not_duplicated(sqlite_tmp_path: Path) -> None:
+    root = sqlite_tmp_path / "command-export-manifest"
+    assert run_ordinary_flow(root, None, mode="pull")["status"] == "completed"
+    with SQLiteProgramStore(root / "state.db") as store:
+        result = export_private_outcome(
+            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        commands = cast(list[dict[str, object]], result["command_results"])
+        checks = cast(list[dict[str, object]], result["checks"])
+        assert len(commands) == 2
+        assert len({(check["attempt"], check["evidence"]) for check in checks}) == len(checks)
 
 
 @pytest.mark.parametrize("payload", [b"not-json", b'{"version":99}'])

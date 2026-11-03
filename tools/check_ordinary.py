@@ -34,6 +34,25 @@ for mode in ("pull", "managed", "mixed"):
 if preparation_only:
     print("Installed ordinary preparation fixture passed.")
     raise SystemExit(0)
+for exercise, exit_code in (("command-export-crash", 0), ("command-export-failed", 7)):
+    root = storage / exercise
+    if run_ordinary_flow(root, None, mode="pull", exercise=exercise)["status"] != "interrupted":
+        raise SystemExit("installed command interruption was not exercised")
+    with SQLiteProgramStore(root / "state.db") as store:
+        before = store.served_change_token()
+        exported = export_private_outcome(
+            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        commands = cast(list[dict[str, object]], exported["command_results"])
+        if (
+            len(commands) != 1
+            or commands[0]["exit_code"] != exit_code
+            or commands[0]["settlement"] != "witnessed"
+            or exported["satisfactions"]
+            or store.served_change_token() != before
+            or "synthetic-private-command-output" in str(exported)
+        ):
+            raise SystemExit("installed reopened export lost or disclosed original command evidence")
 if run_ordinary_flow(storage / "private-stop-uncertain", None, mode="managed", exercise="private-stop-uncertain") != {
     "status": "stopped-unknown",
     "native_sends": 0,
