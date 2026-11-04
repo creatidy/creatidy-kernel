@@ -135,6 +135,9 @@ its pseudonymous exact subject and owner, fence, typed result fields and indepen
 settlement witness. Missing or inconsistent result, owner, integrity or witness remains unknown;
 command completion is not a verification decision. Raw command arguments and output are excluded.
 Retained aggregate command Evidence is projected in `checks` and deduplicated with manifest evidence.
+`domain_cancellations` preserves WorkUnit and Attempt decision records separately from driver
+`cancellations`; their physical settlement remains unknown. `program_conclusions` preserves
+historical terminal observations across amendments, with original specification and record order.
 
 The projection retains the original deadline/boot projection, recorded work revocation, exact managed
 cancellation intent and any qualified original-target settlement evidence without asserting the current

@@ -35,7 +35,16 @@ from creatidy_kernel.adapters.task_execution import (
     scarcity_router_143_task,
 )
 from creatidy_kernel.core.deadlines import BootClockReading
-from creatidy_kernel.core.domain import ActivateProgram, AttemptSpec, PrepareAttempt, ProgramSpec
+from creatidy_kernel.core.domain import (
+    ActivateProgram,
+    AmendProgramSpec,
+    AttemptSpec,
+    CancelProgram,
+    CancelWorkUnit,
+    PrepareAttempt,
+    ProgramSpec,
+    SpecAmendment,
+)
 from creatidy_kernel.core.execution import (
     Activity,
     Artifact,
@@ -271,6 +280,51 @@ with SQLiteProgramStore(reference_dir / "kernel.sqlite3") as store:
     native = cast(list[dict[str, object]], result["native_effects"])
     if len(native) != 1 or native[0]["driver"] != "reference-pr-v1" or native[0]["current_remote_state"] is not None:
         raise SystemExit("installed reference outcome lost historical native publication lineage")
+    program = store.load("reference")
+    store.admit(
+        "reference",
+        "amend-after-completion",
+        AmendProgramSpec(
+            program.revision, "owner", SpecAmendment(program.spec.revision, objective="synthetic amendment")
+        ),
+    )
+with SQLiteProgramStore(reference_dir / "kernel.sqlite3") as store:
+    history = export_private_outcome(store, "reference", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+    conclusions = cast(list[dict[str, object]], history["program_conclusions"])
+    if not conclusions or conclusions[0]["spec"] == cast(dict[str, object], history["program"])["spec"]:
+        raise SystemExit("installed export lost historical conclusions after amendment and reopen")
+domain_path = storage / "domain-cancel.sqlite3"
+with SQLiteProgramStore(domain_path) as store:
+    program = store.create(reference_spec(), "domain-create")
+    program = store.admit("reference", "domain-activate", ActivateProgram(program.revision, "owner"))
+    attempt = AttemptSpec(
+        "domain-attempt",
+        "reference",
+        "first",
+        program.spec.revision,
+        program.spec.digest,
+        program.resolved_inputs("first"),
+    )
+    program = store.admit("reference", "domain-prepare", PrepareAttempt(program.revision, "worker", attempt))
+    program = store.admit(
+        "reference",
+        "domain-cancel-work",
+        CancelWorkUnit(program.revision, "owner", "first", "synthetic-private-reason"),
+    )
+    store.admit("reference", "domain-cancel-program", CancelProgram(program.revision, "owner"))
+with SQLiteProgramStore(domain_path) as store:
+    before = store.served_change_token()
+    exported = export_private_outcome(store, "reference", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+    records = cast(list[dict[str, object]], exported["domain_cancellations"])
+    if (
+        {item["kind"] for item in records} != {"work-unit", "attempt"}
+        or exported["cancellations"]
+        or any(item["physical_settlement"] != "unknown" for item in records)
+        or not exported["program_conclusions"]
+        or "synthetic-private-reason" in json.dumps(exported)
+        or store.served_change_token() != before
+    ):
+        raise SystemExit("installed export lost domain cancellation history after reopen")
 for driver in ("reference", "task_execution"):
     for qualified in (False, True):
         path = storage / f"{driver}-{qualified}.sqlite3"

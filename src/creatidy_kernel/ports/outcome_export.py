@@ -1725,6 +1725,43 @@ def export_private_outcome(
         "findings": findings,
         "decisions": decisions,
         "cancellations": cancellations,
+        "domain_cancellations": [
+            {
+                "kind": "work-unit",
+                "work_unit": ref("work-unit", item.work_unit_id),
+                "work_unit_fingerprint": ref("work-unit-fingerprint", item.work_unit_fingerprint),
+                "spec_revision": item.spec_revision,
+                "spec": ref("spec", item.spec_digest),
+                "actor": ref("actor", item.actor_id),
+                "reason": ref("cancellation-reason", item.reason),
+                "record_order": item.record_order,
+                "physical_settlement": "unknown",
+            }
+            for item in program.cancellations
+        ]
+        + [
+            {
+                "kind": "attempt",
+                "attempt": ref("attempt", item.attempt_id),
+                "work_unit": ref("work-unit", attempt_by_id[item.attempt_id].spec.work_unit_id),
+                "spec_revision": attempt_by_id[item.attempt_id].spec.spec_revision,
+                "spec": ref("spec", attempt_by_id[item.attempt_id].spec.spec_digest),
+                "actor": ref("actor", item.actor_id),
+                "reason": ref("cancellation-reason", item.reason),
+                "record_order": item.record_order,
+                "physical_settlement": "unknown",
+            }
+            for item in program.attempt_cancellations
+        ],
+        "program_conclusions": [
+            {
+                "status": item.status.value,
+                "spec_revision": item.spec_revision,
+                "spec": ref("spec", item.spec_digest),
+                "record_order": item.record_order,
+            }
+            for item in program.conclusions
+        ],
         "work_budget": None
         if budget_policy is None or binding is None
         else {

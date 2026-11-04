@@ -14,6 +14,7 @@ from unittest.mock import patch
 import pytest
 from ordinary_flow_fixture import run_ordinary_flow
 from test_allocation_recovery import CountingAllocator, RecordingRuntime, initial, step
+from test_sqlite_store import _complete_and_cancel  # pyright: ignore[reportPrivateUsage]
 from test_sqlite_store import sqlite_tmp_path as sqlite_tmp_path
 from test_work_budget import Clock, initialize, policy, prepare
 from test_work_ownership import claim, client, workspace
@@ -96,6 +97,30 @@ def test_private_export_preserves_correction_and_unknown_coverage(sqlite_tmp_pat
             store.operations(),
             store.work_budget_status(program.program_id),
         ) == before
+
+
+def test_domain_cancellations_and_conclusions_survive_reopen(sqlite_tmp_path: Path) -> None:
+    path = sqlite_tmp_path / "domain-cancellations.sqlite3"
+    with SQLiteProgramStore(path) as store:
+        expected = _complete_and_cancel(store)
+    with SQLiteProgramStore(path) as store:
+        before = (store.served_change_token(), store.operations())
+        result = export_private_outcome(
+            store, expected.program_id, owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        decisions = cast(list[dict[str, object]], result["domain_cancellations"])
+        conclusions = cast(list[dict[str, object]], result["program_conclusions"])
+        assert result["cancellations"] == []
+        assert {item["kind"] for item in decisions} == {"work-unit", "attempt"}
+        assert {item["record_order"] for item in decisions} == {
+            item.record_order for item in (*expected.cancellations, *expected.attempt_cancellations)
+        }
+        assert all(item["physical_settlement"] == "unknown" for item in decisions)
+        assert [(item["status"], item["spec_revision"], item["record_order"]) for item in conclusions] == [
+            (item.status.value, item.spec_revision, item.record_order) for item in expected.conclusions
+        ]
+        assert "owner narrowed scope" not in json.dumps(result)
+        assert (store.served_change_token(), store.operations()) == before
 
 
 def test_private_export_redacts_untrusted_ids_and_rejects_other_policy(sqlite_tmp_path: Path) -> None:
