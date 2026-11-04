@@ -14,6 +14,7 @@ from test_reference_live_recovery_gaps import scenario as scenario
 from creatidy_kernel.adapters.reference import reference_export
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.deadlines import BootClockReading
+from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.program_store import OperationRecord
 
 pytest_plugins = ["test_sqlite_store"]
@@ -95,6 +96,18 @@ def test_natural_receipt_cut_stops_started_target_without_manual_acceptance(
             proof = json.loads(witness)
             assert proof["runtime_fence"] == 1 and proof["attempt"] == attempt_digest
             assert proof["request_digest"] == request_digest and proof["owned_group_settled"] is True
+        exported = export_private_outcome(store, "reference", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+        records = cast(list[dict[str, object]], exported["cancellations"])
+        assert len(records) == 1 and records[0]["driver"] == "independent-runtime-cancellation"
+        original_attempt = cast(list[dict[str, object]], exported["attempts"])[0]
+        assert (
+            records[0]["attempt"] == original_attempt["id"]
+            and records[0]["handle"] == original_attempt["runtime_handle"]
+        )
+        assert records[0]["runtime_fence"] == recovered.fence and records[0]["cancellation_fence"] == cancellation.fence
+        assert records[0]["current_activity"] is None and records[0]["physical_settlement"] is None
+        proof_records = cast(list[dict[str, object]], records[0]["settlement_proofs"])
+        assert any(item["qualified_original_group"] is True for item in proof_records) is (owner == "original")
         assert not store.operations("acceptance:") and len(store.operations("reference:live-poll:")) == 1
     assert (scenario.directory / "repository/protected-worker-output").read_text() == "retain"
 

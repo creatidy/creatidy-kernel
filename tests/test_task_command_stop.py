@@ -18,6 +18,7 @@ from test_work_budget import Clock
 from creatidy_kernel.adapters import task_execution
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.deadlines import BootClockReading
+from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 
 pytest_plugins = ["test_sqlite_store"]
 
@@ -47,6 +48,47 @@ class OwnedRuntime(FixtureConnection):
         if self.process.poll() is None:
             os.killpg(self.process.pid, signal.SIGKILL)
             self.process.wait(timeout=5)
+
+
+def test_pre_attempt_original_group_settlement_is_exported(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(task_execution.time, "time", lambda: 100)
+    source, control = make_source(sqlite_tmp_path), sqlite_tmp_path / "pre-attempt-control"
+    runtime = OwnedRuntime()
+    try:
+        stopped = task_execution.run_task(
+            control,
+            task=fixture_task(repeats=1),
+            source_repository=source,
+            owner_approved=True,
+            trusted_development_acknowledged=True,
+            connection=runtime,
+            version=runtime.version,
+            allocation=ALLOCATION,
+            deadline=110,
+            boot_clock=Clock(),
+            cancel_requested=True,
+        )
+        assert stopped["condition"] == "cancelled_no_dispatch" and runtime.starts == 0
+        with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+            exported = export_private_outcome(
+                store, task_execution.PROGRAM_ID, owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+            )
+            assert exported["attempts"] == []
+            cancellation = cast(list[dict[str, object]], exported["cancellations"])[0]
+            assert cancellation["attempt"] is None and cancellation["no_dispatch_observed"] is True
+            assert cancellation["settlement_recorded"] is True
+            assert cancellation["qualified_original_no_dispatch_group"] is True
+            assert cancellation["settlement_evidence"] is not None
+            assert (
+                cancellation["owned_group"] == cancellation["expected_group"]
+                and cancellation["owned_group"] is not None
+            )
+            assert cancellation["result_reconciled"] is True and cancellation["transport_succeeded"] is True
+            assert cancellation["current_activity"] is None and cancellation["physical_settlement"] is None
+    finally:
+        runtime.retire_fixture()
 
 
 @pytest.mark.parametrize("trigger", ["stop", "boot-expiry"])
@@ -183,6 +225,22 @@ def test_unknown_command_does_not_preempt_original_runtime_cleanup(
             )
             assert settlement["owned_group_settled"] is settlement["result_reconciled"] is True
             assert cancellation.status == "accepted" and operation.status == "terminal"
+            exported = export_private_outcome(
+                store, task_execution.PROGRAM_ID, owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+            )
+            cancel_export = cast(list[dict[str, object]], exported["cancellations"])[0]
+            assert cancel_export["driver"] == "independent-runtime-cancellation"
+            attempt_export = cast(list[dict[str, object]], exported["attempts"])[0]
+            assert (
+                cancel_export["attempt"] == attempt_export["id"]
+                and cancel_export["handle"] == attempt_export["runtime_handle"]
+            )
+            assert cancel_export["runtime_fence"] == operation.fence
+            assert any(
+                item["qualified_original_group"] is True
+                for item in cast(list[dict[str, object]], cancel_export["settlement_proofs"])
+            )
+            assert cancel_export["current_activity"] is None and cancel_export["physical_settlement"] is None
             original_binding = store.artifact(task_execution.OPERATION_ID, f"command-owner:{key}")
             original_result = store.find_artifact(task_execution.OPERATION_ID, key)
             assert not store.operations("acceptance:") and not store.operations(task_execution.PR_OPERATION)

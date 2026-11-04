@@ -107,6 +107,69 @@ create a controller, open SQLite or discover a capability by itself. Installed c
 separate observer/worker/owner client processes against the existing owner, including stale revisions,
 role injection, duplicate commands and explicit gaps; it is not a Console UI or live-provider proof.
 
+## Private Outcome Export
+
+`export_private_outcome` reads one owner-thread Program cut from the existing durable store using the
+explicit `private-metadata-v1` policy. It exports a versioned local-only projection of Program/spec,
+WorkUnit, Attempt, claim, original Operation and delivery observations, exact-subject check and review
+evidence, satisfaction references, predecessor and remediation edges, and source-qualified usage
+observations including correction links. Recorded check/review freshness is not reevaluated during
+export, and a recorded PASS or APPROVE is conditional evidence, not causal model quality. Its references
+are HMAC pseudonyms; the default fresh key is discarded, so links remain valid only within that export.
+An owner may provide the same separately held 32-byte key when cross-export correlation is intended.
+The key is never put in the document; pseudonymization is not anonymization or sharing permission.
+
+Only enumerated non-content metric and unit labels are emitted verbatim. Other labels are represented
+by pseudonymous references with null labels, not guessed or silently changed. Reported, measured,
+estimated and owner-record provenance remain distinct. Known subtotals are separated by exact
+source/metric/unit/provenance; cross-source and complete totals, hidden external work, route/call identity and physical
+settlement remain unknown where no producer supplies them. Original source contents, prompts,
+free-form findings, workspace paths, native handles and raw identifiers are not emitted. Source rights
+are not established by provenance; no source content, upload, MI intake, third-party consent or Router
+learning authority is granted by local creation. Unsupported owner policies and invalid required
+producer records are refused; an unverifiable review receipt has no inferred verdict. A changing
+durable cut is refused rather than mixed.
+
+`command_results` contains one source-qualified historical record per reserved ordinary or bounded-task command operation, including
+its pseudonymous exact subject and owner, fence, typed result fields and independently qualified
+settlement witness. Missing or inconsistent result, owner, integrity or witness remains unknown;
+command completion is not a verification decision. Raw command arguments and output are excluded.
+Retained aggregate command Evidence is projected in `checks` and deduplicated with manifest evidence.
+`domain_cancellations` preserves WorkUnit and Attempt decision records separately from driver
+`cancellations`; their physical settlement remains unknown. `program_conclusions` preserves
+historical terminal observations across amendments, with original specification and record order.
+
+The projection retains the original deadline/boot projection, recorded work revocation, exact managed
+cancellation intent and any qualified original-target settlement evidence without asserting the current
+physical process state. A completed Program can retain its completion while remaining authority is
+revoked. Ordinary native publication and the reference PR driver retain pseudonymous original
+issue/repository, operation, acceptance and receipt lineage when producer records exist; a retained
+receipt is historical, not current Forge state. Finding IDs and fingerprints are pseudonymized and
+linked to the original review, rejection and remediation Attempt; finding prose is omitted.
+The bounded-task `task-pr-v1` publication uses its own original task/Program binding and the same
+historical-receipt rule. When an approving review is followed by an expired prerequisite, its approval
+is retained as historical review evidence without claiming the rejected candidate was accepted.
+An original bounded-task cancellation recorded before any Attempt is represented separately as
+pre-Attempt evidence; an absent runtime Operation does not fabricate an Attempt, runtime handle or
+proof about escaped descendants.
+Original candidate metadata, terminal candidate dispositions, standalone check results and retained
+verification manifests remain visible even if the controller stopped before accepting or rejecting the
+Attempt. A recorded missing check is unknown, not a passing result; overlapping standalone and
+manifest evidence is deduplicated while retaining both references. Candidate patch contents are never
+read into the export: their retained digest is reported as a recorded reference, not fresh content
+verification. The bounded-task candidate preserves its original task, base, tree and head from the
+task-bound journal. If its output artifact is not yet recorded, the candidate digest remains unknown;
+when it is recorded, the exported digest is reconstructed from that metadata and does not by itself
+prove the runtime candidate matched it. Independent reference and bounded-task cancellation intents and their original-handle,
+fence, transport, observation and owned-group settlement records remain historical evidence, including
+uncertainty and mismatched/unqualified observations; they are not redispatched or adopted as a current
+process or proof about escaped descendants.
+
+`write_private_outcome` publishes only this policy's result into an already-open owner-owned private
+directory using a new 0600 file and never replaces an existing name. A failure before publication may
+leave only a private temporary orphan; a failure after publication is uncertain and requires inspection,
+not automatic retry or deletion. It is local cooperative custody, not a hostile-same-user sandbox.
+
 ## Current Boundary Evidence
 
 This section's original cut is historical; #54/PR92 and #90/PR93 now provide bounded durable product

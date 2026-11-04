@@ -10,6 +10,7 @@ from typing import cast
 import creatidy_kernel
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.intake import IntakeRefused
+from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 
 ROOT = Path(__file__).resolve().parents[1]
 if Path(creatidy_kernel.__file__).resolve().is_relative_to(ROOT):
@@ -33,6 +34,53 @@ for mode in ("pull", "managed", "mixed"):
 if preparation_only:
     print("Installed ordinary preparation fixture passed.")
     raise SystemExit(0)
+for exercise, exit_code in (("command-export-crash", 0), ("command-export-failed", 7)):
+    root = storage / exercise
+    if run_ordinary_flow(root, None, mode="pull", exercise=exercise)["status"] != "interrupted":
+        raise SystemExit("installed command interruption was not exercised")
+    with SQLiteProgramStore(root / "state.db") as store:
+        before = store.served_change_token()
+        exported = export_private_outcome(
+            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        commands = cast(list[dict[str, object]], exported["command_results"])
+        if (
+            len(commands) != 1
+            or commands[0]["exit_code"] != exit_code
+            or commands[0]["settlement"] != "witnessed"
+            or exported["satisfactions"]
+            or store.served_change_token() != before
+            or "synthetic-private-command-output" in str(exported)
+        ):
+            raise SystemExit("installed reopened export lost or disclosed original command evidence")
+if run_ordinary_flow(storage / "private-stop-uncertain", None, mode="managed", exercise="private-stop-uncertain") != {
+    "status": "stopped-unknown",
+    "native_sends": 0,
+}:
+    raise SystemExit("installed outcome export concealed uncertain managed cancellation")
+for exercise in ("outcome-candidate-cut", "outcome-check-cut", "outcome-manifest-stop-cut"):
+    root = storage / exercise
+    if run_ordinary_flow(root, None, mode="pull", exercise=exercise) != {"status": "retained", "native_sends": 0}:
+        raise SystemExit("installed partial outcome cut did not preserve its original evidence")
+    with SQLiteProgramStore(root / "state.db") as store:
+        exported = export_private_outcome(
+            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        if len(cast(list[object], exported["candidates"])) != 1 or exported["satisfactions"]:
+            raise SystemExit("installed reopened partial outcome misrepresented candidate acceptance")
+        if exercise == "outcome-check-cut" and not exported["checks"]:
+            raise SystemExit("installed reopened partial outcome lost a recorded check")
+        if exercise == "outcome-manifest-stop-cut" and not exported["verification_manifests"]:
+            raise SystemExit("installed reopened partial outcome lost the pre-decision manifest")
+with SQLiteProgramStore(storage / "private-stop-uncertain" / "state.db") as store:
+    exported = export_private_outcome(store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+    cancellations = cast(list[dict[str, object]], exported["cancellations"])
+    if len(cancellations) != 1 or cancellations[0]["settlement_recorded"] is not False:
+        raise SystemExit("installed reopened export misstated uncertain original cancellation")
+for mode in ("pull", "managed"):
+    result = run_ordinary_flow(storage / f"private-outcome-{mode}", None, mode=mode, exercise="private-outcome-export")
+    if result["status"] != "completed" or result["satisfactions"] != 2:
+        raise SystemExit("installed private outcome export did not preserve original producers")
 for mode in ("pull", "managed"):
     result = run_ordinary_flow(storage / f"{mode}-stop", None, mode=mode, exercise="stop")
     if result["status"] != "stopped" or result["native_sends"] != 0:
@@ -42,6 +90,19 @@ for mode in ("pull", "managed"):
     result = run_ordinary_flow(storage / f"{mode}-review-remediation", None, mode=mode, exercise="review-remediation")
     if result["status"] != "completed" or result["satisfactions"] != 2:
         raise SystemExit(f"installed ordinary {mode} failed to deliver substantive review findings")
+    with SQLiteProgramStore(storage / f"{mode}-review-remediation" / "state.db") as store:
+        exported = export_private_outcome(
+            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        reviews = cast(list[dict[str, object]], exported["reviews"])
+        attempts = cast(list[dict[str, object]], exported["attempts"])
+        review = next(item for item in reviews if item["verdict"] == "request_changes")
+        remediation = next(item for item in attempts if item["remediation_of"] == review["attempt"])
+        original_findings = cast(list[dict[str, object]], review["findings"])
+        if not original_findings or not all(
+            item in cast(list[dict[str, object]], remediation["remediation_findings"]) for item in original_findings
+        ):
+            raise SystemExit("installed reopened export lost exact review finding lineage")
 if run_ordinary_flow(
     storage / "review-remediation-tampered", None, mode="pull", exercise="review-remediation-tampered"
 ) != {"status": "refused", "native_sends": 0}:
@@ -98,6 +159,10 @@ if run_ordinary_flow(storage / "stop-completed", None, mode="pull", exercise="st
     "native_sends": 0,
 }:
     raise SystemExit("installed STOP changed completion or allowed later publication")
+with SQLiteProgramStore(storage / "stop-completed" / "state.db") as store:
+    exported = export_private_outcome(store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+    if cast(dict[str, object], exported["coverage"])["work_revocation_recorded"] is not True:
+        raise SystemExit("installed reopened export lost completed-Program revocation")
 for exercise in ("managed-program-stop", "managed-budget-revoke"):
     if run_ordinary_flow(storage / exercise, None, mode="managed", exercise=exercise) != {
         "status": "stopped",

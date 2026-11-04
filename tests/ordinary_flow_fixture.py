@@ -22,6 +22,7 @@ from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
@@ -60,6 +61,7 @@ from creatidy_kernel.adapters.task_execution import VerificationCommand
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import (
+    AttemptSpec,
     AuthorityEnvelope,
     BudgetPolicy,
     DomainAction,
@@ -69,7 +71,7 @@ from creatidy_kernel.core.domain import (
     ProgramStatus,
     ResumeProgram,
 )
-from creatidy_kernel.core.execution import ExecutionRequest
+from creatidy_kernel.core.execution import Candidate, ExecutionRequest
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.intake import (
     Declaration,
@@ -81,12 +83,15 @@ from creatidy_kernel.core.intake import (
     digest,
     encode,
 )
+from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, WorkClaim
 from creatidy_kernel.core.served import command_prefix
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
+from creatidy_kernel.ports.application import Collection
 from creatidy_kernel.ports.intake import OrdinaryIntake
 from creatidy_kernel.ports.ordinary import OrdinaryApproval, OrdinaryHandoff, OrdinaryProgram
+from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.ownership import WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
 from creatidy_kernel.ports.served import OwnerProjection
@@ -392,7 +397,8 @@ print("Done")
         boot_clock = lambda: BootClockReading(  # noqa: E731 - Controlled fixture clock.
             int(time.time()) + time_offset[0], time.monotonic_ns() + time_offset[0] * 10**9, "ordinary-fixture-boot"
         )
-        with SQLiteProgramStore(root / "state.db", boot_clock=boot_clock) as store:
+        with SQLiteProgramStore(root / "state.db", boot_clock=boot_clock) as initial_store:
+            store: SQLiteProgramStore = initial_store
             reader = OwnerReviewedForgejoEvidence(
                 store,
                 Principal("owner", "owner"),
@@ -843,6 +849,7 @@ print("Done")
                 in {"remediation", "review-remediation", "review-remediation-tampered", "review-remediation-served"}
                 else units
             ):
+                store = cast(SQLiteProgramStore, store)  # pyright: ignore[reportUnnecessaryCast]
                 ordinal = units.index(unit)
                 bad_candidate = (
                     exercise in {"remediation", "rejected-replay", "rejected-replay-reopen"} and position == 0
@@ -857,7 +864,9 @@ print("Done")
                         sys.executable,
                         "-B",
                         "-c",
-                        "from pathlib import Path; assert Path("
+                        "print('synthetic-private-command-output'); raise SystemExit(7)"
+                        if exercise == "command-export-failed"
+                        else "from pathlib import Path; assert Path("
                         + repr(unit + ".py")
                         + ").read_text() == "
                         + repr("VALUE = " + str(ordinal + 1) + "\n"),
@@ -2276,6 +2285,24 @@ print("Done")
                             raise AssertionError(f"synthetic managed intake observations: {proof!r}") from error
                     else:
                         managed.start(handoff)
+                    if exercise == "private-stop-uncertain":
+                        with patch.object(
+                            WorkOwnership, "witness", side_effect=ValueError("synthetic unavailable proof")
+                        ):
+                            assert managed.request_stop("synthetic-private-stop") == "cancel_uncertain"
+                        result = export_private_outcome(
+                            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+                        )
+                        cancelled = cast(list[dict[str, object]], result["cancellations"])
+                        assert len(cancelled) == 1 and cancelled[0]["request_recorded"] is True
+                        assert (
+                            cancelled[0]["settlement_recorded"] is False and cancelled[0]["terminal_observed"] is None
+                        )
+                        assert cancelled[0]["physical_settlement"] is None
+                        assert cast(dict[str, object], result["coverage"])["work_revocation_recorded"] is True
+                        assert b"synthetic-private-stop" not in encode(result)
+                        assert not native_state["sends"]
+                        return {"status": "stopped-unknown", "native_sends": 0}
                     if exercise == "served-managed-stop-cli":
                         before = store.load("everyday-program")
                         binding = LocalOwnerSession(
@@ -2368,6 +2395,14 @@ print("Done")
                     if exercise == "stop":
                         settled = managed.request_stop("owner requested STOP")
                         assert store.load("everyday-program").status is ProgramStatus.CANCELLED
+                        outcome_export = export_private_outcome(
+                            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+                        )
+                        cancellation = cast(list[dict[str, object]], outcome_export["cancellations"])[0]
+                        assert cancellation["request_recorded"] is True and cancellation["settlement_recorded"] is True
+                        assert cancellation["settled_original_group"] is not None
+                        assert cancellation["terminal_observed"] is None and cancellation["physical_settlement"] is None
+                        assert b"owner requested STOP" not in encode(outcome_export)
                         assert not store.load("everyday-program").satisfactions
                         assert not native_state["sends"]
                         try:
@@ -2443,6 +2478,77 @@ print("Done")
                     control.observe(handoff.claim),
                     evidence="owner receives exact task-owned bytes after qualified task-scope quiescence",
                 )
+                if exercise in {"outcome-candidate-cut", "outcome-check-cut", "outcome-manifest-stop-cut"}:
+                    original_collect = OrdinaryGitWorkspace.collect
+                    original_finalize = SQLiteProgramStore.finalize_artifact
+                    hit = [False]
+
+                    def interrupt_collect(
+                        target: OrdinaryGitWorkspace,
+                        original_attempt: AttemptSpec,
+                        original_claim: WorkClaim,
+                        original: Callable[
+                            [OrdinaryGitWorkspace, AttemptSpec, WorkClaim], tuple[Candidate, Collection]
+                        ] = original_collect,
+                        flag: list[bool] = hit,
+                    ) -> tuple[Candidate, Collection]:
+                        original(target, original_attempt, original_claim)
+                        flag[0] = True
+                        raise RuntimeError("synthetic candidate cut")
+
+                    def interrupt_artifact(
+                        target: SQLiteProgramStore,
+                        operation_id: str,
+                        name: str,
+                        data: bytes,
+                        original: Callable[[SQLiteProgramStore, str, str, bytes], str] = original_finalize,
+                        flag: list[bool] = hit,
+                    ) -> str:
+                        result = original(target, operation_id, name, data)
+                        if (
+                            exercise == "outcome-check-cut"
+                            and operation_id.startswith("verification:")
+                            and name == "result"
+                        ) or (
+                            exercise == "outcome-manifest-stop-cut"
+                            and operation_id.startswith("runtime:")
+                            and name.startswith("verification:")
+                        ):
+                            flag[0] = True
+                            raise RuntimeError("synthetic verification cut")
+                        return result
+
+                    with (
+                        patch.object(OrdinaryGitWorkspace, "collect", interrupt_collect)
+                        if exercise == "outcome-candidate-cut"
+                        else patch.object(SQLiteProgramStore, "finalize_artifact", interrupt_artifact)
+                    ):
+                        try:
+                            client.report(handoff)
+                        except RuntimeError as error:
+                            assert str(error).startswith("synthetic ")
+                        else:
+                            raise AssertionError("requested outcome crash cut was not reached")
+                    assert hit[0]
+                    if exercise == "outcome-manifest-stop-cut":
+                        app.stop(approved, "synthetic outcome STOP")
+                    before = store.served_change_token()
+                    result = export_private_outcome(
+                        store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+                    )
+                    assert store.served_change_token() == before
+                    assert len(cast(list[object], result["candidates"])) == 1
+                    assert not cast(list[object], result["satisfactions"])
+                    if exercise == "outcome-candidate-cut":
+                        assert not cast(list[object], result["checks"])
+                    elif exercise == "outcome-check-cut":
+                        assert cast(list[object], result["checks"])
+                        assert not cast(list[object], result["verification_manifests"])
+                    else:
+                        manifests = cast(list[dict[str, object]], result["verification_manifests"])
+                        assert manifests and all(item["decision"] is None for item in manifests)
+                        assert cast(dict[str, object], result["coverage"])["work_revocation_recorded"] is True
+                    return {"status": "retained", "native_sends": 0}
                 if exercise == "report-verification-revision-race":
                     revision = store.load("everyday-program").revision
                     original_check = OrdinaryGitWorkspace.check
@@ -2501,7 +2607,14 @@ print("Done")
                     assert not calls and not native_state["sends"]
                     return {"status": "unknown", "native_sends": 0}
                 if (
-                    exercise in {"command-evidence-crash", "command-evidence-no-witness", "command-evidence-partial"}
+                    exercise
+                    in {
+                        "command-evidence-crash",
+                        "command-evidence-no-witness",
+                        "command-evidence-partial",
+                        "command-export-crash",
+                        "command-export-failed",
+                    }
                     and position == 0
                 ):
                     finalize = SQLiteProgramStore.finalize_artifact
@@ -2530,6 +2643,8 @@ print("Done")
                     original_observed_at = original_result["observed_at"]
                     time_offset[0] = 10
                     store.close()
+                    if exercise in {"command-export-crash", "command-export-failed"}:
+                        return {"status": "interrupted", "native_sends": 0}
                     store = owners.enter_context(SQLiteProgramStore(root / "state.db", boot_clock=boot_clock))
                     reader = OwnerReviewedForgejoEvidence(
                         store,
@@ -2899,8 +3014,22 @@ print("Done")
             assert store.load("everyday-program").status is ProgramStatus.COMPLETED
             if exercise == "stop-completed":
                 original = store.load("everyday-program")
+                before_export = export_private_outcome(
+                    store, original.program_id, owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+                )
                 app.stop(approved, "owner withdrew publication")
                 assert store.load("everyday-program") == original
+                after_export = export_private_outcome(
+                    store, original.program_id, owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+                )
+                before_coverage = cast(dict[str, object], before_export["coverage"])
+                after_coverage = cast(dict[str, object], after_export["coverage"])
+                assert before_coverage["work_revocation_recorded"] is False
+                assert after_coverage["work_revocation_recorded"] is True
+                assert after_coverage["revocation_evidence"] is not None
+                budget = cast(dict[str, object], after_export["work_budget"])
+                assert cast(dict[str, object], budget["original_deadline"])["wall_deadline"] == approved.expires_at
+                assert b"owner withdrew publication" not in encode(after_export)
                 try:
                     publications[0][0].publish(publications[0][1])
                 except ValueError:
@@ -3012,6 +3141,13 @@ print("Done")
                     assert first == ("unknown", "held")
                     assert sync.publish(handoff) == first
                     assert len(cast(list[object], native_state["sends"])) == 1
+                    uncertain = export_private_outcome(
+                        store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+                    )
+                    native = cast(list[dict[str, object]], uncertain["native_effects"])
+                    assert len(native) == 1 and native[0]["action"] == "pr"
+                    assert native[0]["receipt_recorded"] is False and native[0]["current_remote_state"] is None
+                    assert len(cast(list[object], native_state["sends"])) == 1
                     return {"status": "unknown", "native_sends": 1}
                 assert all(item.startswith("forgejo:") for item in first), first
                 repeated = sync.publish(handoff)
@@ -3026,6 +3162,126 @@ print("Done")
                 item.startswith("ses_") and item != "ses_fixture" for item in sessions
             )
             assert calls
+            if exercise in {"private-outcome-export", "review-remediation", "lost-reply"}:
+                if exercise == "review-remediation":
+                    for number, original_attempt in enumerate(store.load("everyday-program").attempts):
+                        operation = f"runtime:{original_attempt.attempt_id}"
+                        usage = UsageObservation(
+                            f"synthetic-usage-{number}",
+                            original_attempt.attempt_id,
+                            f"synthetic-receipt-{number}",
+                            "money",
+                            "USD",
+                            Decimal(number + 1),
+                            Provenance.OWNER_RECORD,
+                            "synthetic-owner",
+                            100,
+                        )
+                        store.record_usage(operation, usage)
+                        if number == 0:
+                            store.record_usage(
+                                operation,
+                                replace(
+                                    usage,
+                                    observation_id="synthetic-correction",
+                                    quantity=Decimal(5),
+                                    supersedes_id=usage.observation_id,
+                                ),
+                            )
+                before = store.served_change_token()
+                outcome_export = export_private_outcome(
+                    store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+                )
+                assert store.served_change_token() == before
+                assert cast(dict[str, object], outcome_export["program"])["status"] == "completed"
+                projected_attempts = cast(list[dict[str, object]], outcome_export["attempts"])
+                assert len(projected_attempts) == (3 if exercise == "review-remediation" else 2)
+                satisfactions = cast(list[dict[str, object]], outcome_export["satisfactions"])
+                assert len(satisfactions) == 2
+                attempt_refs = {item["id"] for item in projected_attempts}
+                satisfaction_refs = {item["id"] for item in satisfactions}
+                assert all(item["attempt"] in attempt_refs for item in satisfactions)
+                assert all(
+                    item["attempt"] in attempt_refs
+                    for item in cast(list[dict[str, object]], outcome_export["usage_history"])
+                )
+                if exercise == "review-remediation":
+                    history = cast(list[dict[str, object]], outcome_export["usage_history"])
+                    assert len(history) == 4 and all(item["attempt_binding"] == "recorded" for item in history)
+                    assert {item["attempt"] for item in history} == attempt_refs
+                    assert cast(dict[str, object], outcome_export["coverage"])["unattributed_usage_observations"] == 0
+                    assert sorted(cast(str, item["quantity"]) for item in history if item["effective"]) == [
+                        "2",
+                        "3",
+                        "5",
+                    ]
+                assert any(
+                    binding["source_kind"] == "predecessor" and binding["satisfaction"] in satisfaction_refs
+                    for item in projected_attempts
+                    for binding in cast(list[dict[str, object]], item["inputs"])
+                )
+                reviews = cast(list[dict[str, object]], outcome_export["reviews"])
+                assert len(reviews) == (3 if exercise == "review-remediation" else 2)
+                assert sum(item["verdict"] == "approve" for item in reviews) == 2
+                checks = cast(list[dict[str, object]], outcome_export["checks"])
+                assert checks and all(item["attempt"] in attempt_refs for item in checks)
+                candidates = cast(list[dict[str, object]], outcome_export["candidates"])
+                assert len(candidates) == len(projected_attempts)
+                assert all(item["candidate"] in {candidate["candidate"] for candidate in candidates} for item in checks)
+                assert all(type(item["passed"]) is bool and item["freshness"] == "not-evaluated" for item in checks)
+                assert len({(item["attempt"], item["evidence"]) for item in checks}) == len(checks)
+                assert any(item["operations"] and item["manifests"] for item in checks)
+                effects = cast(list[dict[str, object]], outcome_export["effects"])
+                assert any(item["category"] == "verification" for item in effects)
+                assert all(item["category"] is not None for item in effects)
+                native_subjects = cast(list[dict[str, object]], outcome_export["native_subjects"])
+                native_effects = cast(list[dict[str, object]], outcome_export["native_effects"])
+                assert len(native_subjects) == len(projected_attempts) and len(native_effects) == 4
+                assert {item["action"] for item in native_effects} == {"pr", "receipt"}
+                for item in native_effects:
+                    original = next(subject for subject in native_subjects if subject["attempt"] == item["attempt"])
+                    assert item["issue"] == original["issue"] and item["work_unit"] == original["work_unit"]
+                    assert item["receipt_recorded"] is True and item["receipt_profile"] == "forgejo-native-readback:v1"
+                    assert item["current_remote_state"] is None and item["satisfaction"] in satisfaction_refs
+                claims = cast(list[dict[str, object]], outcome_export["claims"])
+                assert len(claims) == len(projected_attempts)
+                assert all(item["resources"] and item["handoff_proofs"] for item in claims)
+                for item in claims:
+                    if item["mode"] == "managed":
+                        stages = {proof["stage"] for proof in cast(list[dict[str, object]], item["handoff_proofs"])}
+                        assert "start" in stages and "complete" in stages
+                review_sessions = {
+                    item["reviewer_session"] for item in reviews if item.get("reviewer_session") is not None
+                }
+                assert all(
+                    item["reviewer_session"] in review_sessions
+                    for item in checks
+                    if item["reviewer_session"] is not None
+                )
+                assert all(item["candidate"] in {review["candidate"] for review in reviews} for item in checks)
+                if exercise == "review-remediation":
+                    assert any(item["verdict"] == "request_changes" for item in reviews)
+                    assert any(item["remediation_of"] in attempt_refs for item in projected_attempts)
+                    decisions = cast(list[dict[str, object]], outcome_export["decisions"])
+                    assert decisions[0]["review_status"] == "changes_requested"
+                    assert decisions[0]["review_operation"] in {item["operation"] for item in reviews}
+                    review = next(item for item in reviews if item["verdict"] == "request_changes")
+                    review_findings = cast(list[dict[str, object]], review["findings"])
+                    assert review_findings
+                    remediation = next(item for item in projected_attempts if item["remediation_of"] is not None)
+                    assert remediation["remediation_of"] == review["attempt"]
+                    remediation_findings = cast(list[dict[str, object]], remediation["remediation_findings"])
+                    assert all(item in remediation_findings for item in review_findings)
+                    findings = cast(list[dict[str, object]], outcome_export["findings"])
+                    assert {item["source"] for item in findings} >= {"product-review", "verification-manifest"}
+                    assert {item["id"] for item in findings if item["source"] == "product-review"} == {
+                        item["id"] for item in review_findings
+                    }
+                    assert b"Implement the approved edge case." not in encode(outcome_export)
+                assert cast(dict[str, object], outcome_export["coverage"])["complete_cost"] is None
+                assert b"A tightly bounded useful edit" not in encode(outcome_export)
+                assert b"team/project" not in encode(outcome_export) and b"fixture-owner" not in encode(outcome_export)
+                assert b"synthetic-owner" not in encode(outcome_export)
             if exercise == "review-remediation-served":
                 snapshot = OwnerProjection(store, "everyday-program").snapshot()
                 prior = [item for item in snapshot.decisions if item.get("status") == "changes_requested"]

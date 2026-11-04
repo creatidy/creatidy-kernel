@@ -730,6 +730,146 @@ class SQLiteProgramStore:
             row = self._connection.execute("PRAGMA data_version").fetchone()
             return (self._connection.total_changes, cast(int, row[0]))
 
+    def outcome_effect_evidence(self, program_id: str, operation_id: str) -> dict[str, object]:
+        """Read only original effect facts for a Program-scoped reservation."""
+        self._assert_writer_thread()
+        with self._gate:
+            reservation = self._work_record("reservation", operation_id)
+            if reservation is None or reservation.get("program") != program_id:
+                if not operation_id.startswith("cancel:"):
+                    raise ValueError("effect is not reserved by the selected Program")
+                program = self._load_head(program_id)
+                cancellation_attempt = next(
+                    (item for item in program.attempts if operation_id == f"cancel:{item.attempt_id}"), None
+                )
+                operation = self.find_operation(operation_id)
+                request = None if operation is None else json.loads(operation.request_json).get("request")
+                if (
+                    cancellation_attempt is None
+                    or operation is None
+                    or operation.effect_key != operation_id
+                    or type(request) is not dict
+                    or cast(dict[str, object], request).get("operation") != f"runtime:{cancellation_attempt.attempt_id}"
+                ):
+                    raise ValueError("effect is not reserved by the selected Program")
+            return {
+                "deliveries": [
+                    dict(row)
+                    for row in self._connection.execute(
+                        "SELECT fence, claimed_at, lease_until FROM delivery_attempts "
+                        "WHERE operation_id = ? ORDER BY fence",
+                        (operation_id,),
+                    ).fetchall()
+                ],
+                "transports": [
+                    dict(row)
+                    for row in self._connection.execute(
+                        "SELECT fence, succeeded FROM operation_transports WHERE operation_id = ? ORDER BY fence",
+                        (operation_id,),
+                    ).fetchall()
+                ],
+                "observations": [
+                    dict(row)
+                    for row in self._connection.execute(
+                        "SELECT observation_id, fence, kind, reference FROM operation_observations "
+                        "WHERE operation_id = ? ORDER BY observation_id",
+                        (operation_id,),
+                    ).fetchall()
+                ],
+                "reconciliations": [
+                    dict(row)
+                    for row in self._connection.execute(
+                        "SELECT sequence, fence, outcome, reference, evidence, matched_digest, authoritative_absence "
+                        "FROM operation_reconciliations WHERE operation_id = ? ORDER BY sequence",
+                        (operation_id,),
+                    ).fetchall()
+                ],
+            }
+
+    def outcome_claim_evidence(self, program_id: str, command_key: str) -> dict[str, object]:
+        """Read only the original claim resources and validated handoff proofs."""
+        self._assert_writer_thread()
+        with self._gate:
+            record = self._work_record("ownership-claim", command_key)
+            if record is None or record.get("program") != program_id:
+                raise ValueError("claim is not owned by the selected Program")
+            claim = self._decode_work_claim(record)
+            proofs: list[dict[str, object]] = []
+            for stage in ("start", "complete", "stop"):
+                stored = self._work_record("ownership-proof", f"{command_key}:{stage}")
+                if stored is None:
+                    continue
+                value = cast(dict[str, object], stored["proof"])
+                proof = HandoffProof(
+                    cast(str, value["source"]),
+                    cast(str, value["profile"]),
+                    HandoffMode(cast(str, value["mode"])),
+                    cast(str, value["attempt_digest"]),
+                    cast(int, value["generation"]),
+                    tuple(ResourceScope(**item) for item in cast(list[dict[str, str]], value["resources"])),
+                    cast(str, value["stage"]),
+                    cast(str, value["reference"]),
+                )
+                proof.check(claim, stage)
+                proofs.append(proof.payload())
+            return {
+                "profile": claim.profile,
+                "original_claim": asdict(claim),
+                "resources": [asdict(item) for item in claim.resources],
+                "proofs": proofs,
+                "quarantine": self._work_record("ownership-unknown", command_key),
+                "release": self._work_record("ownership-release", command_key),
+                "reconciliations": [
+                    json.loads(row["request_json"])["request"]
+                    for row in self._connection.execute(
+                        "SELECT request_json FROM operations "
+                        "WHERE operation_id LIKE 'work-budget:v1:ownership-reconcile:%' "
+                        "AND json_extract(request_json, '$.request.claim') = ? ORDER BY operation_id",
+                        (command_key,),
+                    ).fetchall()
+                ],
+            }
+
+    def outcome_revocation(self, program_id: str) -> dict[str, object] | None:
+        """Return recorded original revocation without clock or authority sampling."""
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        with self._gate:
+            return self._work_record("revoked", program_id)
+
+    def outcome_artifact_metadata(
+        self, program_id: str, operation_id: str, prefix: str
+    ) -> tuple[dict[str, object], ...]:
+        """List retained artifact metadata only for an original scoped producer operation."""
+        self._assert_writer_thread()
+        if prefix not in {
+            "candidate.patch",
+            "output",
+            "verification:",
+            "command-evidence:",
+            "observation:",
+            "owned-observation:",
+            "stop-uncertain:",
+        }:
+            raise ValueError("unsupported outcome artifact prefix")
+        with self._gate:
+            program = self._load_head(program_id)
+            allowed = any(
+                operation_id in {f"runtime:{item.attempt_id}", f"cancel:{item.attempt_id}"} for item in program.attempts
+            )
+            reservation = self._work_record("reservation", operation_id)
+            if not allowed and (reservation is None or reservation.get("program") != program_id):
+                raise ValueError("artifact operation is not owned by the selected Program")
+            pattern = prefix if prefix in {"candidate.patch", "output"} else prefix + "%"
+            return tuple(
+                dict(row)
+                for row in self._connection.execute(
+                    "SELECT name, digest, size FROM artifact_references "
+                    "WHERE operation_id = ? AND name LIKE ? ORDER BY name",
+                    (operation_id, pattern),
+                ).fetchall()
+            )
+
     def served_claims(self, program_id: str, *, offset: int = 0, limit: int = 8) -> tuple[dict[str, object], ...]:
         """Project only recorded ownership facts for one Program, without sampling authority."""
         self._assert_writer_thread()

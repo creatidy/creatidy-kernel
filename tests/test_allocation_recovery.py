@@ -46,6 +46,7 @@ from creatidy_kernel.ports.allocation import (
     load_allocation,
 )
 from creatidy_kernel.ports.application import Collection, advance_work_unit, manifest_bytes
+from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 
 pytest_plugins = ["test_sqlite_store"]
 OPERATION = "runtime:reference:first"
@@ -185,6 +186,10 @@ def test_unknown_resolution_can_terminalize_original_handle_without_acceptance(
         assert store.operation(OPERATION).status == "terminal"
         assert store.find_artifact(OPERATION, "identity") is None
         assert decode_runtime_receipt(store.artifact(OPERATION, "runtime-receipt"))[2].resolved is None
+        exported = export_private_outcome(store, "reference", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+        terminal = cast(dict[str, object], cast(list[dict[str, object]], exported["attempts"])[0]["terminal_outcome"])
+        assert terminal["candidate"] == ("present" if present else "absent")
+        assert terminal["current_activity"] is None
     assert len(runtime.requests) == 1
     assert runtime.candidate_calls == (2 if present else 1)
 
