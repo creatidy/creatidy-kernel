@@ -24,6 +24,7 @@ from creatidy_kernel.adapters.operator_profile import (
     configuration_fields,
     default_profile_path,
     load_profile,
+    migrate_sops_profile,
     profile_template,
     unknown_fields,
 )
@@ -125,6 +126,10 @@ def _effective_environment(args: argparse.Namespace) -> dict[str, str]:
 def _config(args: argparse.Namespace) -> int:
     if args.config_command == "template":
         print(profile_template())
+        return 0
+    if args.config_command == "migrate-sops":
+        migrate_sops_profile(args.source, args.destination)
+        print("profile migration complete; original retained for rollback")
         return 0
     if args.config_profile is not None:
         values = load_profile(args.config_profile, sops=args.config_sops)
@@ -249,6 +254,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     config_validate.add_argument("--json", action="store_true", help="Print structured validation evidence")
     config_commands.add_parser("template", help="Print a generic operator profile template")
+    migrate = config_commands.add_parser("migrate-sops", help="Rotate an encrypted profile into a new JSON file")
+    migrate.add_argument("--source", type=Path, required=True, help="Existing absolute SOPS profile path")
+    migrate.add_argument("--destination", type=Path, required=True, help="New absolute JSON path; never overwritten")
     doctor = commands.add_parser("doctor", help="Safe readiness diagnostics for one frozen task; no thread or turn")
     doctor.add_argument("--data-dir", type=Path, default=None, help="Control directory; default is user-local state")
     doctor.add_argument("--repo", type=Path, default=None, help="Advanced explicit read-only source checkout override")

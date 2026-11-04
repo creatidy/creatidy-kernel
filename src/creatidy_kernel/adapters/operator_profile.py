@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
@@ -125,6 +126,88 @@ def load_profile(
     except (OSError, UnicodeDecodeError, ValueError) as error:
         raise ProfileError("operator profile is unreadable") from error
     return parse_dotenv(text)
+
+
+def migrate_sops_profile(source: Path, destination: Path, *, environment: Mapping[str, str] | None = None) -> None:
+    """Rotate a SOPS profile into a new JSON file, retaining the original for rollback."""
+    if not destination.is_absolute() or destination.suffix != ".json" or source == destination:
+        raise ProfileError("migration requires a distinct absolute JSON destination")
+    if not source.is_absolute() or source.is_symlink() or not source.is_file():
+        raise ProfileError("operator profile must be an existing plain file")
+    values = os.environ if environment is None else environment
+    try:
+        source_stat = source.stat()
+        if source_stat.st_size > MAX_PROFILE_BYTES:
+            raise ProfileError("profile exceeds size limit")
+        source_bytes = source.read_bytes()
+    except OSError:
+        raise ProfileError("profile migration failed") from None
+    original = load_profile(source, sops=True, environment=values)
+    search_path = values.get("PATH") or os.defpath
+    executable = shutil.which("sops", path=search_path)
+    if executable is None:
+        raise ProfileError("sops executable unavailable; install sops or load a plaintext profile")
+    child = {"PATH": search_path}
+    for name, value in values.items():
+        if name in ("HOME", "LANG", "LC_ALL", "TMPDIR") or name.startswith(_SOPS_ENVIRONMENT_PREFIX):
+            child[name] = value
+    temporary: str | None = None
+    try:
+        rotated = subprocess.run(  # noqa: S603 - resolved executable, fixed argv.
+            (executable, "--rotate", "--output-type", "json", str(source)),
+            env=child,
+            capture_output=True,
+            timeout=SOPS_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if rotated.returncode != 0 or not rotated.stdout or len(rotated.stdout) > MAX_PROFILE_BYTES:
+            raise ProfileError("profile migration failed")
+        try:
+            document = json.loads(rotated.stdout)
+        except (ValueError, RecursionError):
+            raise ProfileError("profile migration produced invalid ciphertext") from None
+        if not isinstance(document, dict):
+            raise ProfileError("profile migration produced invalid ciphertext")
+        encrypted = cast("dict[str, object]", document)
+        if (
+            set(encrypted) != set(original) | {"sops"}
+            or not isinstance(encrypted.get("sops"), dict)
+            or any(
+                not isinstance(encrypted[key], str) or not cast(str, encrypted[key]).startswith("ENC[AES256_GCM,")
+                for key in original
+            )
+        ):
+            raise ProfileError("profile migration produced invalid ciphertext")
+        fd, temporary = tempfile.mkstemp(prefix=".kernel-profile-", suffix=".json", dir=destination.parent)
+        with os.fdopen(fd, "wb") as output:
+            output.write(rotated.stdout)
+            output.flush()
+            os.fsync(output.fileno())
+        if load_profile(Path(temporary), sops=True, environment=values) != original:
+            raise ProfileError("profile migration verification failed")
+        current = source.stat()
+        if source.read_bytes() != source_bytes or (current.st_ino, current.st_dev, current.st_mtime_ns) != (
+            source_stat.st_ino,
+            source_stat.st_dev,
+            source_stat.st_mtime_ns,
+        ):
+            raise ProfileError("source profile changed during migration")
+        os.link(temporary, destination, follow_symlinks=False)
+        directory_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except ProfileError:
+        raise
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        raise ProfileError("profile migration failed; destination may require inspection") from None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
 
 def unknown_fields(values: Mapping[str, str]) -> tuple[str, ...]:

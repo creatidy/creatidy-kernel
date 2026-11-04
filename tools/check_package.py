@@ -4,6 +4,7 @@
 import email
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,24 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
     )
     subprocess.run([str(python), "-I", "-m", "creatidy_kernel.adapters.cli", "--help"], cwd=work, check=True)
     cli = environment / ("Scripts/creatidy-kernel.exe" if os.name == "nt" else "bin/creatidy-kernel")
+    if shutil.which("sops") and shutil.which("age-keygen"):
+        test_environment = dict(os.environ)
+        test_environment["CREATIDY_TEST_INSTALLED_CLI"] = str(cli)
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                str(ROOT / "tests/test_operator_profile.py"),
+                "-k",
+                "real_sops_age_profile",
+            ],
+            cwd=work,
+            env=test_environment,
+            check=True,
+        )
+    else:
+        print("Installed SOPS/age migration: UNPROVED (local sops and age-keygen required)")
     subprocess.run([str(cli), "reference", "--help"], cwd=work, check=True)
     for command in ("preflight", "run", "status", "export"):
         subprocess.run([str(cli), "task", command, "--help"], cwd=work, check=True)
@@ -119,6 +138,11 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
         )
     subprocess.run(
         [sys.executable, str(ROOT / "tools/check_schema_upgrade.py"), str(python), str(storage_root)],
+        cwd=work,
+        check=True,
+    )
+    subprocess.run(
+        [sys.executable, str(ROOT / "tools/check_uninstall.py"), str(python), str(cli), str(storage_root)],
         cwd=work,
         check=True,
     )
