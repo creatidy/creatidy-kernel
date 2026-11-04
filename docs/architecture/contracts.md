@@ -130,7 +130,7 @@ learning authority is granted by local creation. Unsupported owner policies and 
 producer records are refused; an unverifiable review receipt has no inferred verdict. A changing
 durable cut is refused rather than mixed.
 
-`command_results` contains one historical record per reserved ordinary command operation, including
+`command_results` contains one source-qualified historical record per reserved ordinary or bounded-task command operation, including
 its pseudonymous exact subject and owner, fence, typed result fields and independently qualified
 settlement witness. Missing or inconsistent result, owner, integrity or witness remains unknown;
 command completion is not a verification decision. Raw command arguments and output are excluded.

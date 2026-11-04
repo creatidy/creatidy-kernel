@@ -861,6 +861,66 @@ for cut in ("before-output", "after-collection", "after-collection-stop"):
         raise SystemExit("installed task candidate export reissued native work")
 
 
+for failure in (False, True):
+    root, source, task = synthetic_task_source(f"command-outcome-{failure}", "synthetic-command-outcome")
+
+    class CommandOutcomeConnection(SyntheticCompletingTaskConnection):
+        failure: bool = False
+
+        def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            result = super().request(method, params)
+            if self.failure and method == "turn/start" and self.cwd is not None:
+                target = Path(self.cwd) / "tests/test_e2e_execution.py"
+                target.write_text(
+                    target.read_text().replace(
+                        "    def test_scenario_11_client_disconnect_propagates_cancel(self):",
+                        "    def test_extra_failure(self):\n        assert False, 'synthetic-private-output'\n\n"
+                        "    def test_scenario_11_client_disconnect_propagates_cancel(self):",
+                    )
+                )
+            return result
+
+    connection = CommandOutcomeConnection(root, qualified=True)
+    connection.failure = failure
+    control = root / "control"
+    allocation = Allocation("codex", "provider", "model", frozenset({"reference"}), 128, "synthetic owner")
+    with patch("creatidy_kernel.adapters.task_execution.time.time", return_value=100):
+        try:
+            run_task(
+                control,
+                task=task,
+                source_repository=source,
+                owner_approved=True,
+                trusted_development_acknowledged=True,
+                connection=connection,
+                version=connection.version,
+                deadline=110,
+                allocation=allocation,
+                boot_clock=pre_attempt_clock,
+                fault="verification",
+            )
+        except TaskInterrupted:
+            pass
+        else:
+            raise SystemExit("installed bounded command interruption not reached")
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = store.served_change_token()
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        commands = cast(list[dict[str, object]], exported["command_results"])
+        if (
+            len(commands) != 1
+            or (commands[0]["exit_code"] == 0) is failure
+            or commands[0]["settlement"] != "witnessed"
+            or commands[0]["integrity"] != "recorded"
+            or exported["satisfactions"]
+            or store.served_change_token() != before
+            or "synthetic-private-output" in json.dumps(exported)
+        ):
+            raise SystemExit("installed bounded command evidence lost or disclosed")
+
+
 class SyntheticReviewRuntime:
     request_value: ExecutionRequest | None = None
 

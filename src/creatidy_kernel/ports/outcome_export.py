@@ -622,6 +622,7 @@ def export_private_outcome(
         )
         command_results.append(
             {
+                "source": "ordinary-command-v1",
                 "attempt": ref("attempt", attempt_id),
                 "operation": ref("operation", operation_id),
                 "candidate": ref("candidate", candidate),
@@ -653,6 +654,109 @@ def export_private_outcome(
                 "timed_out": raw_result.get("timed_out") if complete and raw_result is not None else None,
                 "authority_lost": raw_result.get("authority_lost") if complete and raw_result is not None else None,
                 "output_exhausted": raw_result.get("output_exhausted") if complete and raw_result is not None else None,
+            }
+        )
+    for item in reservations:
+        operation_id, attempt_id = item.get("operation"), item.get("attempt")
+        if program_id != "task_execution" or type(operation_id) is not str or not operation_id.startswith("command:"):
+            continue
+        if attempt_id != "task_execution:change" or item.get("category") != "tool":
+            raise ValueError("bounded task command lacks original Program or Attempt")
+        attempt = attempt_by_id.get(cast(str, attempt_id))
+        operation = store.find_operation(operation_id)
+        if attempt is None or operation is None or operation.effect_key != operation_id:
+            raise ValueError("bounded task command lacks original operation")
+        request = _mapping(_mapping(json.loads(operation.request_json)).get("request"))
+        subject = _mapping(request.get("subject"))
+        head = subject.get("head_revision")
+        prefix = f"command:{attempt_id}:{head}:"
+        parts = operation_id.removeprefix(prefix).split(":")
+        if (
+            type(head) is not str
+            or not head
+            or not operation_id.startswith(prefix)
+            or len(parts) != 2
+            or any(not part.isdecimal() for part in parts)
+            or request.get("command_index") != int(parts[0])
+            or request.get("repeat") != int(parts[1])
+            or subject.get("attempt_digest") != attempt.spec.digest
+            or subject.get("spec_digest") != attempt.spec.spec_digest
+        ):
+            raise ValueError("bounded task command differs from original Attempt or subject")
+        runtime_id = f"runtime:{attempt_id}"
+        owner_data = store.find_artifact(runtime_id, f"command-owner:{operation_id}")
+        owner = None if owner_data is None else _mapping(json.loads(owner_data))
+        owner_bound = owner is not None and (
+            owner.get("version") == 1
+            and owner.get("operation") == operation_id
+            and owner.get("effect_key") == operation.effect_key
+            and owner.get("request_digest") == operation.request_digest
+            and owner.get("fence") == operation.fence
+            and type(owner.get("group_reference")) is str
+            and bool(owner.get("group_reference"))
+            and owner.get("profile") == "trusted-development:owned-verification-group"
+        )
+        data = store.find_artifact(runtime_id, operation_id)
+        result = None if data is None else _mapping(json.loads(data))
+        digest = None if result is None else "sha256:" + hashlib.sha256(encode(result)).hexdigest()
+        witnessed = False
+        if owner_bound and result is not None:
+            for fact in store.operations(f"command-settlement:{operation_id}:"):
+                witness_request = _mapping(_mapping(json.loads(fact.request_json)).get("request"))
+                if type(witness_request.get("witness")) is not dict:
+                    continue
+                witness = _mapping(witness_request.get("witness"))
+                if (
+                    fact.operation_id
+                    == f"command-settlement:{operation_id}:{hashlib.sha256(encode(witness)).hexdigest()}"
+                    and all(witness.get(name) == value for name, value in cast(dict[str, object], owner).items())
+                    and witness.get("owned_group_settled") is True
+                    and witness.get("result_reconciled") is True
+                    and witness.get("result_digest") == digest
+                ):
+                    witnessed = True
+        integrity_data = store.find_artifact(runtime_id, f"command-integrity:{operation_id}")
+        integrity = None if integrity_data is None else _mapping(json.loads(integrity_data))
+        integrity_bound = integrity is not None and (
+            integrity.get("version") == 1
+            and integrity.get("operation") == operation_id
+            and integrity.get("head") == head
+            and integrity.get("result_digest") == digest
+            and digest is not None
+            and type(integrity.get("complete")) is bool
+            and type(integrity.get("clean")) is bool
+            and len(cast(bytes, integrity_data)) <= 65536
+        )
+        command_results.append(
+            {
+                "source": "bounded-task-command-v1",
+                "attempt": ref("attempt", attempt_id),
+                "operation": ref("operation", operation_id),
+                "candidate": ref("candidate", subject.get("candidate_digest")),
+                "policy": ref("policy", subject.get("policy_digest")),
+                "repository": ref("repository", subject.get("repository")),
+                "base": ref("revision", subject.get("base_revision")),
+                "head": ref("revision", head),
+                "ordinal": int(parts[0]),
+                "repeat": int(parts[1]),
+                "fence": operation.fence,
+                "owner": ref("runtime-handle", owner.get("group_reference") if owner_bound and owner else None),
+                "owner_binding": "recorded" if owner_bound else "unknown",
+                "result_recorded": result is not None,
+                "runtime_result_recorded": result is not None,
+                "result_receipt_recorded": None,
+                "result_consistent": None,
+                "workspace_subject": None,
+                "integrity": "recorded" if integrity_bound else "unknown",
+                "integrity_complete": integrity.get("complete") if integrity_bound and integrity else None,
+                "integrity_clean": integrity.get("clean") if integrity_bound and integrity else None,
+                "settlement": "witnessed" if witnessed else "unknown",
+                "exit_code": result.get("exit_code") if result and type(result.get("exit_code")) is int else None,
+                "observed_at": result.get("observed_at") if result and type(result.get("observed_at")) is int else None,
+                **{
+                    name: result.get(name) if result and type(result.get(name)) is bool else None
+                    for name in ("timed_out", "authority_lost", "output_exhausted")
+                },
             }
         )
     for item in reservations:
@@ -1533,13 +1637,17 @@ def export_private_outcome(
         matching = [
             candidate
             for candidate in candidates
-            if candidate.get("source") == "ordinary-candidate-v1"
+            if candidate.get("source")
+            == ("ordinary-candidate-v1" if command["source"] == "ordinary-command-v1" else "task-candidate-v1")
             and candidate.get("attempt") == command["attempt"]
             and candidate.get("candidate") == command["candidate"]
             and candidate.get("head") == command["head"]
         ]
         command["candidate_binding"] = "recorded" if matching else "unknown"
-        if not matching or command["workspace_subject"] != matching[0].get("workspace_subject"):
+        if not matching or (
+            command["source"] == "ordinary-command-v1"
+            and command["workspace_subject"] != matching[0].get("workspace_subject")
+        ):
             command["integrity"] = "unknown"
     deduplicated_checks: dict[str, dict[str, object]] = {}
     for observation in checks:

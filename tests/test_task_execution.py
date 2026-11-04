@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import NoReturn, cast
+from unittest.mock import patch
 
 import pytest
 
@@ -1642,6 +1643,51 @@ def test_uncertain_dispatch_is_not_duplicated_after_lost_context(sqlite_tmp_path
     assert first.starts == 1
     with SQLiteProgramStore(control / "kernel.sqlite3") as store:
         assert store.operation("runtime:task_execution:change").attempts == 1
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_private_outcome_retains_interrupted_bounded_command(sqlite_tmp_path: Path, exit_code: int) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    task = fixture_task(repeats=1)
+
+    def edit(path: Path) -> None:
+        deflake_edit(path)
+        if exit_code:
+            target = path / "tests" / "test_e2e_execution.py"
+            target.write_text(
+                target.read_text().replace(
+                    "    def test_scenario_11_client_disconnect_propagates_cancel(self):",
+                    "    def test_extra_failure(self):\n        assert False, 'synthetic-private-output'\n\n"
+                    "    def test_scenario_11_client_disconnect_propagates_cancel(self):",
+                )
+            )
+
+    connection = FixtureConnection(edit)
+    with pytest.raises(TaskInterrupted):
+        run(control, source, connection, fault="verification", task=task)
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = (store.served_change_token(), store.operations())
+        with patch("subprocess.Popen", side_effect=AssertionError("export must not dispatch")):
+            exported = export_private_outcome(
+                store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+            )
+        commands = cast(list[dict[str, object]], exported["command_results"])
+        assert len(commands) == 1 and (commands[0]["exit_code"] == 0) is (exit_code == 0)
+        assert commands[0]["settlement"] == "witnessed" and commands[0]["candidate_binding"] == "recorded"
+        assert commands[0]["integrity"] == "recorded" and commands[0]["integrity_clean"] is True
+        assert not exported["satisfactions"] and "AssertionError" not in json.dumps(exported)
+        assert (store.served_change_token(), store.operations()) == before
+        operations = SQLiteProgramStore.operations
+
+        def hide_witness(target: SQLiteProgramStore, prefix: str = "") -> tuple[OperationRecord, ...]:
+            return () if prefix.startswith("command-settlement:") else operations(target, prefix)
+
+        with patch.object(SQLiteProgramStore, "operations", hide_witness):
+            unresolved = export_private_outcome(
+                store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+            )
+        assert cast(list[dict[str, object]], unresolved["command_results"])[0]["settlement"] == "unknown"
 
 
 def test_verification_crash_reruns_deterministic_local_checks(sqlite_tmp_path: Path) -> None:
