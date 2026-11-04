@@ -258,9 +258,10 @@ def test_real_sops_age_profile_is_read_only_and_missing_key_refuses(tmp_path: Pa
     recipient = subprocess.run(  # noqa: S603
         [keygen, "-y"], input=private_key, env=environment, capture_output=True, check=True, text=True
     ).stdout.strip()
+    expected = {"CREATIDY_KERNEL_FORGE_TOKEN": SIMULATED, "CREATIDY_KERNEL_ROUTER_KEY": ""}
     encrypted = subprocess.run(  # noqa: S603
         [sops, "--encrypt", "--age", recipient, "--input-type", "json", "--output-type", "json", "/dev/stdin"],
-        input=json.dumps({"CREATIDY_KERNEL_FORGE_TOKEN": SIMULATED}),
+        input=json.dumps(expected),
         env=environment,
         capture_output=True,
         check=True,
@@ -270,20 +271,59 @@ def test_real_sops_age_profile_is_read_only_and_missing_key_refuses(tmp_path: Pa
     profile = write_profile(tmp_path / "profile.json", encrypted)
     before, mtime = profile.read_bytes(), profile.stat().st_mtime_ns
     tool_environment = {**environment, "PATH": str(Path(sops).parent), "SOPS_AGE_KEY": private_key}
-    assert load_profile(profile, sops=True, environment=tool_environment) == {"CREATIDY_KERNEL_FORGE_TOKEN": SIMULATED}
+    assert load_profile(profile, sops=True, environment=tool_environment) == expected
     with pytest.raises(ProfileError) as error:
         load_profile(profile, sops=True, environment={**tool_environment, "SOPS_AGE_KEY": ""})
     assert SIMULATED not in str(error.value)
     assert profile.read_bytes() == before
     assert profile.stat().st_mtime_ns == mtime
+    prefix_fixture = "ENC[AES256_GCM,synthetic-plaintext-not-ciphertext"
+    selective = subprocess.run(  # noqa: S603 - local SOPS with a synthetic age recipient.
+        [
+            sops,
+            "--encrypt",
+            "--age",
+            recipient,
+            "--unencrypted-regex",
+            "^CREATIDY_KERNEL_FORGE_TOKEN$",
+            "--input-type",
+            "json",
+            "--output-type",
+            "json",
+            "/dev/stdin",
+        ],
+        input=json.dumps({"CREATIDY_KERNEL_FORGE_TOKEN": prefix_fixture}),
+        env=environment,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
+    assert prefix_fixture in selective
+    selective_profile = write_profile(tmp_path / "selective.json", selective)
+    selective_before = selective_profile.read_bytes()
+    selective_rotation = subprocess.run(  # noqa: S603 - synthetic local fixture only.
+        [sops, "--rotate", "--output-type", "json", str(selective_profile)],
+        env=tool_environment,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    rotated_document = json.loads(selective_rotation.stdout)
+    assert rotated_document["CREATIDY_KERNEL_FORGE_TOKEN"] == prefix_fixture
+    assert rotated_document["sops"]["unencrypted_regex"] == "^CREATIDY_KERNEL_FORGE_TOKEN$"
+    refused = tmp_path / "selective-output.json"
+    with patch("creatidy_kernel.adapters.operator_profile.tempfile.mkstemp") as staging:
+        with pytest.raises(ProfileError, match="invalid ciphertext") as error:
+            migrate_sops_profile(selective_profile, refused, environment=tool_environment)
+        staging.assert_not_called()
+    assert prefix_fixture not in str(error.value)
+    assert not refused.exists() and selective_profile.read_bytes() == selective_before
     destination = tmp_path / "migrated.json"
     migrate_sops_profile(profile, destination, environment=tool_environment)
     migrated = destination.read_bytes()
     assert migrated != before and SIMULATED.encode() not in migrated
-    assert load_profile(destination, sops=True, environment=tool_environment) == {
-        "CREATIDY_KERNEL_FORGE_TOKEN": SIMULATED
-    }
-    assert load_profile(profile, sops=True, environment=tool_environment) == {"CREATIDY_KERNEL_FORGE_TOKEN": SIMULATED}
+    assert load_profile(destination, sops=True, environment=tool_environment) == expected
+    assert load_profile(profile, sops=True, environment=tool_environment) == expected
     with pytest.raises(ProfileError):
         migrate_sops_profile(profile, destination, environment=tool_environment)
     assert destination.read_bytes() == migrated
@@ -318,9 +358,7 @@ def test_real_sops_age_profile_is_read_only_and_missing_key_refuses(tmp_path: Pa
         assert target.exists() == (failed_call == 2)
         if target.exists():
             assert SIMULATED.encode() not in target.read_bytes()
-            assert load_profile(target, sops=True, environment=tool_environment) == {
-                "CREATIDY_KERNEL_FORGE_TOKEN": SIMULATED
-            }
+            assert load_profile(target, sops=True, environment=tool_environment) == expected
         assert not list(tmp_path.glob(".kernel-profile-*.json"))
         assert profile.read_bytes() == before and profile.stat().st_mtime_ns == mtime
     with pytest.raises(ProfileError):
@@ -331,6 +369,23 @@ def test_real_sops_age_profile_is_read_only_and_missing_key_refuses(tmp_path: Pa
     assert profile.read_bytes() == before and profile.stat().st_mtime_ns == mtime
     installed_cli = os.environ.get("CREATIDY_TEST_INSTALLED_CLI")
     if installed_cli:
+        failed = subprocess.run(  # noqa: S603
+            [
+                installed_cli,
+                "config",
+                "migrate-sops",
+                "--source",
+                str(selective_profile),
+                "--destination",
+                str(refused),
+            ],
+            env=tool_environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert failed.returncode != 0 and not refused.exists()
+        assert prefix_fixture not in failed.stdout + failed.stderr
         installed_destination = tmp_path / "installed.json"
         result = subprocess.run(  # noqa: S603
             [
@@ -348,9 +403,7 @@ def test_real_sops_age_profile_is_read_only_and_missing_key_refuses(tmp_path: Pa
             check=True,
         )
         assert SIMULATED not in result.stdout + result.stderr
-        assert load_profile(installed_destination, sops=True, environment=tool_environment) == {
-            "CREATIDY_KERNEL_FORGE_TOKEN": SIMULATED
-        }
+        assert load_profile(installed_destination, sops=True, environment=tool_environment) == expected
         validate = subprocess.run(  # noqa: S603
             [installed_cli, "config", "validate", "--profile", str(installed_destination), "--sops", "--json"],
             env=tool_environment,

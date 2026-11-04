@@ -31,6 +31,22 @@ _KEY = re.compile(r"[A-Z][A-Z0-9_]*")
 OPERATIONAL_KEYS = ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR")
 KNOWN_KEYS = frozenset(LIVE_ENV.values()) | set(OPERATIONAL_KEYS)
 _SOPS_ENVIRONMENT_PREFIX = "SOPS_"
+_SOPS_METADATA_FIELDS = frozenset(
+    {
+        "age",
+        "azure_kv",
+        "gcp_kms",
+        "hc_vault",
+        "key_groups",
+        "kms",
+        "lastmodified",
+        "mac",
+        "pgp",
+        "shamir_threshold",
+        "unencrypted_suffix",
+        "version",
+    }
+)
 
 
 class ProfileError(ValueError):
@@ -169,15 +185,37 @@ def migrate_sops_profile(source: Path, destination: Path, *, environment: Mappin
         if not isinstance(document, dict):
             raise ProfileError("profile migration produced invalid ciphertext")
         encrypted = cast("dict[str, object]", document)
+        metadata = encrypted.get("sops")
+        if set(encrypted) != set(original) | {"sops"} or not isinstance(metadata, dict):
+            raise ProfileError("profile migration produced invalid ciphertext")
+        metadata = cast("dict[str, object]", metadata)
         if (
-            set(encrypted) != set(original) | {"sops"}
-            or not isinstance(encrypted.get("sops"), dict)
+            set(metadata) - _SOPS_METADATA_FIELDS
+            or metadata.get("unencrypted_suffix") != "_unencrypted"
+            or any(key.endswith("_unencrypted") for key in original)
             or any(
-                not isinstance(encrypted[key], str) or not cast(str, encrypted[key]).startswith("ENC[AES256_GCM,")
-                for key in original
+                not isinstance(encrypted[key], str)
+                or (value == "" and encrypted[key] != "")
+                or (
+                    value != ""
+                    and (encrypted[key] == value or not cast(str, encrypted[key]).startswith("ENC[AES256_GCM,"))
+                )
+                for key, value in original.items()
             )
         ):
             raise ProfileError("profile migration produced invalid ciphertext")
+        verified = subprocess.run(  # noqa: S603 - resolved executable, ciphertext supplied on stdin.
+            (executable, "--decrypt", "--input-type", "json", "--output-type", "json", "/dev/stdin"),
+            input=rotated.stdout,
+            env=child,
+            capture_output=True,
+            timeout=SOPS_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if verified.returncode != 0 or len(verified.stdout) > MAX_DECRYPTED_BYTES:
+            raise ProfileError("profile migration verification failed")
+        if parse_json_profile(verified.stdout.decode("utf-8", "replace")) != original:
+            raise ProfileError("profile migration verification failed")
         fd, temporary = tempfile.mkstemp(prefix=".kernel-profile-", suffix=".json", dir=destination.parent)
         with os.fdopen(fd, "wb") as output:
             output.write(rotated.stdout)

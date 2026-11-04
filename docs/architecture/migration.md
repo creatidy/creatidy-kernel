@@ -257,8 +257,11 @@ migration of real owner data requires separately scoped owner authority and rema
 
 The explicit `creatidy-kernel config migrate-sops --source /absolute/old.yaml --destination
 /absolute/new.json` operation asks the locally installed SOPS to rotate the encrypted document
-to JSON, verifies that all profile fields are encrypted and decrypt to the original values, and
+to JSON, verifies the default full-field SOPS policy and that every nonempty profile field is encrypted
+and decrypts to its original value, and
 publishes a private new file without overwriting an existing destination. It never changes the source.
+SOPS encodes an empty string as an empty string; this contains no plaintext value. Selective or unknown
+SOPS encryption policies are refused before staging rather than being interpreted or silently widened.
 It requires SOPS and the original decryption key environment; the existing parent directory must
 support same-filesystem hard links and directory fsync. SOPS is trusted and may contact any external
 key service configured in the source; offline use requires locally available keys. Kernel does not
