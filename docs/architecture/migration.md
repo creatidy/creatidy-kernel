@@ -228,9 +228,10 @@ snapshot before dispatch. A returned acquisition Path carries no protected lifet
 ## Platform, Storage And Profile Reception (G13)
 
 Bounded exercised reception for [#62](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/62)
-(2026-10-26). Synthetic fixtures only; no real WSL/Windows/macOS host, real
-profile, key or ciphertext was used, and no release, publication or live task
-is claimed.
+(2026-10-26). The original reception used synthetic fixtures only. The later
+[#62 compatibility cut](successor.md#installed-compatibility-cut-2026-11-04) also records one
+actual WSL2 native-ext4 host; no real Windows/macOS host, owner profile, key or ciphertext was used,
+and no release, publication or live task is claimed.
 
 **Storage and platform.** Store startup and `validate_local_storage` accept
 exactly the verified native local Linux filesystems (`bcachefs`, `btrfs`,
@@ -242,18 +243,34 @@ native Linux, while Windows drives mounted as `9p` (WSL2 DrvFS) or `drvfs`
 fallback, and non-Linux runtimes refuse storage validation explicitly. A
 database announcing a schema version newer than supported refuses at startup;
 its records and announced version survive the refusal unchanged, are never
-reinterpreted, and no lost-effect dispatch or relabelled identity occurs. Real WSL, Windows and macOS execution remains explicit
-evidence work, not implicit support; each eventual platform cell must name its
-executed host, filesystem and revisions.
+reinterpreted, and no lost-effect dispatch or relabelled identity occurs. Beyond the single WSL2
+native-ext4 host in the compatibility cut, real host execution remains explicit evidence work, not
+implicit support; each platform cell must name its executed host, filesystem and revisions.
 
-**Operator profile.** Kernel never writes the user profile. Plaintext dotenv
+**Operator profile.** Ordinary loading never writes the user profile. Plaintext dotenv
 and SOPS loading are read-only: failed decryption (executable unavailable,
 nonzero exit, key unavailable), corrupt or oversized decrypted output leaves
 the original ciphertext byte-identical — including modification time — and
 diagnostics stay fixed messages that never contain profile values. Encrypted
 fixtures in tests are synthetic stand-ins; real key rotation, recipient
-migration or an actual encrypted-profile transition requires separately scoped
-owner authority and remains unclaimed.
+migration of real owner data requires separately scoped owner authority and remains unclaimed.
+
+The explicit `creatidy-kernel config migrate-sops --source /absolute/old.yaml --destination
+/absolute/new.json` operation asks the locally installed SOPS to rotate the encrypted document
+to JSON, verifies the default full-field SOPS policy and that every nonempty profile field is encrypted
+and decrypts to its original value, and
+publishes a private new file without overwriting an existing destination. It never changes the source.
+SOPS encodes an empty string as an empty string; this contains no plaintext value. Selective or unknown
+SOPS encryption policies are refused before staging rather than being interpreted or silently widened.
+It requires SOPS and the original decryption key environment; the existing parent directory must
+support same-filesystem hard links and directory fsync. SOPS is trusted and may contact any external
+key service configured in the source; offline use requires locally available keys. Kernel does not
+change recipients or manage keys. No plaintext is deliberately written to disk or printed. SOPS
+configuration and key access remain operator-owned. Do not migrate a profile concurrently with edits.
+If publication reports an error, the destination may already exist: inspect it without deleting either
+file. To roll back, explicitly use the original profile path and keys; migration never deletes either
+file. A test using actual SOPS and synthetic age keys exercises this path, not a real owner transition
+or recipient/key migration.
 
 **Trust labeling.** `TRUSTED_DEVELOPMENT` in this matrix means trusted native
 execution with task-level deadline/STOP semantics, not strict per-syscall
@@ -270,6 +287,50 @@ backup bundles with verified manifests). The user owns the operator profile
 and any SOPS key material; the source cache follows the #61 ownership
 contract. Uninstalling removes Kernel-owned state only under an explicit
 operator action; no component deletes or rewrites the user profile.
+
+## Installation, Upgrade And Cleanup
+
+The installed SDK provides backup and restore, not an automatic uninstall or repair command. Use the
+trusted controller identity, with no other controller holding the store. These explicit paths must be
+on a supported native filesystem; backup and restore destinations must be new. Opening an old store
+can migrate it, so first preserve a verified original with a compatible existing reader before upgrading.
+
+```python
+import json
+from pathlib import Path
+from creatidy_kernel.adapters.sqlite_store import BackupBundle, SQLiteProgramStore
+
+database = Path("/absolute/native/state/kernel.sqlite3")
+bundle_dir = Path("/absolute/native/backups/bundle")  # parent exists, bundle does not
+with SQLiteProgramStore(database) as store:
+    bundle = store.backup(bundle_dir)
+
+# In a later offline process, reconstruct the bundle from its original manifest.
+manifest_path = bundle_dir / "manifest.json"
+manifest = json.loads(manifest_path.read_text())
+bundle = BackupBundle(
+    bundle_dir,
+    bundle_dir / "kernel.sqlite3",
+    manifest_path,
+    manifest["database_sha256"],
+    manifest["history_record_count"],
+    manifest["schema_version"],
+)
+SQLiteProgramStore.restore_backup(bundle, Path("/absolute/native/recovery/restored.sqlite3"))
+```
+
+Restore verifies the bundle and requires a new database path and artifact directory. Reopening the
+restored image with the current reader may migrate it; it does not authorize downgrade, adopt physical
+workspaces or replay unknown effects. A failed restore can leave a partial artifact directory; retain
+and inspect it rather than retrying destructively. For an interrupted automatic schema upgrade, retain
+the original database, sidecars and pre-schema bundles; retry only with a compatible current reader
+after understanding the failure. Invalid/future schemas, unknown effects and unavailable keys do not
+authorize blind repair.
+
+The distribution, Kernel state/cache and owner profile/keys have separate ownership. Uninstalling the
+distribution does not remove state or keys. Source-cache markers, locks and unknown staging trees do
+not grant cleanup authority. No recursive deletion is performed by these instructions; the owner
+separately authorizes data removal after resolving retention and recovery needs.
 
 ## Historical Second-Pass Mapping
 

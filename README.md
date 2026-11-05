@@ -291,6 +291,13 @@ Secret management and deployment remain **operator-owned**: public Kernel neithe
 infrastructure nor stores deployment details; the optional generic SOPS profile adapter below covers
 only a user-supplied profile and the user's own SOPS key environment.
 
+For an explicitly authorized SOPS profile transition, `creatidy-kernel config migrate-sops --source
+/absolute/old.yaml --destination /absolute/new.json` rotates into a new encrypted JSON file without
+overwriting the source or destination. Rollback means selecting the unchanged original profile; retain
+its keys. SOPS and the original key are required, and external key services may involve network access.
+See [profile migration and recovery](docs/architecture/migration.md#platform-storage-and-profile-reception-g13)
+for prerequisites, failure handling and the limits of synthetic evidence.
+
 Runtime configuration describes executable infrastructure. `TaskSpec` separately owns repository,
 base branch, allowed paths, instructions and acceptance/verification authority. The parsed runtime
 binding constrains which Router recommendation can become an Allocation; its exact configured
@@ -725,6 +732,34 @@ enable #57 remote transport, live inference or unapproved Forge effects.
 
 The installed `creatidy-kernel` command is self-contained for the bounded-task operator path;
 the former private operator wrapper is no longer required.
+
+### Installation And Recovery
+
+For a local source build, Python 3.12+, `uv` and the locked build dependencies are prerequisites.
+`uv build --no-build-isolation` creates a local wheel and sdist; use `uv pip install --python
+/absolute/path/to/venv/bin/python /absolute/path/to/the-built.whl` to install into an explicitly
+selected environment. Dependency acquisition may require network access; no published package or
+signed release is implied. Verify the actual artifact and [compatibility cut](docs/architecture/successor.md#installed-compatibility-cut-2026-11-04)
+before an upgrade. `creatidy-kernel config template` and `config validate` are local configuration
+tools. `doctor` and `task preflight` can acquire source and contact configured services; they are not
+an offline-only check and neither authorizes execution.
+
+Before upgrading, stop the controller and preserve a verified bundle using the installed
+`SQLiteProgramStore.backup` SDK on a supported native filesystem. Opening an old store with the new
+reader can migrate it: preserve a verified original backup before opening it with a new version. The
+store also creates versioned pre-schema backups during applicable migrations. Restore a verified bundle
+to a **new** offline path through `SQLiteProgramStore.restore_backup`; it requires a `BackupBundle`, an
+existing parent, and absent destination database and artifact directory. See
+[state recovery](docs/architecture/migration.md#installation-upgrade-and-cleanup) for the executable SDK
+example. A newer schema or unsupported storage refuses; never remove SQLite sidecars, rewrite version
+markers, replay unknown effects or use an older binary as a repair method. Preserve workspaces and
+original profile/key material for explicit reconciliation.
+
+Uninstalling the Python distribution, for example with `uv pip uninstall --python
+/absolute/path/to/venv/bin/python creatidy-kernel`, does not delete local state, cache, profiles or keys.
+There is no automatic recursive cleanup command. Delete state or cache only under the owner's explicit
+authority, after the controller is stopped and recovery needs and unknown effects are resolved. Profiles,
+SOPS keys and other owner data are separately owned; package removal never authorizes deleting them.
 
 ```sh
 uv run --locked creatidy-kernel config template            # generic profile template with placeholders
