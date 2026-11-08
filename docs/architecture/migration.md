@@ -20,11 +20,11 @@ the architecture mandate.
 | Codex five-method Runtime, Workspace and reference paths | Retain bounded adapter | Add evidenced ownership/settlement and generic new Program composition; pull enters application directly, not fake managed Runtime. No takeover of Kilo or generic sandbox claim |
 | Product review/remediation #54 and STOP #90 | Retain delivered code | Reuse in ordinary engine; extend normal-completion witness and original boot-scoped deadlines under #59/#56. Do not reopen completed bounded deliveries |
 | Router recommendation and allocation codecs 1/2/3 | Retain exact historical bytes | Separate optional executable-route contract receipt, never relabel recommendation as enforced inference or synthesize missing identity |
-| Existing harness configuration | Supported target input for basic cooperative work | Record unavailable model-level admission/usage honestly. Strict route/pin/no-hidden-call tasks require #52 capability or refuse; no gateway interception required just to manage work |
+| Existing harness configuration | Supported target input for basic cooperative work | Record unavailable model-level admission/usage honestly. Strict route/pin/no-hidden-call tasks require independently proved capabilities or refuse; #52 is retired without implementation, and no gateway interception is required just to manage work |
 | MI utilized reference #101 | Retain immutable provenance/local-only | Optional content/harness evidence #55 remains separately scoped; no new catalogue, ranking or knowledge authority |
 | Offline status/export and directory-based CLI | Retain recovery/compatibility use | Shared owner-served #57 view and commands for active operation; #58 complete private outcomes. No second SQLite reader |
 | Platform/profile/source safety and #102 fixtures | Retain | Per-combination version matrix and interrupted/non-destructive migration/refusal under #62, with real-host claims only after actual receipts |
-| Push-only/default-gateway interpretation | Superseded target assumption | One core, pull and push with different proven capability profiles; strict Router integration remains required in its own supported profile |
+| Push-only/default-gateway interpretation | Superseded target assumption | One core, pull and optional supported push with different proven capability profiles; strict Router integration is not required for initial acceptance |
 | #53 / PR85 experiment | Closed/not implemented; evidence only | No automatic code reuse, reopening, strict syscall-expiry or isolation claim. A new delivery must satisfy the revised accepted profile |
 
 Compatibility manifests bind producer/contract, driver/harness/build/profile/platform and evidence
@@ -37,6 +37,9 @@ schema migration. Destructive operations, release activation and real user-data 
 separate owner decisions. Linux/local-storage limitations remain until an actual received alternative.
 
 ## Current Public Transition
+
+The following dated mapping is historical; #52 is retired wontfix and is no longer a required
+consumer delivery or #60 predecessor. Its evidence remains bounded to tested combinations.
 
 Kernel `eb4f4a2956712bfaf39a3271e1523e7f77a91e26` integrates public source acquisition, generic
 profiles/optional SOPS, Codex discovery, user-local defaults and doctor/preflight/status/export

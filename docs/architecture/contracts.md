@@ -364,10 +364,12 @@ endpoints, flags or versions. Each producer owns its schema and executable produ
 - Separate harness control from model-backend ingress; validate exact harness/adapter/protocol/source
   versions and tool/stream/retry semantics. ACP client file/terminal execution needs its own proved
   permission boundary. Unsupported resume/recovery stays unknown or refused.
-- Persist Router's executable route before Attempt dispatch; keep main calls sticky, explicit user
+- For a separately evidenced route-enabled profile, persist Router's executable route before Attempt dispatch; keep main calls sticky, explicit user
   pin and separately authorized helper/review route evidence. Preserve provider/model/resource/access
   mode/explicit effort/opaque variant/harness versions and requested/resolved/observed gaps. No
   physical identity inference for plan-managed execution or effort inferred from variant.
+  This conditional contract is not a mandatory ordinary-work or #60 initial-acceptance capability;
+  #52 was retired wontfix without implementation. Unsupported or unknown strict profiles must refuse.
 - MI produces complete versioned knowledge with provenance/time/conflict/withdrawal semantics;
   Router admits/consumes it. Kernel retains actual utilized references, frozen evidence cut and
   evaluation semantics without ranking or granting authority. Missing publication cannot be invented

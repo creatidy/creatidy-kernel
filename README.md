@@ -610,7 +610,7 @@ require an independently configured `profile_policy_version`, the complete appro
 and exact returned profile/version/requirement equality. There is no local profile catalogue or
 floor lookup. Selection is not reservation, gateway admission, privacy enforcement, a worker grant
 or ordinary dispatch. The reference application refuses to allocate new ordinary work via its L0
-path. #52 owns the route consumer; #53/PR #85 is closed not implemented and supplies no accepted
+path. #52 was retired wontfix without an accepted route consumer; #53/PR #85 is closed not implemented and supplies no accepted
 native reception or strict-expiry proof.
 
 `make package-check` exercises preparation, approval, intact refusal, typed recommendation over

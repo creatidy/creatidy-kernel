@@ -97,8 +97,9 @@ Basic work coordination uses an explicitly acknowledged existing harness configu
 requiring Router gateway compatibility or intercepting every model HTTP call. That path reports model
 resource control/consumption as unavailable where not observed. Strict routing, exact pins, inference
 admission, hard quota or no-hidden-call profiles still require proven Router/harness capabilities and
-refuse otherwise. #52 remains a real full executable-integration obligation; its Kilo multipart and
-fail-open-plugin negative evidence is preserved, not flattened away or made a global work gate.
+refuse otherwise. The owner retired #52 as wontfix without accepting its criteria; strict integration
+is not required for initial product acceptance. Its exact-version negative evidence remains preserved,
+not flattened away or generalized to other combinations. See [#60](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/60).
 
 Console, CLI/TUI and optional IDE/Kilo UI consume the same owner-served snapshot/events/command
 authority. An agent work integration and a UI extension are distinct clients. Authentication and

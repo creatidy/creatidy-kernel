@@ -9,6 +9,15 @@ subsequent normal `/loop`; this roadmap itself does not select work or authorize
 production effects. The older G01-G13 corpus below is retained
 with its dated evidence, not a competing push-only plan or a current eligibility observation.
 
+Owner decision 2026-11-08: [#52](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/52)
+is retired wontfix, not completed. Strict Router/harness inference enforcement is not required for
+initial acceptance or a #60 prerequisite. Unverified strict capabilities remain unknown/unsupported
+and requested profiles must refuse without evidence. PR #100 and unmerged PR #118 retain negative
+evidence for their exact tested combinations only. The older #52 implementation and edge statements
+below are historical, not active delivery instructions. #105 remains owner-deferred, with its
+heterogeneous-provider acceptance still required for broad #60 completion. Optional managed push
+reception remains profile-specific; no particular harness is mandatory. No product GO is implied.
+
 ## Full-Product Delivery Sequence
 
 The [complete backlog publication plan](backlog-alignment.md) gives every open issue's disposition,
@@ -23,13 +32,13 @@ this table or infer eligibility from a closed prerequisite alone; refresh actual
 | Whole-work policy #56 | Configurable project/work limits, original boot-scoped time envelope, unitful attributable consumption/unknowns, review/retry/output bounds | Existing #54 review reused; no real numerical owner budget needed to implement validation with synthetic fixtures; strict Router facts lane-local |
 | Ordinary work engine #106 | Discover/plan/validate approved ordinary Programs, select/claim/reserve, pull handoff and managed push, submit/review/remediate/accept/synchronize through one application path | #105 + #59 + #56; existing #49/#51/#54 are retained foundations, not missing preparation series. Local CLI works without waiting for optional UI/server deployment |
 | Shared command/state #57 | Authenticated owner/worker/observer boundary and useful installed CLI/MCP/API surfaces, snapshots/events/gaps/STOP, optional UI consumers | #59 for claim semantics; consumes #106's ordinary execution for full end-to-end commands. Does not make #106's local core depend on #57 transport |
-| Strict executable Router profile #52 | Actual Attempt-bound route/pin/identity/admission and supported harness/tool/helper/recovery receipt | Genuine separate obligation. Existing Kilo multipart incompatibility affects this exact combination, not ordinary coordination |
+| Strict executable Router profile #52 | Retired without completed acceptance; retain exact negative evidence | Not a required delivery or #60 prerequisite; unsupported/unknown profiles refuse |
 | Complete local outcomes #58 | Private versioned full-result lineage and corrected known/unknown unitful costs across drivers/modes | #56 and actual execution facts; absent strict-route facts stay unknown for basic profile; Router #177/MI sharing are not gates |
 | Compatibility #62 | Installed driver/harness/profile/state compatibility, supported-platform evidence and non-destructive upgrades/refusals | Accompanies each delivery; never waits for every adapter or release. Existing #102 synthetic evidence retained |
 | Optional MI expansion #55 | Direct source/harness evidence only when requested, with immutable provenance and unsupported policy refusal | #101 retention already integrated; direct MI knowledge is not a core/gateway prerequisite |
-| Full acceptance #60 | Installed same-core pull/push plus heterogeneous stack, strict-profile receipt, authorization/STOP/recovery, negative cases and migrations | Downstream of implemented components and declared profile support; never a prerequisite for them, and no every-future-harness promise |
+| Full acceptance #60 | Installed same-core pull and supported optional push, heterogeneous stack, authorization/STOP/recovery, negative cases and migrations | #105 remains deferred and required for broad acceptance; strict routing is not required and unverified profiles are not advertised |
 
-Architecture enables useful ordinary work without weakening the strict Router obligation. Each
+Architecture enables useful ordinary work without claiming unproved strict Router capabilities. Each
 functional issue delivers working behavior, not merely another specification, research or synthetic
 demo. Deterministic tests use synthetic external systems; executable provider adapters and installed
 composition must actually ship before a capability is called implemented. Live acceptance remains

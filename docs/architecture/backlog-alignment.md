@@ -14,6 +14,20 @@ The original preparation aliases now have real identities:
 References to preparation below preserve the historical audit, not a current claim of nonpublication.
 No functional capability or live acceptance is established by publication or consistency acceptance.
 
+## Subsequent Owner Disposition
+
+On 2026-11-08 the owner retired [#52](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/52)
+as wontfix, without completing its acceptance criteria. The later
+[#60 reconciliation](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/60#issuecomment-21185)
+removes the #60 -> #52 native edge and strict Router/harness enforcement from required initial
+acceptance. The publication payload, edge plan, priority and cross-project statements below record
+the 2026-10-27 cut, not current requirements where they conflict with this decision. Preserve PR #100
+and closed-unmerged PR #118 as exact-combination negative evidence, not universal incompatibility.
+Ordinary pull needs no Router gateway; unsupported or unverified strict profiles refuse. Supported
+optional managed push still needs exact profile evidence. #105 remains owner-deferred and its
+heterogeneous-provider obligations remain required for broad #60 acceptance. This does not establish
+any capability, product GO or live acceptance, amend ADR 0011/0012, or reopen #53.
+
 ## Publication Revision
 
 Fresh prepublication exhaustion on 2026-10-27 found twelve open issues (5 + 5 + 2 + empty), all
