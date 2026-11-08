@@ -252,6 +252,88 @@ and distribution rights, supported-profile/maintenance acceptance and the remain
 Live inference, credentials, paid calls and production operations remain separately unauthorized.
 This #52 gate does not gate unrelated independently eligible Kernel issues.
 
+## Current #52 Codex Responses Proof (2026-11-08)
+
+This owner-selected refresh starts from Kernel `4cb500a6d58d983854ad795a56db0af3c6d902f8`
+(#62/PR #117 integrated), not the historical Responses-absent cut above. Router now implements
+Responses surface 1 at canonical source
+[`925ec06681c7fa085edd5015f57663e85d735768`](https://forgejo.creatidy.com/Creatidy/scarcity-router/src/commit/925ec06681c7fa085edd5015f57663e85d735768).
+Its accepted #174/#179/#180/#181/#184 producer slices are not full native-harness reception.
+SR #227 is downstream composed acceptance, **not** an upstream implementation prerequisite.
+
+The installed executable reports **`codex-cli 0.159.3`**, SHA-256
+`8bf204b36a2f6dd0dab73aa2f639892e67ef9ac8befccb4a05b1496ebf25c479`.
+The public annotated tag `rust-v0.159.3` resolves to source
+[`01fc69f4026735edfdf6789820549727a4867b11`](https://github.com/openai/codex/tree/01fc69f4026735edfdf6789820549727a4867b11).
+Observed version/digest and matching source tag are distinct evidence, **not signed binary-to-source
+attestation**. Both public sources retain Apache-2.0 licenses; no source implementation is copied,
+vendored or adopted as a new package dependency by this probe.
+
+`tools/check_codex52.py` uses the installed Kernel `CodexStdio` boundary and a dedicated native
+app-server with a new synthetic HOME/CODEX_HOME/workspace. Before initialization, its configured
+provider is an explicit loopback endpoint with analytics/feedback disabled. HTTP and stream retry
+counts are zero, WebSockets disabled. The endpoint invokes the **actual unchanged Router parser**
+in an isolated Python process and returns its refusal; it never invokes admission, a coordinator,
+a worker or inference. This is not a permissive completion source or a new gateway.
+
+| Executed observation | Exact bounded result |
+| --- | --- |
+| Native main request with synthetic schema-2 pin, opaque variant and explicit high effort | Pin bytes and `reasoning.effort=high` survive native serialization and configured thread resolution. This is not an authenticated RouteDecision/admission or physical-model observation. |
+| Original full `execution_requirements` supplied as thread config and provider `extra_body` | Both configuration attempts are absent from the final wire body. The pinned source's `model-provider-info/src/lib.rs:136-201` has no body-injection field; `codex-api/src/common.rs:279-304` uses a fixed `ResponsesApiRequest`. Kernel cannot silently invent a native SDK hook. |
+| Actual native body versus actual SR `gateway_responses.parse_responses_request` | `unsupported_parameter`, `param=request`. `instructions`, `include`, `prompt_cache_key` and `client_metadata` are outside SR's closed surface-1 top-level keys. |
+| Independent one-field producer negatives | Each of those four fields is refused on an otherwise valid synthetic context. Multipart developer context, reasoning summary, opaque variant as effort, stored continuation, compaction items, hosted tools, orphan function results and missing explicit context-effort field also refuse. No negative is repaired or forwarded. |
+| Positive producer controls | The original version-2 executable context round-trips; explicit high effort, stream request and complete synchronous function-call/result history parse. Parsing alone is not admission, execution, SSE decoding or native tool-loop conformance. |
+| Owned native teardown | The existing dedicated process-group witness reports settled after the refused probe. This is not active-inference STOP, provider cancellation/settlement or strict native-effect expiry. |
+| Helper/review/compaction, actual function continuation/SSE, unknown retry/recovery | Not established after the early native main-path refusal. The producer has no `/v1/responses/compact` route; native compaction/reasoning-state preservation cannot be inferred from a normal Responses endpoint. No hidden-call, fallback or no-replay guarantee is claimed. |
+
+**Verdict: NOT_ESTABLISHED for this exact installed native Codex/Router combination.** SR's bounded
+stateless Responses support is real, but it is not native Codex wire compatibility. In particular,
+preserving only a model pin is insufficient when original executable requirements disappear.
+`core/src/client.rs:959-1005` unconditionally constructs the native `include` field; there is no
+supported general body override in this pinned source. Removing instructions/context, flattening
+parts, passing demands in ignored headers, or substituting an in-process permissive parser would
+weaken the contract. None is implemented.
+
+Source-only SDK cross-check at the same Codex revision: `sdk/typescript/src/codexOptions.ts:5-27`
+exposes base URL, key, environment and CLI configuration overrides; `exec.ts:91-114,176-199`
+serializes these into native `codex exec` arguments/environment, not an independent HTTP body
+serializer or fetch hook. `threadOptions.ts:17-30` has no executable-context field. This source
+inspection is not an installed TypeScript SDK execution receipt or proof for another version.
+
+The missing native request-envelope injection capability belongs to **Codex/upstream**. Acceptance
+of native instructions, ordered multipart context, reasoning/state and any required compaction
+semantics belongs to **Router**, under separately authorized producer work. Fixing only one side is
+not a full remedy. Kernel owns repeating the exact installed proof, then implementing the original
+Attempt/Operation-bound route consumer and its full lifecycle evidence. No new upstream issue or
+producer mutation is authorized here. Other harness/version combinations are not disproved.
+
+Kernel #52 remains incomplete: AC1/AC2 route persistence and full executable lifecycle have no
+supported native envelope to dispatch; AC4 strict-profile negatives remain necessary; AC6 receives
+only this installed negative cell. AC3's Kilo 7.8.18 NOT_ESTABLISHED receipt remains unchanged; AC5
+basic cooperative Kilo and acknowledged native Codex work remain independent. No production route
+adapter, additional model loop, resource catalogue or unused persistence layer is justified by this
+negative. ADR 0012 and #53 CLOSED / NOT IMPLEMENTED remain unchanged; usage is unknown, not zero.
+
+Reproduce with explicitly prepared clean public source checkouts and a new receipt directory:
+
+```sh
+uv run --locked python tools/check_codex52.py \
+  --codex-bin /absolute/codex \
+  --codex-source /path/to/codex-01fc69f \
+  --router-source /path/to/router-925ec066 \
+  --receipts /path/to/new-synthetic-receipts
+```
+
+The tool verifies exact source HEADs/cleanliness and observed binary digest and refuses changed
+inputs. `native-request.json` contains synthetic native prompts/context only; `report.json` retains
+the pin/effort loss/refusal, actual parser controls, exact versions and explicit unproved scope.
+For the same proof using the wheel installed outside the source tree, supply
+`CREATIDY_TEST_CODEX52_BIN`, `CREATIDY_TEST_CODEX52_SOURCE` and
+`CREATIDY_TEST_ROUTER52_SOURCE` together to `make package-check`. It invokes the same runner with
+the installed interpreter's `-I` mode; normal package/core checks need neither producer nor harness.
+This trusted-development test is not an OS network sandbox, hostile-worker isolation, live/provider
+acceptance, product GO or permission to merge/close incomplete #52.
+
 ## Reuse And Downstream Reception
 
 The ladder yields **retain existing seams and prove bounded adaptation**, not BUILD a replacement

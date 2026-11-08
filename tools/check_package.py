@@ -141,6 +141,34 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
         cwd=work,
         check=True,
     )
+    codex52 = tuple(
+        os.environ.get(key)
+        for key in (
+            "CREATIDY_TEST_CODEX52_BIN",
+            "CREATIDY_TEST_CODEX52_SOURCE",
+            "CREATIDY_TEST_ROUTER52_SOURCE",
+        )
+    )
+    if any(codex52):
+        if not all(codex52):
+            raise SystemExit("Codex52 proof requires all three explicit binary/source inputs")
+        subprocess.run(
+            [
+                str(python),
+                "-I",
+                str(ROOT / "tools/check_codex52.py"),
+                "--codex-bin",
+                str(codex52[0]),
+                "--codex-source",
+                str(codex52[1]),
+                "--router-source",
+                str(codex52[2]),
+                "--receipts",
+                str(work / "codex52-receipts"),
+            ],
+            cwd=work,
+            check=True,
+        )
     subprocess.run(
         [sys.executable, str(ROOT / "tools/check_uninstall.py"), str(python), str(cli), str(storage_root)],
         cwd=work,
