@@ -38,6 +38,9 @@ exact invalid/wontfix/duplicate labels case-insensitively, verify explicit gates
 then order by explicit priority, required ordering and oldest registration.
 Issues, not open PRs, are planning authority. Stop the entire invocation for
 STOP_AND_ASK, STOP_REVISE or BLOCKED; no eligible issues yields QUEUE_EMPTY.
+Complete issue eligibility requires full-acceptance prerequisites; an authorized,
+independently useful partial scope requires its own identified, canonically verified
+prerequisites, while unrelated unmet parent prerequisites remain binding for full acceptance.
 This does not authorize product GO, cross-repository mutation, Scarcity Router
 operation, main, releases or deployments. Standalone implementation remains
 owner-selected and unmerged; standalone review remains read-only.

@@ -71,6 +71,20 @@ def trace_dependency(issue: int, records: Mapping[int, DependencyEvidence]) -> t
     return "ELIGIBLE", (issue,)
 
 
+def partial_scope_eligibility(
+    authorized: bool, useful: bool, prerequisites: tuple[int, ...] | None, records: Mapping[int, DependencyEvidence]
+) -> str:
+    """Model only the declared partial scope, not the parent's full acceptance."""
+    if not authorized or not useful:
+        return "GATED"
+    if prerequisites is None:
+        return "UNVERIFIED"
+    results = [trace_dependency(issue, records)[0] for issue in prerequisites]
+    if "UNVERIFIED" in results:
+        return "UNVERIFIED"
+    return "ELIGIBLE" if all(result == "SATISFIED" for result in results) else "GATED"
+
+
 def select_confirmed_eligible(
     repository_issues: tuple[int, ...], records: Mapping[int, DependencyEvidence]
 ) -> tuple[int | None, str | None]:
@@ -317,7 +331,7 @@ class WorkflowContractTests(unittest.TestCase):
             "At the beginning of EVERY cycle fetch current canonical Forgejo issue state",
             "list ALL open Creatidy/creatidy-kernel issues, paging to exhaustion",
             "Require actual issue records (not PRs)",
-            "Exclude unmet explicit prerequisites/gates",
+            "Exclude unmet explicit prerequisites/gates applicable to the selected complete or partial scope",
             "issues waiting for an unresolved owner decision",
             "not merely closed dependency state",
             "Do not invent dependencies from similar prose",
@@ -557,7 +571,8 @@ class WorkflowContractTests(unittest.TestCase):
             "explicitly bounded, independently useful scope",
             "existing owner authorization or accepted issue scope",
             "every acceptance criterion applicable to that scope must be satisfied",
-            "Partial delivery does not bypass SELECT, issue eligibility, prerequisites, exclusion, reconciliation",
+            "Partial delivery does not bypass SELECT, scope eligibility, applicable prerequisites, exclusion, "
+            "reconciliation",
             "Neither an open PR nor the partial classification selects an ineligible issue",
         ):
             self.assertIn(requirement, merge)
@@ -569,6 +584,29 @@ class WorkflowContractTests(unittest.TestCase):
             "not authority to reselect or redeliver it",
         ):
             self.assertIn(requirement, complete)
+
+    def test_partial_eligibility_requires_only_verified_scope_prerequisites(self) -> None:
+        records: dict[int, DependencyEvidence] = {
+            60: {"state": "open", "evidence": "current", "contract": "ready", "dependencies": [105]},
+            105: {"state": "open", "evidence": "current", "contract": "gated", "dependencies": []},
+            52: {"state": "closed", "evidence": "current", "contract": "ready", "dependencies": []},
+        }
+        self.assertEqual(trace_dependency(60, records)[0], "GATED")
+        self.assertEqual(partial_scope_eligibility(True, True, (52,), records), "ELIGIBLE")
+        self.assertEqual(partial_scope_eligibility(True, True, (52, 105), records), "GATED")
+        self.assertEqual(partial_scope_eligibility(True, True, (52, 999), records), "UNVERIFIED")
+        self.assertEqual(partial_scope_eligibility(True, True, None, records), "UNVERIFIED")
+        self.assertEqual(partial_scope_eligibility(False, True, (52,), records), "GATED")
+        self.assertEqual(partial_scope_eligibility(True, False, (52,), records), "GATED")
+        loop = text(".kilo/command/loop.md")
+        for requirement in (
+            "every prerequisite it actually consumes",
+            "verify those prerequisites against current canonical evidence",
+            "an unrelated unmet parent prerequisite alone does not",
+            "all unmet parent dependencies and acceptance criteria",
+            "If applicability or required evidence is unknown, treat it as UNVERIFIED",
+        ):
+            self.assertIn(requirement, loop)
 
     def test_stop_boundary_and_repository_safety(self) -> None:
         loop = text(".kilo/command/loop.md")
