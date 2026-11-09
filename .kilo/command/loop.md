@@ -44,6 +44,17 @@ never authority for eligibility, priority, dependencies, acceptance or Forgejo s
 
 ## SELECT
 
+Evaluate complete issue delivery and any explicitly authorized independently useful
+bounded partial delivery separately. Complete issue eligibility requires every applicable
+native dependency, producer gate and owner decision for full acceptance. For a partial
+delivery, identify its exact authorized scope and every prerequisite it actually consumes;
+verify those prerequisites against current canonical evidence. An unmet prerequisite for
+that scope blocks it, while an unrelated unmet parent prerequisite alone does not. Preserve
+all unmet parent dependencies and acceptance criteria; a PR alone grants no authority.
+If applicability or required evidence is unknown, treat it as UNVERIFIED, not satisfied.
+Apply the same selection, ordering and exclusion rules to the eligible issue and exact
+authorized scope, not to an unrelated PR.
+
 At the beginning of EVERY cycle fetch current canonical Forgejo issue state via
 MCP: list ALL open Creatidy/creatidy-kernel issues, paging to exhaustion. Do
 not select from a partial page, cached notes or a PR list. Require actual issue
@@ -56,7 +67,8 @@ records (not PRs). Apply these steps in order:
    other label, and do not use substring matching.
 2. Read each remaining candidate's current canonical body/comments and explicit
    dependency edges via MCP, plus applicable accepted Kernel roadmap/gate
-   requirements. Exclude unmet explicit prerequisites/gates and issues waiting for
+   requirements. Exclude unmet explicit prerequisites/gates applicable to the selected
+   complete or partial scope and issues waiting for
    an unresolved owner decision. Record the issue/ref, observed state, revision/commit where
    available, and the evidence source/time used for each edge and required producer
    contract. Refresh this evidence before deciding eligibility or any terminal
@@ -70,6 +82,7 @@ records (not PRs). Apply these steps in order:
    without an explicit owner restart decision it is ineligible. An open unrelated PR
    never supplies such a decision.
 3. Walk each explicit dependency chain backward from the candidate, recursively
+   restricting partial deliveries to prerequisites verified as applicable to their scope,
    refreshing every edge and producer/contract observation, until reaching the
    earliest open issue that is itself eligible to execute, or a verified satisfied
    prerequisite. Select that executable predecessor before its dependent. A verified
@@ -116,7 +129,8 @@ as in COMPLETE without reimplementing; merged status alone does not prove accept
 
 ## Post-Selection Eligibility Revalidation
 
-After selection, inspect the issue and required producer/contracts using fresh
+After selection, inspect the issue and required producer/contracts for the selected
+complete or authorized partial scope using fresh
 evidence BEFORE the first substantive implementation mutation. Discovery of an
 unmet explicit prerequisite, absent required upstream producer/contract/artifact,
 or an already-known dependency gate that would have excluded the issue in SELECT
@@ -278,7 +292,7 @@ acceptance criterion. A partial delivery has an explicitly bounded, independentl
 useful scope permitted by existing owner authorization or accepted issue scope; every
 acceptance criterion applicable to that scope must be satisfied. Record the exact
 scope, evidence, unmet requirements and dependencies. Partial delivery does not bypass
-SELECT, issue eligibility, prerequisites, exclusion, reconciliation or any review and
+SELECT, scope eligibility, applicable prerequisites, exclusion, reconciliation or any review and
 merge gate. Neither an open PR nor the partial classification selects an ineligible issue.
 
 Use supported `forgejo-mcp_merge_pull_request` for this PR, style `merge` (preserve

@@ -40,6 +40,10 @@
   Preserve STOP_REVISE dispositions; an open PR cannot authorize restarting them.
   No issue registration is authorized merely to keep `/loop` running.
 - Before substantive delivery, apply loop.md's post-selection eligibility revalidation.
+  A complete issue requires all full-acceptance prerequisites; an explicitly authorized,
+  independently useful partial scope requires its own identified, canonically verified
+  prerequisites. Unmet unrelated parent prerequisites remain binding for full acceptance
+  but do not alone gate that partial scope; unknown applicability is UNVERIFIED.
   A freshly proven missing prerequisite/producer/contract makes an untouched issue
   temporarily ineligible: retain history/counters, keep it open, safely return to
   clean develop and rebuild the full canonical queue; continue SELECT nonterminally.
