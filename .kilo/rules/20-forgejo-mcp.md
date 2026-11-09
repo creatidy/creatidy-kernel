@@ -9,7 +9,9 @@
 - Use normal Git for fetch, branch switching, commit and push. Use configured
   Forgejo MCP for platform operations: issue reads/comments, PR creation/metadata
   and optional review publication. Only explicit `/loop` also authorizes supported
-  Forgejo MCP PR merge to develop and issue closure AFTER verified merge/acceptance.
+  Forgejo MCP PR merge to develop and issue closure AFTER verified merge/full issue acceptance.
+  An accepted bounded partial delivery leaves the parent issue open when full acceptance
+  is unmet and does not satisfy dependencies or authorize downstream work.
   Re-fetch current PR/develop and match exact independently approved HEAD/base,
   clean checkout, empty findings and successful required validation before merge.
   No force/auto-merge, direct develop push, main, release or deployment. An unavailable

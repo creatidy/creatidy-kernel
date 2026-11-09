@@ -272,6 +272,15 @@ empty findings, clean checkout, successful required `make check` and `make packa
 and target develop. A changed HEAD/base invalidates APPROVE: return to FINISH with
 the SAME counter (or terminate at the bound); never merge stale approval.
 
+Classify the delivery before merge as complete or partial, using the current selected
+issue and owner authority, not the PR alone. A complete delivery satisfies every issue
+acceptance criterion. A partial delivery has an explicitly bounded, independently
+useful scope permitted by existing owner authorization or accepted issue scope; every
+acceptance criterion applicable to that scope must be satisfied. Record the exact
+scope, evidence, unmet requirements and dependencies. Partial delivery does not bypass
+SELECT, issue eligibility, prerequisites, exclusion, reconciliation or any review and
+merge gate. Neither an open PR nor the partial classification selects an ineligible issue.
+
 Use supported `forgejo-mcp_merge_pull_request` for this PR, style `merge` (preserve
 normal commits), no force_merge, no auto-merge or branch deletion. Respect protection
 and server checks. Unavailable supported merge operation is BLOCKED only after
@@ -285,13 +294,22 @@ state before any diagnosed retry; do not blindly repeat an effectful merge.
 After merge fetch MCP PR metadata and canonical develop. Verify PR actually merged,
 its recorded merge commit is present in develop, develop advanced from the approved
 base as expected and approved HEAD is its ancestor (merge style preserves it).
-Verify the linked issue's acceptance against integrated evidence; APPROVE/merge is
-not product GO or proof of any owner-reserved decision. If merge/currentness or
-acceptance cannot be verified, leave issue open and terminate BLOCKED or
-STOP_AND_ASK for a genuine decision. Do not continue the queue with incomplete work.
+Verify the linked issue's acceptance against integrated evidence, distinguishing the
+bounded partial scope from full issue acceptance; APPROVE/merge is not product GO or
+proof of any owner-reserved decision. If merge/currentness or the applicable delivery
+acceptance cannot be verified, leave issue open and terminate BLOCKED or STOP_AND_ASK
+for a genuine decision. Do not continue the queue with an unverified delivery.
 
-Only after verified merge AND acceptance, post issue completion evidence and use
-`forgejo-mcp_issue_state_change` to close that issue when appropriate; verify actual
+For an accepted partial delivery with full issue acceptance still unmet, post exact
+integrated scope/evidence and the outstanding requirements and dependencies on the
+issue; verify the issue remains OPEN. Do not close it, claim full acceptance, product
+GO, dependency satisfaction or authority to begin downstream work. Reporting/state
+verification failure is BLOCKED. An already integrated partial PR is evidence only,
+not authority to reselect or redeliver it; subsequent work still follows fresh SELECT,
+eligibility, explicit dependencies and any owner-deferred decision.
+
+For a complete delivery, only after verified merge AND acceptance, post issue completion
+evidence and use `forgejo-mcp_issue_state_change` to close that issue when appropriate; verify actual
 closed state. Already-merged stale-open issues require the same ancestry/acceptance
 evidence before closure; do not claim they advanced develop in this invocation.
 Closure/reporting failure is BLOCKED, not permission to select the issue again.

@@ -62,7 +62,10 @@
   Forgejo, create one PR to `develop` via MCP and post a concise issue update.
 - Standalone implementation/finish/review never merge or auto-merge. Only explicit
   `/loop` authorizes the supported Forgejo PR merge to develop after fresh exact
-  approval/currentness gates, verified integrated acceptance then issue closure.
+  approval/currentness gates. Complete delivery requires verified integrated issue
+  acceptance before closure. An authorized, independently useful bounded partial
+  delivery keeps the issue open while full acceptance is unmet, records outstanding
+  requirements and dependencies, and never bypasses SELECT or dependency gates.
   Never direct-push develop, touch main, release, promote or deploy. Outside that
   completion gate keep the issue open at handoff; use `Refs #N`,
   not automatic closing keywords. Report issue/PR, base/head SHAs, validation and

@@ -29,7 +29,9 @@ and resumed reviewers do not. Every changed HEAD/base requires a fresh whole-PR 
 publication is optional, never orchestration state. No external controller exists.
 
 Only an explicit owner `/loop` invocation delegates autonomous selection and
-approved PR merge to develop/completed-issue closure. Its primary context is the
+approved PR merge to develop/completed-issue closure. An authorized bounded partial
+delivery may be integrated under its existing gates without closing an incompletely
+accepted parent issue or satisfying its dependencies. Its primary context is the
 sole orchestrator, reusing implement-issue/finish-pr and the unchanged reviewer.
 Read `.kilo/command/loop.md`: refresh all canonical open issues each cycle, exclude
 exact invalid/wontfix/duplicate labels case-insensitively, verify explicit gates,
