@@ -39,6 +39,9 @@
 - `/finish-pr` records each reviewed HEAD/base/verdict, normal remediation commits,
   regression/check results and final currentness. Only an exact matching native
   reviewer result plus a final MCP currentness check can yield READY_TO_MERGE.
+- `/loop` verifies integrated acceptance for the exact delivery scope. A partial
+  delivery records its remaining issue requirements/dependencies and leaves the issue
+  open until full acceptance; it does not itself satisfy dependency gates.
 - Reviewer tool/runtime/environment/dependency/public-source problems are not
   automatic owner decisions or implementation findings. Diagnose and try a bounded
   materially different authorized method while preserving exact HEAD, full independent

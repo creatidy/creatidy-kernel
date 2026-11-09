@@ -538,7 +538,7 @@ class WorkflowContractTests(unittest.TestCase):
             "recorded merge commit is present in develop",
             "approved HEAD is its ancestor",
             "Verify the linked issue's acceptance against integrated evidence",
-            "Only after verified merge AND acceptance",
+            "only after verified merge AND acceptance",
             "`forgejo-mcp_issue_state_change`",
             "verify actual closed state",
             "Already-merged stale-open issues require the same ancestry/acceptance evidence",
@@ -546,6 +546,27 @@ class WorkflowContractTests(unittest.TestCase):
             "return this SAME checkout to current develop",
             "only fast-forward a nondivergent local develop",
             "Then SELECT again with a fresh canonical queue",
+        ):
+            self.assertIn(requirement, complete)
+
+    def test_partial_delivery_preserves_full_acceptance_and_existing_gates(self) -> None:
+        loop = text(".kilo/command/loop.md")
+        merge = loop.split("## MERGE", 1)[1].split("## COMPLETE", 1)[0]
+        complete = loop.split("## COMPLETE", 1)[1].split("## Terminal Reporting", 1)[0]
+        for requirement in (
+            "explicitly bounded, independently useful scope",
+            "existing owner authorization or accepted issue scope",
+            "every acceptance criterion applicable to that scope must be satisfied",
+            "Partial delivery does not bypass SELECT, issue eligibility, prerequisites, exclusion, reconciliation",
+            "Neither an open PR nor the partial classification selects an ineligible issue",
+        ):
+            self.assertIn(requirement, merge)
+        for requirement in (
+            "verify the issue remains OPEN",
+            "Do not close it, claim full acceptance, product GO, dependency satisfaction",
+            "authority to begin downstream work",
+            "Reporting/state verification failure is BLOCKED",
+            "not authority to reselect or redeliver it",
         ):
             self.assertIn(requirement, complete)
 
