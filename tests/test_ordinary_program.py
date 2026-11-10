@@ -719,6 +719,7 @@ def test_interrupted_preparation_retains_claim_and_unknown_bytes(
 
 
 @pytest.mark.parametrize("mode", ["pull", "managed", "mixed"])
+@pytest.mark.serial_native
 def test_ordinary_two_obligation_program_with_real_native_cold_review(sqlite_tmp_path: Path, mode: str) -> None:
     binary = os.environ.get("CREATIDY_KILO_NATIVE_TEST_BINARY")
     if not binary:

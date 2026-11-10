@@ -17,7 +17,9 @@ check:
 	uv run --locked ruff check .
 	uv run --locked basedpyright
 	uv run --locked lint-imports
-	uv run --locked pytest
+	# Native proofs use host-global process and container state; do not overlap phases.
+	uv run --locked pytest -n 2 -m 'not serial_native'
+	uv run --locked pytest -m serial_native
 	uv run --locked python tools/check_secrets.py
 	git diff --check
 
