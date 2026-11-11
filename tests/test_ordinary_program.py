@@ -559,6 +559,12 @@ def test_installed_client_reads_large_proposal_across_connections(sqlite_tmp_pat
     ) == {"status": "read", "native_sends": 0}
 
 
+def test_installed_client_replays_legacy_approval_without_granting_new_authority(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "installed-legacy-approval", None, mode="pull", exercise="served-legacy-installed-client"
+    ) == {"status": "historical", "native_sends": 0}
+
+
 def test_owner_approval_rechecks_absence_after_external_validation(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(
         sqlite_tmp_path / "approve-revision-race", None, mode="pull", exercise="approve-revision-race"

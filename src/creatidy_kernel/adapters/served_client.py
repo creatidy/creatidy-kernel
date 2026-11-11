@@ -182,11 +182,10 @@ def main(argv: list[str] | None = None) -> int:
             or args.decision_id is None
             or args.expires_at is None
             or args.proposal_digest is None
-            or args.scope_digest is None
         ):
             parser.error(
                 "approve requires --command-id, --expected-revision, --decision-id, --expires-at, "
-                "--proposal-digest and --scope-digest"
+                "and --proposal-digest"
             )
         if any(
             value is not None
@@ -200,9 +199,10 @@ def main(argv: list[str] | None = None) -> int:
                 "decision_id": args.decision_id,
                 "expires_at": args.expires_at,
                 "proposal_digest": args.proposal_digest,
-                "scope_digest": args.scope_digest,
             }
         )
+        if args.scope_digest is not None:
+            request["scope_digest"] = args.scope_digest
     elif args.action == "reconcile":
         if args.command_id is None or args.expected_revision is None or args.subject is None or args.evidence is None:
             parser.error("reconcile requires --command-id, --expected-revision, --subject and --evidence")

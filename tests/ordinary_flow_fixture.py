@@ -872,6 +872,109 @@ print("Done")
                 read_chunk(8192, expected, refused=True)
                 proposal_binding.revoke()
                 return {"status": "read", "native_sends": 0}
+            if exercise == "served-legacy-installed-client":
+                binding = LocalOwnerSession(OwnerProjection(store, "everyday-program"), app, None, proposal=proposal)
+                expires = int(time.time()) + 900
+                request = {
+                    "version": 1,
+                    "action": "approve",
+                    "command_id": "legacy-command",
+                    "expected_revision": -1,
+                    "decision_id": "legacy-decision",
+                    "expires_at": expires,
+                    "proposal_digest": proposal.digest,
+                }
+                operation_id = command_prefix("everyday-program") + digest(encode(["owner", "legacy-command"]))
+
+                def invoke(*, refused: bool) -> dict[str, object]:
+                    owner_socket, owner_client = socket.socketpair()
+                    with owner_socket, owner_client:
+                        channel = binding.attach(owner_socket)
+                        process = subprocess.Popen(  # noqa: S603 - Fixed client and synthetic descriptor.
+                            [
+                                sys.executable,
+                                "-I",
+                                "-m",
+                                "creatidy_kernel.adapters.served_client",
+                                "--fd",
+                                str(owner_client.fileno()),
+                                "approve",
+                                "--command-id",
+                                "legacy-command",
+                                "--expected-revision",
+                                "-1",
+                                "--decision-id",
+                                "legacy-decision",
+                                "--expires-at",
+                                str(expires),
+                                "--proposal-digest",
+                                proposal.digest,
+                            ],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            pass_fds=(owner_client.fileno(),),
+                            env={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                        )
+                        try:
+                            assert select.select([owner_socket], [], [], 10)[0]
+                            if refused:
+                                try:
+                                    channel.serve_once()
+                                except LocalChannelRefused:
+                                    pass
+                                else:
+                                    raise AssertionError("unrecorded legacy approval was accepted")
+                            else:
+                                channel.serve_once()
+                            stdout, stderr = process.communicate(timeout=10)
+                            if refused:
+                                assert process.returncode != 0 and not stdout
+                                return {}
+                            assert process.returncode == 0, stderr.decode(errors="replace")
+                            return cast(dict[str, object], json.loads(stdout)["result"])
+                        finally:
+                            if process.poll() is None:
+                                process.kill()
+                                process.wait(timeout=10)
+                            binding.detach(channel)
+
+                before = (store.history("everyday-program"), store.operations())
+                invoke(refused=True)
+                assert (store.history("everyday-program"), store.operations()) == before
+                assert store.find_operation(operation_id) is None
+                assert store.find_program("everyday-program") is None
+                assert store.find_artifact("ordinary-program:approval:legacy-decision", "record") is None
+                store.intent(
+                    operation_id,
+                    operation_id,
+                    {
+                        **request,
+                        "scope": "everyday-program",
+                        "actor": "owner",
+                        "proposal": proposal.digest,
+                        "policy": app.policy.digest,
+                    },
+                )
+                receipt = {
+                    "version": 1,
+                    "status": "approved",
+                    "decision_id": "legacy-decision",
+                    "spec_digest": "historical",
+                    "expires_at": expires,
+                    "authority": "historical-only",
+                }
+                receipt_bytes = encode(receipt)
+                store.finalize_artifact(operation_id, "receipt", receipt_bytes)
+                app.policy = replace(app.policy, paths=app.policy.paths | {"other.py"})
+                before = (store.history("everyday-program"), store.operations())
+                assert invoke(refused=False) == receipt
+                assert (store.history("everyday-program"), store.operations()) == before
+                assert store.artifact(operation_id, "receipt") == receipt_bytes
+                assert store.find_program("everyday-program") is None
+                assert store.find_artifact("ordinary-program:approval:legacy-decision", "record") is None
+                binding.revoke()
+                return {"status": "historical", "native_sends": 0}
             if exercise in {"served-host-receipts", "served-host-process-create"}:
                 binding = LocalOwnerSession(OwnerProjection(store, "everyday-program"), app, None, proposal=proposal)
                 script = (
