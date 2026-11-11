@@ -835,6 +835,18 @@ print("Done")
                 assert finish(replay, path) == {"status": "unknown", "settlement": "unknown"}
                 assert store.load("everyday-program").revision == revision
                 binding.revoke()
+                replacement = replace(proposal, objective="A different host-bound proposal")
+                binding = LocalOwnerSession(
+                    OwnerProjection(store, "everyday-program"), app, approved, proposal=replacement
+                )
+                replay, path = spawn(approval_request)
+                assert finish(replay, path) == receipt
+                replay, path = spawn(unknown_request)
+                assert finish(replay, path) == {"status": "unknown", "settlement": "unknown"}
+                changed, path = spawn({**approval_request, "decision_id": "other-decision"})
+                assert finish(changed, path, refused=True) == {"error": True}
+                assert store.load("everyday-program").revision == revision
+                binding.revoke()
                 store.close()
                 store = owners.enter_context(SQLiteProgramStore(root / "state.db", boot_clock=boot_clock))
                 app.store = store

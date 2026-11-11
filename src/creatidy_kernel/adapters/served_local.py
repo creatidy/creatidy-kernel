@@ -931,7 +931,7 @@ class LocalOwnerChannel(LocalReadChannel):
         return result
 
     def _approve(self, request: dict[str, object]) -> object:
-        if self._proposal is None or set(request) != {
+        if set(request) != {
             "version",
             "action",
             "command_id",
@@ -941,7 +941,6 @@ class LocalOwnerChannel(LocalReadChannel):
             "proposal_digest",
         }:
             raise LocalChannelRefused("a host-bound proposal and exact approval request are required")
-        proposal = self._proposal
         command_id, revision, decision_id, expires_at, proposal_digest = (
             request["command_id"],
             request["expected_revision"],
@@ -961,8 +960,8 @@ class LocalOwnerChannel(LocalReadChannel):
             or type(expires_at) is not int
             or expires_at < 1
             or type(proposal_digest) is not str
-            or proposal_digest != proposal.digest
-            or proposal.program_id != self._owner.scope
+            or len(proposal_digest) != 64
+            or any(character not in "0123456789abcdef" for character in proposal_digest)
         ):
             raise LocalChannelRefused("invalid approval request")
         store = self._application.store
@@ -994,6 +993,9 @@ class LocalOwnerChannel(LocalReadChannel):
             ):
                 raise LocalChannelRefused("recorded approval receipt is invalid")
             return result
+        proposal = self._proposal
+        if proposal is None or proposal.program_id != self._owner.scope or proposal.digest != proposal_digest:
+            raise LocalChannelRefused("reviewed proposal is no longer bound")
         current = store.find_program(self._owner.scope)
         if (-1 if current is None else current.revision) != revision:
             raise LocalChannelRefused("caller expected revision is stale")
