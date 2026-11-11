@@ -17,6 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory, ExitStack() as cleanup:
     started = time.perf_counter()
+    affinity = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+    quota_path = Path("/sys/fs/cgroup/cpu.max")
+    quota = quota_path.read_text(encoding="ascii").strip() if quota_path.is_file() else "unavailable"
+    print(f"Package test runner CPU affinity: {affinity}; cgroup CPU quota: {quota}", flush=True)
     work = Path(directory)
     dist = work / "dist"
     build = ["uv", "build", "--no-sources", "--no-build-isolation", "--python", sys.executable]
@@ -177,7 +181,9 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
             "-p",
             "xdist.plugin",
             "-n",
-            "4",
+            "8",
+            "--dist",
+            "worksteal",
             "-m",
             "not serial_native",
             str(ROOT / "tests"),
