@@ -765,6 +765,90 @@ print("Done")
                     channel.serve_once()
                     assert json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]["status"] == "approved"
                 return {"status": "read", "native_sends": 0}
+            if exercise == "served-large-installed-client":
+                large = app.propose("everyday-program", ('ż"\\' * 120_000), selections)
+                proposal_binding = LocalOwnerSession(
+                    OwnerProjection(store, "everyday-program"), app, None, proposal=large
+                )
+                before = (store.history("everyday-program"), store.operations())
+
+                def read_chunk(offset: int, identity: str | None, *, refused: bool = False) -> dict[str, object]:
+                    owner_socket, owner_client = socket.socketpair()
+                    with owner_socket, owner_client:
+                        channel = proposal_binding.attach(owner_socket)
+                        args = ["proposal-chunk", "--offset", str(offset)]
+                        if identity is not None:
+                            args += ["--proposal-digest", identity]
+                        process = subprocess.Popen(  # noqa: S603 - Fixed installed client and synthetic descriptor.
+                            [
+                                sys.executable,
+                                "-I",
+                                "-m",
+                                "creatidy_kernel.adapters.served_client",
+                                "--fd",
+                                str(owner_client.fileno()),
+                                *args,
+                            ],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            pass_fds=(owner_client.fileno(),),
+                            env={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                        )
+                        try:
+                            assert select.select([owner_socket], [], [], 10)[0]
+                            if refused:
+                                try:
+                                    channel.serve_once()
+                                except LocalChannelRefused:
+                                    pass
+                                else:
+                                    raise AssertionError("changed proposal accepted continuation")
+                                stdout, _ = process.communicate(timeout=10)
+                                assert process.returncode != 0 and not stdout
+                                return {}
+                            channel.serve_once()
+                            stdout, stderr = process.communicate(timeout=10)
+                            assert process.returncode == 0, stderr.decode(errors="replace")
+                            return cast(dict[str, object], json.loads(stdout)["result"])
+                        finally:
+                            if process.poll() is None:
+                                process.kill()
+                                process.wait(timeout=10)
+                            proposal_binding.detach(channel)
+
+                assembled = bytearray()
+                expected: str | None = None
+                total: int | None = None
+                with (
+                    patch("creatidy_kernel.adapters.served_local.encode", wraps=encode) as serializations,
+                    patch("creatidy_kernel.adapters.served_local.digest", wraps=digest) as hashes,
+                ):
+                    while total is None or len(assembled) < total:
+                        offset = len(assembled)
+                        part = read_chunk(offset, expected)
+                        if expected is None:
+                            expected = cast(str, part["digest"])
+                            total = cast(int, part["bytes"])
+                            assert total > 1024 * 1024
+                        assert part["digest"] == expected and part["bytes"] == total and part["offset"] == offset
+                        assembled.extend(base64.b64decode(cast(str, part["data_base64"]), validate=True))
+                        assert part["complete"] == (len(assembled) == total)
+                    proposal_encodes = [
+                        call
+                        for call in serializations.call_args_list
+                        if isinstance(call.args[0], dict)
+                        and cast(dict[str, object], call.args[0]).get("kind") == "ordinary-program-proposal"
+                    ]
+                    assert len(proposal_encodes) == 1
+                    assert sum(1 for call in hashes.call_args_list if len(call.args[0]) > 1024 * 1024) == 1
+                assert len(assembled) == total and digest(bytes(assembled)) == expected
+                assert bytes(assembled) == encode(large.payload)
+                assert (store.history("everyday-program"), store.operations()) == before
+                setattr(proposal_binding, "_proposal", replace(large, objective="changed"))  # noqa: B010
+                read_chunk(8192, expected, refused=True)
+                proposal_binding.revoke()
+                return {"status": "read", "native_sends": 0}
             if exercise in {"served-host-receipts", "served-host-process-create"}:
                 binding = LocalOwnerSession(OwnerProjection(store, "everyday-program"), app, None, proposal=proposal)
                 script = (

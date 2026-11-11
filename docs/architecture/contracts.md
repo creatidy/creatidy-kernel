@@ -96,7 +96,9 @@ owner-only `proposal-chunk --offset 0` returns the first 8192 canonical JSON byt
 using the returned digest and next byte offset; a changed proposal or invalid offset refuses. Clients
 must assemble contiguous bytes, verify the reported total and SHA-256, and decode the entire JSON before
 presenting it for approval. Each frame is bounded; aggregate size and processing are not bounded by this
-protocol. These are reads, not approval.
+protocol. The owner session retains one canonical byte snapshot and digest per bound immutable proposal,
+reusing it across channel attachments; replacement invalidates it and revocation discards it. The snapshot
+uses memory proportional to proposal size for the session lifetime. These are reads, not approval.
 The installed client uses `proposal` before `approve --proposal-digest <digest>`; the digest is an
 identity, not an authorization credential. The owner capability accepts `approve`, `reconcile`,
 `start-managed` and `stop`. Mutations require a command ID and caller-observed expected Program revision

@@ -553,6 +553,12 @@ def test_large_proposal_is_read_in_exact_bounded_chunks(sqlite_tmp_path: Path) -
     }
 
 
+def test_installed_client_reads_large_proposal_across_connections(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "installed-large-proposal", None, mode="pull", exercise="served-large-installed-client"
+    ) == {"status": "read", "native_sends": 0}
+
+
 def test_owner_approval_rechecks_absence_after_external_validation(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(
         sqlite_tmp_path / "approve-revision-race", None, mode="pull", exercise="approve-revision-race"

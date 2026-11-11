@@ -17,8 +17,17 @@ run_ordinary_flow = cast(Callable[..., dict[str, object]], import_module("ordina
 
 if Path(creatidy_kernel.__file__).resolve().is_relative_to(ROOT):
     raise SystemExit("Ordinary fixture imported source instead of the installed wheel")
-if len(sys.argv) != 3 or sys.argv[2] != "--preparation-only":
-    raise SystemExit("Expected a directory and --preparation-only")
+if len(sys.argv) != 3 or sys.argv[2] not in {"--preparation-only", "--proposal-chunks-only"}:
+    raise SystemExit("Expected a directory and --preparation-only or --proposal-chunks-only")
+
+if sys.argv[2] == "--proposal-chunks-only":
+    result = run_ordinary_flow(
+        Path(sys.argv[1]) / "proposal-chunks", None, mode="pull", exercise="served-large-installed-client"
+    )
+    if result != {"status": "read", "native_sends": 0}:
+        raise SystemExit("Installed large proposal client journey failed")
+    print("Installed large proposal client journey passed.")
+    raise SystemExit(0)
 
 result = run_ordinary_flow(Path(sys.argv[1]) / "pull-normal", None, mode="pull", exercise="normal")
 if result["status"] != "completed" or result["satisfactions"] != 2 or result["native_sends"] != 4:

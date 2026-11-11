@@ -715,12 +715,14 @@ class LocalOwnerChannel(LocalReadChannel):
         handoff: OrdinaryHandoff | None = None,
         managed: OrdinaryManagedRun | None = None,
         approval_binding: list[OrdinaryApproval | None] | None = None,
+        proposal_cache: list[tuple[OrdinaryProposal, bytes, str]] | None = None,
     ) -> None:
         _validate_owner_binding(owner, application, approved, proposal, control, handoff, managed)
         super().__init__(owner, channel)
         self._application = application
         self._approval_binding = [approved] if approval_binding is None else approval_binding
         self._proposal = proposal
+        self._proposal_cache = [] if proposal_cache is None else proposal_cache
         self._control, self._handoff = control, handoff
         self._managed = managed
 
@@ -745,8 +747,10 @@ class LocalOwnerChannel(LocalReadChannel):
             offset, expected = request["offset"], request["proposal_digest"]
             if proposal.program_id != self._owner.scope or type(offset) is not int or offset < 0:
                 raise LocalChannelRefused("invalid proposal chunk request")
-            raw = encode(proposal.payload)
-            identity = digest(raw)
+            if not self._proposal_cache or self._proposal_cache[0][0] is not proposal:
+                raw = encode(proposal.payload)
+                self._proposal_cache[:] = [(proposal, raw, digest(raw))]
+            _, raw, identity = self._proposal_cache[0]
             if offset > len(raw) or (expected != identity and not (offset == 0 and expected is None)):
                 raise LocalChannelRefused("proposal changed or chunk offset invalid")
             chunk = raw[offset : offset + 8192]
@@ -1055,6 +1059,7 @@ class LocalOwnerSession:
         self._owner, self._application = owner, application
         self._approval_binding: list[OrdinaryApproval | None] = [approved]
         self._proposal, self._control, self._handoff, self._managed = proposal, control, handoff, managed
+        self._proposal_cache: list[tuple[OrdinaryProposal, bytes, str]] = []
         self._channels: list[LocalOwnerChannel] = []
         self._revoked = False
 
@@ -1075,6 +1080,7 @@ class LocalOwnerSession:
             handoff=self._handoff,
             managed=self._managed,
             approval_binding=self._approval_binding,
+            proposal_cache=self._proposal_cache,
         )
         self._channels.append(result)
         return result
@@ -1088,5 +1094,6 @@ class LocalOwnerSession:
     def revoke(self) -> None:
         """Revoke communication only; this does not cancel or settle the work."""
         self._revoked = True
+        self._proposal_cache.clear()
         for channel in self._channels:
             channel.revoke()
