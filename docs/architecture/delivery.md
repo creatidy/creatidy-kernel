@@ -36,7 +36,7 @@ same-repository jobs. Push validation runs maintainer-controlled source. Checkou
 persisted Git credentials but does not prove token denial to subprocesses. The source tests check
 triggers, pins and absence of configured secret references, not deployed credential containment.
 
-The local gate checks formatting, lint/security rules, strict basedpyright, inward imports, synthetic
+The repository gate checks formatting, lint/security rules, strict basedpyright, inward imports, synthetic
 unit/boundary tests, license/metadata and documentation-link hygiene, plus detect-secrets without
 remote credential verification. The scanner selects Git-visible tracked/untracked source files and
 does not walk ignored local state. Package validation builds wheel/sdist, compares rebuilt package

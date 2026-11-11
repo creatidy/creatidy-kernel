@@ -2,6 +2,14 @@
 
 <!-- Adapted from Model Intelligence for Kernel identity and issue-quality rules; see NOTICE. -->
 
+- Start each major issue in a new primary Kilo session. Use one active primary
+  continuation per delivery; do not duplicate or overlap continuations, or schedule
+  delayed/background primary continuation while review or mutation may be active.
+  If continuation is necessary, terminate the previous invocation first and identify
+  the next turn as a continuation. Start the next major issue in a new session.
+- Run independent reviews sequentially as foreground tasks, awaiting each result
+  before mutation or another review. Preserve all review ordinals across sessions.
+  These are operating rules, not a runtime-enforced mutex.
 - Outside an explicit owner `/loop`, start implementation only when Adrian selects one Forgejo issue by
   number, URL or unambiguous title. Fetch the actual issue via MCP before planning
   or editing. Summarize title, goal, scope, acceptance criteria, constraints, links
@@ -32,6 +40,10 @@
   Preserve STOP_REVISE dispositions; an open PR cannot authorize restarting them.
   No issue registration is authorized merely to keep `/loop` running.
 - Before substantive delivery, apply loop.md's post-selection eligibility revalidation.
+  A complete issue requires all full-acceptance prerequisites; an explicitly authorized,
+  independently useful partial scope requires its own identified, canonically verified
+  prerequisites. Unmet unrelated parent prerequisites remain binding for full acceptance
+  but do not alone gate that partial scope; unknown applicability is UNVERIFIED.
   A freshly proven missing prerequisite/producer/contract makes an untouched issue
   temporarily ineligible: retain history/counters, keep it open, safely return to
   clean develop and rebuild the full canonical queue; continue SELECT nonterminally.
@@ -54,7 +66,10 @@
   Forgejo, create one PR to `develop` via MCP and post a concise issue update.
 - Standalone implementation/finish/review never merge or auto-merge. Only explicit
   `/loop` authorizes the supported Forgejo PR merge to develop after fresh exact
-  approval/currentness gates, verified integrated acceptance then issue closure.
+  approval/currentness gates. Complete delivery requires verified integrated issue
+  acceptance before closure. An authorized, independently useful bounded partial
+  delivery keeps the issue open while full acceptance is unmet, records outstanding
+  requirements and dependencies, and never bypasses SELECT or dependency gates.
   Never direct-push develop, touch main, release, promote or deploy. Outside that
   completion gate keep the issue open at handoff; use `Refs #N`,
   not automatic closing keywords. Report issue/PR, base/head SHAs, validation and

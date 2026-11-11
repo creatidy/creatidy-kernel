@@ -13,6 +13,246 @@ and missing receipts are in the [coverage roadmap](successor.md), governed by
 [ADR 0007](../adr/0007-shared-harness-routing-observability.md). Ports use core-owned values;
 unsupported requirements must fail closed, not through weaker fallbacks.
 
+## Local Owner-Served Contract
+
+The version-1 local contract is implemented by `ports.served.OwnerProjection` and
+`adapters.served_local`. The trusted host owns the existing exclusive SQLite connection and must call
+the handler on that same owning thread. The observer never opens the database or changes an Attempt,
+dispatches work, renews a lease or grants authority. A snapshot contains the Program revision/spec,
+work-unit and Attempt facts, recorded budget revocation, exact reservation/Operation correlations and
+per-Program served-command receipt coverage. Command history is a deterministic sample of at most 64
+records, with `(sampled, total, complete)` coverage; when incomplete there is no history continuation
+API, but a caller can replay a known exact command ID to read its own historical receipt. It is not a
+complete event log. Route identity and physical settlement remain explicitly
+unknown where no producer supplies them. Claim generation, recorded proof stages, quarantine, release,
+recorded workspace subject and recorded reconciliation need are journal facts, not a fresh
+filesystem scan, current lease guarantee or physical-settlement assertion. When multiple subjects were
+observed, the legacy journal cannot establish their last visit, so these fields are unknown. Recorded
+workspace, candidate and runtime identifiers and review dispositions are correlated to their Attempt;
+absent evidence remains unknown. Decision applicability is `pending`, `historical` or `unknown` based
+on the current Program, WorkUnit and Attempt specification; resolved or superseded decisions remain
+in history but do not generate new action-required alerts. Usage values are grouped by metric, unit and provenance as known
+subtotals; unreported work remains unknown and is never counted as zero.
+
+The status includes the original task deadline, original claim expiry and latest recorded renewal
+horizon. Its clock sample is explicitly uncommitted and display-only: `not-expired-observed` is not
+authorization, and dispatch always repeats the producer's durable clock, budget and claim checks.
+Unverifiable clocks yield `unknown`; expiration or revocation suggests reconciliation or STOP, never
+claims physical settlement, and observing status does not renew or persist a clock sample.
+
+Progress positions contain an ephemeral producer epoch, Program scope and monotonically increasing
+sequence. The bounded buffer is an observation hint, **not a durable global event log**. Because a
+snapshot sampler cannot prove it observed every intermediate mutation, a detected state change emits a
+`resync-required` hint with `gap=true`; restart, wrong producer/scope, future position and buffer
+overflow also require a fresh snapshot. Reads and reconnects cannot dispatch or renew. Positions from
+Forgejo pagination or native runtime notifications are not interchangeable with this producer position.
+While command coverage is incomplete, event reads continue to report a gap because the sampled history
+cannot prove it observed changes to omitted receipts.
+Snapshot collections are returned in pages of at most eight records each, with per-collection
+`(offset, total, at_end)` coverage. Request `snapshot --page N` and compare the producer position
+across pages; if it changes, restart from a fresh snapshot. While any collection exceeds the first
+page, event reads also report a gap. Records exceeding 4096 encoded bytes appear as a digest, byte
+count and index rather than inflating the frame; `record` reads their canonical JSON in 8192-byte
+base64 chunks, qualified by the exact producer position, collection and index. A changed position
+refuses the detail request. All of these reads preserve durable authority.
+The position conservatively incorporates SQLite's owning-connection and external change counters
+across every page, so unrelated database writes can also require resynchronization. A clock sample's
+exact display timestamp is not part of the durable cut; changes in task or claim expiry classifications
+do advance the position.
+Program IDs are not shortened in storage. IDs whose encoded representation exceeds 4096 bytes use
+a SHA-256 scope reference in the cursor and an oversized marker in the wire snapshot; the exact ID is
+recoverable through the position-qualified `record` operation with collection `scope` and index zero.
+
+The host creates an already-connected local `socket.socketpair()` and binds one endpoint to a
+`LocalReadChannel`, `LocalWorkerSession` or `LocalOwnerSession`; it passes only the peer descriptor to
+`creatidy-kernel-client` (`--fd N`). The host must service `serve_once()` on the SQLite owner thread
+after the descriptor becomes readable, then detach one-shot channels. Separate worker and owner
+capabilities are bound to their existing trusted `OrdinaryWorkClient` or `OrdinaryProgram` objects; a
+wire payload cannot select a `Principal`, policy, provider credential, outbox fence or review verdict.
+Closing/revoking a descriptor revokes communication only, not task authority or physical settlement.
+
+For optional local alerts the host may bind a connected `AF_UNIX` datagram endpoint to
+`LocalDecisionNotifier` and supply it to a `LocalWorkerSession`. A completed served report publishes
+bounded `decision-required` hints without blocking and deduplicates each decision within that notifier's
+lifetime. Full, closed or unavailable endpoints set `dropped` rather than retrying work; after loss,
+restart, or reconnect the consumer must read the authoritative snapshot. The host may also call
+`publish(snapshot)` after other owner-thread changes; notifications exist only while the host services
+the session and are not a persistent service or remote notification guarantee.
+Uncertain product reviews are derived from the original review request, reservation, operation and
+receipt state, not from the transport receipt; resolving one does not issue another review prompt.
+An immutable earlier served `review_unknown` receipt remains historical after its exact original
+review operation is accepted with a recorded receipt; it does not create a second pending decision.
+
+Frames use a four-byte network-order length and UTF-8 JSON version1; input is bounded to64KiB and
+output to1MiB. Read actions are `snapshot` and `events`. The worker capability accepts `claim`,
+`context`, `start`, `quiesce`, `renew`, `submit` and `report`; `context` is bounded and uses the bound
+original claim's existing authorization and workspace-observation handler to supply the approved
+declaration, effective inputs and any original remediation findings. It is not a historical grant of
+authority and can be refused after expiry or revocation. The owner capability accepts `approve`, `reconcile`,
+`start-managed` and `stop`. Mutations require a command ID and caller-observed expected Program revision
+(`-1` means absent for initial approval). Trusted host composition binds an exact approved proposal,
+claim and managed target where applicable; the request cannot choose them. Exact duplicate command
+inputs return their original receipt as historical evidence, not renewed permission. If an intent
+exists but its outcome receipt is missing, the response is `unknown` and no automatic repeat occurs.
+Cooperative task-scope quiescence is never represented as managed process settlement; a STOP receipt
+can prove at most its one explicitly bound original managed target, not all effects or descendants.
+Worker `start` is limited to pull handoffs; a managed handoff can start only through the original owner's
+`start-managed` capability.
+Before a new managed start, the retained managed client's exact approval must match the session's
+current host-bound approval. An amendment does not retarget an old managed client. A matching historical
+start receipt remains readable without dispatching again, even if the shared approval subsequently changes.
+
+This descriptor capability assumes a trusted local host chooses and passes the correct endpoint; it
+is not remote authentication, a named service socket, hostile same-UID isolation or a grant to expose
+the store over a network. Authentication, caller admission/revocation, exposure/origin policy and
+credential-safe diagnostics must be received before any remote transport is enabled. The CLI does not
+create a controller, open SQLite or discover a capability by itself. Installed conformance exercises
+separate observer/worker/owner client processes against the existing owner, including stale revisions,
+role injection, duplicate commands and explicit gaps; it is not a Console UI or live-provider proof.
+
+### Supervisor-Launched Owner Backend
+
+`adapters.served_host.launch_owner` is a Linux-only supervisor SDK for a child backend, not a listener
+or attachment to an existing process. The trusted supervisor selects and authenticates an absolute
+executable and its arguments, supplies a deliberately restricted environment, and binds an existing
+`LocalOwnerSession` to the existing owner, approved proposal/work and exact Program scope. The SDK
+creates a Unix stream socketpair, attaches the owner end, and appends the numeric child descriptor as
+the last argument. Only that descriptor is passed; the supervisor closes its copy of the child end.
+`receive_owner` takes ownership of any integer descriptor numbered at least 3 even on refusal, including
+unsupported platforms and non-socket descriptors. It never consumes standard descriptors 0, 1 or 2.
+The backend must receive the descriptor, expected scope, producer label and recipient label from its trusted startup configuration and
+call `receive_owner` before using the version-1 served protocol. The fixed greeting identifies
+`creatidy-kernel-owner-descriptor-v1`, wire version 1, role owner, exact scope, and supervisor-configured
+producer and recipient labels; unknown versions, extra/duplicate fields and mismatches refuse. Labels are
+non-secret, bounded ASCII identifiers: the trusted supervisor must map each producer label to the intended
+actual Kernel composition and each recipient label to the intended backend, and independently configure
+the backend's expectations. Scope alone does not identify a producer. This checks the supervisor's
+configured pairing, not the actual database, executable, durable identity or cryptographic authentication.
+There is no durable SQLite producer ID: projection positions change with each construction, and filesystem
+ownership metadata does not authenticate a producer. Duplicate or incorrect label assignment, descriptor
+substitution, a forged greeting or a compromised supervisor defeats this check. Trust derives from the
+supervisor's correct selection and protected descriptor inheritance, not the labels. No hostile same-UID
+isolation is claimed.
+Owner session and channel construction additionally require the projection, application, bound ownership
+controller, and any managed workspace and managed worker/control bindings to reference the very same
+in-process store object. This prevents accidental cross-store composition even for equal Program scopes;
+it is not a durable database identity or authentication of the host's chosen store.
+
+The owner thread polls `launched.channel.fileno()` and calls `launched.serve_once()` when readable; it
+detaches the channel if serving fails, including EOF. The host must also call `launched.close()` in a
+`finally` when a child exits, a launch is replaced, or the host stops polling it; merely observing process
+exit or using `launched.channel.serve_once()` directly does not detach it. `close()`
+detaches and closes that channel, not the child process or task. Session revocation closes all attached
+channels; individual launch handles may still be detached afterward. Concurrent clients
+need separate launches and descriptors, subject to the session's 64-channel bound; requests are serialized
+by the owner thread. Revocation is serviced on that same thread, so it cannot preempt a command already
+being handled; that command's outcome must be recovered from its original producer evidence. Each served frame has existing bounded read limits; long-running underlying actions
+retain their own existing limits and uncertainty. A launch failure detaches the channel. There is no
+descriptor expiry or reconnect to an existing process: on backend restart launch a new child and channel;
+on Kernel/supervisor restart rebuild the original authorized owner composition and launch anew. Old
+channels cease communication when their owning process exits, but a surviving child may need separate
+supervisor cleanup. No channel closure cancels work, rolls back an effect, revokes task authority or proves
+settlement. The owner must separately invoke existing Kernel authority revocation and the existing
+command handlers recheck the applicable current authority; a historical receipt is not a renewed grant.
+When STOP has a bound managed target but its managed object has no retained handoff, it revokes work
+authority and records settlement as unknown. A missing in-memory handoff may reflect process loss; it
+does not establish that native work was never started or has physically settled.
+
+The descriptor is a bearer capability. Do not put it in URLs, browser storage, logs or diagnostics, or
+pass it to workers; child code must prevent further descriptor inheritance. The descriptor number is not
+a secret on its own, but command-line arguments and process metadata can expose startup details. Never
+pass credentials in arguments; the host must not inherit ambient credentials into the backend environment.
+There is no on-disk token or network transport. Socketpair inheritance protects against ordinary accidental
+endpoint discovery, not same-user inspection, descriptor theft, replay by a holder, compromised children,
+or a misconfigured supervisor launching the wrong executable. Browser input and login do not supply the
+host-bound principal, approval, proposal or target. Separate observer and worker session interfaces remain
+unchanged; this launch SDK provisions neither and cannot elevate them.
+Synthetic launch tests check that an unrelated inheritable descriptor and an omitted ambient environment
+value do not reach the backend, and that the received descriptor is non-inheritable across an ordinary
+worker exec. A trusted backend can still deliberately duplicate or explicitly pass its capability.
+
+Use the exact original command ID and inputs after a lost reply. Stored receipts are historical and
+per-Program snapshot coverage is bounded as described above; a missing receipt is not proof of nonexecution.
+An existing intent without a receipt remains unknown and must be reconciled against the original operation
+and producer evidence, not retried blindly. The existing per-command conflict and revision checks apply;
+no global exactly-once or physical-settlement guarantee follows. Snapshot positions and gaps remain
+producer-scoped and restart requires snapshot resynchronization.
+
+The repository's installed-wheel pytest phase includes `test_served_host.py` and the ordinary-program
+supervisor receipt test. These exercise synthetic separate child processes and the installed producer,
+including active channel closure, more than 64 refused replacements, producer-process death and event-gap
+resync, wrong scope/version/configured binding, concurrent duplicate approvals, dropped reply and a missing
+approval receipt. A separate synthetic ordinary-producer process test replays the original approval
+receipt and preserves a missing receipt as unknown after the original producer exits and a fresh producer
+reopens the store. Separate forced exits occur after the approval receipt commit and after another
+approval's intent commit, before their replies and first replay; the restarted test compares exact
+recorded command/receipt evidence and history/operations. It does not cover every command or crash point. This is
+not a consumer-owned Console conformance receipt or a live/hostile-local security proof. In particular,
+the test evidence does not cover every owner command across process or Kernel crash boundaries.
+
+## Private Outcome Export
+
+`export_private_outcome` reads one owner-thread Program cut from the existing durable store using the
+explicit `private-metadata-v1` policy. It exports a versioned local-only projection of Program/spec,
+WorkUnit, Attempt, claim, original Operation and delivery observations, exact-subject check and review
+evidence, satisfaction references, predecessor and remediation edges, and source-qualified usage
+observations including correction links. Recorded check/review freshness is not reevaluated during
+export, and a recorded PASS or APPROVE is conditional evidence, not causal model quality. Its references
+are HMAC pseudonyms; the default fresh key is discarded, so links remain valid only within that export.
+An owner may provide the same separately held 32-byte key when cross-export correlation is intended.
+The key is never put in the document; pseudonymization is not anonymization or sharing permission.
+
+Only enumerated non-content metric and unit labels are emitted verbatim. Other labels are represented
+by pseudonymous references with null labels, not guessed or silently changed. Reported, measured,
+estimated and owner-record provenance remain distinct. Known subtotals are separated by exact
+source/metric/unit/provenance; cross-source and complete totals, hidden external work, route/call identity and physical
+settlement remain unknown where no producer supplies them. Original source contents, prompts,
+free-form findings, workspace paths, native handles and raw identifiers are not emitted. Source rights
+are not established by provenance; no source content, upload, MI intake, third-party consent or Router
+learning authority is granted by local creation. Unsupported owner policies and invalid required
+producer records are refused; an unverifiable review receipt has no inferred verdict. A changing
+durable cut is refused rather than mixed.
+
+`command_results` contains one source-qualified historical record per reserved ordinary or bounded-task command operation, including
+its pseudonymous exact subject and owner, fence, typed result fields and independently qualified
+settlement witness. Missing or inconsistent result, owner, integrity or witness remains unknown;
+command completion is not a verification decision. Raw command arguments and output are excluded.
+Retained aggregate command Evidence is projected in `checks` and deduplicated with manifest evidence.
+`domain_cancellations` preserves WorkUnit and Attempt decision records separately from driver
+`cancellations`; their physical settlement remains unknown. `program_conclusions` preserves
+historical terminal observations across amendments, with original specification and record order.
+
+The projection retains the original deadline/boot projection, recorded work revocation, exact managed
+cancellation intent and any qualified original-target settlement evidence without asserting the current
+physical process state. A completed Program can retain its completion while remaining authority is
+revoked. Ordinary native publication and the reference PR driver retain pseudonymous original
+issue/repository, operation, acceptance and receipt lineage when producer records exist; a retained
+receipt is historical, not current Forge state. Finding IDs and fingerprints are pseudonymized and
+linked to the original review, rejection and remediation Attempt; finding prose is omitted.
+The bounded-task `task-pr-v1` publication uses its own original task/Program binding and the same
+historical-receipt rule. When an approving review is followed by an expired prerequisite, its approval
+is retained as historical review evidence without claiming the rejected candidate was accepted.
+An original bounded-task cancellation recorded before any Attempt is represented separately as
+pre-Attempt evidence; an absent runtime Operation does not fabricate an Attempt, runtime handle or
+proof about escaped descendants.
+Original candidate metadata, terminal candidate dispositions, standalone check results and retained
+verification manifests remain visible even if the controller stopped before accepting or rejecting the
+Attempt. A recorded missing check is unknown, not a passing result; overlapping standalone and
+manifest evidence is deduplicated while retaining both references. Candidate patch contents are never
+read into the export: their retained digest is reported as a recorded reference, not fresh content
+verification. The bounded-task candidate preserves its original task, base, tree and head from the
+task-bound journal. If its output artifact is not yet recorded, the candidate digest remains unknown;
+when it is recorded, the exported digest is reconstructed from that metadata and does not by itself
+prove the runtime candidate matched it. Independent reference and bounded-task cancellation intents and their original-handle,
+fence, transport, observation and owned-group settlement records remain historical evidence, including
+uncertainty and mismatched/unqualified observations; they are not redispatched or adopted as a current
+process or proof about escaped descendants.
+
+`write_private_outcome` publishes only this policy's result into an already-open owner-owned private
+directory using a new 0600 file and never replaces an existing name. A failure before publication may
+leave only a private temporary orphan; a failure after publication is uncertain and requires inspection,
+not automatic retry or deletion. It is local cooperative custody, not a hostile-same-user sandbox.
+
 ## Current Boundary Evidence
 
 This section's original cut is historical; #54/PR92 and #90/PR93 now provide bounded durable product
@@ -194,10 +434,12 @@ endpoints, flags or versions. Each producer owns its schema and executable produ
 - Separate harness control from model-backend ingress; validate exact harness/adapter/protocol/source
   versions and tool/stream/retry semantics. ACP client file/terminal execution needs its own proved
   permission boundary. Unsupported resume/recovery stays unknown or refused.
-- Persist Router's executable route before Attempt dispatch; keep main calls sticky, explicit user
+- For a separately evidenced route-enabled profile, persist Router's executable route before Attempt dispatch; keep main calls sticky, explicit user
   pin and separately authorized helper/review route evidence. Preserve provider/model/resource/access
   mode/explicit effort/opaque variant/harness versions and requested/resolved/observed gaps. No
   physical identity inference for plan-managed execution or effort inferred from variant.
+  This conditional contract is not a mandatory ordinary-work or #60 initial-acceptance capability;
+  #52 was retired wontfix without implementation. Unsupported or unknown strict profiles must refuse.
 - MI produces complete versioned knowledge with provenance/time/conflict/withdrawal semantics;
   Router admits/consumes it. Kernel retains actual utilized references, frozen evidence cut and
   evaluation semantics without ranking or granting authority. Missing publication cannot be invented

@@ -20,9 +20,8 @@ Ordinary feature development requires verified architecture/backlog alignment; t
 2026-10-27 mandate delegates that objective acceptance and subsequent normal `/loop` continuation.
 
 **Status: deterministic domain, durable persistence, bounded Forge and Codex Runtime adapters,
-an offline two-node CLI reference flow, bounded TaskSpec support for two frozen real
-tasks, and inert ordinary preparation/approval through a trusted local API, not a general
-autonomous Program engine.**
+an offline two-node CLI reference flow, bounded TaskSpec support for two frozen real tasks,
+and a trusted-local Forgejo ordinary Program SDK for cooperative pull and managed push.**
 The code includes immutable Program intent, legal domain commands, single-controller SQLite history
 and rebuildable projections, an external-operation journal/outbox with a synthetic effect seam and
 content-addressed artifacts, plus a replaceable resource allocator. Synthetic Runtime, Workspace and
@@ -90,11 +89,10 @@ Public dependencies may be reused; no private `creatidy-onprem` is required for 
 [ADR 0007](docs/adr/0007-shared-harness-routing-observability.md) records the owner's 2026-10-04
 shared-architecture direction and source availability. [The coverage roadmap](docs/architecture/successor.md)
 maps the accepted AC4 baseline separately from observed evidence and registered work still to prove.
-The current foundations and bounded intake are not evidence that ordinary execution, rich routing, gateway,
-product review, isolation, full costs or
-Console integration are complete. Durable synthetic-first product review/remediation is now integrated
-through #54/PR #92 and bounded cancellation settlement through #90/PR #93; ordinary/native full-path
-composition is still incomplete. No Creatidy cloud account is required by the target architecture.
+The trusted-local ordinary SDK composes durable Program execution and exact-subject product review with
+the existing bounded adapters. Synthetic installed journeys do not establish live provider, rich routing,
+gateway, hostile isolation, complete costs or Console integration. No Creatidy cloud account is required
+by the target architecture.
 
 ## Development Authority
 
@@ -125,14 +123,16 @@ Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). From a checkout:
 ```sh
 uv sync --locked
 uv run --locked python examples/fixed_allocation.py
-make check
-make package-check
+uv run --locked pytest tests/test_resources.py
 ```
 
 The example prints a configured allocation; it makes no model call or reservation. Tests need no
 Forgejo server, Scarcity Router, Prefect, M5-B or private Creatidy infrastructure. Dependency setup
 needs access to the configured package index unless already cached; the tests and example run offline.
 On systems without Make, the individual commands are listed in [CONTRIBUTING.md](CONTRIBUTING.md).
+The complete CI gates are `make check` and `make package-check`: native-sensitive tests run separately,
+and the remaining test suite runs once against the wheel rebuilt from the sdist. During development,
+run the focused tests relevant to the change rather than duplicating the full CI run locally.
 
 SQLite persistence tests require a verified native local Linux filesystem. They use pytest's temporary
 directory by default; if it is on a rejected filesystem, set `CREATIDY_TEST_STORAGE_DIR` to a
@@ -293,6 +293,13 @@ Secret management and deployment remain **operator-owned**: public Kernel neithe
 infrastructure nor stores deployment details; the optional generic SOPS profile adapter below covers
 only a user-supplied profile and the user's own SOPS key environment.
 
+For an explicitly authorized SOPS profile transition, `creatidy-kernel config migrate-sops --source
+/absolute/old.yaml --destination /absolute/new.json` rotates into a new encrypted JSON file without
+overwriting the source or destination. Rollback means selecting the unchanged original profile; retain
+its keys. SOPS and the original key are required, and external key services may involve network access.
+See [profile migration and recovery](docs/architecture/migration.md#platform-storage-and-profile-reception-g13)
+for prerequisites, failure handling and the limits of synthetic evidence.
+
 Runtime configuration describes executable infrastructure. `TaskSpec` separately owns repository,
 base branch, allowed paths, instructions and acceptance/verification authority. The parsed runtime
 binding constrains which Router recommendation can become an Allocation; its exact configured
@@ -398,7 +405,7 @@ atomically; review and publication reserve alongside their intents. Recovery ret
 counts and unknown work. Successful acceptance releases its logical work slot in the same transaction;
 STOP/expiry still requires the bounded cancellation path's exact witness, not a lease or turn status.
 The separate local work/resource handler below extends this with workspace/session fencing; the
-ordinary dispatcher remains #106. The independently configured #105 drivers are described below.
+ordinary SDK composes these boundaries; the independently configured drivers are described below.
 
 New delivery rechecks the original Attempt, applicable specification, WorkUnit state, immutable
 Operation binding and current observed resource headroom. Historical reservation/receipt replay is
@@ -470,11 +477,80 @@ explicit uncertain cleanup targets; receipt recovery never accepts a candidate o
 `task export` is a thin persisted task/Allocation/candidate/acceptance/PR summary, not the richer
 reference export or a task-integrated `core.outcomes` pipeline. It lacks full requested/resolved/observed
 identity, provenance, usage, review/remediation and cancellation history. A stored PR receipt is
-historical evidence, not current remote state. [#58](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/58)
-covers versioned private full-path outcome/cost export, preserving unknowns and causal limits.
-Current status/export open SQLite themselves and are not concurrent views of an active exclusive
-controller. [#57](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/57) owns the served
-snapshot/events/command/notification contract; no future API/flag is asserted here.
+historical evidence, not current remote state. The separate private outcome SDK below reads the
+owner's existing store rather than upgrading the `task export` contract. Current task status/export
+open SQLite themselves and are not concurrent views of an active exclusive controller. The served
+snapshot/events/command/notification contract is separate from both exports.
+
+## Ordinary Forgejo SDK
+
+The trusted host composes `ports.ordinary.OrdinaryProgram` and `OrdinaryWorkClient` with independently
+configured Forgejo discovery/dependency, intake, source, verification and product-review producers.
+The same durable Program, Attempt, claim and budget path serves cooperative pull and retained managed
+Codex handoff. The SDK exposes owner approval, worker request/start/report, exact candidate review and
+separately authorized Forgejo synchronization; native ticket state is not Kernel acceptance. This is
+not a remote API, a replacement coding agent or an automatic owner-approval mechanism.
+
+The host must supply an authenticated owner, delegated worker, finite original budget and deadline,
+trusted verification recipes, and a review profile with no inherited implementation context. Kilo
+review uses a fresh native session and validates the only prompt and returned receipt. Tests run actual
+installed handlers against synthetic Forgejo services; an optional pinned Kilo binary can exercise the
+real local session protocol with a deterministic local provider. These checks are not a live provider,
+billing, hostile-isolation or remote-deployment guarantee. Incomplete discovery, stale evidence, missing
+settlement, unsupported native conditional effects and unknown synchronization outcomes refuse rather
+than being interpreted as success.
+
+The original approved source is materialized only after the shared resource claim. Exact controller
+preparation has its own immutable schema-6 evidence; interrupted preparation and unrecognized workspace
+bytes remain retained and require reconciliation. Schema-5 readers refuse schema 6 before issuing work.
+`make package-check` exercises installed pull, managed and mixed two-obligation Programs, reopen,
+remediation, STOP and a lost Forgejo response without a duplicate send. The narrower `task run` command
+below remains limited to frozen TaskSpecs and is not the ordinary SDK.
+
+## Local Owner-Served State
+
+For a running trusted-local controller, construct `OwnerProjection` with its existing
+`SQLiteProgramStore` on the store-owning thread. The local version-1 client is
+`creatidy-kernel-client`: it reads `snapshot` or `events`, or uses a separately host-bound worker or
+owner capability for the documented ordinary commands. It never opens the active SQLite file.
+
+The host supplies a preconnected local descriptor, for example by creating a `socket.socketpair()`,
+binding the owner endpoint with `LocalWorkerSession.attach()`, passing the peer with
+`subprocess.Popen(..., pass_fds=(peer.fileno(),))`, calling `serve_once()` on the owner thread when
+the endpoint is readable, and then calling `detach()`. Owner and observer capabilities are distinct;
+the wire request cannot choose a principal, provider policy, review verdict or outbox fence. The CLI
+accepts only an already-passed `--fd`, not a network URL. See the [version-1 local contract](docs/architecture/contracts.md#local-owner-served-contract)
+for commands, expected revisions, gap handling and limitations.
+
+Progress is bounded, producer-scoped and lossy. A `gap` requires a new snapshot; it is not a durable
+global event log. Historical command receipts do not renew authority. Closing a client descriptor
+does not cancel an Attempt or prove physical settlement. The trusted host must authenticate and bind
+callers before passing a descriptor; this is not a remote authentication or hostile same-UID isolation
+scheme, and no remote listener is enabled by this contract.
+
+For a separately running backend launched by the trusted supervisor, the Linux-only
+`adapters.served_host.launch_owner` and `receive_owner` SDKs provide a version-checked inherited
+owner descriptor with supervisor-configured producer and recipient labels. Those labels are not durable or
+cryptographic identity. The supervisor still binds the exact existing owner session and services it on the
+SQLite owner thread. This is not attachment to an already-running backend, peer authentication or
+hostile same-UID isolation; see the [supervisor contract](docs/architecture/contracts.md#supervisor-launched-owner-backend).
+
+## Private Outcome SDK
+
+On the SQLite owner thread, `ports.outcome_export.export_private_outcome` reads a versioned local-only
+Program outcome using the explicit `private-metadata-v1` owner policy. The installed
+`adapters.outcome_file.write_private_outcome` can publish that result as a new 0600 file in a
+previously opened owner-private directory descriptor; it never replaces an existing name. It is an SDK,
+not a new CLI or remote service. The default ephemeral HMAC key links references within one export;
+an owner may separately retain and explicitly supply a 32-byte key for cross-export correlation.
+
+Raw identifiers, source content, prompts, workspace paths and free-form findings are excluded; unknown
+source rights are not treated as sharing permission. Resource subtotals remain separated by source,
+unit and provenance
+where the private policy permits their labels, while omitted labels and missing costs remain explicit.
+This is not complete billing, current remote state, approval to share, or evidence of causal model
+quality. The [private outcome contract](docs/architecture/contracts.md#private-outcome-export) defines
+publication uncertainty and producer-coverage limits.
 
 ## Ordinary Preparation
 
@@ -534,7 +610,7 @@ require an independently configured `profile_policy_version`, the complete appro
 and exact returned profile/version/requirement equality. There is no local profile catalogue or
 floor lookup. Selection is not reservation, gateway admission, privacy enforcement, a worker grant
 or ordinary dispatch. The reference application refuses to allocate new ordinary work via its L0
-path. #52 owns the route consumer; #53/PR #85 is closed not implemented and supplies no accepted
+path. #52 was retired wontfix without an accepted route consumer; #53/PR #85 is closed not implemented and supplies no accepted
 native reception or strict-expiry proof.
 
 `make package-check` exercises preparation, approval, intact refusal, typed recommendation over
@@ -658,7 +734,8 @@ old history, IDs, unknowns, clock rows and artifacts are not rewritten. Older sc
 before they could ignore resource claims. Restoring to a new SQLite identity does not silently rebind
 an old physical workspace. `make package-check` exercises actual installed pull and managed handlers,
 synthetic dedicated native processes and actual pinned schema-2/3/4 reader refusal outside the checkout.
-This does not enable the #106 ordinary dispatcher, #57 remote transport, live inference or Forge effects.
+The ordinary SDK adds its separately versioned schema-6 controller-preparation boundary; it does not
+enable #57 remote transport, live inference or unapproved Forge effects.
 
 ## Independent Project Drivers
 
@@ -753,6 +830,34 @@ Endpoint/permission/version/terms evidence and native refusals are in
 
 The installed `creatidy-kernel` command is self-contained for the bounded-task operator path;
 the former private operator wrapper is no longer required.
+
+### Installation And Recovery
+
+For a local source build, Python 3.12+, `uv` and the locked build dependencies are prerequisites.
+`uv build --no-build-isolation` creates a local wheel and sdist; use `uv pip install --python
+/absolute/path/to/venv/bin/python /absolute/path/to/the-built.whl` to install into an explicitly
+selected environment. Dependency acquisition may require network access; no published package or
+signed release is implied. Verify the actual artifact and [compatibility cut](docs/architecture/successor.md#installed-compatibility-cut-2026-11-04)
+before an upgrade. `creatidy-kernel config template` and `config validate` are local configuration
+tools. `doctor` and `task preflight` can acquire source and contact configured services; they are not
+an offline-only check and neither authorizes execution.
+
+Before upgrading, stop the controller and preserve a verified bundle using the installed
+`SQLiteProgramStore.backup` SDK on a supported native filesystem. Opening an old store with the new
+reader can migrate it: preserve a verified original backup before opening it with a new version. The
+store also creates versioned pre-schema backups during applicable migrations. Restore a verified bundle
+to a **new** offline path through `SQLiteProgramStore.restore_backup`; it requires a `BackupBundle`, an
+existing parent, and absent destination database and artifact directory. See
+[state recovery](docs/architecture/migration.md#installation-upgrade-and-cleanup) for the executable SDK
+example. A newer schema or unsupported storage refuses; never remove SQLite sidecars, rewrite version
+markers, replay unknown effects or use an older binary as a repair method. Preserve workspaces and
+original profile/key material for explicit reconciliation.
+
+Uninstalling the Python distribution, for example with `uv pip uninstall --python
+/absolute/path/to/venv/bin/python creatidy-kernel`, does not delete local state, cache, profiles or keys.
+There is no automatic recursive cleanup command. Delete state or cache only under the owner's explicit
+authority, after the controller is stopped and recovery needs and unknown effects are resolved. Profiles,
+SOPS keys and other owner data are separately owned; package removal never authorizes deleting them.
 
 ```sh
 uv run --locked creatidy-kernel config template            # generic profile template with placeholders

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bounded task composition proof: real Git fixtures, native-shaped fakes, no paid calls."""
 
+import hashlib
+import hmac
 import inspect
 import json
 import os
@@ -10,8 +12,10 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
+from unittest.mock import patch
 
 import pytest
 
@@ -29,6 +33,7 @@ from creatidy_kernel.adapters.task_execution import (
     LiveTaskComponents,
     OwnedVerificationCommand,
     TaskChecks,
+    TaskCollector,
     TaskInterrupted,
     TaskRuntimeConfig,
     TaskSpec,
@@ -44,11 +49,12 @@ from creatidy_kernel.adapters.task_execution import (
 from creatidy_kernel.adapters.task_execution import git_text as task_git
 from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import DomainCommandType, FinishAttempt, Program
-from creatidy_kernel.core.execution import UnsupportedExecution
+from creatidy_kernel.core.execution import Candidate, ExecutionRequest, UnsupportedExecution
 from creatidy_kernel.core.forge import Reference
 from creatidy_kernel.core.resources import Allocation, AllocationUnavailable, ResourceRequest
-from creatidy_kernel.core.verification import Evidence, EvidenceSubject
+from creatidy_kernel.core.verification import CandidateResult, Evidence, EvidenceSubject
 from creatidy_kernel.ports.forge import Forge
+from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.program_store import OperationRecord
 from creatidy_kernel.ports.resources import ResourceAllocator
 
@@ -484,6 +490,11 @@ def test_receipt_only_terminal_without_resolution_finishes_without_redispatch(
         assert store.find_artifact(operation.operation_id, "identity") is None
         assert find(store, operation.operation_id, "runtime-receipt") == receipt
         assert json.loads(store.artifact(operation.operation_id, "terminal-outcome"))["candidate"] == "absent"
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        terminal = cast(dict[str, object], cast(list[dict[str, object]], exported["attempts"])[0]["terminal_outcome"])
+        assert terminal["candidate"] == "absent" and terminal["current_activity"] is None
     assert original.starts == 1 and recovered.starts == 0
 
 
@@ -507,6 +518,11 @@ def test_lost_terminal_candidate_read_remains_recoverable(sqlite_tmp_path: Path)
     with SQLiteProgramStore(control / "kernel.sqlite3") as store:
         original = store.artifact("runtime:task_execution:change", "terminal-outcome")
         assert json.loads(original)["candidate"] == "unknown"
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        terminal = cast(dict[str, object], cast(list[dict[str, object]], exported["attempts"])[0]["terminal_outcome"])
+        assert terminal["candidate"] == "unknown" and terminal["current_activity"] is None
     assert run(control, source, connection)["condition"] == "accepted"
     assert connection.starts == 1
     with SQLiteProgramStore(control / "kernel.sqlite3") as store:
@@ -762,6 +778,17 @@ def test_cancel_before_attempt_is_stable_without_dispatch(sqlite_tmp_path: Path,
     assert first["runtime_operation_absent"] is True
     assert first["attempts"] == []
     assert "cancellation" in first
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = store.operations()
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        assert exported["attempts"] == []
+        cancellations = cast(list[dict[str, object]], exported["cancellations"])
+        assert len(cancellations) == 1 and cancellations[0]["attempt"] is None
+        assert cancellations[0]["runtime_operation_recorded"] is False
+        assert cancellations[0]["no_dispatch_observed"] is True and cancellations[0]["current_activity"] is None
+        assert store.operations() == before
     requested[0] = False
     for _ in range(2):
         restored = run(control, source, connection, allocation=None, allocator=allocator)
@@ -773,6 +800,125 @@ def test_cancel_before_attempt_is_stable_without_dispatch(sqlite_tmp_path: Path,
     assert task_status(control)["condition"] == "cancelled_no_dispatch"
     assert allocator.calls == (0 if before_allocation else 1)
     assert connection.starts == 0
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        reopened = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        assert reopened["attempts"] == [] and len(cast(list[object], reopened["cancellations"])) == 1
+
+
+@pytest.mark.parametrize("stop_after_cut", [False, True])
+def test_private_outcome_reopens_original_task_candidate_before_verification(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop_after_cut: bool
+) -> None:
+    source, control = make_source(sqlite_tmp_path), sqlite_tmp_path / "candidate-cut"
+    connection = FixtureConnection(deflake_edit)
+    original = TaskCollector.collect
+    captured: list[Candidate] = []
+
+    def interrupt(target: TaskCollector, request: ExecutionRequest, candidate: Candidate, *, now: int) -> NoReturn:
+        original(target, request, candidate, now=now)
+        captured.append(candidate)
+        raise TaskInterrupted("synthetic after-collection cut")
+
+    with monkeypatch.context() as context:
+        context.setattr(TaskCollector, "collect", interrupt)
+        with pytest.raises(TaskInterrupted, match="after-collection"):
+            run(control, source, connection, task=fixture_task(repeats=1))
+    assert len(captured) == 1 and connection.starts == 1
+    if stop_after_cut:
+        stopped = run(control, source, connection, task=fixture_task(repeats=1), cancel_requested=True)
+        assert stopped["condition"] in {"cancelled", "cancel_uncertain"} and connection.starts == 1
+    expected = CandidateResult("candidate:task_execution:change", captured[0], (("change", "candidate.patch"),)).digest
+
+    def reference(kind: str, value: str) -> str:
+        payload = json.dumps([kind, value], ensure_ascii=True, separators=(",", ":")).encode()
+        return "hmac-sha256:" + hmac.new(b"k" * 32, payload, hashlib.sha256).hexdigest()
+
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = (store.history("task_execution"), store.operations())
+        candidate_operation = store.operation("candidate:task_execution:change")
+        original_record = json.loads(candidate_operation.request_json)["request"]
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        candidates = cast(list[dict[str, object]], exported["candidates"])
+        assert len(candidates) == 1 and candidates[0]["candidate"] == reference("candidate", expected)
+        assert candidates[0]["head"] == reference("revision", original_record["head"])
+        assert candidates[0]["base"] == reference("revision", original_record["base"])
+        assert candidates[0]["tree"] == reference("revision", original_record["tree"])
+        assert candidates[0]["patch_integrity"] == "recorded-digest-only-not-read"
+        assert (
+            candidates[0]["candidate_binding"]
+            == "reconstructed-from-recorded-output; runtime-candidate-match-not-proven"
+        )
+        assert cast(int, candidates[0]["patch_bytes"]) > 0
+        assert exported["checks"] == [] and exported["verification_manifests"] == [] and exported["satisfactions"] == []
+        assert (store.history("task_execution"), store.operations()) == before and connection.starts == 1
+        original_lookup = SQLiteProgramStore.find_operation
+
+        def mismatched(target: SQLiteProgramStore, operation_id: str) -> OperationRecord | None:
+            record = original_lookup(target, operation_id)
+            if record is None or operation_id != "candidate:task_execution:change":
+                return record
+            raw = json.loads(record.request_json)
+            raw["request"]["base"] = "0" * 40
+            return replace(record, request_json=json.dumps(raw))
+
+        with monkeypatch.context() as context:
+            context.setattr(SQLiteProgramStore, "find_operation", mismatched)
+            with pytest.raises(ValueError, match="task candidate differs"):
+                export_private_outcome(store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+
+
+def test_private_outcome_preserves_task_candidate_before_output_publication(
+    sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, control = make_source(sqlite_tmp_path), sqlite_tmp_path / "candidate-before-output"
+    connection = FixtureConnection(deflake_edit)
+    original = SQLiteProgramStore.finalize_artifact
+
+    def interrupt(store: SQLiteProgramStore, operation_id: str, name: str, data: bytes) -> str:
+        if operation_id == "runtime:task_execution:change" and name == "output":
+            raise TaskInterrupted("synthetic before-output cut")
+        return original(store, operation_id, name, data)
+
+    with monkeypatch.context() as context:
+        context.setattr(SQLiteProgramStore, "finalize_artifact", interrupt)
+        with pytest.raises(TaskInterrupted, match="before-output"):
+            run(control, source, connection, task=fixture_task(repeats=1))
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = (store.history("task_execution"), store.operations())
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        candidate = cast(list[dict[str, object]], exported["candidates"])[0]
+        assert candidate["source"] == "task-candidate-v1" and candidate["head"] is not None
+        assert candidate["base"] is not None and candidate["tree"] is not None
+        assert candidate["patch_recorded"] is False and candidate["candidate"] is None and candidate["patch"] is None
+        assert candidate["patch_bytes"] is None
+        assert candidate["patch_integrity"] == "not-recorded"
+        assert candidate["candidate_binding"] == "unknown-output-not-recorded"
+        assert not exported["checks"] and not exported["satisfactions"]
+        assert (store.history("task_execution"), store.operations()) == before and connection.starts == 1
+
+
+def test_pre_attempt_cancellation_crash_stays_unsettled_without_dispatch(sqlite_tmp_path: Path) -> None:
+    source, control = make_source(sqlite_tmp_path), sqlite_tmp_path / "pre-attempt-crash"
+    connection = FixtureConnection(deflake_edit)
+    with pytest.raises(TaskInterrupted):
+        run(control, source, connection, cancel_requested=True, fault="cancel-claim")
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = store.operations()
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        cancellation = cast(list[dict[str, object]], exported["cancellations"])[0]
+        assert exported["attempts"] == [] and cancellation["attempt"] is None
+        assert cancellation["operation_status"] == "dispatched" and cancellation["settlement_recorded"] is False
+        assert cancellation["qualified_original_no_dispatch_group"] is None
+        assert cancellation["no_dispatch_observed"] is True and cancellation["current_activity"] is None
+        assert store.operations() == before and connection.starts == 0 and connection.interrupts == 0
 
 
 def test_cancellation_after_terminal_verification_is_durable(sqlite_tmp_path: Path) -> None:
@@ -998,6 +1144,17 @@ def test_expiry_journals_interrupt_once_even_after_lost_reply(
             assert store.find_artifact(cancellation.operation_id, "receipt") is None
         else:
             assert store.find_artifact(cancellation.operation_id, "receipt") is not None
+        before_operations = store.operations()
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        original = cast(list[dict[str, object]], exported["cancellations"])[0]
+        assert original["driver"] == "independent-runtime-cancellation"
+        assert (
+            original["operation_status"] == cancellation.status and original["cancellation_fence"] == cancellation.fence
+        )
+        assert original["current_activity"] is None and original["physical_settlement"] is None
+        assert store.operations() == before_operations and cancellation.attempts == 1
 
 
 def test_long_verification_cannot_extend_original_deadline(
@@ -1488,6 +1645,51 @@ def test_uncertain_dispatch_is_not_duplicated_after_lost_context(sqlite_tmp_path
         assert store.operation("runtime:task_execution:change").attempts == 1
 
 
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_private_outcome_retains_interrupted_bounded_command(sqlite_tmp_path: Path, exit_code: int) -> None:
+    source = make_source(sqlite_tmp_path)
+    control = sqlite_tmp_path / "control"
+    task = fixture_task(repeats=1)
+
+    def edit(path: Path) -> None:
+        deflake_edit(path)
+        if exit_code:
+            target = path / "tests" / "test_e2e_execution.py"
+            target.write_text(
+                target.read_text().replace(
+                    "    def test_scenario_11_client_disconnect_propagates_cancel(self):",
+                    "    def test_extra_failure(self):\n        assert False, 'synthetic-private-output'\n\n"
+                    "    def test_scenario_11_client_disconnect_propagates_cancel(self):",
+                )
+            )
+
+    connection = FixtureConnection(edit)
+    with pytest.raises(TaskInterrupted):
+        run(control, source, connection, fault="verification", task=task)
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = (store.served_change_token(), store.operations())
+        with patch("subprocess.Popen", side_effect=AssertionError("export must not dispatch")):
+            exported = export_private_outcome(
+                store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+            )
+        commands = cast(list[dict[str, object]], exported["command_results"])
+        assert len(commands) == 1 and (commands[0]["exit_code"] == 0) is (exit_code == 0)
+        assert commands[0]["settlement"] == "witnessed" and commands[0]["candidate_binding"] == "recorded"
+        assert commands[0]["integrity"] == "recorded" and commands[0]["integrity_clean"] is True
+        assert not exported["satisfactions"] and "AssertionError" not in json.dumps(exported)
+        assert (store.served_change_token(), store.operations()) == before
+        operations = SQLiteProgramStore.operations
+
+        def hide_witness(target: SQLiteProgramStore, prefix: str = "") -> tuple[OperationRecord, ...]:
+            return () if prefix.startswith("command-settlement:") else operations(target, prefix)
+
+        with patch.object(SQLiteProgramStore, "operations", hide_witness):
+            unresolved = export_private_outcome(
+                store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+            )
+        assert cast(list[dict[str, object]], unresolved["command_results"])[0]["settlement"] == "unknown"
+
+
 def test_verification_crash_reruns_deterministic_local_checks(sqlite_tmp_path: Path) -> None:
     source = make_source(sqlite_tmp_path)
     control = sqlite_tmp_path / "control"
@@ -1521,6 +1723,18 @@ def test_pr_delivery_recovery_never_creates_a_second_pr(sqlite_tmp_path: Path, f
     assert transport.posts <= 1
     pr = cast(dict[str, object], result["pr"])
     assert pr["status"] in {"accepted", "unknown"}
+    with SQLiteProgramStore(control / "kernel.sqlite3") as store:
+        before = store.operations()
+        exported = export_private_outcome(
+            store, "task_execution", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        native = cast(list[dict[str, object]], exported["native_effects"])
+        assert len(native) == 1 and native[0]["driver"] == "task-pr-v1"
+        assert native[0]["attempt"] == cast(list[dict[str, object]], exported["attempts"])[0]["id"]
+        assert native[0]["current_remote_state"] is None and native[0]["receipt_recorded"] is (
+            pr["status"] == "accepted"
+        )
+        assert store.operations() == before
     if fault == "pr-send":
         # No durable reference was retained: delivery stays unknown and is never re-pushed.
         assert pr["status"] == "unknown"

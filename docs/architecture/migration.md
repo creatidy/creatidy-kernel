@@ -20,11 +20,11 @@ the architecture mandate.
 | Codex five-method Runtime, Workspace and reference paths | Retain bounded adapter | Add evidenced ownership/settlement and generic new Program composition; pull enters application directly, not fake managed Runtime. No takeover of Kilo or generic sandbox claim |
 | Product review/remediation #54 and STOP #90 | Retain delivered code | Reuse in ordinary engine; extend normal-completion witness and original boot-scoped deadlines under #59/#56. Do not reopen completed bounded deliveries |
 | Router recommendation and allocation codecs 1/2/3 | Retain exact historical bytes | Separate optional executable-route contract receipt, never relabel recommendation as enforced inference or synthesize missing identity |
-| Existing harness configuration | Supported target input for basic cooperative work | Record unavailable model-level admission/usage honestly. Strict route/pin/no-hidden-call tasks require #52 capability or refuse; no gateway interception required just to manage work |
+| Existing harness configuration | Supported target input for basic cooperative work | Record unavailable model-level admission/usage honestly. Strict route/pin/no-hidden-call tasks require independently proved capabilities or refuse; #52 is retired without implementation, and no gateway interception is required just to manage work |
 | MI utilized reference #101 | Retain immutable provenance/local-only | Optional content/harness evidence #55 remains separately scoped; no new catalogue, ranking or knowledge authority |
 | Offline status/export and directory-based CLI | Retain recovery/compatibility use | Shared owner-served #57 view and commands for active operation; #58 complete private outcomes. No second SQLite reader |
 | Platform/profile/source safety and #102 fixtures | Retain | Per-combination version matrix and interrupted/non-destructive migration/refusal under #62, with real-host claims only after actual receipts |
-| Push-only/default-gateway interpretation | Superseded target assumption | One core, pull and push with different proven capability profiles; strict Router integration remains required in its own supported profile |
+| Push-only/default-gateway interpretation | Superseded target assumption | One core, pull and optional supported push with different proven capability profiles; strict Router integration is not required for initial acceptance |
 | #53 / PR85 experiment | Closed/not implemented; evidence only | No automatic code reuse, reopening, strict syscall-expiry or isolation claim. A new delivery must satisfy the revised accepted profile |
 
 Compatibility manifests bind producer/contract, driver/harness/build/profile/platform and evidence
@@ -74,6 +74,9 @@ expected principal, permission/conditional-conflict and real receipt evidence. I
 authorizes live effects now nor makes #52/#55/Console/MI/Router feeds prerequisites of #105.
 
 ## Current Public Transition
+
+The following dated mapping is historical; #52 is retired wontfix and is no longer a required
+consumer delivery or #60 predecessor. Its evidence remains bounded to tested combinations.
 
 Kernel `eb4f4a2956712bfaf39a3271e1523e7f77a91e26` integrates public source acquisition, generic
 profiles/optional SOPS, Codex discovery, user-local defaults and doctor/preflight/status/export
@@ -211,6 +214,16 @@ authorization. Installed tests preserve that database unchanged on refusal and v
 older reader refuses new typed authorization records. The schema number remains 5 and unsupported
 ownership record types continue to fail closed.
 
+Ordinary execution introduces schema 6 for the controller-owned preparation boundary. Before upgrading
+any schema-1 through schema-5 database, the store publishes a verified
+`<database>.pre-schema-6-<logical-digest>` backup, retaining original history, clock rows and artifacts.
+The new immutable marker and `ownership-prepared` evidence distinguish exact controller materialization
+after a resource claim from worker settlement or general owner reconciliation. A schema-5 reader refuses
+schema 6 before it can write a clock observation or dispatch; an actual pinned reader at
+`b1c9ffca16f06596e5c3afdca3b9893cf7422d8d` is tested against the installed ordinary journey. Unknown or
+interrupted preparation remains retained rather than adopted. This migration does not rewrite old
+claim or source identities and does not provide physical worker settlement.
+
 ## Verification Compatibility
 
 Verification changes under #50 preserve the original Task #143/#166 payloads, policy references,
@@ -255,9 +268,10 @@ snapshot before dispatch. A returned acquisition Path carries no protected lifet
 ## Platform, Storage And Profile Reception (G13)
 
 Bounded exercised reception for [#62](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/62)
-(2026-10-26). Synthetic fixtures only; no real WSL/Windows/macOS host, real
-profile, key or ciphertext was used, and no release, publication or live task
-is claimed.
+(2026-10-26). The original reception used synthetic fixtures only. The later
+[#62 compatibility cut](successor.md#installed-compatibility-cut-2026-11-04) also records one
+actual WSL2 native-ext4 host; no real Windows/macOS host, owner profile, key or ciphertext was used,
+and no release, publication or live task is claimed.
 
 **Storage and platform.** Store startup and `validate_local_storage` accept
 exactly the verified native local Linux filesystems (`bcachefs`, `btrfs`,
@@ -269,18 +283,34 @@ native Linux, while Windows drives mounted as `9p` (WSL2 DrvFS) or `drvfs`
 fallback, and non-Linux runtimes refuse storage validation explicitly. A
 database announcing a schema version newer than supported refuses at startup;
 its records and announced version survive the refusal unchanged, are never
-reinterpreted, and no lost-effect dispatch or relabelled identity occurs. Real WSL, Windows and macOS execution remains explicit
-evidence work, not implicit support; each eventual platform cell must name its
-executed host, filesystem and revisions.
+reinterpreted, and no lost-effect dispatch or relabelled identity occurs. Beyond the single WSL2
+native-ext4 host in the compatibility cut, real host execution remains explicit evidence work, not
+implicit support; each platform cell must name its executed host, filesystem and revisions.
 
-**Operator profile.** Kernel never writes the user profile. Plaintext dotenv
+**Operator profile.** Ordinary loading never writes the user profile. Plaintext dotenv
 and SOPS loading are read-only: failed decryption (executable unavailable,
 nonzero exit, key unavailable), corrupt or oversized decrypted output leaves
 the original ciphertext byte-identical — including modification time — and
 diagnostics stay fixed messages that never contain profile values. Encrypted
 fixtures in tests are synthetic stand-ins; real key rotation, recipient
-migration or an actual encrypted-profile transition requires separately scoped
-owner authority and remains unclaimed.
+migration of real owner data requires separately scoped owner authority and remains unclaimed.
+
+The explicit `creatidy-kernel config migrate-sops --source /absolute/old.yaml --destination
+/absolute/new.json` operation asks the locally installed SOPS to rotate the encrypted document
+to JSON, verifies the default full-field SOPS policy and that every nonempty profile field is encrypted
+and decrypts to its original value, and
+publishes a private new file without overwriting an existing destination. It never changes the source.
+SOPS encodes an empty string as an empty string; this contains no plaintext value. Selective or unknown
+SOPS encryption policies are refused before staging rather than being interpreted or silently widened.
+It requires SOPS and the original decryption key environment; the existing parent directory must
+support same-filesystem hard links and directory fsync. SOPS is trusted and may contact any external
+key service configured in the source; offline use requires locally available keys. Kernel does not
+change recipients or manage keys. No plaintext is deliberately written to disk or printed. SOPS
+configuration and key access remain operator-owned. Do not migrate a profile concurrently with edits.
+If publication reports an error, the destination may already exist: inspect it without deleting either
+file. To roll back, explicitly use the original profile path and keys; migration never deletes either
+file. A test using actual SOPS and synthetic age keys exercises this path, not a real owner transition
+or recipient/key migration.
 
 **Trust labeling.** `TRUSTED_DEVELOPMENT` in this matrix means trusted native
 execution with task-level deadline/STOP semantics, not strict per-syscall
@@ -297,6 +327,50 @@ backup bundles with verified manifests). The user owns the operator profile
 and any SOPS key material; the source cache follows the #61 ownership
 contract. Uninstalling removes Kernel-owned state only under an explicit
 operator action; no component deletes or rewrites the user profile.
+
+## Installation, Upgrade And Cleanup
+
+The installed SDK provides backup and restore, not an automatic uninstall or repair command. Use the
+trusted controller identity, with no other controller holding the store. These explicit paths must be
+on a supported native filesystem; backup and restore destinations must be new. Opening an old store
+can migrate it, so first preserve a verified original with a compatible existing reader before upgrading.
+
+```python
+import json
+from pathlib import Path
+from creatidy_kernel.adapters.sqlite_store import BackupBundle, SQLiteProgramStore
+
+database = Path("/absolute/native/state/kernel.sqlite3")
+bundle_dir = Path("/absolute/native/backups/bundle")  # parent exists, bundle does not
+with SQLiteProgramStore(database) as store:
+    bundle = store.backup(bundle_dir)
+
+# In a later offline process, reconstruct the bundle from its original manifest.
+manifest_path = bundle_dir / "manifest.json"
+manifest = json.loads(manifest_path.read_text())
+bundle = BackupBundle(
+    bundle_dir,
+    bundle_dir / "kernel.sqlite3",
+    manifest_path,
+    manifest["database_sha256"],
+    manifest["history_record_count"],
+    manifest["schema_version"],
+)
+SQLiteProgramStore.restore_backup(bundle, Path("/absolute/native/recovery/restored.sqlite3"))
+```
+
+Restore verifies the bundle and requires a new database path and artifact directory. Reopening the
+restored image with the current reader may migrate it; it does not authorize downgrade, adopt physical
+workspaces or replay unknown effects. A failed restore can leave a partial artifact directory; retain
+and inspect it rather than retrying destructively. For an interrupted automatic schema upgrade, retain
+the original database, sidecars and pre-schema bundles; retry only with a compatible current reader
+after understanding the failure. Invalid/future schemas, unknown effects and unavailable keys do not
+authorize blind repair.
+
+The distribution, Kernel state/cache and owner profile/keys have separate ownership. Uninstalling the
+distribution does not remove state or keys. Source-cache markers, locks and unknown staging trees do
+not grant cleanup authority. No recursive deletion is performed by these instructions; the owner
+separately authorizes data removal after resolving retention and recovery needs.
 
 ## Historical Second-Pass Mapping
 

@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Installed real pinned-base reader versus the new authority schema, offline only."""
 
+import hashlib
+import importlib.metadata
 import io
+import json
+import os
 import sqlite3
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import tempfile
+import zipfile
 from contextlib import closing
 from pathlib import Path
 
@@ -18,6 +24,7 @@ PINNED_PREQUALIFICATION_ID = "3aa2b8f0232892ddfc61545bff7c646176253628"  # Exact
 PINNED_PRE_ACCEPTANCE_ID = "88d59fcd594cbf7fd529971a12139628bef9b6a5"  # Exact public Git object ID.
 PINNED_PRE_PUBLICATION_ID = "3ebd84a28c6c3bfcf6ed7f4b1937fc425ae05b13"  # Exact public Git object ID.
 PINNED_PRE_WORKSPACE_ID = "397ee0cb6a11f0638b9b19f48076f34d1d1c69b1"  # Exact public schema-5 pathname-only producer.
+PINNED_PRE_ORDINARY_ID = "b1c9ffca16f06596e5c3afdca3b9893cf7422d8d"  # Exact integrated pre-ordinary reader.
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -28,6 +35,56 @@ def install_pinned_reader(directory: Path, *, commit_id: str = PINNED_BASE_ID) -
     )
     if resolved.stdout.strip() != commit_id:
         raise RuntimeError("pinned public base object unavailable")
+    configured = os.environ.get("CREATIDY_TEST_READER_CACHE")
+    if configured is not None:
+        import fcntl
+
+        cache = Path(configured).resolve(strict=True)
+        if not cache.is_dir():
+            raise RuntimeError("pinned reader cache must be an existing run-private directory")
+        uv_version = subprocess.run(["uv", "--version"], check=True, capture_output=True, text=True).stdout.strip()
+        identity = {
+            "commit": commit_id,
+            "python": str(Path(sys.executable).resolve(strict=True)),
+            "version": sys.version,
+            "platform": sysconfig.get_platform(),
+            "uv": uv_version,
+            "builder": {
+                name: importlib.metadata.version(name)
+                for name in ("hatchling", "packaging", "pathspec", "pluggy", "trove-classifiers")
+            },
+        }
+        key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        with (cache / f"{key}.lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            entry = cache / key
+            marker = entry / "complete.json"
+            if not entry.exists():
+                entry.mkdir(mode=0o700)
+                python = _build_pinned_reader(entry, commit_id)
+                marker.write_text(json.dumps(identity, sort_keys=True), encoding="utf-8")
+            elif not marker.is_file() or json.loads(marker.read_text(encoding="utf-8")) != identity:
+                raise RuntimeError("pinned reader cache entry is incomplete or mismatched")
+            else:
+                python = entry / "legacy-venv/bin/python"
+            (wheel,) = (entry / "dist").glob("*.whl")
+            site = (
+                entry / "legacy-venv/lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+            )
+            with zipfile.ZipFile(wheel) as archive:
+                for name in archive.namelist():
+                    if name.startswith("creatidy_kernel/") and not name.endswith("/"):
+                        if ".." in Path(name).parts:
+                            raise RuntimeError("pinned reader wheel contains an unsafe package path")
+                        if (site / name).read_bytes() != archive.read(name):
+                            raise RuntimeError("pinned reader cache differs from its built wheel")
+            if not python.is_file():
+                raise RuntimeError("pinned reader cache interpreter is missing")
+            return python
+    return _build_pinned_reader(directory, commit_id)
+
+
+def _build_pinned_reader(directory: Path, commit_id: str) -> Path:
     archive = subprocess.run(["git", "archive", "--format=tar", commit_id], cwd=ROOT, check=True, capture_output=True)
     source = directory / "source"
     source.mkdir()
@@ -69,6 +126,82 @@ with SQLiteProgramStore(Path(sys.argv[1])) as store:
     store.finalize_artifact('legacy-evidence', 'original', b'synthetic retained original bytes')
 """
 
+INTERRUPT_UPGRADE = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+original = SQLiteProgramStore._migrate_5_to_6
+def interrupted(self):
+    original(self)
+    raise RuntimeError('synthetic interruption')
+SQLiteProgramStore._migrate_5_to_6 = interrupted
+try:
+    SQLiteProgramStore(Path(sys.argv[1]))
+except RuntimeError as error:
+    assert str(error) == 'synthetic interruption'
+else:
+    raise AssertionError('upgrade interruption did not occur')
+"""
+
+REFUSE_FUTURE = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore, UnsupportedSQLiteConfiguration
+try:
+    SQLiteProgramStore(Path(sys.argv[1]))
+except UnsupportedSQLiteConfiguration as error:
+    assert 'newer than supported' in str(error)
+else:
+    raise AssertionError('future schema was accepted')
+"""
+
+OPEN_EMPTY = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+path = Path(sys.argv[1])
+for _ in range(2):
+    with SQLiteProgramStore(path) as store:
+        assert store.startup_evidence.schema_version == 6
+        assert store.operations() == ()
+"""
+
+REFUSE_UNVERSIONED = """
+import sqlite3, sys
+from pathlib import Path
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore, UnsupportedSQLiteConfiguration
+try:
+    SQLiteProgramStore(Path(sys.argv[1]))
+except (sqlite3.DatabaseError, UnsupportedSQLiteConfiguration):
+    pass
+else:
+    raise AssertionError('unversioned nonempty state was accepted')
+"""
+
+CREATE_REFERENCE_RECEIPT = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.reference import run_reference, ReferenceInterrupted
+try:
+    run_reference(Path(sys.argv[1]), owner_approved=True, fault='receipt')
+except ReferenceInterrupted:
+    pass
+else:
+    raise AssertionError('expected original runtime receipt interruption')
+"""
+
+EXPORT_REFERENCE = """
+import json, sys
+from pathlib import Path
+from creatidy_kernel.adapters.reference import export_reference
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+directory = Path(sys.argv[1])
+export = export_reference(directory)
+with SQLiteProgramStore(directory / 'kernel.sqlite3') as store:
+    allocation_bytes = store.artifact('runtime:reference:first', 'allocation').hex()
+print(json.dumps({'export':export,'allocation_bytes':allocation_bytes}, sort_keys=True))
+"""
+
 UPGRADE_AND_REVOKE = """
 import sys
 from pathlib import Path
@@ -79,7 +212,7 @@ from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy
 clock = lambda: BootClockReading(100, 1000000000, 'installed-synthetic-boot')
 path = Path(sys.argv[1])
 with SQLiteProgramStore(path, boot_clock=clock) as store:
-    assert store.startup_evidence.schema_version == 5
+    assert store.startup_evidence.schema_version == 6
     program = store.load('reference')
     assert store.artifact('legacy-evidence', 'original') == b'synthetic retained original bytes'
     policy = WorkBudgetPolicy.basic(1, 1, verifications=1, retained_bytes=1024)
@@ -92,7 +225,7 @@ with SQLiteProgramStore(path, boot_clock=clock) as store:
     store.revoke_work_budget('reference', 'synthetic owner stop')
     before = store.work_budget_status('reference')
     bundle = store.backup(path.parent / 'schema-four-backup')
-    assert bundle.schema_version == 5
+    assert bundle.schema_version == 6
 restored = SQLiteProgramStore.restore_backup(bundle, path.parent / 'restored-four.sqlite3')
 with SQLiteProgramStore(restored, boot_clock=clock) as store:
     assert store.work_budget_status('reference') == before
@@ -114,7 +247,7 @@ old_bundle = BackupBundle(backups[0], backups[0] / 'kernel.sqlite3', backups[0] 
                           manifest['database_sha256'], manifest['history_record_count'], old_schema)
 restored = SQLiteProgramStore.restore_backup(old_bundle, path.parent / 'restored-original.sqlite3')
 with SQLiteProgramStore(restored, boot_clock=clock) as store:
-    assert store.startup_evidence.schema_version == 5
+    assert store.startup_evidence.schema_version == 6
     assert not store.has_work_budget('reference')
     assert store.artifact('legacy-evidence', 'original') == b'synthetic retained original bytes'
 """
@@ -134,7 +267,7 @@ else:
 """
 
 CREATE_ORIGINAL_CLAIM = """
-import sys
+import json, sys
 from pathlib import Path
 from creatidy_kernel.adapters.reference import reference_spec
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
@@ -160,6 +293,10 @@ with SQLiteProgramStore(directory / 'kernel.sqlite3', boot_clock=clock) as store
     attempt = AttemptSpec('original','reference','first',program.spec.revision,program.spec.digest,
                           program.resolved_inputs('first'),workspace_reference=str(tree.path))
     original = app.claim('claim:original',program.revision,attempt,lease_seconds=5)
+    print(json.dumps({'command_key':original.command_key,'claimant':original.claimant,
+        'attempt':original.attempt.digest,'generation':original.generation,'mode':original.mode.value,
+        'profile':original.profile,'resources':[(r.kind,r.key) for r in original.resources],
+        'workspace_subject':original.workspace_subject,'expires_at':original.expires_at},sort_keys=True))
     app.quiesce(original,'client:exact-scope-quiescent')
     if state == 'edited':
         (tree.path / 'manual').write_bytes(b'synthetic manually retained bytes')
@@ -179,7 +316,7 @@ with SQLiteProgramStore(directory / 'kernel.sqlite3', boot_clock=clock) as store
 """
 
 REPLAY_ORIGINAL_CLAIM = """
-import sys
+import json, sys
 from pathlib import Path
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
@@ -194,6 +331,10 @@ with SQLiteProgramStore(directory / 'kernel.sqlite3', boot_clock=clock) as store
     app = WorkOwnership(store,Principal('worker','worker'),tree,mode=HandoffMode.PULL,profile=COOPERATIVE_PROFILE)
     attempt = store.load('reference').attempt('original').spec
     original = app.claim('claim:original',1,attempt,lease_seconds=5)
+    print(json.dumps({'command_key':original.command_key,'claimant':original.claimant,
+        'attempt':original.attempt.digest,'generation':original.generation,'mode':original.mode.value,
+        'profile':original.profile,'resources':[(r.kind,r.key) for r in original.resources],
+        'workspace_subject':original.workspace_subject,'expires_at':original.expires_at},sort_keys=True))
     assert original.attempt == attempt and original.generation == 1 and original.expires_at == 105
     assert store.artifact(original.operation_id,'ownership-baseline')
     assert store.operation(original.operation_id).attempts == 0
@@ -281,11 +422,11 @@ with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
 REFUSE_QUALIFICATION_DOWNGRADE = """
 import sys
 from pathlib import Path
-from creatidy_kernel.adapters.sqlite_store import CorruptHistory,SQLiteProgramStore
+from creatidy_kernel.adapters.sqlite_store import CorruptHistory,SQLiteProgramStore,UnsupportedSQLiteConfiguration
 try:
     with SQLiteProgramStore(Path(sys.argv[1])):
         raise AssertionError('old reader ignored the logical/profile settlement distinction')
-except CorruptHistory:
+except (CorruptHistory, UnsupportedSQLiteConfiguration):
     pass
 """
 
@@ -443,7 +584,7 @@ with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
 """
 
 
-def main(new_python: Path, storage_root: Path) -> None:
+def main(new_python: Path, storage_root: Path, prepared_ordinary: Path | None = None) -> None:
     with tempfile.TemporaryDirectory(prefix="installed-schema-upgrade-", dir=storage_root) as value:
         directory = Path(value)
         for schema, commit_id in ((2, PINNED_BASE_ID), (3, PINNED_PRECLOCK_ID), (4, PINNED_PREOWNERSHIP_ID)):
@@ -457,9 +598,22 @@ def main(new_python: Path, storage_root: Path) -> None:
             with closing(sqlite3.connect(path)) as original:
                 history = original.execute("SELECT * FROM history").fetchall()
                 admissions = original.execute("SELECT * FROM command_admissions").fetchall()
+                original_dump = tuple(original.iterdump())
+            subprocess.run([str(new_python), "-I", "-c", INTERRUPT_UPGRADE, str(path)], cwd=fixture, check=True)
+            with closing(sqlite3.connect(path)) as interrupted:
+                if (
+                    tuple(interrupted.iterdump()) != original_dump
+                    or interrupted.execute("PRAGMA user_version").fetchone()[0] != schema
+                ):
+                    raise RuntimeError("interrupted upgrade changed original state")
+            backups_before = sorted(fixture.glob(path.name + ".pre-schema-*"))
+            if len(backups_before) != (3 if schema in (2, 3) else 2):
+                raise RuntimeError("interrupted upgrade failed to retain original backups")
             subprocess.run(
                 [str(new_python), "-I", "-c", UPGRADE_AND_REVOKE, str(path), str(schema)], cwd=fixture, check=True
             )
+            if sorted(fixture.glob(path.name + ".pre-schema-*")) != backups_before:
+                raise RuntimeError("upgrade did not reuse the interrupted migration backups")
             with closing(sqlite3.connect(path)) as current:
                 before = tuple(current.iterdump())
                 if (
@@ -475,33 +629,104 @@ def main(new_python: Path, storage_root: Path) -> None:
             with closing(sqlite3.connect(path)) as current:
                 if (
                     tuple(current.iterdump()) != before
-                    or current.execute("PRAGMA user_version").fetchone()[0] != 5
+                    or current.execute("PRAGMA user_version").fetchone()[0] != 6
                     or current.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] != 0
                 ):
                     raise RuntimeError("downgraded reader changed protected records or dispatched")
             if marker.exists():
                 raise RuntimeError("downgraded reader performed an effect")
+            receipt = fixture / "receipt-journey"
+            receipt.mkdir()
+            subprocess.run(
+                [str(old_python), "-I", "-c", CREATE_REFERENCE_RECEIPT, str(receipt)], cwd=fixture, check=True
+            )
+            before_export = subprocess.run(
+                [str(old_python), "-I", "-c", EXPORT_REFERENCE, str(receipt)],
+                cwd=fixture,
+                check=True,
+                capture_output=True,
+            ).stdout
+            after_export = subprocess.run(
+                [str(new_python), "-I", "-c", EXPORT_REFERENCE, str(receipt)],
+                cwd=fixture,
+                check=True,
+                capture_output=True,
+            ).stdout
+            import json
+
+            before_payload = json.loads(before_export)
+            after_payload = json.loads(after_export)
+            before_attempt = before_payload["export"]["attempts"][0]
+            after_attempt = after_payload["export"]["attempts"][0]
+            if (
+                before_attempt["attempt"] != after_attempt["attempt"]
+                or before_attempt["allocation"] != after_attempt["allocation"]
+                or before_payload["allocation_bytes"] != after_payload["allocation_bytes"]
+                or before_attempt["operation"] != after_attempt["operation"]
+                or not before_attempt["operation"]["accepted_reference"]
+            ):
+                raise RuntimeError("installed migration changed original Attempt, allocation or runtime handle")
+        future = directory / "future"
+        future.mkdir()
+        empty = future / "unversioned.sqlite3"
+        with closing(sqlite3.connect(empty)) as connection:
+            if connection.execute("PRAGMA user_version").fetchone()[0] != 0:
+                raise RuntimeError("empty database unexpectedly has a schema version")
+        subprocess.run([str(new_python), "-I", "-c", OPEN_EMPTY, str(empty)], cwd=future, check=True)
+        unversioned = future / "unversioned-nonempty.sqlite3"
+        subprocess.run([str(new_python), "-I", "-c", CREATE_LEGACY, str(unversioned), "6"], cwd=future, check=True)
+        with closing(sqlite3.connect(unversioned)) as connection:
+            connection.execute("PRAGMA user_version=0")
+            connection.commit()
+            before = tuple(connection.iterdump())
+        subprocess.run([str(new_python), "-I", "-c", REFUSE_UNVERSIONED, str(unversioned)], cwd=future, check=True)
+        with closing(sqlite3.connect(unversioned)) as connection:
+            if tuple(connection.iterdump()) != before or connection.execute("PRAGMA user_version").fetchone()[0] != 0:
+                raise RuntimeError("unversioned nonempty refusal changed original records")
+        path = future / "future.sqlite3"
+        subprocess.run([str(new_python), "-I", "-c", CREATE_LEGACY, str(path), "6"], cwd=future, check=True)
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("PRAGMA user_version=999")
+            connection.commit()
+            before = tuple(connection.iterdump())
+        subprocess.run([str(new_python), "-I", "-c", REFUSE_FUTURE, str(path)], cwd=future, check=True)
+        with closing(sqlite3.connect(path)) as connection:
+            if tuple(connection.iterdump()) != before or connection.execute("PRAGMA user_version").fetchone()[0] != 999:
+                raise RuntimeError("future-schema refusal changed original records")
         original = directory / "original-ownership"
         original.mkdir()
         old_python = install_pinned_reader(original, commit_id=PINNED_INITIAL_OWNERSHIP_ID)
         for state in ("edited", "retired", "conflict"):
             fixture = original / state
             fixture.mkdir()
-            subprocess.run(
-                [str(old_python), "-I", "-c", CREATE_ORIGINAL_CLAIM, str(fixture), state], cwd=fixture, check=True
-            )
+            original_claim = subprocess.run(
+                [str(old_python), "-I", "-c", CREATE_ORIGINAL_CLAIM, str(fixture), state],
+                cwd=fixture,
+                check=True,
+                capture_output=True,
+            ).stdout
             path = fixture / "kernel.sqlite3"
             with closing(sqlite3.connect(path)) as current:
                 before = tuple(current.iterdump())
-            subprocess.run(
-                [str(new_python), "-I", "-c", REPLAY_ORIGINAL_CLAIM, str(fixture), state], cwd=fixture, check=True
-            )
+            replayed_claim = subprocess.run(
+                [str(new_python), "-I", "-c", REPLAY_ORIGINAL_CLAIM, str(fixture), state],
+                cwd=fixture,
+                check=True,
+                capture_output=True,
+            ).stdout
+            if original_claim != replayed_claim:
+                raise RuntimeError("migration changed original grant or expiry")
             if state != "conflict":
                 with closing(sqlite3.connect(path)) as current:
-                    if tuple(current.iterdump()) != before:
-                        raise RuntimeError(
-                            "historical explicit-request replay rewrote original claim/history/clock rows"
-                        )
+                    upgraded = tuple(current.iterdump())
+                    if tuple(line for line in upgraded if "ordinary_preparation_contract" not in line) != before:
+                        raise RuntimeError("schema-6 migration rewrote original claim/history/clock rows")
+                subprocess.run(
+                    [str(new_python), "-I", "-c", REPLAY_ORIGINAL_CLAIM, str(fixture), state], cwd=fixture, check=True
+                )
+                with closing(sqlite3.connect(path)) as current:
+                    if tuple(current.iterdump()) != upgraded:
+                        raise RuntimeError("historical explicit-request replay rewrote migrated original rows")
         qualification = directory / "qualification"
         qualification.mkdir()
         prior_python = install_pinned_reader(qualification, commit_id=PINNED_PREQUALIFICATION_ID)
@@ -513,7 +738,7 @@ def main(new_python: Path, storage_root: Path) -> None:
             before = tuple(current.iterdump())
         subprocess.run([str(new_python), "-I", "-c", REFUSE_LOGICAL_REUSE, str(legacy)], cwd=legacy, check=True)
         with closing(sqlite3.connect(path)) as current:
-            if tuple(current.iterdump()) != before:
+            if tuple(line for line in current.iterdump() if "ordinary_preparation_contract" not in line) != before:
                 raise RuntimeError("old untyped settlement was rewritten/promoted on recovery")
         typed = qualification / "typed"
         typed.mkdir()
@@ -547,7 +772,7 @@ def main(new_python: Path, storage_root: Path) -> None:
             check=True,
         )
         with closing(sqlite3.connect(path)) as current:
-            if tuple(current.iterdump()) != before:
+            if tuple(line for line in current.iterdump() if "ordinary_preparation_contract" not in line) != before:
                 raise RuntimeError("original unproven publication history was rewritten or authorized")
         new_publication = publication / "typed"
         new_publication.mkdir()
@@ -604,7 +829,10 @@ def main(new_python: Path, storage_root: Path) -> None:
                 check=True,
             )
             with closing(sqlite3.connect(path)) as current:
-                if tuple(current.iterdump()) != before:
+                after = tuple(current.iterdump())
+                if (bound and after != before) or (
+                    not bound and tuple(line for line in after if "ordinary_preparation_contract" not in line) != before
+                ):
                     raise RuntimeError("workspace compatibility rewrote original history or identity records")
         original_owned = workspace / "original-owned-alias"
         original_owned.mkdir()
@@ -622,9 +850,33 @@ def main(new_python: Path, storage_root: Path) -> None:
             cwd=original_owned,
             check=True,
         )
+        ordinary = directory / "ordinary-preparation"
+        ordinary.mkdir()
+        pre_ordinary_python = install_pinned_reader(ordinary, commit_id=PINNED_PRE_ORDINARY_ID)
+        if prepared_ordinary is None:
+            fixture = ordinary / "installed-flow"
+            fixture.mkdir()
+            subprocess.run(
+                [str(new_python), "-I", str(ROOT / "tools/check_ordinary.py"), str(fixture), "--preparation-only"],
+                cwd=fixture,
+                check=True,
+            )
+        else:
+            fixture = prepared_ordinary.resolve(strict=True)
+            if not fixture.is_relative_to(storage_root.resolve(strict=True)):
+                raise RuntimeError("prepared installed ordinary fixture is outside the test storage root")
+        path = fixture / "pull-normal" / "state.db"
+        with closing(sqlite3.connect(path)) as current:
+            before = tuple(current.iterdump())
+        subprocess.run(
+            [str(pre_ordinary_python), "-I", "-c", REFUSE_QUALIFICATION_DOWNGRADE, str(path)], cwd=fixture, check=True
+        )
+        with closing(sqlite3.connect(path)) as current:
+            if tuple(current.iterdump()) != before:
+                raise RuntimeError("pre-ordinary reader changed controller preparation records")
         print(
             f"Installed schema upgrade: actual readers {PINNED_BASE_ID}, {PINNED_PRECLOCK_ID}, "
-            f"{PINNED_PREOWNERSHIP_ID} refuse schema 5; original bytes, v2/v3/v4/v5 backups and artifacts preserved; "
+            f"{PINNED_PREOWNERSHIP_ID} refuse schema 6; original bytes, v2/v3/v4/v5 backups and artifacts preserved; "
             f"original schema-5 claims from {PINNED_INITIAL_OWNERSHIP_ID} replay unchanged "
             "and conflicting work stays fenced."
         )
@@ -641,7 +893,10 @@ def main(new_python: Path, storage_root: Path) -> None:
             f"{PINNED_PRE_WORKSPACE_ID} refuses the new identity category without writes; its original owned capture "
             "retains the aliased inode while the actual shared handler admits independent work without backfill."
         )
+        print(f"Installed ordinary preparation: actual prior reader {PINNED_PRE_ORDINARY_ID} refuses without writes.")
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]), Path(sys.argv[2]))
+    if len(sys.argv) not in (3, 4):
+        raise SystemExit("expected installed Python, storage root and optional prepared ordinary fixture")
+    main(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]) if len(sys.argv) == 4 else None)

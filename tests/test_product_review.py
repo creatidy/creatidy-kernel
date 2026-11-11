@@ -6,6 +6,7 @@ import time
 from dataclasses import asdict, replace
 from hashlib import sha256
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -52,6 +53,7 @@ from creatidy_kernel.core.verification import (
 )
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy
 from creatidy_kernel.ports.application import Collection, advance_work_unit
+from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.verification import (
     ProductReviewStatus,
     ReviewLookup,
@@ -445,6 +447,53 @@ def test_candidate_review_remediates_as_fresh_budgeted_attempt(sqlite_tmp_path: 
         retry_context = store.artifact(f"runtime:{retries[0].attempt_id}", "context")
         assert b"fingerprint-1" in retry_context and first_attempt.encode() in retry_context
         assert reviewer.calls == 2
+
+
+def test_private_export_keeps_approved_review_when_check_expires_during_review(sqlite_tmp_path: Path) -> None:
+    clock = [10]
+
+    class AdvancingReviewer(Dispatcher):
+        def dispatch(
+            self, operation: OperationKey, request: ProductReviewRequest, *, fence: int
+        ) -> ProductReviewReceipt:
+            receipt = replace(super().dispatch(operation, request, fence=fence), fresh_until=1000)
+            self.receipt = receipt
+            clock[0] = 101
+            return receipt
+
+    path = sqlite_tmp_path / "stale-check-review.sqlite3"
+    runtime = ReviewRuntime()
+    reviewer = AdvancingReviewer()
+    workspace = WorkspaceHandle(
+        "workspace:first",
+        WorkspaceSpec("fixture", "base-revision", (), "tools:v1", "synthetic", TrustMode.TRUSTED_DEVELOPMENT),
+    )
+    with SQLiteProgramStore(path) as store:
+        program = store.create(reference_spec(), "create")
+        program = store.admit(program.program_id, "activate", ActivateProgram(program.revision, "owner"))
+        configure_budget(store, program)
+        status = advance_work_unit(
+            store,
+            program,
+            "first",
+            allocator=FixedAllocator(),
+            runtime=runtime,
+            workspace=workspace,
+            collector=CandidateCollector(),
+            policy=VerificationPolicy(REFERENCE_POLICY.reference, ("exact-content",), True),
+            now=10,
+            clock=lambda: clock[0],
+            product_reviewer=reviewer,
+        )
+        assert status == "rejected" and reviewer.calls == 1
+        assert not store.load("reference").satisfactions
+    with SQLiteProgramStore(path) as store:
+        exported = export_private_outcome(store, "reference", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+        reviews = cast(list[dict[str, object]], exported["reviews"])
+        decisions = cast(list[dict[str, object]], exported["decisions"])
+        assert len(reviews) == 1 and reviews[0]["verdict"] == "approve"
+        assert len(decisions) == 1 and decisions[0]["review_status"] == "approved"
+        assert exported["satisfactions"] == [] and reviewer.calls == 1
 
 
 def test_repeated_findings_pause_before_remaining_attempt_budget(sqlite_tmp_path: Path) -> None:

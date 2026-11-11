@@ -889,7 +889,7 @@ for line in sys.stdin:
         require(store.work_budget_status("reference") == retained)
         require(store.operation(claimed.operation_id).attempts == 0)
         require((one.path / "unknown-user-data").read_bytes() == b"synthetic manual bytes must survive")
-        require(store.startup_evidence.schema_version == 5)
+        require(store.startup_evidence.schema_version == 6)
     settlement_conformance(directory, fixture)
     publication_replay_conformance(directory, fixture)
     live_alias_conformance(directory)

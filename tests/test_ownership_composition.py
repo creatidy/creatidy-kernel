@@ -463,4 +463,4 @@ def test_actual_prior_untyped_logical_completion_is_not_promoted_on_reopen(
             app.claim("claim:next", program.revision, attempt, lease_seconds=5)
         assert not store.operations("work-budget:v1:ownership-settlement:")
     with closing(sqlite3.connect(path)) as current:
-        assert tuple(current.iterdump()) == before
+        assert tuple(line for line in current.iterdump() if "ordinary_preparation_contract" not in line) == before

@@ -162,7 +162,11 @@ Review correctness,
 regressions, architecture, tests, temporal/provenance behavior under adversarial
 valid typed inputs, security/privacy and reuse/license evidence where relevant.
 Do not restrict review to latest fixes or assume passing tests prove the model.
-Run only inspected safe validation through the allowlist, in the clean exact checkout.
+Independently inspect canonical CI evidence: identify the actual tested checkout,
+verify successful required `make check`, `make package-check` and audit steps for
+the current subject, and treat missing, pending, stale, failed or ambiguous evidence
+as a limitation, never a pass. Do not repeat the complete CI gates locally merely for
+review. Run only inspected safe validation through the allowlist, in the clean exact checkout.
 Use the allowlisted `env -i ... make -C <supplied-checkout>` commands: they provide
 synthetic HOME/TMPDIR, minimum PATH/locale, offline mode and only the pre-existing locked dependency cache;
 they omit the owner's ambient environment, SSH/cloud/provider/model/Forge/browser

@@ -29,16 +29,41 @@ and resumed reviewers do not. Every changed HEAD/base requires a fresh whole-PR 
 publication is optional, never orchestration state. No external controller exists.
 
 Only an explicit owner `/loop` invocation delegates autonomous selection and
-approved PR merge to develop/completed-issue closure. Its primary context is the
+approved PR merge to develop/completed-issue closure. An authorized bounded partial
+delivery may be integrated under its existing gates without closing an incompletely
+accepted parent issue or satisfying its dependencies. Its primary context is the
 sole orchestrator, reusing implement-issue/finish-pr and the unchanged reviewer.
 Read `.kilo/command/loop.md`: refresh all canonical open issues each cycle, exclude
 exact invalid/wontfix/duplicate labels case-insensitively, verify explicit gates,
 then order by explicit priority, required ordering and oldest registration.
 Issues, not open PRs, are planning authority. Stop the entire invocation for
 STOP_AND_ASK, STOP_REVISE or BLOCKED; no eligible issues yields QUEUE_EMPTY.
+Complete issue eligibility requires full-acceptance prerequisites; an authorized,
+independently useful partial scope requires its own identified, canonically verified
+prerequisites, while unrelated unmet parent prerequisites remain binding for full acceptance.
 This does not authorize product GO, cross-repository mutation, Scarcity Router
 operation, main, releases or deployments. Standalone implementation remains
 owner-selected and unmerged; standalone review remains read-only.
+
+## Test And CI Discipline
+
+- Run focused checks during development. Canonical CI runs the complete required gates on the exact
+  delivery subject; do not repeat the full suite locally merely before pushing or review. Run additional
+  checks when needed to diagnose failures or prove requirements CI does not exercise.
+- Do not execute the same scenario twice without identifying the distinct verification gained.
+  When consolidating tests, preserve the union of required assertions, negative paths and integration
+  guarantees. Keep a single source of truth for scenario selection where practical.
+- Build identical artifacts once per run when their provenance and reuse can be verified. Keep mutable
+  databases, workspaces, processes and external state isolated; distinct revisions and build proofs
+  are not interchangeable merely because their outputs have similar names.
+- Parallelize only after checking filesystem, process, network and host-global isolation. Ensure test
+  partitions are disjoint and complete, and retain required serial or separately isolated proofs.
+  Do not hide concurrency failures with retries, weaker assertions or longer timeouts.
+- Verify the actual CI checkout and all required successful steps against the current reviewed subject
+  before integration. Missing or stale evidence is not a pass; report skipped or unavailable proofs
+  explicitly. Independent review remains mandatory, without automatically repeating full CI locally.
+- Measure wall-clock time, phase costs, test outcomes and environment before and after performance
+  changes. Report the limits of the comparison and do not claim a speedup from unmeasured work.
 
 ## Independent Review — Conversational Independence
 

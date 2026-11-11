@@ -223,7 +223,7 @@ with SQLiteProgramStore(Path(sys.argv[1]), boot_clock=lambda: reading) as store:
     clock = CountingClock()
     clock.reading = BootClockReading(103, 3_000_000_000, "synthetic-boot-a")
     with SQLiteProgramStore(path, boot_clock=clock) as store:
-        assert store.startup_evidence.schema_version == 5 and store.original_work_deadline("reference") == 110
+        assert store.startup_evidence.schema_version == 6 and store.original_work_deadline("reference") == 110
         with pytest.raises(BudgetRefused, match="rollback"):
             store.claim("runtime:a1", now=103, lease_seconds=1)
         assert store.operation("runtime:a1").attempts == 0

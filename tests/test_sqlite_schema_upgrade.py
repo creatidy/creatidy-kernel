@@ -6,6 +6,7 @@ import json
 import sqlite3
 import subprocess
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from typing import cast
@@ -14,9 +15,37 @@ import pytest
 
 from creatidy_kernel.adapters import sqlite_store
 from creatidy_kernel.adapters.sqlite_store import CorruptHistory, SQLiteProgramStore
-from tools.check_schema_upgrade import CREATE_LEGACY, REFUSE_DOWNGRADE, install_pinned_reader
+from tools.check_schema_upgrade import CREATE_LEGACY, PINNED_PRE_ORDINARY_ID, REFUSE_DOWNGRADE, install_pinned_reader
 
 pytest_plugins = ["test_sqlite_store"]
+
+
+def test_pinned_reader_cache_reuses_one_verified_build_across_concurrent_consumers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("CREATIDY_TEST_READER_CACHE", str(cache))
+    directories = [tmp_path / "first", tmp_path / "second"]
+    for directory in directories:
+        directory.mkdir()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        readers = list(executor.map(install_pinned_reader, directories))
+    assert readers[0] == readers[1]
+    assert len(list(cache.glob("*/dist/*.whl"))) == 1
+    subprocess.run([str(readers[0]), "-I", "-c", "import creatidy_kernel"], check=True)  # noqa: S603
+    package = next(cache.glob("*/legacy-venv/lib/python*/site-packages/creatidy_kernel/__init__.py"))
+    original = package.read_bytes()
+    package.write_bytes(b"# corrupted test-only cache\n")
+    with pytest.raises(RuntimeError, match="differs from its built wheel"):
+        install_pinned_reader(directories[0])
+    package.write_bytes(original)
+    marker = next(cache.glob("*/complete.json"))
+    marker.unlink()
+    with pytest.raises(RuntimeError, match="incomplete or mismatched"):
+        install_pinned_reader(directories[0])
+    with pytest.raises(subprocess.CalledProcessError):
+        install_pinned_reader(directories[0], commit_id="0" * 40)
 
 
 @pytest.fixture(scope="module")
@@ -31,7 +60,7 @@ def legacy_database(sqlite_tmp_path: Path, pinned_reader: Path) -> Path:
     return path
 
 
-@pytest.mark.parametrize("migration_step", ["_migrate_2_to_3", "_migrate_3_to_4", "_migrate_4_to_5"])
+@pytest.mark.parametrize("migration_step", ["_migrate_2_to_3", "_migrate_3_to_4", "_migrate_4_to_5", "_migrate_5_to_6"])
 def test_migration_interruption_rolls_back_then_reuses_atomic_original_backup(
     legacy_database: Path, monkeypatch: pytest.MonkeyPatch, migration_step: str
 ) -> None:
@@ -56,7 +85,7 @@ def test_migration_interruption_rolls_back_then_reuses_atomic_original_backup(
     manifest = json.loads((backups[0] / "manifest.json").read_text())
     assert manifest["schema_version"] == 2 and manifest["artifacts"]
     with SQLiteProgramStore(path) as upgraded:
-        assert upgraded.startup_evidence.schema_version == 5
+        assert upgraded.startup_evidence.schema_version == 6
         assert upgraded.artifact("legacy-evidence", "original") == b"synthetic retained original bytes"
     assert list(path.parent.glob(path.name + ".pre-schema-4-*")) == backups
 
@@ -98,7 +127,36 @@ def test_failed_backup_never_installs_the_new_authority_contract(
     assert not list(path.parent.glob(path.name + ".pre-schema-4-*"))
     assert not list(path.parent.glob("." + path.name + ".pre-schema-4-*"))
     with SQLiteProgramStore(path) as recovered:
-        assert recovered.startup_evidence.schema_version == 5
+        assert recovered.startup_evidence.schema_version == 6
+
+
+def test_schema5_interruption_retains_original_backup_and_rows(
+    sqlite_tmp_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reader = install_pinned_reader(tmp_path, commit_id=PINNED_PRE_ORDINARY_ID)
+    path = sqlite_tmp_path / "schema5.sqlite3"
+    subprocess.run([str(reader), "-I", "-c", CREATE_LEGACY, str(path), "5"], check=True)  # noqa: S603 - Pinned synthetic reader.
+    with closing(sqlite3.connect(path)) as raw:
+        original = tuple(raw.iterdump())
+    migrate = cast(Callable[[SQLiteProgramStore], None], inspect.getattr_static(SQLiteProgramStore, "_migrate_5_to_6"))
+
+    def interrupted(store: SQLiteProgramStore) -> None:
+        migrate(store)
+        raise RuntimeError("synthetic schema-6 interruption")
+
+    with monkeypatch.context() as failure:
+        failure.setattr(SQLiteProgramStore, "_migrate_5_to_6", interrupted)
+        with pytest.raises(RuntimeError, match="schema-6 interruption"):
+            SQLiteProgramStore(path)
+    with closing(sqlite3.connect(path)) as raw:
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert tuple(raw.iterdump()) == original
+    backups = list(path.parent.glob(path.name + ".pre-schema-6-*"))
+    assert len(backups) == 1
+    with SQLiteProgramStore(path) as store:
+        assert store.startup_evidence.schema_version == 6
+        assert store.artifact("legacy-evidence", "original") == b"synthetic retained original bytes"
+    assert list(path.parent.glob(path.name + ".pre-schema-6-*")) == backups
 
 
 @pytest.mark.parametrize("corruption", ["schema", "omitted-artifact", "artifact-bytes"])

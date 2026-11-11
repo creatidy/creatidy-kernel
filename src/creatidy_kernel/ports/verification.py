@@ -221,7 +221,8 @@ def _decode_subject(value: object) -> EvidenceSubject:
     )
 
 
-def _decode_receipt(data: bytes) -> ProductReviewReceipt:
+def decode_product_review_receipt(data: bytes) -> ProductReviewReceipt:
+    """Decode the original durable substantive-review receipt without dispatch."""
     value: object = json.loads(data)
     expected = {
         "findings",
@@ -335,6 +336,7 @@ def dispatch_product_review(
     *,
     now: int,
     lease_seconds: int = 60,
+    delivery: Callable[[str, int], int] | None = None,
 ) -> ProductReviewResult:
     """Persist review intent and receipt; reconcile uncertain delivery before retry."""
     request_bytes = _review_request_bytes(request)
@@ -367,7 +369,7 @@ def dispatch_product_review(
     receipt_bytes = store.find_artifact(operation_id, "review-receipt")
     operation = store.operation(operation_id)
     if receipt_bytes is not None:
-        receipt = _decode_receipt(receipt_bytes)
+        receipt = decode_product_review_receipt(receipt_bytes)
         _validate_review_receipt(request, receipt)
         if operation.status in {"dispatched", "unknown"}:
             operation = store.observe(
@@ -424,7 +426,11 @@ def dispatch_product_review(
             authoritative_absence=True,
         )
 
-    fence = store.claim(operation_id, now=now, lease_seconds=lease_seconds)
+    fence = (
+        store.claim(operation_id, now=now, lease_seconds=lease_seconds)
+        if delivery is None
+        else delivery(operation_id, lease_seconds)
+    )
     operation = store.operation(operation_id)
     key = OperationKey(operation_id, operation.effect_key, operation.request_digest)
     store.check_work_dispatch(operation_id)
@@ -462,12 +468,14 @@ class DurableProductReviewChecks:
         *,
         clock: Callable[[], int],
         lease_seconds: int = 60,
+        delivery: Callable[[str, int], int] | None = None,
     ) -> None:
         self.store = store
         self.checks = checks
         self.request_for_subject = request_for_subject
         self.dispatcher = dispatcher
         self.clock = clock
+        self.delivery = delivery
         self.lease_seconds = lease_seconds
         self.last_result: ProductReviewResult | None = None
 
@@ -486,6 +494,7 @@ class DurableProductReviewChecks:
             self.dispatcher,
             now=now,
             lease_seconds=self.lease_seconds,
+            delivery=self.delivery,
         )
         self.last_result = result
         return result.evidence

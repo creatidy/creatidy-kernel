@@ -40,6 +40,7 @@ from creatidy_kernel.core.domain import (
     AmendProgramSpec,
     AttemptSpec,
     AttemptStatus,
+    CancelProgram,
     DomainCommandType,
     FinishAttempt,
     PrepareAttempt,
@@ -59,10 +60,11 @@ from creatidy_kernel.core.ownership import (
     ResourceScope,
     WorkClaim,
 )
+from creatidy_kernel.core.served import command_prefix
 from creatidy_kernel.core.work_budget import COUNT_ONLY_WORK, BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _APPLICATION_ID = 0x43544B31
 _DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _LOCAL_FILESYSTEMS = {
@@ -249,6 +251,7 @@ class SQLiteProgramStore:
         self._owner_thread_token = object()
         self._owner_thread_local.store_token = self._owner_thread_token
         self._gate = threading.RLock()
+        self._report_revision: tuple[str, int] | None = None
         self._busy_timeout_ms = busy_timeout_ms
         self._boot_clock = boot_clock
         self._clock_watermarks: dict[str, BootClockReading] = {}
@@ -685,6 +688,294 @@ class SQLiteProgramStore:
                 )
             )
 
+    def find_operation(self, operation_id: str) -> OperationRecord | None:
+        """Return one exact operation, treating only a missing row as absent."""
+        self._assert_writer_thread()
+        self._validate_command_key(operation_id)
+        with self._gate:
+            row = self._connection.execute(
+                "SELECT 1 FROM operations WHERE operation_id = ?", (operation_id,)
+            ).fetchone()
+            return None if row is None else self.operation(operation_id)
+
+    def served_operations(self, program_id: str) -> tuple[OperationRecord, ...]:
+        """Read a bounded sample of one Program's command namespace."""
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        prefix = command_prefix(program_id)
+        with self._gate:
+            rows = self._connection.execute(
+                "SELECT operation_id FROM operations WHERE operation_id >= ? AND operation_id < ? "
+                "ORDER BY operation_id LIMIT 64",
+                (prefix, prefix + "\U0010ffff"),
+            ).fetchall()
+            return tuple(self.operation(cast(str, row["operation_id"])) for row in rows)
+
+    def served_operation_count(self, program_id: str) -> int:
+        """Count durable commands without materializing unbounded history."""
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        prefix = command_prefix(program_id)
+        with self._gate:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM operations WHERE operation_id >= ? AND operation_id < ?",
+                (prefix, prefix + "\U0010ffff"),
+            ).fetchone()
+            return cast(int, row[0])
+
+    def served_change_token(self) -> tuple[int, int]:
+        """Read conservative connection-local and external SQLite change counters."""
+        self._assert_writer_thread()
+        with self._gate:
+            row = self._connection.execute("PRAGMA data_version").fetchone()
+            return (self._connection.total_changes, cast(int, row[0]))
+
+    def outcome_effect_evidence(self, program_id: str, operation_id: str) -> dict[str, object]:
+        """Read only original effect facts for a Program-scoped reservation."""
+        self._assert_writer_thread()
+        with self._gate:
+            reservation = self._work_record("reservation", operation_id)
+            if reservation is None or reservation.get("program") != program_id:
+                if not operation_id.startswith("cancel:"):
+                    raise ValueError("effect is not reserved by the selected Program")
+                program = self._load_head(program_id)
+                cancellation_attempt = next(
+                    (item for item in program.attempts if operation_id == f"cancel:{item.attempt_id}"), None
+                )
+                operation = self.find_operation(operation_id)
+                request = None if operation is None else json.loads(operation.request_json).get("request")
+                if (
+                    cancellation_attempt is None
+                    or operation is None
+                    or operation.effect_key != operation_id
+                    or type(request) is not dict
+                    or cast(dict[str, object], request).get("operation") != f"runtime:{cancellation_attempt.attempt_id}"
+                ):
+                    raise ValueError("effect is not reserved by the selected Program")
+            return {
+                "deliveries": [
+                    dict(row)
+                    for row in self._connection.execute(
+                        "SELECT fence, claimed_at, lease_until FROM delivery_attempts "
+                        "WHERE operation_id = ? ORDER BY fence",
+                        (operation_id,),
+                    ).fetchall()
+                ],
+                "transports": [
+                    dict(row)
+                    for row in self._connection.execute(
+                        "SELECT fence, succeeded FROM operation_transports WHERE operation_id = ? ORDER BY fence",
+                        (operation_id,),
+                    ).fetchall()
+                ],
+                "observations": [
+                    dict(row)
+                    for row in self._connection.execute(
+                        "SELECT observation_id, fence, kind, reference FROM operation_observations "
+                        "WHERE operation_id = ? ORDER BY observation_id",
+                        (operation_id,),
+                    ).fetchall()
+                ],
+                "reconciliations": [
+                    dict(row)
+                    for row in self._connection.execute(
+                        "SELECT sequence, fence, outcome, reference, evidence, matched_digest, authoritative_absence "
+                        "FROM operation_reconciliations WHERE operation_id = ? ORDER BY sequence",
+                        (operation_id,),
+                    ).fetchall()
+                ],
+            }
+
+    def outcome_claim_evidence(self, program_id: str, command_key: str) -> dict[str, object]:
+        """Read only the original claim resources and validated handoff proofs."""
+        self._assert_writer_thread()
+        with self._gate:
+            record = self._work_record("ownership-claim", command_key)
+            if record is None or record.get("program") != program_id:
+                raise ValueError("claim is not owned by the selected Program")
+            claim = self._decode_work_claim(record)
+            proofs: list[dict[str, object]] = []
+            for stage in ("start", "complete", "stop"):
+                stored = self._work_record("ownership-proof", f"{command_key}:{stage}")
+                if stored is None:
+                    continue
+                value = cast(dict[str, object], stored["proof"])
+                proof = HandoffProof(
+                    cast(str, value["source"]),
+                    cast(str, value["profile"]),
+                    HandoffMode(cast(str, value["mode"])),
+                    cast(str, value["attempt_digest"]),
+                    cast(int, value["generation"]),
+                    tuple(ResourceScope(**item) for item in cast(list[dict[str, str]], value["resources"])),
+                    cast(str, value["stage"]),
+                    cast(str, value["reference"]),
+                )
+                proof.check(claim, stage)
+                proofs.append(proof.payload())
+            return {
+                "profile": claim.profile,
+                "original_claim": asdict(claim),
+                "resources": [asdict(item) for item in claim.resources],
+                "proofs": proofs,
+                "quarantine": self._work_record("ownership-unknown", command_key),
+                "release": self._work_record("ownership-release", command_key),
+                "reconciliations": [
+                    json.loads(row["request_json"])["request"]
+                    for row in self._connection.execute(
+                        "SELECT request_json FROM operations "
+                        "WHERE operation_id LIKE 'work-budget:v1:ownership-reconcile:%' "
+                        "AND json_extract(request_json, '$.request.claim') = ? ORDER BY operation_id",
+                        (command_key,),
+                    ).fetchall()
+                ],
+            }
+
+    def outcome_revocation(self, program_id: str) -> dict[str, object] | None:
+        """Return recorded original revocation without clock or authority sampling."""
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        with self._gate:
+            return self._work_record("revoked", program_id)
+
+    def outcome_artifact_metadata(
+        self, program_id: str, operation_id: str, prefix: str
+    ) -> tuple[dict[str, object], ...]:
+        """List retained artifact metadata only for an original scoped producer operation."""
+        self._assert_writer_thread()
+        if prefix not in {
+            "candidate.patch",
+            "output",
+            "verification:",
+            "command-evidence:",
+            "observation:",
+            "owned-observation:",
+            "stop-uncertain:",
+        }:
+            raise ValueError("unsupported outcome artifact prefix")
+        with self._gate:
+            program = self._load_head(program_id)
+            allowed = any(
+                operation_id in {f"runtime:{item.attempt_id}", f"cancel:{item.attempt_id}"} for item in program.attempts
+            )
+            reservation = self._work_record("reservation", operation_id)
+            if not allowed and (reservation is None or reservation.get("program") != program_id):
+                raise ValueError("artifact operation is not owned by the selected Program")
+            pattern = prefix if prefix in {"candidate.patch", "output"} else prefix + "%"
+            return tuple(
+                dict(row)
+                for row in self._connection.execute(
+                    "SELECT name, digest, size FROM artifact_references "
+                    "WHERE operation_id = ? AND name LIKE ? ORDER BY name",
+                    (operation_id, pattern),
+                ).fetchall()
+            )
+
+    def served_claims(self, program_id: str, *, offset: int = 0, limit: int = 8) -> tuple[dict[str, object], ...]:
+        """Project only recorded ownership facts for one Program, without sampling authority."""
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8:
+            raise OwnershipConflict("invalid claim projection page")
+        with self._gate:
+            renewals = self._work_records("ownership-renew")
+            rows = self._connection.execute(
+                "SELECT request_json FROM operations WHERE operation_id LIKE 'work-budget:v1:ownership-claim:%' "
+                "AND json_extract(request_json, '$.request.program') = ? ORDER BY operation_id LIMIT ? OFFSET ?",
+                (program_id, limit, offset),
+            ).fetchall()
+            result: list[dict[str, object]] = []
+            for row in rows:
+                claim = self._decode_work_claim(cast(dict[str, object], json.loads(row["request_json"])["request"]))
+                observations = self._connection.execute(
+                    "SELECT request_json FROM operations "
+                    "WHERE operation_id LIKE 'work-budget:v1:ownership-observation:%' "
+                    "AND json_extract(request_json, '$.request.claim') = ? "
+                    "ORDER BY json_extract(request_json, '$.request.order') DESC LIMIT 2",
+                    (claim.command_key,),
+                ).fetchall()
+                # The old journal stores each subject only once, not each visit.
+                # Multiple subjects cannot establish which was observed last.
+                latest = (
+                    claim.workspace_subject
+                    if not observations
+                    else cast(str, json.loads(observations[0]["request_json"])["request"]["subject"])
+                    if len(observations) == 1
+                    else None
+                )
+                candidate = self._work_record("ownership-candidate", claim.command_key)
+                released = self._work_record("ownership-release", claim.command_key) is not None
+                reconciled = (
+                    None
+                    if latest is None
+                    else (
+                        latest == claim.workspace_subject
+                        or self._work_record("ownership-prepared", f"{claim.command_key}:{latest}") is not None
+                        or self._work_record("ownership-reconcile", f"{claim.command_key}:{latest}") is not None
+                    )
+                )
+                result.append(
+                    {
+                        "attempt": claim.attempt.attempt_id,
+                        "claim": claim.command_key,
+                        "claimant": claim.claimant,
+                        "generation": claim.generation,
+                        "original_expires_at": claim.expires_at,
+                        "recorded_expires_at": max(
+                            [
+                                claim.expires_at,
+                                *(
+                                    cast(int, item["expires_at"])
+                                    for item in renewals
+                                    if item["claim"] == claim.command_key
+                                ),
+                            ]
+                        ),
+                        "mode": claim.mode.value,
+                        "released_recorded": released,
+                        "quarantined_recorded": self._work_record("ownership-unknown", claim.command_key) is not None,
+                        "latest_recorded_subject": latest,
+                        "candidate_recorded_subject": None if candidate is None else candidate["subject"],
+                        "recorded_owner_reconciliation_needed": (
+                            False if released else None if reconciled is None else not reconciled
+                        ),
+                        "recorded_proofs": tuple(
+                            stage
+                            for stage in ("start", "complete", "stop")
+                            if self._work_record("ownership-proof", f"{claim.command_key}:{stage}") is not None
+                        ),
+                    }
+                )
+            return tuple(result)
+
+    def served_claim_count(self, program_id: str) -> int:
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        with self._gate:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM operations WHERE operation_id LIKE 'work-budget:v1:ownership-claim:%' "
+                "AND json_extract(request_json, '$.request.program') = ?",
+                (program_id,),
+            ).fetchone()
+            return cast(int, row[0])
+
+    def served_expired_claim_count(self, program_id: str, observed_at: int) -> int:
+        """Count displayed claim cutoffs using original claims and recorded renewals."""
+        self._assert_writer_thread()
+        self._validate_program_id(program_id)
+        if type(observed_at) is not int or observed_at < 0:
+            raise ValueError("invalid display clock observation")
+        with self._gate:
+            renewals = self._work_records("ownership-renew")
+            expiries: dict[str, int] = {}
+            for item in renewals:
+                key, expiry = cast(str, item["claim"]), cast(int, item["expires_at"])
+                expiries[key] = max(expiries.get(key, expiry), expiry)
+            return sum(
+                max(cast(int, item["expires_at"]), expiries.get(cast(str, item["command"]), 0)) <= observed_at
+                for item in self._work_records("ownership-claim")
+                if item["program"] == program_id
+            )
+
     def operations(self, prefix: str = "") -> tuple[OperationRecord, ...]:
         """Return stable operation identities for bounded application recovery/export."""
         self._assert_writer_thread()
@@ -697,6 +988,24 @@ class SQLiteProgramStore:
 
     def claim_owned_operation(self, claim: WorkClaim, operation_id: str, subject: str, lease_seconds: int) -> int:
         return self._claim_operation(operation_id, now=0, lease_seconds=lease_seconds, ownership=(claim, subject))
+
+    @contextmanager
+    def report_revision_guard(self, program_id: str, revision: int) -> Generator[None, None, None]:
+        """Fence new report effects to the revision admitted after FinishAttempt."""
+        self._assert_writer_thread()
+        if self._report_revision is not None or type(revision) is not int or revision < 0:
+            raise OwnershipConflict("invalid or nested report revision guard")
+        self._report_revision = (program_id, revision)
+        try:
+            self._check_report_revision(program_id)
+            yield
+        finally:
+            self._report_revision = None
+
+    def _check_report_revision(self, program_id: str) -> None:
+        if self._report_revision is not None and self._report_revision[0] == program_id:
+            if self._load_head(program_id).revision != self._report_revision[1]:
+                raise OwnershipConflict("caller report revision changed before effect")
 
     def _claim_operation(
         self,
@@ -719,6 +1028,8 @@ class SQLiteProgramStore:
         ):
             op = self.operation(operation_id)
             reservation = self._work_record("reservation", operation_id)
+            if reservation is not None:
+                self._check_report_revision(cast(str, reservation["program"]))
             if ownership is not None and (
                 reservation is None
                 or (reservation["program"], reservation["attempt"])
@@ -837,6 +1148,7 @@ class SQLiteProgramStore:
             "ownership-proof": {"claim", "proof"},
             "ownership-observation": {"claim", "subject", "attribution", "order"},
             "ownership-reconcile": {"claim", "subject", "owner", "evidence"},
+            "ownership-prepared": {"claim", "subject", "owner", "attempt_digest", "prepared_digest"},
             "ownership-candidate": {"claim", "subject"},
             "ownership-release": {"claim", "evidence"},
             "ownership-unknown": {"claim", "evidence"},
@@ -904,6 +1216,19 @@ class SQLiteProgramStore:
                     if claim_record is None:
                         raise OwnershipConflict("ownership record has no original claim")
                     claim = self._decode_work_claim(claim_record)
+                    if kind == "ownership-prepared":
+                        prepared = self.artifact(f"ordinary-workspace:{claim.attempt.attempt_id}", "prepared")
+                        data = cast(dict[str, object], json.loads(prepared))
+                        if (
+                            record["owner"] != self._claim_owner(claim)
+                            or record["attempt_digest"] != claim.attempt.digest
+                            or record["prepared_digest"] != hashlib.sha256(prepared).hexdigest()
+                            or data.get("attempt") != claim.attempt.digest
+                            or data.get("prepared_subject") != record["subject"]
+                            or self._work_key(kind, f"{claim.command_key}:{record['subject']}")
+                            != operation.operation_id
+                        ):
+                            raise OwnershipConflict("ordinary preparation proof differs from the original claim")
                     if kind == "ownership-publication":
                         self._validate_claim_publication(record)
                         if self._work_key(kind, cast(str, record["operation"])) != operation.operation_id:
@@ -1233,7 +1558,9 @@ class SQLiteProgramStore:
                     ):
                         raise OwnershipConflict("unreconciled effect retains conflicting resources")
 
-    def check_work_claim(self, claim: WorkClaim, *, settled: bool = False) -> None:
+    def check_work_claim(
+        self, claim: WorkClaim, *, settled: bool = False, expected_revision: int | None = None
+    ) -> None:
         self._assert_writer_thread()
         with (
             self._gate,
@@ -1241,8 +1568,15 @@ class SQLiteProgramStore:
             self._transaction(readings),
         ):
             self._check_work_claim(claim, settled=settled, retirement_receipt=settled)
+            if (
+                expected_revision is not None
+                and self._load_head(claim.attempt.program_id).revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before claim authority check")
 
-    def renew_work_claim(self, command_key: str, claim: WorkClaim, lease_seconds: int) -> int:
+    def renew_work_claim(
+        self, command_key: str, claim: WorkClaim, lease_seconds: int, *, expected_revision: int | None = None
+    ) -> int:
         self._assert_writer_thread()
         if type(lease_seconds) is not int or lease_seconds <= 0:
             raise OwnershipConflict("renewal needs a positive bounded duration")
@@ -1251,6 +1585,11 @@ class SQLiteProgramStore:
             self._workspace_cut((claim.attempt.workspace_reference,)) as readings,
             self._transaction(readings),
         ):
+            if (
+                expected_revision is not None
+                and self._load_head(claim.attempt.program_id).revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before renewal")
             previous = self._work_record("ownership-renew", command_key)
             if previous is not None:
                 if (previous["claim"], previous["claimant"], previous["lease_seconds"]) != (
@@ -1279,7 +1618,14 @@ class SQLiteProgramStore:
             )
             return expiry
 
-    def record_claim_proof(self, claim: WorkClaim, proof: HandoffProof, *, worker_report: bool = False) -> None:
+    def record_claim_proof(
+        self,
+        claim: WorkClaim,
+        proof: HandoffProof,
+        *,
+        worker_report: bool = False,
+        expected_revision: int | None = None,
+    ) -> None:
         self._assert_writer_thread()
         proof.check(claim, proof.stage)
         with (
@@ -1290,6 +1636,11 @@ class SQLiteProgramStore:
             # Exact trusted reconciliation is allowed after revoke/expiry, unlike
             # worker renewal, candidate reports, acceptance or publication.
             self._check_work_claim(claim, authority=worker_report or proof.stage == "start")
+            if (
+                expected_revision is not None
+                and self._load_head(claim.attempt.program_id).revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before proof admission")
             if claim.mode is HandoffMode.MANAGED and proof.stage != "start":
                 started = self._work_record("ownership-proof", f"{claim.command_key}:start")
                 if started is None:
@@ -1347,7 +1698,9 @@ class SQLiteProgramStore:
                 )
             self._finalize_artifact(claim.operation_id, f"workspace:{subject}", snapshot)
 
-    def reconcile_claim_workspace(self, claim: WorkClaim, owner: str, subject: str, evidence: str) -> None:
+    def reconcile_claim_workspace(
+        self, claim: WorkClaim, owner: str, subject: str, evidence: str, *, expected_revision: int | None = None
+    ) -> None:
         self._assert_writer_thread()
         if not evidence.strip():
             raise OwnershipConflict("explicit reconciliation evidence required")
@@ -1357,6 +1710,11 @@ class SQLiteProgramStore:
             self._transaction(readings),
         ):
             self._check_work_claim(claim, authority=False, settled=True)
+            if (
+                expected_revision is not None
+                and self._load_head(claim.attempt.program_id).revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before reconciliation")
             if self._claim_owner(claim) != owner:
                 raise OwnershipConflict("only original owner can reconcile workspace changes")
             self._check_current_workspace_subject(claim, subject)
@@ -1373,6 +1731,83 @@ class SQLiteProgramStore:
                 },
             )
 
+    def accept_ordinary_preparation(
+        self, claim: WorkClaim, owner: str, subject: str, *, expected_revision: int | None = None
+    ) -> None:
+        """Admit exact controller materialization before any worker dispatch, without claiming settlement."""
+        self._assert_writer_thread()
+        prepared_key = f"ordinary-workspace:{claim.attempt.attempt_id}"
+        prepared = self.artifact(prepared_key, "prepared")
+        proof = cast(dict[str, object], json.loads(prepared))
+        prepared_digest = hashlib.sha256(prepared).hexdigest()
+        with (
+            self._gate,
+            self._workspace_cut((claim.attempt.workspace_reference,), subjects=(claim,)) as readings,
+            self._transaction(readings),
+        ):
+            self._check_work_claim(claim)
+            operation = self.operation(claim.operation_id)
+            program = self._load_head(claim.attempt.program_id)
+            if expected_revision is not None and (
+                type(expected_revision) is not int or expected_revision < 0 or program.revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before preparation acceptance")
+            attempt = program.attempt(claim.attempt.attempt_id)
+            artifact = self._connection.execute(
+                "SELECT digest, size FROM artifact_references WHERE operation_id = ? AND name = ?",
+                (prepared_key, "prepared"),
+            ).fetchone()
+            if (
+                owner != self._claim_owner(claim)
+                or attempt.status is not AttemptStatus.PREPARED
+                or operation.status != "intent"
+                or operation.attempts != 0
+                or proof.get("attempt") != claim.attempt.digest
+                or proof.get("prepared_subject") != subject
+                or artifact is None
+                or (artifact["digest"], artifact["size"]) != (prepared_digest, len(prepared))
+                or self._work_record("ownership-observation", f"{claim.command_key}:{subject}") is None
+            ):
+                raise OwnershipConflict("exact original controller preparation before dispatch required")
+            self._check_current_workspace_subject(claim, subject)
+            self._write_work_record(
+                "ownership-prepared",
+                f"{claim.command_key}:{subject}",
+                {
+                    "claim": claim.command_key,
+                    "subject": subject,
+                    "owner": owner,
+                    "attempt_digest": claim.attempt.digest,
+                    "prepared_digest": prepared_digest,
+                },
+            )
+
+    def find_ordinary_preparation(self, claim: WorkClaim) -> bool:
+        """Read the original admitted preparation without renewing or sampling authority."""
+        self._assert_writer_thread()
+        original = self._work_record("ownership-claim", claim.command_key)
+        if original is None or self._decode_work_claim(original) != claim:
+            raise OwnershipConflict("historical preparation claim generation or identity differs")
+        prepared = self.find_artifact(f"ordinary-workspace:{claim.attempt.attempt_id}", "prepared")
+        if prepared is None:
+            return False
+        data = cast(dict[str, object], json.loads(prepared))
+        subject = data.get("prepared_subject")
+        if type(subject) is not str or data.get("attempt") != claim.attempt.digest:
+            raise OwnershipConflict("retained ordinary preparation differs from the exact Attempt")
+        record = self._work_record("ownership-prepared", f"{claim.command_key}:{subject}")
+        if record is None:
+            return False
+        if (
+            record.get("claim") != claim.command_key
+            or record.get("subject") != subject
+            or record.get("owner") != self._claim_owner(claim)
+            or record.get("attempt_digest") != claim.attempt.digest
+            or record.get("prepared_digest") != hashlib.sha256(prepared).hexdigest()
+        ):
+            raise OwnershipConflict("retained ordinary preparation receipt is inconsistent")
+        return True
+
     def _check_workspace_subject(self, claim: WorkClaim, subject: str, *, fresh: bool = False) -> None:
         if fresh:
             self._check_current_workspace_subject(claim, subject)
@@ -1383,6 +1818,7 @@ class SQLiteProgramStore:
                 f"{claim.command_key}:{subject}",
             )
             is None
+            and self._work_record("ownership-prepared", f"{claim.command_key}:{subject}") is None
         ):
             raise OwnershipConflict("changed/manual workspace bytes require explicit exact-subject reconciliation")
 
@@ -1409,7 +1845,9 @@ class SQLiteProgramStore:
             self._check_work_claim(claim, settled=True)
             self._check_claim_candidate(claim, subject)
 
-    def submit_claim_candidate(self, claim: WorkClaim, subject: str, snapshot: bytes) -> str:
+    def submit_claim_candidate(
+        self, claim: WorkClaim, subject: str, snapshot: bytes, *, expected_revision: int | None = None
+    ) -> str:
         self._assert_writer_thread()
         if hashlib.sha256(snapshot).hexdigest() != subject:
             raise OwnershipConflict("candidate snapshot digest differs")
@@ -1423,6 +1861,11 @@ class SQLiteProgramStore:
             self._transaction(readings),
         ):
             self._check_work_claim(claim, settled=True)
+            if (
+                expected_revision is not None
+                and self._load_head(claim.attempt.program_id).revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before candidate submission")
             self._check_workspace_subject(claim, subject, fresh=True)
             self._write_work_record(
                 "ownership-candidate", claim.command_key, {"claim": claim.command_key, "subject": subject}
@@ -2282,6 +2725,7 @@ class SQLiteProgramStore:
         amendment: AmendProgramSpec | None = None,
         records: tuple[tuple[str, dict[str, object], bytes | None], ...] = (),
         validate: Callable[[], None] | None = None,
+        expected_revision: int | None = None,
     ) -> Program:
         """Publish one budgeted Program decision, its inert records and binding atomically.
 
@@ -2298,6 +2742,8 @@ class SQLiteProgramStore:
             readings = self._prepare_work_clocks()
             changes = self._connection.total_changes
             current = self.find_program(spec.program_id)
+            if expected_revision is not None and (-1 if current is None else current.revision) != expected_revision:
+                raise ProgramReadChanged("caller expected revision changed before approval admission")
             existing = self._work_binding(spec.program_id)
             origin = self.pending_work_projection(spec)
             if existing is not None or origin is not None:
@@ -2584,12 +3030,73 @@ class SQLiteProgramStore:
             return result
         return result
 
-    def revoke_work_budget(self, program_id: str, evidence: str) -> None:
+    def revoke_work_budget(self, program_id: str, evidence: str, *, expected_revision: int | None = None) -> None:
         self._assert_writer_thread()
         self._validate_command_key(evidence)
         with self._gate, self._transaction():
+            if expected_revision is not None and self._load_head(program_id).revision != expected_revision:
+                raise OwnershipConflict("caller expected revision changed before budget revocation")
             if self._work_record("revoked", program_id) is None:
                 self._write_work_record("revoked", program_id, {"program": program_id, "evidence": evidence})
+
+    def work_budget_revoked(self, program_id: str) -> bool | None:
+        """Read recorded revocation without sampling clocks or granting authority."""
+        self._assert_writer_thread()
+        with self._gate:
+            if self._work_binding(program_id) is None:
+                return None
+            return self._work_record("revoked", program_id) is not None
+
+    def served_authority_horizon(self, program_id: str) -> dict[str, object]:
+        """Sample time for display only; never persist or confer authority."""
+        self._assert_writer_thread()
+        with self._gate:
+            binding = self._work_binding(program_id)
+            if binding is None:
+                return {"deadline": None, "observed_at": None, "clock": "unknown"}
+            projection = DeadlineProjection.decode(binding["projection"])
+            row = self._connection.execute(
+                "SELECT * FROM work_clock_state WHERE program_id = ?", (program_id,)
+            ).fetchone()
+            changes = self._connection.total_changes
+            try:
+                reading = self._boot_clock()
+            except (OSError, ValueError):
+                reading = None
+            observed = None
+            if (
+                not self._closed
+                and self._connection.total_changes == changes
+                and row is not None
+                and not row["pending"]
+                and projection.verifiable(reading)
+                and reading is not None
+                and reading.wall >= row["wall"]
+                and reading.boot_ns >= row["boot_ns"]
+            ):
+                observed = projection.decision_time(reading)
+            return {
+                "deadline": projection.wall_deadline,
+                "observed_at": observed,
+                "clock": "unknown" if observed is None else "uncommitted-display-sample",
+            }
+
+    def stop_ordinary_program(
+        self, program_id: str, command_key: str, actor: str, evidence: str, *, expected_revision: int | None = None
+    ) -> Program:
+        """Atomically cancel nonterminal work and revoke its remaining budget authority."""
+        self._assert_writer_thread()
+        self._validate_command_key(command_key)
+        self._validate_command_key(evidence)
+        with self._gate, self._transaction():
+            program = self._load_head(program_id)
+            if expected_revision is not None and program.revision != expected_revision:
+                raise OwnershipConflict("caller expected revision changed before STOP")
+            if program.status not in {ProgramStatus.CANCELLED, ProgramStatus.COMPLETED}:
+                program = self._admit_decision(program_id, command_key, CancelProgram(program.revision, actor), None)
+            if self._work_record("revoked", program_id) is None:
+                self._write_work_record("revoked", program_id, {"program": program_id, "evidence": evidence})
+            return program
 
     def _bind_work_dispatch(self, program_id: str, attempt_id: str, operation_id: str) -> None:
         attempt = self._load_head(program_id).attempt(attempt_id).spec
@@ -2654,11 +3161,63 @@ class SQLiteProgramStore:
                 raise OperationConflict("driver delivery fence, request or lease stale")
         return now
 
+    def check_operation_delivery(
+        self, operation_id: str, fence: int, *, deadline: int | None = None, expected_revision: int | None = None
+    ) -> None:
+        """Final send cut after credentials/input callbacks, not a cached admission.
+
+        The transport must invoke this after all potentially reentrant preparation
+        and immediately before its physical send. No external callbacks run after
+        the sampled workspace/clock cut. Historical reads do not call this gate.
+        """
+        self._assert_writer_thread()
+        with (
+            self._gate,
+            self._workspace_cut(
+                self._operation_workspace_references(operation_id), subjects=(self._operation_work_claim(operation_id),)
+            ) as readings,
+            self._transaction(readings),
+        ):
+            self._check_work_dispatch(operation_id)
+            operation = self.operation(operation_id)
+            reservation = self._work_record("reservation", operation_id)
+            if reservation is None:
+                raise BudgetRefused("delivery lacks original reservation")
+            if (
+                expected_revision is not None
+                and self._load_head(cast(str, reservation["program"])).revision != expected_revision
+            ):
+                raise OwnershipConflict("caller expected revision changed before delivery")
+            now = self.work_decision_time(cast(str, reservation["program"]))
+            if deadline is not None and (type(deadline) is not int or now >= deadline):
+                raise BudgetRefused("original delivery consent deadline expired or invalid")
+            if (
+                type(fence) is not int
+                or operation.fence != fence
+                or operation.status != "dispatched"
+                or operation.lease_until is None
+                or now >= operation.lease_until
+            ):
+                raise OperationConflict("delivery fence, active status or original lease no longer current")
+            claim = self._operation_work_claim(operation_id)
+            if claim is not None and operation_id != claim.operation_id:
+                self._check_work_claim(
+                    claim,
+                    settled=True,
+                    publication=reservation["category"] == WorkKind.AUXILIARY.value,
+                    exclude_operation=operation_id,
+                )
+                candidate = self._work_record("ownership-candidate", claim.command_key)
+                if candidate is None:
+                    raise OwnershipConflict("delivery lacks an exact submitted candidate")
+                self._check_claim_candidate(claim, cast(str, candidate["subject"]))
+
     def _check_work_dispatch(self, operation_id: str) -> None:
         reservation = self._work_record("reservation", operation_id)
         if reservation is None:
             raise BudgetRefused("dispatch lacks original work reservation")
         program_id, attempt_id = cast(str, reservation["program"]), cast(str, reservation["attempt"])
+        self._check_report_revision(program_id)
         self.check_work_authority(program_id)
         program = self._load_head(program_id)
         try:
@@ -2911,6 +3470,7 @@ class SQLiteProgramStore:
             ) as readings,
             self._transaction(readings),
         ):
+            self._check_report_revision(program_id)
             existed = self._work_record("reservation", operation_id) is not None
             fresh = (
                 not existed
@@ -3542,7 +4102,7 @@ class SQLiteProgramStore:
             if (
                 manifest["format"] != "creatidy-kernel-sqlite-backup"
                 or type(manifest["schema_version"]) is not int
-                or manifest["schema_version"] not in (1, 2, 3, 4, 5)
+                or manifest["schema_version"] not in (1, 2, 3, 4, 5, 6)
             ):
                 raise ValueError("unsupported backup manifest")
             with (directory / "kernel.sqlite3").open("rb") as stream:
@@ -3903,6 +4463,8 @@ class SQLiteProgramStore:
             self._backup_before_schema_four()
         if original_version in (1, 2, 3, 4):
             self._backup_before_schema_four(target_schema=5)
+        if original_version in (1, 2, 3, 4, 5):
+            self._backup_before_schema_four(target_schema=6)
         with self._transaction():
             version = cast(int, self._connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SCHEMA_VERSION:
@@ -3922,6 +4484,9 @@ class SQLiteProgramStore:
             if version == 4:
                 self._migrate_4_to_5()
                 version = 5
+            if version == 5:
+                self._migrate_5_to_6()
+                version = 6
             if version != SCHEMA_VERSION:
                 raise UnsupportedSQLiteConfiguration(f"no migration path from schema version {version}")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -4131,6 +4696,22 @@ class SQLiteProgramStore:
                 "BEGIN SELECT RAISE(ABORT, 'ownership contract is immutable'); END"
             )
 
+    def _migrate_5_to_6(self) -> None:
+        # Schema-5 readers must refuse before ignoring the controller-preparation authority boundary.
+        self._connection.execute(
+            "CREATE TABLE ordinary_preparation_contract (version INTEGER PRIMARY KEY CHECK(version = 1), "
+            "contract TEXT NOT NULL CHECK(contract = 'ordinary-owned-preparation:v1')) WITHOUT ROWID"
+        )
+        self._connection.execute(
+            "INSERT INTO ordinary_preparation_contract VALUES (1, 'ordinary-owned-preparation:v1')"
+        )
+        for action in ("UPDATE", "DELETE"):
+            self._connection.execute(
+                f"CREATE TRIGGER ordinary_preparation_contract_no_{action.lower()} BEFORE {action} "
+                "ON ordinary_preparation_contract BEGIN "
+                "SELECT RAISE(ABORT, 'ordinary preparation contract is immutable'); END"
+            )
+
     def _validate_schema(self) -> None:
         tables = {
             cast(str, row[0])
@@ -4152,6 +4733,7 @@ class SQLiteProgramStore:
             "store_contract",
             "work_clock_state",
             "ownership_contract",
+            "ordinary_preparation_contract",
         }
         if not required <= tables:
             raise UnsupportedSQLiteConfiguration("database schema is missing required K2 tables")
@@ -4185,6 +4767,7 @@ class SQLiteProgramStore:
             "store_contract": {"schema_version", "authority_contract"},
             "work_clock_state": {"program_id", "wall", "boot_ns", "boot_id", "clock", "pending"},
             "ownership_contract": {"version", "contract"},
+            "ordinary_preparation_contract": {"version", "contract"},
         }
         for table, expected in columns.items():
             actual = {cast(str, row["name"]) for row in self._connection.execute(f"PRAGMA table_info({table})")}
@@ -4198,6 +4781,7 @@ class SQLiteProgramStore:
         required_triggers |= {"operations_no_delete", "outbox_no_update", "outbox_no_delete"}
         required_triggers |= {"store_contract_no_update", "store_contract_no_delete"}
         required_triggers |= {"ownership_contract_no_update", "ownership_contract_no_delete"}
+        required_triggers |= {"ordinary_preparation_contract_no_update", "ordinary_preparation_contract_no_delete"}
         required_triggers |= {
             f"{table}_no_{action}"
             for table in (
@@ -4220,6 +4804,11 @@ class SQLiteProgramStore:
             (1, "work-resource-ownership:v1")
         ]:
             raise UnsupportedSQLiteConfiguration("database ownership compatibility contract is invalid")
+        if [
+            tuple(row)
+            for row in self._connection.execute("SELECT version, contract FROM ordinary_preparation_contract")
+        ] != [(1, "ordinary-owned-preparation:v1")]:
+            raise UnsupportedSQLiteConfiguration("database ordinary preparation compatibility contract is invalid")
         if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise CorruptHistory("database contains a foreign-key violation")
 

@@ -917,10 +917,10 @@ class OwnedVerificationCommand:
             pass
         return self.settled()
 
-    def persist(self, store: SQLiteProgramStore) -> None:
+    def persist(self, store: SQLiteProgramStore, *, evidence_operation: str = OPERATION_ID) -> None:
         key = cast(str, self.binding["operation"])
         if self.result is not None:
-            store.finalize_artifact(OPERATION_ID, key, manifest_bytes(self.result))
+            store.finalize_artifact(evidence_operation, key, manifest_bytes(self.result))
         data = manifest_bytes(
             {
                 **self.binding,
@@ -1197,6 +1197,9 @@ def _run_command(
         "owned_group_settled": settled,
         "escaped_descendants": "unverified; trusted-development is not containment",
     }
+
+
+run_verification_command = _run_command
 
 
 class TaskChecks:

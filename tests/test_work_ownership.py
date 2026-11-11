@@ -484,7 +484,7 @@ def test_claim_records_are_nondispatchable_and_migration_keeps_original_rows(sql
         assert record["generation"] == 1
         assert "workspace_subject" not in json.loads(record["input"])
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
 
 
 @pytest.mark.parametrize("stage", ["complete", "stop"])
@@ -1406,4 +1406,7 @@ def test_actual_original_claim_records_replay_without_rewriting_or_adopting_conf
             assert store.operation("runtime:competing").attempts == 0
     if state != "conflict":
         with closing(sqlite3.connect(path)) as current:
-            assert tuple(current.iterdump()) == original_rows
+            assert (
+                tuple(line for line in current.iterdump() if "ordinary_preparation_contract" not in line)
+                == original_rows
+            )

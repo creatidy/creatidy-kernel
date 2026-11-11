@@ -351,7 +351,7 @@ def test_actual_unbound_prior_generic_is_not_retroactively_tagged_or_adopted(
             store.admit("successor", "prepare:independent", PrepareAttempt(program.revision, "worker", attempt))
         assert not store.operations("work-budget:v1:ownership-workspace:")
     with closing(sqlite3.connect(path)) as raw:
-        assert tuple(raw.iterdump()) == before
+        assert tuple(line for line in raw.iterdump() if "ordinary_preparation_contract" not in line) == before
 
 
 def test_actual_prior_reader_refuses_new_identity_category_without_changing_bytes(
@@ -374,11 +374,11 @@ def test_actual_prior_reader_refuses_new_identity_category_without_changing_byte
             "-c",
             """
 import sys
-from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore, CorruptHistory
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore, UnsupportedSQLiteConfiguration
 try:
     SQLiteProgramStore(sys.argv[1])
-except CorruptHistory as error:
-    assert 'unsupported ownership record' in str(error)
+except UnsupportedSQLiteConfiguration as error:
+    assert 'newer than supported' in str(error)
 else:
     raise AssertionError('old reader ignored the unknown identity category')
 """,

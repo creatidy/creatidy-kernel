@@ -10,7 +10,7 @@ from collections.abc import Callable
 from typing import Protocol
 
 from creatidy_kernel.core.authority import Principal
-from creatidy_kernel.core.domain import AttemptSpec
+from creatidy_kernel.core.domain import AttemptSpec, Program
 from creatidy_kernel.core.ownership import (
     COOPERATIVE_PROFILE,
     HandoffMode,
@@ -25,6 +25,8 @@ from creatidy_kernel.ports.program_store import OperationRecord
 class OwnershipStore(Protocol):
     @property
     def ownership_authority(self) -> str: ...
+
+    def load(self, program_id: str) -> Program: ...
 
     def find_work_claim(
         self,
@@ -52,15 +54,26 @@ class OwnershipStore(Protocol):
         lease_seconds: int,
     ) -> WorkClaim: ...
 
-    def check_work_claim(self, claim: WorkClaim, *, settled: bool = False) -> None: ...
+    def check_work_claim(
+        self, claim: WorkClaim, *, settled: bool = False, expected_revision: int | None = None
+    ) -> None: ...
 
-    def renew_work_claim(self, command_key: str, claim: WorkClaim, lease_seconds: int) -> int: ...
+    def renew_work_claim(
+        self, command_key: str, claim: WorkClaim, lease_seconds: int, *, expected_revision: int | None = None
+    ) -> int: ...
 
     def claim_owned_operation(self, claim: WorkClaim, operation_id: str, subject: str, lease_seconds: int) -> int: ...
 
     def check_claim_candidate(self, claim: WorkClaim, subject: str) -> None: ...
 
-    def record_claim_proof(self, claim: WorkClaim, proof: HandoffProof, *, worker_report: bool = False) -> None: ...
+    def record_claim_proof(
+        self,
+        claim: WorkClaim,
+        proof: HandoffProof,
+        *,
+        worker_report: bool = False,
+        expected_revision: int | None = None,
+    ) -> None: ...
 
     def observe_claim_workspace(
         self,
@@ -71,9 +84,13 @@ class OwnershipStore(Protocol):
         owner: str | None = None,
     ) -> None: ...
 
-    def reconcile_claim_workspace(self, claim: WorkClaim, owner: str, subject: str, evidence: str) -> None: ...
+    def reconcile_claim_workspace(
+        self, claim: WorkClaim, owner: str, subject: str, evidence: str, *, expected_revision: int | None = None
+    ) -> None: ...
 
-    def submit_claim_candidate(self, claim: WorkClaim, subject: str, snapshot: bytes) -> str: ...
+    def submit_claim_candidate(
+        self, claim: WorkClaim, subject: str, snapshot: bytes, *, expected_revision: int | None = None
+    ) -> str: ...
 
     def cleanup_work_claim(
         self,
@@ -165,6 +182,10 @@ class WorkOwnership:
         self._resources = (workspace.resource, *resources)
         workspace.bind_authority(store.ownership_authority)
 
+    def uses_store(self, store: object) -> bool:
+        """Check the live host composition, not durable producer identity."""
+        return self._store is store
+
     def _bound_caller(self, claim: WorkClaim) -> None:
         if (claim.mode, claim.profile, claim.resources) != (
             self._mode,
@@ -221,12 +242,28 @@ class WorkOwnership:
             lease_seconds,
         )
 
-    def renew(self, command_key: str, claim: WorkClaim, *, lease_seconds: int) -> int:
+    def renew(
+        self, command_key: str, claim: WorkClaim, *, lease_seconds: int, expected_revision: int | None = None
+    ) -> int:
         self._caller(claim)
         if self._principal.role != "worker":
             raise OwnershipConflict("only original authenticated claimant can renew")
+        if expected_revision is not None and self._store.load(claim.attempt.program_id).revision != expected_revision:
+            raise OwnershipConflict("caller expected revision is stale")
         self.observe(claim)
-        return self._store.renew_work_claim(command_key, claim, lease_seconds)
+        if expected_revision is None:
+            return self._store.renew_work_claim(command_key, claim, lease_seconds)
+        return self._store.renew_work_claim(command_key, claim, lease_seconds, expected_revision=expected_revision)
+
+    def check_current(self, claim: WorkClaim, *, expected_revision: int | None = None) -> None:
+        """Validate the exact retained generation without renewing its authority."""
+        self._caller(claim)
+        if self._principal.role != "worker":
+            raise OwnershipConflict("current work authority requires the original claimant")
+        if expected_revision is None:
+            self._store.check_work_claim(claim)
+        else:
+            self._store.check_work_claim(claim, expected_revision=expected_revision)
 
     def observe(self, claim: WorkClaim) -> str:
         self._caller(claim)
@@ -239,48 +276,60 @@ class WorkOwnership:
         )
         return subject
 
-    def witness(self, claim: WorkClaim, stage: str) -> None:
+    def witness(self, claim: WorkClaim, stage: str, *, expected_revision: int | None = None) -> None:
         self._caller(claim)
         proof = None if self._witness is None else self._witness.witness(claim, stage)
         if proof is None:
             raise OwnershipConflict("task-scope settlement/profile witness unknown; preserve resources")
-        self._store.record_claim_proof(claim, proof)
+        if expected_revision is None:
+            self._store.record_claim_proof(claim, proof)
+        else:
+            self._store.record_claim_proof(claim, proof, expected_revision=expected_revision)
 
-    def quiesce(self, claim: WorkClaim, receipt_id: str) -> None:
+    def quiesce(self, claim: WorkClaim, receipt_id: str, *, expected_revision: int | None = None) -> None:
         """Authenticated cooperative task-scope promise, not physical process settlement."""
         self._caller(claim)
         if self._mode is not HandoffMode.PULL or self._principal.role != "worker":
             raise OwnershipConflict("managed work requires its configured native witness")
+        if expected_revision is not None and self._store.load(claim.attempt.program_id).revision != expected_revision:
+            raise OwnershipConflict("caller expected revision is stale")
         self.observe(claim)
-        self._store.record_claim_proof(
-            claim,
-            HandoffProof(
-                self._principal.actor_id,
-                self._profile,
-                self._mode,
-                claim.attempt.digest,
-                claim.generation,
-                claim.resources,
-                "complete",
-                receipt_id,
-            ),
-            worker_report=True,
+        proof = HandoffProof(
+            self._principal.actor_id,
+            self._profile,
+            self._mode,
+            claim.attempt.digest,
+            claim.generation,
+            claim.resources,
+            "complete",
+            receipt_id,
         )
+        if expected_revision is None:
+            self._store.record_claim_proof(claim, proof, worker_report=True)
+        else:
+            self._store.record_claim_proof(claim, proof, worker_report=True, expected_revision=expected_revision)
 
-    def reconcile(self, claim: WorkClaim, subject: str, *, evidence: str) -> None:
+    def reconcile(self, claim: WorkClaim, subject: str, *, evidence: str, expected_revision: int | None = None) -> None:
         """Owner-only trusted call; never silently attribute changed bytes to a harness."""
         self._caller(claim)
         owner = self._owner()
+        if expected_revision is not None and self._store.load(claim.attempt.program_id).revision != expected_revision:
+            raise OwnershipConflict("caller expected revision is stale")
         if self.observe(claim) != subject:
             raise OwnershipConflict("workspace changed after reconciliation subject was selected")
-        self._store.reconcile_claim_workspace(claim, owner, subject, evidence)
+        if expected_revision is None:
+            self._store.reconcile_claim_workspace(claim, owner, subject, evidence)
+        else:
+            self._store.reconcile_claim_workspace(claim, owner, subject, evidence, expected_revision=expected_revision)
 
-    def submit(self, claim: WorkClaim) -> str:
+    def submit(self, claim: WorkClaim, *, expected_revision: int | None = None) -> str:
         self._caller(claim)
         self._store.check_work_claim(claim, settled=True)
         subject, snapshot = self._workspace.capture()
         self._store.observe_claim_workspace(claim, subject, snapshot)
-        return self._store.submit_claim_candidate(claim, subject, snapshot)
+        if expected_revision is None:
+            return self._store.submit_claim_candidate(claim, subject, snapshot)
+        return self._store.submit_claim_candidate(claim, subject, snapshot, expected_revision=expected_revision)
 
     def authorize_publication(
         self,
