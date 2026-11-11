@@ -134,8 +134,15 @@ class ForgejoCI:
         max_pages: int = 20,
     ) -> None:
         self.repository = _binding(forge, binding, "ci")
-        if not 0 < max_pages <= 1000 or source_binding.family != "scm":
-            raise ValueError("finite Forgejo CI scan and independent SCM binding required")
+        if not 0 < max_pages <= 1000 or (
+            source_binding.family,
+            source_binding.implementation,
+            source_binding.api_version,
+            source_binding.origin,
+            source_binding.tenant,
+            source_binding.namespace,
+        ) != ("scm", "forgejo-facade", "1", binding.origin, binding.tenant, binding.namespace):
+            raise ValueError("finite Forgejo CI scan and matching Forgejo SCM repository required")
         self.forge, self.binding, self.source_binding, self.clock = forge, binding, source_binding, clock
         self.max_pages = max_pages
 

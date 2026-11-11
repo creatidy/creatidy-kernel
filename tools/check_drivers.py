@@ -278,6 +278,9 @@ class SyntheticServices:
                         "_class": "hudson.plugins.git.util.BuildData",
                         "remoteUrls": [REMOTE],
                         "lastBuiltRevision": {"SHA1": HEAD},
+                        "buildsByBranchName": {
+                            "refs/remotes/origin/main": {"buildNumber": 12, "revision": {"SHA1": HEAD}}
+                        },
                     }
                 ],
                 "artifacts": [],

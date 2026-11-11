@@ -495,11 +495,7 @@ class JenkinsCI:
         if source.binding != self.source_binding or source.kind != "commit" or source.key != source.revision:
             raise ValueError("exact SCM commit subject required")
         now = self.clock()
-        tree = (
-            "number,building,result,timestamp,duration,actions[_class,remoteUrls,lastBuiltRevision[SHA1]],"
-            "artifacts[fileName,relativePath]"
-        )
-        status, payload, headers = _read(self.http, f"{self.prefix}/{key}/api/json?{urlencode({'tree': tree})}")
+        status, payload, headers = _read(self.http, f"{self.prefix}/{key}/api/json?{urlencode({'depth': 5})}")
         try:
             data = object_value(payload)
             if (
@@ -520,6 +516,14 @@ class JenkinsCI:
             ]
             if len(matching) != 1 or object_value(matching[0].get("lastBuiltRevision")).get("SHA1") != source.revision:
                 raise ValueError("exact checkout unavailable or ambiguous")
+            builds = object_value(matching[0].get("buildsByBranchName"))
+            if not any(
+                type(value.get("buildNumber")) is int
+                and str(value["buildNumber"]) == key
+                and object_value(value.get("revision")).get("SHA1") == source.revision
+                for value in (object_value(item) for item in builds.values())
+            ):
+                raise ValueError("checkout not bound to the requested build")
             if data.get("result") not in {None, "SUCCESS", "FAILURE", "UNSTABLE", "ABORTED", "NOT_BUILT"}:
                 raise ValueError("unknown native Jenkins result")
             if data["building"] is False and data.get("result") is None:

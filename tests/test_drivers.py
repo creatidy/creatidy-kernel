@@ -9,11 +9,16 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
+from typing import cast
 from urllib.parse import urlunsplit
 
 import pytest
 
 from creatidy_kernel.adapters.driver_http import object_value
+from creatidy_kernel.adapters.forge_refs import ForgeBinding
+from creatidy_kernel.adapters.forgejo import ForgejoForge
+from creatidy_kernel.adapters.forgejo_drivers import ForgejoCI
 from creatidy_kernel.adapters.project_drivers import GitHubSCM, JiraWorkManagement, binding_from_mapping
 from creatidy_kernel.adapters.sqlite_store import IdempotencyConflict, OperationConflict, SQLiteProgramStore
 from creatidy_kernel.core.domain import CancelProgram
@@ -375,7 +380,7 @@ def test_native_marker_from_another_principal_is_not_kernel_receipt(services: Sy
     assert knowledge.reconcile(page).status is EffectStatus.UNKNOWN
 
 
-@pytest.mark.parametrize("mode", ["wrongsha", "wrongremote", "duplicate", "parameters", "unknownresult"])
+@pytest.mark.parametrize("mode", ["wrongsha", "wrongremote", "duplicate", "parameters", "unknownresult", "inherited"])
 def test_jenkins_requires_actual_checkout_evidence_not_parameters_or_job_name(
     services: SyntheticServices, mode: str
 ) -> None:
@@ -386,7 +391,7 @@ def test_jenkins_requires_actual_checkout_evidence_not_parameters_or_job_name(
             return None
         status, raw = services.route(method, path, body)
         data = copy.deepcopy(object_value(raw))
-        actions = [object_value(value) for value in cast_list(data["actions"])]
+        actions: list[dict[str, object]] = [object_value(value) for value in cast_list(data["actions"])]
         if mode == "wrongsha":
             actions[0]["lastBuiltRevision"] = {"SHA1": "c" * 40}
         if mode == "wrongremote":
@@ -399,6 +404,8 @@ def test_jenkins_requires_actual_checkout_evidence_not_parameters_or_job_name(
             ]
         if mode == "unknownresult":
             data["result"] = "CUSTOM_PASS"
+        if mode == "inherited":
+            actions[0]["buildsByBranchName"] = {"main": {"buildNumber": 11, "revision": {"SHA1": HEAD}}}
         data["actions"] = actions
         return status, data
 
@@ -407,6 +414,23 @@ def test_jenkins_requires_actual_checkout_evidence_not_parameters_or_job_name(
     assert project.ci.build("12", source).presence is not Presence.FOUND
     with pytest.raises(ValueError):
         project.ci.build("12", replace(source, binding=replace(scm.binding, tenant="other")))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("origin", "https://other.example.test"),
+        ("namespace", "other/repo"),
+        ("implementation", "github"),
+        ("tenant", "other"),
+    ],
+)
+def test_forgejo_ci_refuses_different_source_repository(field: str, value: str) -> None:
+    ci = binding("ci", "forgejo-facade", "acme/service", "1")
+    source = replace(ci, family="scm")
+    forge = cast(ForgejoForge, SimpleNamespace(binding=ForgeBinding(ci.origin, ci.namespace)))
+    with pytest.raises(ValueError):
+        ForgejoCI(forge, ci, replace(source, **{field: value}), Clock().wall)
 
 
 def cast_list(value: object) -> list[object]:
