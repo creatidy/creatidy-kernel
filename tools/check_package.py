@@ -88,6 +88,11 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
         cwd=work,
         check=True,
     )
+    subprocess.run(
+        [str(python), "-I", str(ROOT / "tools/check_ordinary.py"), str(ordinary_directory), "--proposal-chunks-only"],
+        cwd=work,
+        check=True,
+    )
     if not (shutil.which("sops") and shutil.which("age-keygen")):
         print("Installed SOPS/age migration: UNPROVED (local sops and age-keygen required)")
     subprocess.run([str(cli), "reference", "--help"], cwd=work, check=True)

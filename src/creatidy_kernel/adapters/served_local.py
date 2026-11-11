@@ -715,12 +715,14 @@ class LocalOwnerChannel(LocalReadChannel):
         handoff: OrdinaryHandoff | None = None,
         managed: OrdinaryManagedRun | None = None,
         approval_binding: list[OrdinaryApproval | None] | None = None,
+        proposal_cache: list[tuple[OrdinaryProposal, bytes, str]] | None = None,
     ) -> None:
         _validate_owner_binding(owner, application, approved, proposal, control, handoff, managed)
         super().__init__(owner, channel)
         self._application = application
         self._approval_binding = [approved] if approval_binding is None else approval_binding
         self._proposal = proposal
+        self._proposal_cache = [] if proposal_cache is None else proposal_cache
         self._control, self._handoff = control, handoff
         self._managed = managed
 
@@ -738,6 +740,36 @@ class LocalOwnerChannel(LocalReadChannel):
         self._approval_binding[0] = value
 
     def _dispatch(self, request: dict[str, object]) -> object:
+        if request.get("action") == "proposal-chunk":
+            if set(request) != {"version", "action", "offset", "proposal_digest"} or self._proposal is None:
+                raise LocalChannelRefused("a host-bound proposal and exact chunk request are required")
+            proposal = self._proposal
+            offset, expected = request["offset"], request["proposal_digest"]
+            if proposal.program_id != self._owner.scope or type(offset) is not int or offset < 0:
+                raise LocalChannelRefused("invalid proposal chunk request")
+            if not self._proposal_cache or self._proposal_cache[0][0] is not proposal:
+                raw = encode(proposal.payload)
+                self._proposal_cache[:] = [(proposal, raw, digest(raw))]
+            _, raw, identity = self._proposal_cache[0]
+            if offset > len(raw) or (expected != identity and not (offset == 0 and expected is None)):
+                raise LocalChannelRefused("proposal changed or chunk offset invalid")
+            chunk = raw[offset : offset + 8192]
+            return {
+                "version": 1,
+                "digest": identity,
+                "offset": offset,
+                "bytes": len(raw),
+                "data_base64": base64.b64encode(chunk).decode("ascii"),
+                "complete": offset + len(chunk) == len(raw),
+            }
+        if request.get("action") == "proposal":
+            if set(request) != {"version", "action"} or self._proposal is None:
+                raise LocalChannelRefused("a host-bound proposal is required")
+            proposal = self._proposal
+            if proposal.program_id != self._owner.scope:
+                raise LocalChannelRefused("proposal differs from owner scope")
+            raw = encode(proposal.payload)
+            return {"version": 1, "scope": proposal.program_id, "digest": digest(raw), "proposal": object_from(raw)}
         if request.get("action") == "approve":
             return self._approve(request)
         if request.get("action") == "reconcile":
@@ -923,20 +955,22 @@ class LocalOwnerChannel(LocalReadChannel):
         return result
 
     def _approve(self, request: dict[str, object]) -> object:
-        if self._proposal is None or set(request) != {
+        if set(request) != {
             "version",
             "action",
             "command_id",
             "expected_revision",
             "decision_id",
             "expires_at",
+            "proposal_digest",
         }:
             raise LocalChannelRefused("a host-bound proposal and exact approval request are required")
-        command_id, revision, decision_id, expires_at = (
+        command_id, revision, decision_id, expires_at, proposal_digest = (
             request["command_id"],
             request["expected_revision"],
             request["decision_id"],
             request["expires_at"],
+            request["proposal_digest"],
         )
         if (
             type(command_id) is not str
@@ -949,6 +983,9 @@ class LocalOwnerChannel(LocalReadChannel):
             or len(decision_id) > 256
             or type(expires_at) is not int
             or expires_at < 1
+            or type(proposal_digest) is not str
+            or len(proposal_digest) != 64
+            or any(character not in "0123456789abcdef" for character in proposal_digest)
         ):
             raise LocalChannelRefused("invalid approval request")
         store = self._application.store
@@ -959,7 +996,7 @@ class LocalOwnerChannel(LocalReadChannel):
             **request,
             "scope": self._owner.scope,
             "actor": self._application.owner.actor_id,
-            "proposal": self._proposal.digest,
+            "proposal": proposal_digest,
             "policy": self._application.policy.digest,
         }
         prior = store.find_operation(operation_id)
@@ -980,12 +1017,16 @@ class LocalOwnerChannel(LocalReadChannel):
             ):
                 raise LocalChannelRefused("recorded approval receipt is invalid")
             return result
+        proposal = self._proposal
+        if proposal is None or proposal.program_id != self._owner.scope or proposal.digest != proposal_digest:
+            raise LocalChannelRefused("reviewed proposal is no longer bound")
         current = store.find_program(self._owner.scope)
         if (-1 if current is None else current.revision) != revision:
             raise LocalChannelRefused("caller expected revision is stale")
+        self._application.check_proposal_record(proposal)
         store.intent(operation_id, operation_id, exact)
         approved = self._application.approve(
-            self._proposal, decision_id=decision_id, expires_at=expires_at, expected_revision=revision
+            proposal, decision_id=decision_id, expires_at=expires_at, expected_revision=revision
         )
         self._approved = approved
         result: dict[str, object] = {
@@ -1018,6 +1059,7 @@ class LocalOwnerSession:
         self._owner, self._application = owner, application
         self._approval_binding: list[OrdinaryApproval | None] = [approved]
         self._proposal, self._control, self._handoff, self._managed = proposal, control, handoff, managed
+        self._proposal_cache: list[tuple[OrdinaryProposal, bytes, str]] = []
         self._channels: list[LocalOwnerChannel] = []
         self._revoked = False
 
@@ -1038,6 +1080,7 @@ class LocalOwnerSession:
             handoff=self._handoff,
             managed=self._managed,
             approval_binding=self._approval_binding,
+            proposal_cache=self._proposal_cache,
         )
         self._channels.append(result)
         return result
@@ -1051,5 +1094,6 @@ class LocalOwnerSession:
     def revoke(self) -> None:
         """Revoke communication only; this does not cancel or settle the work."""
         self._revoked = True
+        self._proposal_cache.clear()
         for channel in self._channels:
             channel.revoke()

@@ -544,16 +544,43 @@ def test_owner_approval_checks_caller_expectation_for_absent_program(sqlite_tmp_
     }
 
 
+def test_large_proposal_is_read_in_exact_bounded_chunks(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "large-proposal", None, mode="pull", exercise="served-large-proposal"
+    ) == {
+        "status": "read",
+        "native_sends": 0,
+    }
+
+
+def test_installed_client_reads_large_proposal_across_connections(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "installed-large-proposal", None, mode="pull", exercise="served-large-installed-client"
+    ) == {"status": "read", "native_sends": 0}
+
+
 def test_owner_approval_rechecks_absence_after_external_validation(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(
         sqlite_tmp_path / "approve-revision-race", None, mode="pull", exercise="approve-revision-race"
     ) == {"status": "refused", "native_sends": 0}
 
 
-@pytest.mark.parametrize("exercise", ["served-owner-approve", "served-owner-approve-stale"])
+@pytest.mark.parametrize(
+    "exercise",
+    [
+        "served-owner-approve",
+        "served-owner-approve-stale",
+        "served-proposal-mismatch",
+        "served-proposal-missing",
+        "served-proposal-race",
+        "served-proposal-unrecorded",
+    ],
+)
 def test_host_bound_approval_uses_exact_proposal_and_expected_revision(sqlite_tmp_path: Path, exercise: str) -> None:
     result = run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise)
-    assert result["status"] == ("approved" if exercise == "served-owner-approve" else "refused")
+    assert result["status"] == (
+        "approved" if exercise in {"served-owner-approve", "served-proposal-race"} else "refused"
+    )
     assert result["native_sends"] == 0
 
 

@@ -88,12 +88,34 @@ output to1MiB. Read actions are `snapshot` and `events`. The worker capability a
 `context`, `start`, `quiesce`, `renew`, `submit` and `report`; `context` is bounded and uses the bound
 original claim's existing authorization and workspace-observation handler to supply the approved
 declaration, effective inputs and any original remediation findings. It is not a historical grant of
-authority and can be refused after expiry or revocation. The owner capability accepts `approve`, `reconcile`,
+authority and can be refused after expiry or revocation. The owner capability also supports `proposal`:
+it returns the complete canonical host-bound proposal payload, its scope and SHA-256 digest, or refuses
+if the proposal is unavailable or the response exceeds the frame limit. For larger proposals, the
+owner-only `proposal-chunk --offset 0` returns the first 8192 canonical JSON bytes as base64, with
+`digest`, `bytes`, `offset` and `complete`. Continue with `proposal-chunk --offset N --proposal-digest D`,
+using the returned digest and next byte offset; a changed proposal or invalid offset refuses. Clients
+must assemble contiguous bytes, verify the reported total and SHA-256, and decode the entire JSON before
+presenting it for approval. Each frame is bounded; aggregate size and processing are not bounded by this
+protocol. The owner session retains one canonical byte snapshot and digest per bound immutable proposal,
+reusing it across channel attachments; replacement invalidates it and revocation discards it. The snapshot
+uses memory proportional to proposal size for the session lifetime. These are reads, not approval.
+The installed client uses `proposal` before `approve --proposal-digest <digest>`; the digest is an
+identity, not an authorization credential. The owner capability accepts `approve`, `reconcile`,
 `start-managed` and `stop`. Mutations require a command ID and caller-observed expected Program revision
 (`-1` means absent for initial approval). Trusted host composition binds an exact approved proposal,
-claim and managed target where applicable; the request cannot choose them. Exact duplicate command
+claim and managed target where applicable; the request cannot choose them. Approval requires the exact
+digest observed by the caller; missing or mismatched identities refuse even for legacy requests. The
+handler captures one frozen proposal and uses that same object for the journal and application approval,
+so a later host binding replacement cannot switch the approved meaning. Existing authority, revision and
+evidence checks still apply. New approval requires the existing exact producer-recorded proposal artifact
+needed for recovery; an unrecorded host-supplied proposal refuses. Historical pre-change approval receipts
+remain stored but the legacy request format cannot replay them through this command; no old request grants
+fresh authority. Exact duplicate command
 inputs return their original receipt as historical evidence, not renewed permission. If an intent
 exists but its outcome receipt is missing, the response is `unknown` and no automatic repeat occurs.
+The exact proposal artifact is checked before recording a new served approval intent and checked again
+by the application. Its absence refuses before that intent, so an identical retry after reconnect also
+refuses while the artifact remains unavailable; other interruptions after intent still remain `unknown`.
 Cooperative task-scope quiescence is never represented as managed process settlement; a STOP receipt
 can prove at most its one explicitly bound original managed target, not all effects or descendants.
 Worker `start` is limited to pull handoffs; a managed handoff can start only through the original owner's

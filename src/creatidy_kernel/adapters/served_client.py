@@ -33,6 +33,8 @@ def main(argv: list[str] | None = None) -> int:
             "submit",
             "report",
             "stop",
+            "proposal",
+            "proposal-chunk",
             "approve",
             "reconcile",
             "start-managed",
@@ -54,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--receipt")
     parser.add_argument("--reason")
     parser.add_argument("--decision-id")
+    parser.add_argument("--proposal-digest")
     parser.add_argument("--expires-at", type=int)
     parser.add_argument("--subject")
     parser.add_argument("--evidence")
@@ -79,6 +82,12 @@ def main(argv: list[str] | None = None) -> int:
                 "after": {"producer": args.producer, "scope": args.scope, "sequence": args.sequence},
             }
         )
+    elif args.action == "proposal-chunk":
+        if args.offset is None or args.collection is not None or args.index is not None:
+            parser.error("proposal-chunk requires --offset and does not accept --collection or --index")
+        if args.offset != 0 and args.proposal_digest is None:
+            parser.error("proposal-chunk continuation requires --proposal-digest")
+        request.update({"offset": args.offset, "proposal_digest": args.proposal_digest})
     elif any(value is not None for value in (args.collection, args.index, args.offset)):
         parser.error("--collection, --index and --offset are only valid for record")
     if args.action == "events":
@@ -90,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("snapshot does not accept a position")
     if args.action != "approve" and (args.decision_id is not None or args.expires_at is not None):
         parser.error("only approve accepts --decision-id and --expires-at")
+    if args.action not in {"approve", "proposal-chunk"} and args.proposal_digest is not None:
+        parser.error("only approve or proposal-chunk accepts --proposal-digest")
     if args.action != "reconcile" and (args.subject is not None or args.evidence is not None):
         parser.error("only reconcile accepts --subject and --evidence")
     if args.action == "claim":
@@ -162,8 +173,11 @@ def main(argv: list[str] | None = None) -> int:
             or args.expected_revision is None
             or args.decision_id is None
             or args.expires_at is None
+            or args.proposal_digest is None
         ):
-            parser.error("approve requires --command-id, --expected-revision, --decision-id and --expires-at")
+            parser.error(
+                "approve requires --command-id, --expected-revision, --decision-id, --expires-at and --proposal-digest"
+            )
         if any(
             value is not None
             for value in (args.lease_seconds, args.remediation_of, args.claim_id, args.receipt, args.reason)
@@ -175,6 +189,7 @@ def main(argv: list[str] | None = None) -> int:
                 "expected_revision": args.expected_revision,
                 "decision_id": args.decision_id,
                 "expires_at": args.expires_at,
+                "proposal_digest": args.proposal_digest,
             }
         )
     elif args.action == "reconcile":
