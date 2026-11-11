@@ -98,6 +98,9 @@ Cooperative task-scope quiescence is never represented as managed process settle
 can prove at most its one explicitly bound original managed target, not all effects or descendants.
 Worker `start` is limited to pull handoffs; a managed handoff can start only through the original owner's
 `start-managed` capability.
+Before a new managed start, the retained managed client's exact approval must match the session's
+current host-bound approval. An amendment does not retarget an old managed client. A matching historical
+start receipt remains readable without dispatching again, even if the shared approval subsequently changes.
 
 This descriptor capability assumes a trusted local host chooses and passes the correct endpoint; it
 is not remote authentication, a named service socket, hostile same-UID isolation or a grant to expose
@@ -106,6 +109,86 @@ credential-safe diagnostics must be received before any remote transport is enab
 create a controller, open SQLite or discover a capability by itself. Installed conformance exercises
 separate observer/worker/owner client processes against the existing owner, including stale revisions,
 role injection, duplicate commands and explicit gaps; it is not a Console UI or live-provider proof.
+
+### Supervisor-Launched Owner Backend
+
+`adapters.served_host.launch_owner` is a Linux-only supervisor SDK for a child backend, not a listener
+or attachment to an existing process. The trusted supervisor selects and authenticates an absolute
+executable and its arguments, supplies a deliberately restricted environment, and binds an existing
+`LocalOwnerSession` to the existing owner, approved proposal/work and exact Program scope. The SDK
+creates a Unix stream socketpair, attaches the owner end, and appends the numeric child descriptor as
+the last argument. Only that descriptor is passed; the supervisor closes its copy of the child end.
+`receive_owner` takes ownership of any integer descriptor numbered at least 3 even on refusal, including
+unsupported platforms and non-socket descriptors. It never consumes standard descriptors 0, 1 or 2.
+The backend must receive the descriptor, expected scope, producer label and recipient label from its trusted startup configuration and
+call `receive_owner` before using the version-1 served protocol. The fixed greeting identifies
+`creatidy-kernel-owner-descriptor-v1`, wire version 1, role owner, exact scope, and supervisor-configured
+producer and recipient labels; unknown versions, extra/duplicate fields and mismatches refuse. Labels are
+non-secret, bounded ASCII identifiers: the trusted supervisor must map each producer label to the intended
+actual Kernel composition and each recipient label to the intended backend, and independently configure
+the backend's expectations. Scope alone does not identify a producer. This checks the supervisor's
+configured pairing, not the actual database, executable, durable identity or cryptographic authentication.
+There is no durable SQLite producer ID: projection positions change with each construction, and filesystem
+ownership metadata does not authenticate a producer. Duplicate or incorrect label assignment, descriptor
+substitution, a forged greeting or a compromised supervisor defeats this check. Trust derives from the
+supervisor's correct selection and protected descriptor inheritance, not the labels. No hostile same-UID
+isolation is claimed.
+Owner session and channel construction additionally require the projection, application, bound ownership
+controller, and any managed workspace and managed worker/control bindings to reference the very same
+in-process store object. This prevents accidental cross-store composition even for equal Program scopes;
+it is not a durable database identity or authentication of the host's chosen store.
+
+The owner thread polls `launched.channel.fileno()` and calls `launched.serve_once()` when readable; it
+detaches the channel if serving fails, including EOF. The host must also call `launched.close()` in a
+`finally` when a child exits, a launch is replaced, or the host stops polling it; merely observing process
+exit or using `launched.channel.serve_once()` directly does not detach it. `close()`
+detaches and closes that channel, not the child process or task. Session revocation closes all attached
+channels; individual launch handles may still be detached afterward. Concurrent clients
+need separate launches and descriptors, subject to the session's 64-channel bound; requests are serialized
+by the owner thread. Revocation is serviced on that same thread, so it cannot preempt a command already
+being handled; that command's outcome must be recovered from its original producer evidence. Each served frame has existing bounded read limits; long-running underlying actions
+retain their own existing limits and uncertainty. A launch failure detaches the channel. There is no
+descriptor expiry or reconnect to an existing process: on backend restart launch a new child and channel;
+on Kernel/supervisor restart rebuild the original authorized owner composition and launch anew. Old
+channels cease communication when their owning process exits, but a surviving child may need separate
+supervisor cleanup. No channel closure cancels work, rolls back an effect, revokes task authority or proves
+settlement. The owner must separately invoke existing Kernel authority revocation and the existing
+command handlers recheck the applicable current authority; a historical receipt is not a renewed grant.
+When STOP has a bound managed target but its managed object has no retained handoff, it revokes work
+authority and records settlement as unknown. A missing in-memory handoff may reflect process loss; it
+does not establish that native work was never started or has physically settled.
+
+The descriptor is a bearer capability. Do not put it in URLs, browser storage, logs or diagnostics, or
+pass it to workers; child code must prevent further descriptor inheritance. The descriptor number is not
+a secret on its own, but command-line arguments and process metadata can expose startup details. Never
+pass credentials in arguments; the host must not inherit ambient credentials into the backend environment.
+There is no on-disk token or network transport. Socketpair inheritance protects against ordinary accidental
+endpoint discovery, not same-user inspection, descriptor theft, replay by a holder, compromised children,
+or a misconfigured supervisor launching the wrong executable. Browser input and login do not supply the
+host-bound principal, approval, proposal or target. Separate observer and worker session interfaces remain
+unchanged; this launch SDK provisions neither and cannot elevate them.
+Synthetic launch tests check that an unrelated inheritable descriptor and an omitted ambient environment
+value do not reach the backend, and that the received descriptor is non-inheritable across an ordinary
+worker exec. A trusted backend can still deliberately duplicate or explicitly pass its capability.
+
+Use the exact original command ID and inputs after a lost reply. Stored receipts are historical and
+per-Program snapshot coverage is bounded as described above; a missing receipt is not proof of nonexecution.
+An existing intent without a receipt remains unknown and must be reconciled against the original operation
+and producer evidence, not retried blindly. The existing per-command conflict and revision checks apply;
+no global exactly-once or physical-settlement guarantee follows. Snapshot positions and gaps remain
+producer-scoped and restart requires snapshot resynchronization.
+
+The repository's installed-wheel pytest phase includes `test_served_host.py` and the ordinary-program
+supervisor receipt test. These exercise synthetic separate child processes and the installed producer,
+including active channel closure, more than 64 refused replacements, producer-process death and event-gap
+resync, wrong scope/version/configured binding, concurrent duplicate approvals, dropped reply and a missing
+approval receipt. A separate synthetic ordinary-producer process test replays the original approval
+receipt and preserves a missing receipt as unknown after the original producer exits and a fresh producer
+reopens the store. Separate forced exits occur after the approval receipt commit and after another
+approval's intent commit, before their replies and first replay; the restarted test compares exact
+recorded command/receipt evidence and history/operations. It does not cover every command or crash point. This is
+not a consumer-owned Console conformance receipt or a live/hostile-local security proof. In particular,
+the test evidence does not cover every owner command across process or Kernel crash boundaries.
 
 ## Private Outcome Export
 

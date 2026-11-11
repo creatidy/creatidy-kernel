@@ -70,6 +70,10 @@ class OwnerProjection:
     def scope(self) -> str:
         return self._scope
 
+    def uses_store(self, store: object) -> bool:
+        """Check the live host composition, not durable producer identity."""
+        return self._store is store
+
     def snapshot(self, *, page: int = 0) -> ServedSnapshot:
         if type(page) is not int or page < 0 or page > 1_000_000:
             raise ValueError("invalid snapshot page")

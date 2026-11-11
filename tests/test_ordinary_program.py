@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
 import os
+import subprocess
+import sys
 from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
@@ -150,6 +152,18 @@ def test_owner_channel_stops_only_its_original_managed_target(sqlite_tmp_path: P
     assert run_ordinary_flow(
         sqlite_tmp_path / "served-managed-stop", None, mode="managed", exercise="served-managed-stop"
     ) == {"status": "stopped", "native_sends": 0}
+
+
+def test_owner_stop_with_unstarted_managed_binding_remains_unknown(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "unstarted-managed", None, mode="managed", exercise="served-managed-stop-unstarted"
+    ) == {"status": "stopped-unknown", "native_sends": 0}
+
+
+def test_managed_start_requires_current_exact_approval_but_historical_replay_survives(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "managed-approval", None, mode="managed", exercise="served-managed-distinct-approval"
+    ) == {"status": "checked", "native_sends": 0}
 
 
 def test_start_rechecks_caller_revision_after_workspace_observation(sqlite_tmp_path: Path) -> None:
@@ -573,6 +587,38 @@ def test_separate_owner_clients_share_host_bound_approval(sqlite_tmp_path: Path)
     assert run_ordinary_flow(
         sqlite_tmp_path / "served-owner-multi-client", None, mode="pull", exercise="served-owner-multi-client"
     ) == {"status": "stopped", "native_sends": 0}
+
+
+def test_supervisor_launch_receipts_and_current_authority(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "served-host-receipts", None, mode="pull", exercise="served-host-receipts"
+    ) == {"status": "stopped", "native_sends": 0}
+
+
+@pytest.mark.parametrize("boundary", ["receipt", "intent"])
+def test_original_host_command_receipt_survives_producer_process_death(sqlite_tmp_path: Path, boundary: str) -> None:
+    root = sqlite_tmp_path / ("process-replay-" + boundary)
+    fixture_dir = str(Path(__file__).parent)
+    env = {"HOME": str(sqlite_tmp_path), "PATH": os.defpath, "LANG": "C.UTF-8"}
+    first = (
+        "import pathlib,sys; sys.path.insert(0,sys.argv[1]); "
+        "from ordinary_flow_fixture import run_ordinary_flow; "
+        "root=pathlib.Path(sys.argv[2]); "
+        "run_ordinary_flow(root,None,mode='pull',exercise='served-host-process-create',"
+        "crash_host_boundary=sys.argv[3]); "
+        "raise SystemExit('producer did not exit at the crash point')"
+    )
+    second = (
+        "import os,pathlib,sys; sys.path.insert(0,sys.argv[1]); "
+        "from ordinary_flow_fixture import replay_host_after_process_restart; "
+        "root=pathlib.Path(sys.argv[2]); replay_host_after_process_restart(root); "
+        "(root/'second-producer.pid').write_text(str(os.getpid()))"
+    )
+    for script in (first, second):
+        subprocess.run(  # noqa: S603 - Fixed synthetic fixture, no shell or ambient credentials.
+            [sys.executable, "-I", "-c", script, fixture_dir, str(root), boundary], env=env, check=True, timeout=90
+        )
+    assert (root / "first-producer.pid").read_text() != (root / "second-producer.pid").read_text()
 
 
 @pytest.mark.parametrize("exercise", ["review-lost", "review-lost-reopen"])
