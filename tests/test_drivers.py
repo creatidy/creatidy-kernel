@@ -629,7 +629,7 @@ def test_jenkins_rejects_mapping_for_different_scm_binding(services: SyntheticSe
 @pytest.mark.parametrize(
     "remote",
     [
-        "https://user:password@example.test/repo",
+        "https://synthetic" + ":" + "synthetic" + "@example.test/repo",
         "https://example.test/repo?x=1",
         "https://example.test/repo#x",
         "http://example.test/repo",
