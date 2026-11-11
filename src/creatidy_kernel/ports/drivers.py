@@ -98,6 +98,31 @@ class DriverEffectGrant:
 
 
 @dataclass(frozen=True, slots=True)
+class DriverDraftGrant:
+    """Separate host authorization for the native draft side effect of one operation."""
+
+    claim: WorkClaim
+    mutation: DriverMutation
+    operation: OperationKey
+    revision: int
+    expires_at: int
+    invalidated: Event
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.claim) is not WorkClaim
+            or type(self.mutation) is not DriverMutation
+            or type(self.operation) is not OperationKey
+            or type(self.revision) is not int
+            or not 0 < self.revision < 2**63
+            or type(self.expires_at) is not int
+            or not 0 < self.expires_at < 2**63
+            or type(self.invalidated) is not Event
+        ):
+            raise ValueError("invalid ephemeral driver draft grant")
+
+
+@dataclass(frozen=True, slots=True)
 class ProjectDrivers:
     work: WorkManagement
     scm: SourceManagement
@@ -163,6 +188,7 @@ class DriverApplication:
         authorize: Callable[[WorkClaim, DriverMutation], DriverEffectGrant | None],
         *,
         lease_seconds: int = 60,
+        authorize_draft: Callable[[WorkClaim, DriverMutation, OperationKey], DriverDraftGrant | None] | None = None,
     ) -> None:
         configured = {
             project.work.binding,
@@ -177,6 +203,7 @@ class DriverApplication:
         self.store, self.ownership, self.project = store, ownership, project
         self.effects = {item.binding: item for item in effects}
         self.clock, self.authorize = clock, authorize
+        self.authorize_draft = authorize_draft
         if not 0 < lease_seconds <= 300:
             raise ValueError("finite driver delivery lease required")
         self.lease_seconds = lease_seconds
@@ -272,6 +299,19 @@ class DriverApplication:
             or Event.is_set(grant.invalidated)
         ):
             raise ValueError("exact driver effect grant unavailable, revoked or bound to different input")
+        draft_grant = None
+        if mutation.target.binding.implementation == "confluence-cloud" and mutation.action == "replace_page":
+            if self.authorize_draft is None:
+                raise ValueError("separate draft effect grant unavailable")
+            draft_grant = self.authorize_draft(claim, mutation, key)
+            if (
+                type(draft_grant) is not DriverDraftGrant
+                or draft_grant.claim != claim
+                or draft_grant.mutation != mutation
+                or draft_grant.operation != key
+                or Event.is_set(draft_grant.invalidated)
+            ):
+                raise ValueError("exact draft effect grant unavailable, revoked or bound to different input")
         fence = self.ownership.dispatch(claim, operation_id, lease_seconds=self.lease_seconds)
         operation = self.store.operation(operation_id)
         delivery = DriverDelivery(key, mutation, fence, operation.attempts)
@@ -282,6 +322,8 @@ class DriverApplication:
             # Only immutable values and the built-in, nonblocking Event flag after this cut.
             if now >= grant.expires_at or Event.is_set(grant.invalidated):
                 raise ValueError("driver effect grant expired or authority revoked before send")
+            if draft_grant is not None and (now >= draft_grant.expires_at or Event.is_set(draft_grant.invalidated)):
+                raise ValueError("draft effect grant expired or authority revoked before send")
 
         try:
             receipt = driver.apply(delivery, before_send)

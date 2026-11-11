@@ -787,7 +787,10 @@ approved native Basic header. Public reads may omit them. A read-only configurat
 callback or mutation token. Enable a separate host-held write callback only for an authorized effect;
 neither credentials nor their discovery paths are serialized in bindings, Task input or Operations.
 Jira and Confluence origins are configured independently even when using the same vendor. Jenkins
-also requires the exact approved SCM binding and remote URL, not merely an equal SHA/job name.
+also requires a trusted-host `TrustedSCMRemote` mapping of the exact Git URL to the complete SCM
+binding and a host-supplied mapping-evidence reference. This explicit attestation is not independent
+proof of repository identity; do not derive it from a worker, Jenkins response or matching SHA.
+The fact retains the mapping digest. Different URLs are not implicitly equivalent.
 
 `DriverApplication.synchronize` is a trusted host entrance for already accepted work, not the #106
 planner/engine. It uses the original authenticated `WorkOwnership` owner, exact accepted candidate,
@@ -802,6 +805,12 @@ Event flag are checked before the HTTP opener; no authorizer, clock callback or 
 after the cut. Kernel authority, body pins, original deadlines and delivery fences still independently
 apply. Grants are never persisted or accepted from worker input. Workers must not receive drivers,
 credentials, this application object or authorizer callbacks.
+Confluence current-page replacement additionally requires `authorize_draft`, a separate trusted-host
+callback that returns an ephemeral `DriverDraftGrant` bound to the exact claim, mutation and
+`OperationKey`, including request digest. It explicitly permits Confluence's native reconciliation
+to alter or overwrite an unpublished draft, including a concurrent draft. Its independent expiry and
+invalidation Event are checked at the same final durable cut; absence or mismatch refuses the send.
+Never clear or reuse an invalidated Event. Cached receipts remain historical and do not renew either grant.
 Supported native effects are explicit-commit GitHub **COMMENT review append** and server-version-
 conditional Confluence current-page replacement. They are not merge permission. GitHub PR creation/
 PATCH and Jira conditional edits/transitions refuse because their supported REST interfaces do not

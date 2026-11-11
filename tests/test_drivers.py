@@ -19,7 +19,13 @@ from creatidy_kernel.adapters.driver_http import object_value
 from creatidy_kernel.adapters.forge_refs import ForgeBinding
 from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.forgejo_drivers import ForgejoCI
-from creatidy_kernel.adapters.project_drivers import GitHubSCM, JiraWorkManagement, binding_from_mapping
+from creatidy_kernel.adapters.project_drivers import (
+    GitHubSCM,
+    JenkinsCI,
+    JiraWorkManagement,
+    TrustedSCMRemote,
+    binding_from_mapping,
+)
 from creatidy_kernel.adapters.sqlite_store import IdempotencyConflict, OperationConflict, SQLiteProgramStore
 from creatidy_kernel.core.domain import CancelProgram
 from creatidy_kernel.core.drivers import (
@@ -34,11 +40,12 @@ from creatidy_kernel.core.execution import OperationKey
 from creatidy_kernel.core.forge import EffectStatus, Presence, UnsupportedForge
 from creatidy_kernel.core.ownership import WorkClaim
 from creatidy_kernel.core.work_budget import BudgetRefused
-from creatidy_kernel.ports.drivers import DriverApplication, DriverEffectGrant
+from creatidy_kernel.ports.drivers import DriverApplication, DriverDraftGrant, DriverEffectGrant
 from creatidy_kernel.ports.program_store import OperationRecord
 from tools.check_drivers import (
     BASE,
     HEAD,
+    REMOTE,
     Clock,
     SyntheticServices,
     accepted,
@@ -66,6 +73,173 @@ def review_mutation(scm: GitHubSCM) -> DriverMutation:
         (("actor", "synthetic-kernel"), ("body", "Exact candidate receipt")),
         "owner:synthetic-effect-policy",
     )
+
+
+def draft_grant(claim: WorkClaim, mutation: DriverMutation, key: OperationKey) -> DriverDraftGrant:
+    return DriverDraftGrant(claim, mutation, key, 1, 1000, Event())
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "no-callback",
+        "missing",
+        "wrong-operation",
+        "wrong-effect",
+        "wrong-digest",
+        "wrong-claim",
+        "wrong-mutation",
+        "revoked",
+        "expired",
+    ],
+)
+def test_confluence_requires_separate_exact_draft_authority(services: SyntheticServices, mode: str) -> None:
+    clock = Clock()
+    project, scm, knowledge, _ = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        owner, claim = accepted(store, Path(directory))
+        mutation = DriverMutation(
+            DriverSubject(knowledge.binding, "page", "900", "19"),
+            "replace_page",
+            (("actor", "synthetic-confluence-writer"), ("body", "<p>new</p>"), ("title", "Guide")),
+            "owner:policy",
+        )
+        services.draft = "another user's draft"
+
+        def grant_for_draft(original: WorkClaim, value: DriverMutation, key: OperationKey) -> DriverDraftGrant | None:
+            if mode == "missing":
+                return None
+            grant = draft_grant(original, value, key)
+            if mode == "wrong-operation":
+                return replace(grant, operation=replace(key, operation_id="different"))
+            if mode == "wrong-effect":
+                return replace(grant, operation=replace(key, effect_key="different"))
+            if mode == "wrong-digest":
+                return replace(grant, operation=replace(key, request_digest="different"))
+            if mode == "wrong-claim":
+                return replace(grant, claim=replace(original, generation=original.generation + 1))
+            if mode == "wrong-mutation":
+                return replace(grant, mutation=replace(value, authority_reference="different"))
+            if mode == "revoked":
+                grant.invalidated.set()
+            if mode == "expired":
+                return replace(grant, expires_at=100)
+            return grant
+
+        app = DriverApplication(
+            store,
+            owner,
+            project,
+            (scm, knowledge),
+            clock.wall,
+            effect_grant,
+            authorize_draft=None if mode == "no-callback" else grant_for_draft,
+        )
+        with pytest.raises(ValueError, match="draft"):
+            app.synchronize(claim, "page:operation", "page:effect", mutation)
+        assert not any(method == "PUT" for method, _, _, _ in services.requests)
+        assert services.draft == "another user's draft"
+
+
+@pytest.mark.parametrize("change", ["revoke", "expire"])
+def test_draft_grant_rechecked_after_provider_preflight(services: SyntheticServices, change: str) -> None:
+    clock = Clock()
+    project, scm, knowledge, transports = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        owner, claim = accepted(store, Path(directory))
+        mutation = DriverMutation(
+            DriverSubject(knowledge.binding, "page", "900", "19"),
+            "replace_page",
+            (("actor", "synthetic-confluence-writer"), ("body", "<p>new</p>"), ("title", "Guide")),
+            "owner:policy",
+        )
+        grants: list[DriverDraftGrant] = []
+
+        def authorize_draft(original: WorkClaim, value: DriverMutation, key: OperationKey) -> DriverDraftGrant:
+            grant = replace(draft_grant(original, value, key), expires_at=150)
+            grants.append(grant)
+            return grant
+
+        def credential() -> str:
+            if change == "revoke":
+                grants[0].invalidated.set()
+            else:
+                clock.now = 150
+            return "Bearer synthetic-write"
+
+        transports[3].write_authorization = credential
+        app = DriverApplication(
+            store, owner, project, (scm, knowledge), clock.wall, effect_grant, authorize_draft=authorize_draft
+        )
+        with pytest.raises(ValueError, match="draft"):
+            app.synchronize(claim, "page:operation", "page:effect", mutation)
+        assert len(grants) == 1
+        assert not any(method == "PUT" for method, _, _, _ in services.requests)
+
+
+@pytest.mark.parametrize("draft_timing", ["existing", "concurrent"])
+def test_explicit_draft_grant_covers_native_reconciliation(services: SyntheticServices, draft_timing: str) -> None:
+    clock = Clock()
+    project, scm, knowledge, transports = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        owner, claim = accepted(store, Path(directory))
+        mutation = DriverMutation(
+            DriverSubject(knowledge.binding, "page", "900", "19"),
+            "replace_page",
+            (("actor", "synthetic-confluence-writer"), ("body", "<p>new</p>"), ("title", "Guide")),
+            "owner:policy",
+        )
+        if draft_timing == "existing":
+            services.draft = "another user's draft"
+        else:
+
+            def credential() -> str:
+                services.draft = "concurrent draft"
+                return "Bearer synthetic-write"
+
+            transports[3].write_authorization = credential
+        app = DriverApplication(
+            store, owner, project, (scm, knowledge), clock.wall, effect_grant, authorize_draft=draft_grant
+        )
+        assert app.synchronize(claim, "page:operation", "page:effect", mutation).status is EffectStatus.ACCEPTED
+        assert services.draft == "<p>new</p>"
+
+
+def test_draft_authorizer_reentry_cannot_bypass_work_authority(services: SyntheticServices) -> None:
+    clock = Clock()
+    project, scm, knowledge, _ = configured(services, clock)
+    with (
+        state_directory() as directory,
+        SQLiteProgramStore(Path(directory) / "state.sqlite3", boot_clock=clock.boot) as store,
+    ):
+        owner, claim = accepted(store, Path(directory))
+        mutation = DriverMutation(
+            DriverSubject(knowledge.binding, "page", "900", "19"),
+            "replace_page",
+            (("actor", "synthetic-confluence-writer"), ("body", "<p>new</p>"), ("title", "Guide")),
+            "owner:policy",
+        )
+
+        def cancel(original: WorkClaim, value: DriverMutation, key: OperationKey) -> DriverDraftGrant:
+            program = store.load(original.attempt.program_id)
+            store.admit(program.program_id, "draft-policy:cancel", CancelProgram(program.revision, "owner"))
+            return draft_grant(original, value, key)
+
+        app = DriverApplication(
+            store, owner, project, (scm, knowledge), clock.wall, effect_grant, authorize_draft=cancel
+        )
+        with pytest.raises((ValueError, BudgetRefused, OperationConflict)):
+            app.synchronize(claim, "page:operation", "page:effect", mutation)
+        assert not services.requests
 
 
 def delivery(mutation: DriverMutation, *, attempts: int = 1) -> DriverDelivery:
@@ -433,6 +607,40 @@ def test_forgejo_ci_refuses_different_source_repository(field: str, value: str) 
         ForgejoCI(forge, ci, replace(source, **{field: value}), Clock().wall)
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("origin", "https://other.example.test"),
+        ("tenant", "other"),
+        ("namespace", "other/repo"),
+        ("implementation", "other"),
+        ("api_version", "other"),
+        ("rights", "other"),
+    ],
+)
+def test_jenkins_rejects_mapping_for_different_scm_binding(services: SyntheticServices, field: str, value: str) -> None:
+    _, scm, _, transports = configured(services, Clock())
+    mapping = TrustedSCMRemote(REMOTE, replace(scm.binding, **{field: value}), "owner:mapping")
+    with pytest.raises(ValueError, match="mapping"):
+        JenkinsCI(transports[2], Clock().wall, remote_mapping=mapping, source_binding=scm.binding)
+    assert not services.requests
+
+
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "https://user:password@example.test/repo",
+        "https://example.test/repo?x=1",
+        "https://example.test/repo#x",
+        "http://example.test/repo",
+        "https://example.test/",
+    ],
+)
+def test_jenkins_remote_mapping_rejects_unqualified_urls(remote: str) -> None:
+    with pytest.raises(ValueError):
+        TrustedSCMRemote(remote, binding("scm", "github", "acme/service", "2026-03-10"), "owner:mapping")
+
+
 def cast_list(value: object) -> list[object]:
     from creatidy_kernel.adapters.driver_http import list_value
 
@@ -758,7 +966,15 @@ def test_effect_grant_is_rechecked_after_final_workspace_capture(
         monkeypatch.setattr(owner, "observe", observed)
         monkeypatch.setattr(LocalOwnedWorkspace, "capture", captured)
         monkeypatch.setattr(store, "check_driver_delivery", checked)
-        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, lambda original, value: grant)
+        app = DriverApplication(
+            store,
+            owner,
+            project,
+            (scm, knowledge),
+            clock.wall,
+            lambda original, value: grant,
+            authorize_draft=draft_grant,
+        )
         with pytest.raises(ValueError, match="grant"):
             app.synchronize(claim, "review", "effect", mutation)
         assert observations == 3 and captures
@@ -806,7 +1022,9 @@ def test_pregrant_authorizer_reentry_is_followed_by_fresh_work_authority(
                 clock.now = 1001
             return DriverEffectGrant(original, value, 1, 2000, Event())
 
-        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, authorize)
+        app = DriverApplication(
+            store, owner, project, (scm, knowledge), clock.wall, authorize, authorize_draft=draft_grant
+        )
         with pytest.raises((ValueError, BudgetRefused, OperationConflict)):
             app.synchronize(claim, "review", "effect", mutation)
         assert calls == [change] and not services.requests
@@ -861,7 +1079,9 @@ def test_authorizer_never_runs_after_final_delivery_cut(
             return DriverEffectGrant(original, value, 1, 2000, Event())
 
         monkeypatch.setattr(store, "check_driver_delivery", checked)
-        app = DriverApplication(store, owner, project, (scm, knowledge), clock.wall, authorize)
+        app = DriverApplication(
+            store, owner, project, (scm, knowledge), clock.wall, authorize, authorize_draft=draft_grant
+        )
         assert app.synchronize(claim, "review", "effect", mutation).status is EffectStatus.ACCEPTED
         assert calls == [False] and clock.now == 100
         assert sum(method in {"POST", "PUT"} for method, _, _, _ in services.requests) == 1

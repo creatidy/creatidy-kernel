@@ -30,6 +30,7 @@ from creatidy_kernel.adapters.project_drivers import (
     JenkinsCI,
     JiraWorkManagement,
     RepositoryDocumentation,
+    TrustedSCMRemote,
 )
 from creatidy_kernel.adapters.reference import reference_spec
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
@@ -56,7 +57,7 @@ from creatidy_kernel.core.execution import OperationKey
 from creatidy_kernel.core.forge import Effect, EffectStatus, Presence, Reference
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, OwnershipConflict, WorkClaim
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
-from creatidy_kernel.ports.drivers import DriverApplication, DriverEffectGrant, ProjectDrivers
+from creatidy_kernel.ports.drivers import DriverApplication, DriverDraftGrant, DriverEffectGrant, ProjectDrivers
 from creatidy_kernel.ports.ownership import WorkOwnership
 
 HEAD = "a" * 40
@@ -109,6 +110,7 @@ class SyntheticServices:
             }
         ]
         self.version = 19
+        self.draft: str | None = None
         self.pages: dict[int, dict[str, object]] = {19: self.page(19, "Guide", "<p>synthetic context</p>", "initial")}
         self.lost: set[str] = set()
         self.filter: Callable[[str, str, object], tuple[int, object] | None] | None = None
@@ -292,6 +294,8 @@ class SyntheticServices:
                 if version["number"] != self.version + 1:
                     return 409, {"message": "version conflict"}
                 self.version += 1
+                if self.draft is not None:
+                    self.draft = cast(str, object_value(data["body"])["value"])
                 self.pages[self.version] = self.page(
                     self.version,
                     cast(str, data["title"]),
@@ -349,7 +353,12 @@ def configured(services: SyntheticServices, clock: Clock, docs: RepositoryDocume
         transports.append(transport)
     work = JiraWorkManagement(transports[0], clock.wall)
     scm = GitHubSCM(transports[1], clock.wall, writer_login="synthetic-kernel")
-    ci = JenkinsCI(transports[2], clock.wall, remote=REMOTE, source_binding=scm.binding)
+    ci = JenkinsCI(
+        transports[2],
+        clock.wall,
+        remote_mapping=TrustedSCMRemote(REMOTE, scm.binding, "owner:synthetic-remote-mapping"),
+        source_binding=scm.binding,
+    )
     knowledge = ConfluenceKnowledge(transports[3], clock.wall, writer_account_id="synthetic-confluence-writer")
     project = ProjectDrivers(work, scm, ci, (knowledge,) if docs is None else (knowledge, docs))
     return project, scm, knowledge, transports
@@ -403,6 +412,10 @@ def accepted(store: SQLiteProgramStore, directory: Path) -> tuple[WorkOwnership,
 def effect_grant(claim: WorkClaim, mutation: DriverMutation) -> DriverEffectGrant:
     """Synthetic trusted-host policy, separate from durable Kernel work authority."""
     return DriverEffectGrant(claim, mutation, 1, 1000, threading.Event())
+
+
+def draft_effect_grant(claim: WorkClaim, mutation: DriverMutation, key: OperationKey) -> DriverDraftGrant:
+    return DriverDraftGrant(claim, mutation, key, 1, 1000, threading.Event())
 
 
 def legacy_conformance(services: SyntheticServices, clock: Clock) -> None:
@@ -518,6 +531,7 @@ def settlement_recovery(directory: Path, *, rejected: bool) -> None:
                 lambda original, value: (
                     effect_grant(original, value) if original == claim and value == mutation else None
                 ),
+                authorize_draft=draft_effect_grant,
             )
             crashed: list[str] = []
 
@@ -689,6 +703,7 @@ def conformance(directory: Path) -> None:
                 lambda original, mutation: (
                     effect_grant(original, mutation) if original == claim and mutation in {review, page} else None
                 ),
+                authorize_draft=draft_effect_grant,
             )
             before = store.load(claim.attempt.program_id)
             receipt = app.synchronize(claim, "sync:review", "effect:review", review)

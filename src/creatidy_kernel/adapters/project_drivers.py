@@ -3,11 +3,11 @@
 
 import hashlib
 from collections.abc import Callable
-from dataclasses import asdict, replace
-from urllib.parse import quote, urlencode
+from dataclasses import asdict, dataclass, replace
+from urllib.parse import quote, urlencode, urlsplit
 
 from creatidy_kernel.adapters.driver_http import DriverHTTP, list_value, native_number, object_value, text
-from creatidy_kernel.adapters.forge_refs import oid, valid_branch
+from creatidy_kernel.adapters.forge_refs import https_origin, oid, valid_branch
 from creatidy_kernel.adapters.intake import GitContentSource
 from creatidy_kernel.core.drivers import (
     DriverBinding,
@@ -20,6 +20,7 @@ from creatidy_kernel.core.drivers import (
     NativeDependency,
     WorkObservation,
     driver_bytes,
+    driver_digest,
 )
 from creatidy_kernel.core.forge import EffectStatus, Presence, UnsupportedForge, effect_marker
 
@@ -474,20 +475,58 @@ def object_value_json(value: bytes) -> dict[str, object]:
     return object_value(raw)
 
 
+@dataclass(frozen=True, slots=True)
+class TrustedSCMRemote:
+    """Host-attested exact remote-to-repository mapping, not a provider observation."""
+
+    remote: str
+    binding: DriverBinding
+    evidence: str
+
+    def __post_init__(self) -> None:
+        if type(self.remote) is not str or type(self.binding) is not DriverBinding or self.binding.family != "scm":
+            raise ValueError("trusted SCM remote mapping required")
+        https_origin(self.remote)
+        parsed = urlsplit(self.remote)
+        if (
+            not parsed.path
+            or parsed.path == "/"
+            or "\\" in self.remote
+            or any(ord(char) < 33 or ord(char) == 127 for char in self.remote)
+            or type(self.evidence) is not str
+            or not self.evidence
+            or len(self.evidence) > 4096
+            or any(ord(char) < 32 or ord(char) == 127 for char in self.evidence)
+        ):
+            raise ValueError("invalid trusted SCM remote mapping")
+
+
 class JenkinsCI:
     """Exact numbered builds, with Git BuildData evidence, never branch/job-name matching."""
 
     API_VERSION = "jenkins-2.479.3;git-5.7.0;git-client-6.1.0"
 
     def __init__(
-        self, http: DriverHTTP, clock: Callable[[], int], *, remote: str, source_binding: DriverBinding, ttl: int = 30
+        self,
+        http: DriverHTTP,
+        clock: Callable[[], int],
+        *,
+        remote_mapping: TrustedSCMRemote,
+        source_binding: DriverBinding,
+        ttl: int = 30,
     ) -> None:
         self.binding = _bound(http, "ci", "jenkins", self.API_VERSION)
         self.prefix = "/" + "/".join("job/" + quote(part, safe="") for part in self.binding.namespace.split("/"))
-        if http.prefix != self.prefix or not 0 < ttl <= 3600 or not remote.startswith("https://"):
-            raise ValueError("exact Jenkins job/SCM remote and finite freshness required")
-        self.http, self.clock, self.remote, self.ttl = http, clock, remote, ttl
+        if (
+            http.prefix != self.prefix
+            or not 0 < ttl <= 3600
+            or type(remote_mapping) is not TrustedSCMRemote
+            or remote_mapping.binding != source_binding
+        ):
+            raise ValueError("exact Jenkins job and trusted SCM remote mapping required")
+        self.http, self.clock, self.remote, self.ttl = http, clock, remote_mapping.remote, ttl
         self.source_binding = source_binding
+        self.mapping_digest = driver_digest(asdict(remote_mapping))
 
     def build(self, key: str, source: DriverSubject) -> DriverFact:
         GitHubSCM.number(key)
@@ -540,7 +579,8 @@ class JenkinsCI:
                 related=(source,),
                 qualification=(
                     "build-native-revision-unavailable;native-Git-BuildData;"
-                    "configured-plugin-profile;not-Kernel-verification"
+                    f"configured-plugin-profile;trusted-remote-mapping-sha256:{self.mapping_digest};"
+                    "not-Kernel-verification"
                 ),
             )
         except ValueError:
