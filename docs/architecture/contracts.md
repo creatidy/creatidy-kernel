@@ -88,10 +88,19 @@ output to1MiB. Read actions are `snapshot` and `events`. The worker capability a
 `context`, `start`, `quiesce`, `renew`, `submit` and `report`; `context` is bounded and uses the bound
 original claim's existing authorization and workspace-observation handler to supply the approved
 declaration, effective inputs and any original remediation findings. It is not a historical grant of
-authority and can be refused after expiry or revocation. The owner capability accepts `approve`, `reconcile`,
+authority and can be refused after expiry or revocation. The owner capability also supports `proposal`:
+it returns the complete canonical host-bound proposal payload, its scope and SHA-256 digest, or refuses
+if the proposal is unavailable or the response exceeds the frame limit. It is a read, not approval.
+The installed client uses `proposal` before `approve --proposal-digest <digest>`; the digest is an
+identity, not an authorization credential. The owner capability accepts `approve`, `reconcile`,
 `start-managed` and `stop`. Mutations require a command ID and caller-observed expected Program revision
 (`-1` means absent for initial approval). Trusted host composition binds an exact approved proposal,
-claim and managed target where applicable; the request cannot choose them. Exact duplicate command
+claim and managed target where applicable; the request cannot choose them. Approval requires the exact
+digest observed by the caller; missing or mismatched identities refuse even for legacy requests. The
+handler captures one frozen proposal and uses that same object for the journal and application approval,
+so a later host binding replacement cannot switch the approved meaning. Existing authority, revision and
+evidence checks still apply. Historical pre-change approval receipts remain stored but the legacy request
+format cannot replay them through this command; no old request grants fresh authority. Exact duplicate command
 inputs return their original receipt as historical evidence, not renewed permission. If an intent
 exists but its outcome receipt is missing, the response is `unknown` and no automatic repeat occurs.
 Cooperative task-scope quiescence is never represented as managed process settlement; a STOP receipt

@@ -85,6 +85,7 @@ from creatidy_kernel.core.intake import (
     encode,
     object_from,
 )
+from creatidy_kernel.core.ordinary import OrdinaryProposal
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, WorkClaim
 from creatidy_kernel.core.served import command_prefix
@@ -719,6 +720,7 @@ print("Done")
                     "expected_revision": -1,
                     "decision_id": "host-decision",
                     "expires_at": int(time.time()) + 900,
+                    "proposal_digest": proposal.digest,
                 }
                 if exercise == "served-host-process-create":
                     assert crash_host_boundary in {"receipt", "intent"}
@@ -736,6 +738,7 @@ print("Done")
                             "expected_revision": store.load("everyday-program").revision,
                             "decision_id": "interrupted-decision",
                             "expires_at": approval_request["expires_at"],
+                            "proposal_digest": proposal.digest,
                         }
 
                     def crash_at_boundary() -> None:
@@ -823,6 +826,7 @@ print("Done")
                     "expected_revision": revision,
                     "decision_id": "interrupted-decision",
                     "expires_at": approved.expires_at,
+                    "proposal_digest": proposal.digest,
                 }
                 interrupted, path = spawn(unknown_request)
                 with patch.object(OrdinaryProgram, "approve", side_effect=OSError("synthetic interruption")):
@@ -905,6 +909,9 @@ print("Done")
                                 process.wait(timeout=10)
                             binding.detach(channel)
 
+                inspected = invoke_owner(["proposal"])
+                assert inspected["proposal"] == json.loads(encode(proposal.payload))
+                assert inspected["digest"] == proposal.digest and inspected["scope"] == proposal.program_id
                 first = invoke_owner(
                     [
                         "approve",
@@ -916,6 +923,8 @@ print("Done")
                         "owner-decision",
                         "--expires-at",
                         str(int(time.time()) + 900),
+                        "--proposal-digest",
+                        cast(str, inspected["digest"]),
                     ]
                 )
                 assert first["status"] == "approved"
@@ -970,7 +979,13 @@ print("Done")
                 assert altered[0] and store.find_program("everyday-program") is not None
                 assert store.find_artifact("ordinary-program:approval:stale-creation", "record") is None
                 return {"status": "refused", "native_sends": 0}
-            if exercise in {"served-owner-approve", "served-owner-approve-stale"}:
+            if exercise in {
+                "served-owner-approve",
+                "served-owner-approve-stale",
+                "served-proposal-mismatch",
+                "served-proposal-missing",
+                "served-proposal-race",
+            }:
                 owner_socket, owner_client = socket.socketpair()
                 with owner_socket, owner_client:
                     server = LocalOwnerChannel(
@@ -983,10 +998,31 @@ print("Done")
                         "expected_revision": 0 if exercise == "served-owner-approve-stale" else -1,
                         "decision_id": "served-owner-decision",
                         "expires_at": int(time.time()) + 900,
+                        "proposal_digest": proposal.digest,
                     }
+                    before_read = (store.history("everyday-program"), store.operations())
+                    write_frame(owner_client, encode({"version": 1, "action": "proposal"}), bound=65536)
+                    server.serve_once()
+                    inspected = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
+                    assert inspected == {
+                        "version": 1,
+                        "scope": proposal.program_id,
+                        "digest": proposal.digest,
+                        "proposal": json.loads(encode(proposal.payload)),
+                    }
+                    assert (store.history("everyday-program"), store.operations()) == before_read
+                    replacement = replace(proposal, objective="A different objective")
+                    if exercise == "served-proposal-mismatch":
+                        setattr(server, "_proposal", replacement)  # noqa: B010 - Simulate host replacement.
+                    if exercise == "served-proposal-missing":
+                        del request["proposal_digest"]
                     wire = json.dumps(request, sort_keys=True).encode()
                     write_frame(owner_client, wire, bound=65536)
-                    if exercise == "served-owner-approve-stale":
+                    if exercise in {
+                        "served-owner-approve-stale",
+                        "served-proposal-mismatch",
+                        "served-proposal-missing",
+                    }:
                         try:
                             server.serve_once()
                         except LocalChannelRefused:
@@ -996,9 +1032,25 @@ print("Done")
                         assert store.find_program("everyday-program") is None
                         assert not store.operations("served-command:")
                         return {"status": "refused", "native_sends": 0}
-                    server.serve_once()
+                    if exercise == "served-proposal-race":
+                        original_current = OrdinaryProgram.current
+
+                        def replace_during_validation(
+                            application: OrdinaryProgram, selected: OrdinaryProposal, expiry: int
+                        ) -> None:
+                            original_current(application, selected, expiry)
+                            setattr(server, "_proposal", replacement)  # noqa: B010 - Reentrant host replacement.
+
+                        with patch.object(OrdinaryProgram, "current", replace_during_validation):
+                            server.serve_once()
+                    else:
+                        server.serve_once()
                     result = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
                     assert result["status"] == "approved"
+                    if exercise == "served-proposal-race":
+                        assert app.recover("served-owner-decision").proposal.digest == proposal.digest
+                        assert store.load("everyday-program").spec.objective == proposal.objective
+                        return {"status": "approved", "native_sends": 0}
                     approved_program = store.load("everyday-program")
                     write_frame(owner_client, wire, bound=65536)
                     server.serve_once()
@@ -1046,6 +1098,7 @@ print("Done")
                                 "expected_revision": approved.program.revision,
                                 "decision_id": "amended-v2",
                                 "expires_at": approved.expires_at,
+                                "proposal_digest": amended.digest,
                             }
                         ),
                         bound=65536,
@@ -1092,6 +1145,7 @@ print("Done")
                         "expected_revision": approved.program.revision,
                         "decision_id": "owner-amend-v1",
                         "expires_at": approved.expires_at,
+                        "proposal_digest": amended.digest,
                     }
                     wire = json.dumps(request, sort_keys=True).encode()
                     write_frame(owner_client, wire, bound=65536)

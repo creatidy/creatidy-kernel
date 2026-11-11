@@ -738,6 +738,14 @@ class LocalOwnerChannel(LocalReadChannel):
         self._approval_binding[0] = value
 
     def _dispatch(self, request: dict[str, object]) -> object:
+        if request.get("action") == "proposal":
+            if set(request) != {"version", "action"} or self._proposal is None:
+                raise LocalChannelRefused("a host-bound proposal is required")
+            proposal = self._proposal
+            if proposal.program_id != self._owner.scope:
+                raise LocalChannelRefused("proposal differs from owner scope")
+            raw = encode(proposal.payload)
+            return {"version": 1, "scope": proposal.program_id, "digest": digest(raw), "proposal": object_from(raw)}
         if request.get("action") == "approve":
             return self._approve(request)
         if request.get("action") == "reconcile":
@@ -930,13 +938,16 @@ class LocalOwnerChannel(LocalReadChannel):
             "expected_revision",
             "decision_id",
             "expires_at",
+            "proposal_digest",
         }:
             raise LocalChannelRefused("a host-bound proposal and exact approval request are required")
-        command_id, revision, decision_id, expires_at = (
+        proposal = self._proposal
+        command_id, revision, decision_id, expires_at, proposal_digest = (
             request["command_id"],
             request["expected_revision"],
             request["decision_id"],
             request["expires_at"],
+            request["proposal_digest"],
         )
         if (
             type(command_id) is not str
@@ -949,6 +960,9 @@ class LocalOwnerChannel(LocalReadChannel):
             or len(decision_id) > 256
             or type(expires_at) is not int
             or expires_at < 1
+            or type(proposal_digest) is not str
+            or proposal_digest != proposal.digest
+            or proposal.program_id != self._owner.scope
         ):
             raise LocalChannelRefused("invalid approval request")
         store = self._application.store
@@ -959,7 +973,7 @@ class LocalOwnerChannel(LocalReadChannel):
             **request,
             "scope": self._owner.scope,
             "actor": self._application.owner.actor_id,
-            "proposal": self._proposal.digest,
+            "proposal": proposal_digest,
             "policy": self._application.policy.digest,
         }
         prior = store.find_operation(operation_id)
@@ -985,7 +999,7 @@ class LocalOwnerChannel(LocalReadChannel):
             raise LocalChannelRefused("caller expected revision is stale")
         store.intent(operation_id, operation_id, exact)
         approved = self._application.approve(
-            self._proposal, decision_id=decision_id, expires_at=expires_at, expected_revision=revision
+            proposal, decision_id=decision_id, expires_at=expires_at, expected_revision=revision
         )
         self._approved = approved
         result: dict[str, object] = {

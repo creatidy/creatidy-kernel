@@ -33,6 +33,7 @@ def main(argv: list[str] | None = None) -> int:
             "submit",
             "report",
             "stop",
+            "proposal",
             "approve",
             "reconcile",
             "start-managed",
@@ -54,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--receipt")
     parser.add_argument("--reason")
     parser.add_argument("--decision-id")
+    parser.add_argument("--proposal-digest")
     parser.add_argument("--expires-at", type=int)
     parser.add_argument("--subject")
     parser.add_argument("--evidence")
@@ -88,8 +90,10 @@ def main(argv: list[str] | None = None) -> int:
         request["limit"] = args.limit
     elif args.action != "record" and (args.producer is not None or args.scope is not None or args.sequence is not None):
         parser.error("snapshot does not accept a position")
-    if args.action != "approve" and (args.decision_id is not None or args.expires_at is not None):
-        parser.error("only approve accepts --decision-id and --expires-at")
+    if args.action != "approve" and any(
+        value is not None for value in (args.decision_id, args.expires_at, args.proposal_digest)
+    ):
+        parser.error("only approve accepts --decision-id, --expires-at and --proposal-digest")
     if args.action != "reconcile" and (args.subject is not None or args.evidence is not None):
         parser.error("only reconcile accepts --subject and --evidence")
     if args.action == "claim":
@@ -162,8 +166,11 @@ def main(argv: list[str] | None = None) -> int:
             or args.expected_revision is None
             or args.decision_id is None
             or args.expires_at is None
+            or args.proposal_digest is None
         ):
-            parser.error("approve requires --command-id, --expected-revision, --decision-id and --expires-at")
+            parser.error(
+                "approve requires --command-id, --expected-revision, --decision-id, --expires-at and --proposal-digest"
+            )
         if any(
             value is not None
             for value in (args.lease_seconds, args.remediation_of, args.claim_id, args.receipt, args.reason)
@@ -175,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
                 "expected_revision": args.expected_revision,
                 "decision_id": args.decision_id,
                 "expires_at": args.expires_at,
+                "proposal_digest": args.proposal_digest,
             }
         )
     elif args.action == "reconcile":
