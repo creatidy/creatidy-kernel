@@ -24,9 +24,9 @@ assert allocator.select(ResourceRequest('work-unit', frozenset(), 0)).provider_i
     assert result.returncode == 0, result.stderr
 
 
-def test_core_and_ports_have_only_standard_library_or_internal_imports() -> None:
+def test_runtime_has_only_standard_library_or_internal_imports() -> None:
     allowed = sys.stdlib_module_names | {"creatidy_kernel"}
-    for layer in ("core", "ports"):
+    for layer in ("core", "ports", "adapters"):
         for path in (ROOT / "src" / "creatidy_kernel" / layer).rglob("*.py"):
             for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
                 if isinstance(node, ast.Import):

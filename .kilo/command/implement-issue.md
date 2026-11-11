@@ -29,8 +29,9 @@ constraints; seek only genuine decisions, not routine reversible choices.
    authorized isolated worktree needed to preserve concurrent owner work.
 3. Implement only accepted scope; use reuse-first and product-boundary rules.
    Track short local progress when needed, excluded through .git/info/exclude.
-4. Run focused checks and final `make check` and `make package-check`. Run `make audit`
-   only when relevant dependency/tooling changes require it. Inspect intended diff/status/full
+4. Run focused checks appropriate to the change; canonical CI runs final `make check` and `make package-check`
+   and `make audit` on the exact delivery subject. Do not duplicate full CI locally merely before pushing.
+   Inspect intended diff/status/full
    base delta for scope, secrets and local state. Run tests/tools that observe
    environment state with a deliberate sanitized environment and synthetic test
    values, not ambient owner credentials. Diagnose failures and change a relevant

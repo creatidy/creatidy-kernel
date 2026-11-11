@@ -18,7 +18,12 @@ def test_license_and_runtime_dependency_contract() -> None:
     assert config["project"]["license"] == "Apache-2.0"
     assert config["project"]["license-files"] == ["LICENSE", "NOTICE"]
     assert config["project"]["dependencies"] == []
-    assert set(config["build-system"]["requires"]) <= set(config["dependency-groups"]["dev"])
+    groups = config["dependency-groups"]
+    dev = set(item for item in groups["dev"] if isinstance(item, str))
+    for item in groups["dev"]:
+        if isinstance(item, dict):
+            dev.update(groups[item["include-group"]])
+    assert set(config["build-system"]["requires"]) <= dev
     assert config["tool"]["uv"]["no-build-isolation-package"] == ["creatidy-kernel"]
     license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
     assert "Version 2.0, January 2004" in license_text
@@ -107,8 +112,26 @@ def test_parallel_and_serial_test_partitions_are_complete(tmp_path: Path) -> Non
         selected = {item for item in all_tests if item.startswith(prefix)}
         assert selected and selected <= serial
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
-    assert "uv run --locked pytest -n 2 -m 'not serial_native'" in makefile
     assert "uv run --locked pytest -m serial_native" in makefile
+    package_check = (ROOT / "tools/check_package.py").read_text(encoding="utf-8")
+    assert '"not serial_native"' in package_check and '"pytest"' in package_check
+
+
+def test_isolated_child_uses_installed_wheel(tmp_path: Path) -> None:
+    configured = os.environ.get("CREATIDY_TEST_INSTALLED_PREFIX")
+    if configured is None:
+        return
+    result = subprocess.run(  # noqa: S603 - fixed isolated interpreter and synthetic environment.
+        [sys.executable, "-I", "-c", "import creatidy_kernel; print(creatidy_kernel.__file__)"],
+        cwd=tmp_path,
+        env={"HOME": str(tmp_path), "PATH": os.defpath},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    origin = Path(result.stdout.strip()).resolve(strict=True)
+    assert origin.is_relative_to(Path(configured).resolve(strict=True))
+    assert not origin.is_relative_to(ROOT)
 
 
 def test_public_runtime_uses_neutral_task_names() -> None:

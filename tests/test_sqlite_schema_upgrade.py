@@ -6,6 +6,7 @@ import json
 import sqlite3
 import subprocess
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from typing import cast
@@ -17,6 +18,34 @@ from creatidy_kernel.adapters.sqlite_store import CorruptHistory, SQLiteProgramS
 from tools.check_schema_upgrade import CREATE_LEGACY, PINNED_PRE_ORDINARY_ID, REFUSE_DOWNGRADE, install_pinned_reader
 
 pytest_plugins = ["test_sqlite_store"]
+
+
+def test_pinned_reader_cache_reuses_one_verified_build_across_concurrent_consumers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("CREATIDY_TEST_READER_CACHE", str(cache))
+    directories = [tmp_path / "first", tmp_path / "second"]
+    for directory in directories:
+        directory.mkdir()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        readers = list(executor.map(install_pinned_reader, directories))
+    assert readers[0] == readers[1]
+    assert len(list(cache.glob("*/dist/*.whl"))) == 1
+    subprocess.run([str(readers[0]), "-I", "-c", "import creatidy_kernel"], check=True)  # noqa: S603
+    package = next(cache.glob("*/legacy-venv/lib/python*/site-packages/creatidy_kernel/__init__.py"))
+    original = package.read_bytes()
+    package.write_bytes(b"# corrupted test-only cache\n")
+    with pytest.raises(RuntimeError, match="differs from its built wheel"):
+        install_pinned_reader(directories[0])
+    package.write_bytes(original)
+    marker = next(cache.glob("*/complete.json"))
+    marker.unlink()
+    with pytest.raises(RuntimeError, match="incomplete or mismatched"):
+        install_pinned_reader(directories[0])
+    with pytest.raises(subprocess.CalledProcessError):
+        install_pinned_reader(directories[0], commit_id="0" * 40)
 
 
 @pytest.fixture(scope="module")

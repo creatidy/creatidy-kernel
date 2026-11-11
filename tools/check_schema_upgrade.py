@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Installed real pinned-base reader versus the new authority schema, offline only."""
 
+import hashlib
+import importlib.metadata
 import io
+import json
+import os
 import sqlite3
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import tempfile
+import zipfile
 from contextlib import closing
 from pathlib import Path
 
@@ -29,6 +35,56 @@ def install_pinned_reader(directory: Path, *, commit_id: str = PINNED_BASE_ID) -
     )
     if resolved.stdout.strip() != commit_id:
         raise RuntimeError("pinned public base object unavailable")
+    configured = os.environ.get("CREATIDY_TEST_READER_CACHE")
+    if configured is not None:
+        import fcntl
+
+        cache = Path(configured).resolve(strict=True)
+        if not cache.is_dir():
+            raise RuntimeError("pinned reader cache must be an existing run-private directory")
+        uv_version = subprocess.run(["uv", "--version"], check=True, capture_output=True, text=True).stdout.strip()
+        identity = {
+            "commit": commit_id,
+            "python": str(Path(sys.executable).resolve(strict=True)),
+            "version": sys.version,
+            "platform": sysconfig.get_platform(),
+            "uv": uv_version,
+            "builder": {
+                name: importlib.metadata.version(name)
+                for name in ("hatchling", "packaging", "pathspec", "pluggy", "trove-classifiers")
+            },
+        }
+        key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        with (cache / f"{key}.lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            entry = cache / key
+            marker = entry / "complete.json"
+            if not entry.exists():
+                entry.mkdir(mode=0o700)
+                python = _build_pinned_reader(entry, commit_id)
+                marker.write_text(json.dumps(identity, sort_keys=True), encoding="utf-8")
+            elif not marker.is_file() or json.loads(marker.read_text(encoding="utf-8")) != identity:
+                raise RuntimeError("pinned reader cache entry is incomplete or mismatched")
+            else:
+                python = entry / "legacy-venv/bin/python"
+            (wheel,) = (entry / "dist").glob("*.whl")
+            site = (
+                entry / "legacy-venv/lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+            )
+            with zipfile.ZipFile(wheel) as archive:
+                for name in archive.namelist():
+                    if name.startswith("creatidy_kernel/") and not name.endswith("/"):
+                        if ".." in Path(name).parts:
+                            raise RuntimeError("pinned reader wheel contains an unsafe package path")
+                        if (site / name).read_bytes() != archive.read(name):
+                            raise RuntimeError("pinned reader cache differs from its built wheel")
+            if not python.is_file():
+                raise RuntimeError("pinned reader cache interpreter is missing")
+            return python
+    return _build_pinned_reader(directory, commit_id)
+
+
+def _build_pinned_reader(directory: Path, commit_id: str) -> Path:
     archive = subprocess.run(["git", "archive", "--format=tar", commit_id], cwd=ROOT, check=True, capture_output=True)
     source = directory / "source"
     source.mkdir()
@@ -528,7 +584,7 @@ with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
 """
 
 
-def main(new_python: Path, storage_root: Path) -> None:
+def main(new_python: Path, storage_root: Path, prepared_ordinary: Path | None = None) -> None:
     with tempfile.TemporaryDirectory(prefix="installed-schema-upgrade-", dir=storage_root) as value:
         directory = Path(value)
         for schema, commit_id in ((2, PINNED_BASE_ID), (3, PINNED_PRECLOCK_ID), (4, PINNED_PREOWNERSHIP_ID)):
@@ -797,13 +853,18 @@ def main(new_python: Path, storage_root: Path) -> None:
         ordinary = directory / "ordinary-preparation"
         ordinary.mkdir()
         pre_ordinary_python = install_pinned_reader(ordinary, commit_id=PINNED_PRE_ORDINARY_ID)
-        fixture = ordinary / "installed-flow"
-        fixture.mkdir()
-        subprocess.run(
-            [str(new_python), "-I", str(ROOT / "tools/check_ordinary.py"), str(fixture), "--preparation-only"],
-            cwd=fixture,
-            check=True,
-        )
+        if prepared_ordinary is None:
+            fixture = ordinary / "installed-flow"
+            fixture.mkdir()
+            subprocess.run(
+                [str(new_python), "-I", str(ROOT / "tools/check_ordinary.py"), str(fixture), "--preparation-only"],
+                cwd=fixture,
+                check=True,
+            )
+        else:
+            fixture = prepared_ordinary.resolve(strict=True)
+            if not fixture.is_relative_to(storage_root.resolve(strict=True)):
+                raise RuntimeError("prepared installed ordinary fixture is outside the test storage root")
         path = fixture / "pull-normal" / "state.db"
         with closing(sqlite3.connect(path)) as current:
             before = tuple(current.iterdump())
@@ -836,4 +897,6 @@ def main(new_python: Path, storage_root: Path) -> None:
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]), Path(sys.argv[2]))
+    if len(sys.argv) not in (3, 4):
+        raise SystemExit("expected installed Python, storage root and optional prepared ordinary fixture")
+    main(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]) if len(sys.argv) == 4 else None)

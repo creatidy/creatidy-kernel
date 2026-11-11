@@ -7,10 +7,11 @@ delegates approved Forgejo PR integration into `develop` under [AGENTS.md](AGENT
 `main` and release tags remain human-controlled. An ordinary contribution does not authorize paid
 model calls, production access or deployment.
 
-## Local Gate
+## Validation
 
 Install Python 3.12+ and uv, then `uv sync --locked`. `make` (or `make help`) lists development
-targets without running checks or live execution. `make check` runs:
+targets without running checks or live execution. During development run focused tests for the change;
+canonical CI runs the full gates on the exact delivery subject. `make check` runs:
 
 ```sh
 uv lock --check
@@ -18,14 +19,17 @@ uv run --locked ruff format --check .
 uv run --locked ruff check .
 uv run --locked basedpyright
 uv run --locked lint-imports
-uv run --locked pytest
+uv run --locked pytest -m serial_native
 uv run --locked python tools/check_secrets.py
 git diff --check
 ```
 
-`make package-check` runs `uv run --locked python tools/check_package.py`, building wheel/sdist and
-testing a clean wheel installation. The builder and its dependencies are in the development lock;
-project installation and package checks use that environment without a second isolated resolution.
+`make package-check` runs `uv run --locked python tools/check_package.py`, builds wheel/sdist,
+and runs the remaining pytest suite once against the installed wheel rebuilt from the sdist.
+It checks the two pytest selections are complete and disjoint, reuses each pinned historical reader
+within the run, and retains the isolated install, no-runtime-dependency and compatibility proofs.
+The test tools and builder are in the lock; the installed-wheel environment is separate from the
+editable development environment.
 `make audit` runs `uv run --locked python tools/audit_dependencies.py` and requires public
 advisory/package-index access. The ordinary tests/example do not contact models or services.
 Format intentional edits with `uv run --locked ruff format .`; do not weaken checks to make them pass.

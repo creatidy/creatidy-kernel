@@ -193,8 +193,8 @@ For the selected issue follow `.kilo/command/implement-issue.md` as though expli
 owner-selected. Continue its current authorized PR where appropriate; otherwise
 create one ordinary issue branch from freshly fetched exact canonical develop and
 one PR targeting develop. Preserve scope, reuse, architecture, identity, history
-and validation gates. Run focused checks and `make check` and `make package-check`, inspect full base delta,
-run `make audit` only when relevant dependency/tooling changes require it,
+and validation gates. Run focused checks; canonical CI runs `make check` and `make package-check`
+and audit on the exact delivery subject. Inspect full base delta,
 commit only intended files, push normally, use `Refs #N` and keep the issue open.
 Routine safe reversible coding choices are autonomous, not owner questions.
 
@@ -282,7 +282,8 @@ For nonexcluded issues, changed authority/acceptance/gates/disposition still
 invalidates continuation; stop with evidence rather than merge. Otherwise
 re-fetch canonical PR metadata and current canonical develop through normal Git;
 verify approved HEAD/base exactly match current remote and local frozen objects,
-empty findings, clean checkout, successful required `make check` and `make package-check`, open/unmerged PR
+empty findings, clean checkout, successful canonical exact-subject CI for required `make check` and `make package-check`
+and audit, open/unmerged PR
 and target develop. A changed HEAD/base invalidates APPROVE: return to FINISH with
 the SAME counter (or terminate at the bound); never merge stale approval.
 

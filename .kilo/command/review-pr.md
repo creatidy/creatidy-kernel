@@ -19,8 +19,9 @@ Git transport for the reviewer and do not edit the PR.
 Use the current clean checkout when safe. If switching would disturb another active
 checkout, use one owner-authorized isolated temporary worktree and record it; do not
 stash/reset unrelated work. Freeze exact HEAD/base/merge-base and refuse divergence.
-Prepare the existing offline locked environment for required `make check` and
-`make package-check`. Before tests/tools that observe inherited state, construct a
+Inspect canonical CI evidence for required `make check` and `make package-check` and
+audit on the exact delivery subject; do not repeat full CI locally merely for review.
+Missing or unverified CI remains an explicit limitation. Before tests/tools that observe inherited state, construct a
 closed environment with only deliberate synthetic values and minimum operational
 variables; do not expose ambient secrets or mount credential directories. Reviewers
 inspect frozen objects read-only and never mutate the delivery. The parent must not

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import json
 import os
 from collections.abc import Callable
 from contextlib import closing
@@ -24,7 +25,12 @@ from creatidy_kernel.ports.ownership import WorkOwnership
 def test_ordinary_installed_handlers_with_synthetic_external_peers(
     sqlite_tmp_path: Path, mode: str, exercise: str
 ) -> None:
-    result = run_ordinary_flow(sqlite_tmp_path / mode, None, mode=mode, exercise=exercise)
+    prepared = os.environ.get("CREATIDY_TEST_PREPARED_ORDINARY")
+    if prepared is not None and mode == "pull" and exercise == "normal":
+        assert os.environ.get("CREATIDY_TEST_INSTALLED_PREFIX")
+        result = cast(dict[str, object], json.loads((Path(prepared) / "result.json").read_text(encoding="utf-8")))
+    else:
+        result = run_ordinary_flow(sqlite_tmp_path / mode, None, mode=mode, exercise=exercise)
     assert result["status"] == "completed"
     assert result["satisfactions"] == 2
     assert result["native_sends"] == 4
@@ -57,7 +63,7 @@ def test_private_outcome_reopens_uncertain_managed_stop(sqlite_tmp_path: Path) -
 def test_private_outcome_reopens_qualified_original_managed_stop(sqlite_tmp_path: Path) -> None:
     root = sqlite_tmp_path / "private-stop-qualified"
     result = run_ordinary_flow(root, None, mode="managed", exercise="stop")
-    assert result["status"] == "stopped" and result["settled"] == "cancelled"
+    assert result["status"] == "stopped" and result["settled"] == "cancelled" and result["native_sends"] == 0
     with SQLiteProgramStore(root / "state.db") as store:
         exported = export_private_outcome(
             store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
@@ -82,6 +88,7 @@ def test_partial_outcome_evidence_survives_reopen(sqlite_tmp_path: Path, exercis
         if exercise == "outcome-check-cut":
             assert cast(list[object], exported["checks"]) and not cast(list[object], exported["verification_manifests"])
         if exercise == "outcome-manifest-stop-cut":
+            assert cast(list[object], exported["verification_manifests"])
             assert all(
                 item["decision"] is None for item in cast(list[dict[str, object]], exported["verification_manifests"])
             )
@@ -128,6 +135,7 @@ def test_stop_domain_and_budget_revocation_rollback_together(sqlite_tmp_path: Pa
 def test_host_bound_owner_stop_is_scoped_and_revision_checked(sqlite_tmp_path: Path, exercise: str) -> None:
     result = run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise)
     assert result["status"] == ("stopped" if exercise == "served-owner-stop" else "refused")
+    assert result["native_sends"] == 0
 
 
 @pytest.mark.parametrize("exercise", ["served-worker-stop", "served-worker-approve"])
@@ -318,6 +326,7 @@ def test_separate_client_reads_original_remediation_context(sqlite_tmp_path: Pat
         sqlite_tmp_path / "review-remediation-served", None, mode="pull", exercise="review-remediation-served"
     )
     assert result["status"] == "completed"
+    assert result["satisfactions"] == 2
 
 
 def test_separate_client_invocations_share_host_bound_worker_session(sqlite_tmp_path: Path) -> None:
@@ -531,6 +540,7 @@ def test_owner_approval_rechecks_absence_after_external_validation(sqlite_tmp_pa
 def test_host_bound_approval_uses_exact_proposal_and_expected_revision(sqlite_tmp_path: Path, exercise: str) -> None:
     result = run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise)
     assert result["status"] == ("approved" if exercise == "served-owner-approve" else "refused")
+    assert result["native_sends"] == 0
 
 
 def test_interleaved_owner_channels_keep_amended_approval(sqlite_tmp_path: Path) -> None:
@@ -549,6 +559,7 @@ def test_lost_agit_reply_ignores_unrelated_branch_pr_without_duplicate_write(sql
     result = run_ordinary_flow(sqlite_tmp_path / "branch-pr", None, mode="pull", exercise="branch-pr")
     assert result["status"] == "completed"
     assert result["native_sends"] == 4
+    assert result["satisfactions"] == 2 and result["review_calls"] == 2
 
 
 def test_copied_marker_on_unrelated_branch_is_unknown_without_retry(sqlite_tmp_path: Path) -> None:
@@ -569,6 +580,7 @@ def test_completed_review_receipt_recovers_without_second_prompt(sqlite_tmp_path
     result = run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise)
     assert result["status"] == "completed"
     assert result["review_calls"] == 2
+    assert result["satisfactions"] == 2
 
 
 def test_managed_unknown_review_is_visible_and_recovers_without_reprompt(sqlite_tmp_path: Path) -> None:
@@ -581,18 +593,34 @@ def test_diamond_dag_composes_shared_ancestor_once(sqlite_tmp_path: Path) -> Non
     assert result["status"] == "completed"
     assert result["satisfactions"] == 4
     assert result["native_sends"] == 8
+    assert result["review_calls"] == 4
 
 
 def test_diamond_branch_advances_shared_ancestor_while_other_inherits(sqlite_tmp_path: Path) -> None:
     result = run_ordinary_flow(sqlite_tmp_path / "diamond-inherited", None, mode="pull", exercise="diamond-inherited")
     assert result["status"] == "completed"
     assert result["satisfactions"] == 4
+    assert result["review_calls"] == 4
 
 
 @pytest.mark.parametrize("mode", ["pull", "managed"])
 def test_substantive_review_findings_reach_remediation_author(sqlite_tmp_path: Path, mode: str) -> None:
-    result = run_ordinary_flow(sqlite_tmp_path / mode, None, mode=mode, exercise="review-remediation")
+    root = sqlite_tmp_path / mode
+    result = run_ordinary_flow(root, None, mode=mode, exercise="review-remediation")
     assert result["status"] == "completed" and result["satisfactions"] == 2
+    with SQLiteProgramStore(root / "state.db") as store:
+        exported = export_private_outcome(
+            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        reviews = cast(list[dict[str, object]], exported["reviews"])
+        attempts = cast(list[dict[str, object]], exported["attempts"])
+        review = next(item for item in reviews if item["verdict"] == "request_changes")
+        remediation = next(item for item in attempts if item["remediation_of"] == review["attempt"])
+        findings = cast(list[dict[str, object]], review["findings"])
+        assert findings and all(
+            item in cast(list[dict[str, object]], remediation["remediation_findings"]) for item in findings
+        )
+        assert "Implement the approved edge case." not in json.dumps(exported)
 
 
 def test_remediation_refuses_review_receipt_with_different_subject(sqlite_tmp_path: Path) -> None:
@@ -639,6 +667,7 @@ def test_rejected_report_replays_exact_evidence_after_time_and_reopen(sqlite_tmp
 def test_unpaginated_comment_collection_above_thirty_is_complete(sqlite_tmp_path: Path) -> None:
     result = run_ordinary_flow(sqlite_tmp_path / "many-comments", None, mode="pull", exercise="many-comments")
     assert result["status"] == "completed" and result["native_sends"] == 4
+    assert result["satisfactions"] == 2 and result["review_calls"] == 2
 
 
 def test_completed_command_evidence_recovers_after_aggregate_commit_failure(sqlite_tmp_path: Path) -> None:
@@ -646,6 +675,7 @@ def test_completed_command_evidence_recovers_after_aggregate_commit_failure(sqli
         sqlite_tmp_path / "aggregate-crash", None, mode="pull", exercise="command-evidence-crash"
     )
     assert result["status"] == "completed" and result["satisfactions"] == 2
+    assert result["review_calls"] == 2
 
 
 def test_command_aggregate_recovery_refuses_missing_original_witness(sqlite_tmp_path: Path) -> None:
@@ -663,10 +693,16 @@ def test_command_aggregate_recovery_refuses_partial_results_without_rerun(sqlite
 
 
 def test_completed_program_can_revoke_remaining_publication_without_rewriting_acceptance(sqlite_tmp_path: Path) -> None:
-    assert run_ordinary_flow(sqlite_tmp_path / "completed-stop", None, mode="pull", exercise="stop-completed") == {
+    root = sqlite_tmp_path / "completed-stop"
+    assert run_ordinary_flow(root, None, mode="pull", exercise="stop-completed") == {
         "status": "completed-revoked",
         "native_sends": 0,
     }
+    with SQLiteProgramStore(root / "state.db") as store:
+        exported = export_private_outcome(
+            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
+        )
+        assert cast(dict[str, object], exported["coverage"])["work_revocation_recorded"] is True
 
 
 @pytest.mark.parametrize("exercise", ["managed-program-stop", "managed-budget-revoke"])
@@ -730,12 +766,8 @@ def test_ordinary_two_obligation_program_with_real_native_cold_review(sqlite_tmp
     assert result["native_sends"] == 4
 
 
-@pytest.mark.parametrize("mode", ["pull", "managed"])
-def test_ordinary_stop_revokes_authority_without_accepting_or_publishing(sqlite_tmp_path: Path, mode: str) -> None:
-    result = run_ordinary_flow(sqlite_tmp_path / mode, None, mode=mode, exercise="stop")
+def test_ordinary_stop_revokes_authority_without_accepting_or_publishing(sqlite_tmp_path: Path) -> None:
+    result = run_ordinary_flow(sqlite_tmp_path / "pull", None, mode="pull", exercise="stop")
     assert result["status"] == "stopped"
     assert result["native_sends"] == 0
-    if mode == "pull":
-        assert result["settled"] is False
-    else:
-        assert result["settled"] == "cancelled"
+    assert result["settled"] is False
