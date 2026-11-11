@@ -45,6 +45,26 @@ This does not authorize product GO, cross-repository mutation, Scarcity Router
 operation, main, releases or deployments. Standalone implementation remains
 owner-selected and unmerged; standalone review remains read-only.
 
+## Test And CI Discipline
+
+- Run focused checks during development. Canonical CI runs the complete required gates on the exact
+  delivery subject; do not repeat the full suite locally merely before pushing or review. Run additional
+  checks when needed to diagnose failures or prove requirements CI does not exercise.
+- Do not execute the same scenario twice without identifying the distinct verification gained.
+  When consolidating tests, preserve the union of required assertions, negative paths and integration
+  guarantees. Keep a single source of truth for scenario selection where practical.
+- Build identical artifacts once per run when their provenance and reuse can be verified. Keep mutable
+  databases, workspaces, processes and external state isolated; distinct revisions and build proofs
+  are not interchangeable merely because their outputs have similar names.
+- Parallelize only after checking filesystem, process, network and host-global isolation. Ensure test
+  partitions are disjoint and complete, and retain required serial or separately isolated proofs.
+  Do not hide concurrency failures with retries, weaker assertions or longer timeouts.
+- Verify the actual CI checkout and all required successful steps against the current reviewed subject
+  before integration. Missing or stale evidence is not a pass; report skipped or unavailable proofs
+  explicitly. Independent review remains mandatory, without automatically repeating full CI locally.
+- Measure wall-clock time, phase costs, test outcomes and environment before and after performance
+  changes. Report the limits of the comparison and do not claim a speedup from unmeasured work.
+
 ## Independent Review — Conversational Independence
 
 An independent review MUST use a fresh, separate reviewer session without the implementation agent's
