@@ -997,6 +997,7 @@ print("Done")
                 "served-proposal-mismatch",
                 "served-proposal-missing",
                 "served-proposal-race",
+                "served-proposal-unrecorded",
             }:
                 owner_socket, owner_client = socket.socketpair()
                 with owner_socket, owner_client:
@@ -1026,6 +1027,13 @@ print("Done")
                     replacement = replace(proposal, objective="A different objective")
                     if exercise == "served-proposal-mismatch":
                         setattr(server, "_proposal", replacement)  # noqa: B010 - Simulate host replacement.
+                    if exercise == "served-proposal-unrecorded":
+                        setattr(server, "_proposal", replacement)  # noqa: B010 - Simulate host replacement.
+                        write_frame(owner_client, encode({"version": 1, "action": "proposal"}), bound=65536)
+                        server.serve_once()
+                        inspected_replacement = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
+                        assert inspected_replacement["proposal"] == json.loads(encode(replacement.payload))
+                        request["proposal_digest"] = inspected_replacement["digest"]
                     if exercise == "served-proposal-missing":
                         del request["proposal_digest"]
                     wire = json.dumps(request, sort_keys=True).encode()
@@ -1034,6 +1042,7 @@ print("Done")
                         "served-owner-approve-stale",
                         "served-proposal-mismatch",
                         "served-proposal-missing",
+                        "served-proposal-unrecorded",
                     }:
                         try:
                             server.serve_once()
@@ -1042,7 +1051,12 @@ print("Done")
                         else:
                             raise AssertionError("stale expected revision approved a new Program")
                         assert store.find_program("everyday-program") is None
-                        assert not store.operations("served-command:")
+                        if exercise == "served-proposal-unrecorded":
+                            assert (
+                                store.find_artifact("ordinary-program:approval:served-owner-decision", "record") is None
+                            )
+                        else:
+                            assert not store.operations("served-command:")
                         return {"status": "refused", "native_sends": 0}
                     if exercise == "served-proposal-race":
                         original_current = OrdinaryProgram.current

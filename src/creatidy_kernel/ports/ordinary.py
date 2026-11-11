@@ -261,6 +261,9 @@ class OrdinaryProgram:
     def approve(
         self, proposal: OrdinaryProposal, *, decision_id: str, expires_at: int, expected_revision: int | None = None
     ) -> OrdinaryApproval:
+        raw_proposal = encode(proposal.payload)
+        if self.store.find_artifact(f"ordinary-program:proposal:{digest(raw_proposal)}", "record") != raw_proposal:
+            raise IntakeRefused("exact proposal record is unavailable")
         # The caller's expiry is an upper bound. Original producer evidence may
         # expire earlier; bind that bound into the boot-clock work envelope too.
         expires_at = min(

@@ -99,8 +99,10 @@ claim and managed target where applicable; the request cannot choose them. Appro
 digest observed by the caller; missing or mismatched identities refuse even for legacy requests. The
 handler captures one frozen proposal and uses that same object for the journal and application approval,
 so a later host binding replacement cannot switch the approved meaning. Existing authority, revision and
-evidence checks still apply. Historical pre-change approval receipts remain stored but the legacy request
-format cannot replay them through this command; no old request grants fresh authority. Exact duplicate command
+evidence checks still apply. New approval requires the existing exact producer-recorded proposal artifact
+needed for recovery; an unrecorded host-supplied proposal refuses. Historical pre-change approval receipts
+remain stored but the legacy request format cannot replay them through this command; no old request grants
+fresh authority. Exact duplicate command
 inputs return their original receipt as historical evidence, not renewed permission. If an intent
 exists but its outcome receipt is missing, the response is `unknown` and no automatic repeat occurs.
 Cooperative task-scope quiescence is never represented as managed process settlement; a STOP receipt

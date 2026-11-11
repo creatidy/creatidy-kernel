@@ -558,6 +558,7 @@ def test_owner_approval_rechecks_absence_after_external_validation(sqlite_tmp_pa
         "served-proposal-mismatch",
         "served-proposal-missing",
         "served-proposal-race",
+        "served-proposal-unrecorded",
     ],
 )
 def test_host_bound_approval_uses_exact_proposal_and_expected_revision(sqlite_tmp_path: Path, exercise: str) -> None:
