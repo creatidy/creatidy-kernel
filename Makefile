@@ -3,8 +3,8 @@
 
 help:
 	@printf '%s\n' 'Creatidy Kernel development' \
-	  '  make check            Locked tooling, formatting, lint, typing, boundaries, tests and secrets' \
-	  '  make package-check    Reproducible wheel/sdist and installed-package smoke checks' \
+	  '  make check            Locked tooling, static checks and serial native-sensitive tests' \
+	  '  make package-check    Reproducible archives, installed-wheel test suite and compatibility' \
 	  '  make audit            Locked dependency advisory audit (network access required)' \
 	  '  make native-proof     Required native verification receipt (explicit pinned bwrap setup)' \
 	  '  make oci-worker-proof Required #78 whole-worker native receipt (CREATIDY_TEST_OCI_TOOLROOT)' \
@@ -17,7 +17,8 @@ check:
 	uv run --locked ruff check .
 	uv run --locked basedpyright
 	uv run --locked lint-imports
-	uv run --locked pytest
+	# Native proofs use host-global process and container state; run separately from package tests.
+	uv run --locked pytest -m serial_native
 	uv run --locked python tools/check_secrets.py
 	git diff --check
 

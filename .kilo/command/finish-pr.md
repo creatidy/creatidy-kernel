@@ -35,8 +35,10 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    use a clean authorized worktree when that resolves ordinary checkout contention.
    It is not an owner decision unless resolving it requires an owner-controlled action.
 2. Require the current PR branch to be clean and match MCP HEAD. Freeze exact
-   HEAD, base and merge base; run required `make check` and `make package-check`,
-   prepare their offline locked environment and inspect reviewer permissions. The
+   HEAD, base and merge base; verify canonical CI has successfully run required
+   `make check` and `make package-check` and audit on the exact delivery subject,
+   including actual checkout and required step evidence, per validation.md. Missing,
+   pending, stale, failed or ambiguous CI is not success. Inspect reviewer permissions. The
    reviewer verifies canonical repository/PR/ref commit metadata through read-only
    Forgejo MCP and checks those exact commits against this primary-prepared clean
    local checkout. It does not need anonymous Git transport. Review frozen objects/
@@ -74,8 +76,8 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    Remediate all in scope and add regression tests.
    Classify each as direct incomplete remediation or genuinely new semantic/
    architectural defect; record that distinction and the reviewed HEAD/verdict.
-6. Run focused validation and full `make check` and `make package-check`; run `make audit`
-   only when relevant dependency/tooling changes require it. Inspect status, intended diff,
+6. Run focused validation; after push verify full `make check` and `make package-check`
+   and audit in canonical exact-subject CI rather than duplicating them locally. Inspect status, intended diff,
    full base delta, whitespace and recent commit style. Verify configured and
    effective author/committer are Adrian Tkacz <adrian.tkacz@creatidy.com>.
    Stage only intended files, commit normally and push the SAME PR branch through

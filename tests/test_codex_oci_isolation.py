@@ -36,6 +36,8 @@ from tools.oci_worker_poc import harness
 from tools.oci_worker_poc.profile import FORBIDDEN_BIND_PREFIXES
 from tools.oci_worker_poc.toolchain import Toolchain, read_provenance
 
+pytestmark = pytest.mark.serial_native
+
 TOOLROOT_ENV = "CREATIDY_TEST_OCI_TOOLROOT"
 PINNED_PODMAN_VERSION = "podman version 6.1.3"
 PINNED_CRUN_VERSION = "crun version 1.30.1"

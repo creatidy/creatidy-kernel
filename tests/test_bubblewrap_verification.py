@@ -33,6 +33,8 @@ from creatidy_kernel.adapters.bubblewrap_verification import (
 from creatidy_kernel.core.verification import EvidenceSubject
 from creatidy_kernel.ports.verification import VerificationInvocation, VerificationResource, VerificationSnapshot
 
+pytestmark = pytest.mark.serial_native
+
 SUBJECT = EvidenceSubject("candidate", "attempt", "spec", "policy", "synthetic-repo", "base", "head")
 
 

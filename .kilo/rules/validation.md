@@ -5,12 +5,23 @@
 - Python 3.12+, uv, src layout and typed `creatidy_kernel`. Prefer standard
   library and minimal dependencies. Maintain uv.lock with intentional dependency
   changes; do not regenerate it to conceal a locked-sync failure.
-- Final gates are `make check` and `make package-check`. Makefile owns locked tooling,
+- Final gates are `make check` and `make package-check`, executed by canonical CI
+  on the exact delivery subject. Makefile owns locked tooling,
   Ruff format/lint, basedpyright, import boundaries, deterministic local pytest,
   secret scanning, `git diff --check`, reproducible wheel/sdist and installed-package smoke checks.
   Do not replace basedpyright with pyright or a weaker substitute, duplicate the detailed check
-  list or bypass any gate. Focused commands may diagnose before the gates.
-  Run `make audit` for relevant dependency/tooling changes or a complete CI-equivalent gate.
+  list or bypass any gate. During development run focused checks appropriate to the
+  change; do not repeat the complete CI gates locally merely before pushing or review.
+  Canonical CI also runs `make audit`. Run additional local checks when necessary to
+  diagnose failures or prove requirements unavailable in CI.
+- Before READY_TO_MERGE or integration, verify the canonical Forgejo workflow run
+  actually tested the current PR HEAD (or an explicitly identified merge tree), its
+  checkout and all required gate steps succeeded, and current PR HEAD/base still
+  match the independently reviewed subjects. Missing, pending, cancelled, failed,
+  stale, ambiguous or inaccessible evidence is not a pass. Inspect the workflow and
+  its checkout evidence rather than inferring success from a badge or protection.
+  Native proofs and SOPS/age not executed in CI remain unproved unless separately
+  demonstrated; never infer their success from a generic green status.
 - Tests use synthetic fixtures, controlled time and no live network/private
   accounts. SQLite tests need a supported native local Linux filesystem; use the existing
   `CREATIDY_TEST_STORAGE_DIR` override only when the default temporary mount is unsupported.

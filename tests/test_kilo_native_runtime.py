@@ -15,6 +15,8 @@ from creatidy_kernel.adapters.kilo_review import NativeKiloReview
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.ports.verification import ProductReviewStatus, dispatch_product_review
 
+pytestmark = pytest.mark.serial_native
+
 
 def test_real_native_cold_review_session(sqlite_tmp_path: Path) -> None:
     binary = os.environ.get("CREATIDY_KILO_NATIVE_TEST_BINARY")

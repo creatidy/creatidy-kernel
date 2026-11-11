@@ -123,14 +123,16 @@ Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). From a checkout:
 ```sh
 uv sync --locked
 uv run --locked python examples/fixed_allocation.py
-make check
-make package-check
+uv run --locked pytest tests/test_resources.py
 ```
 
 The example prints a configured allocation; it makes no model call or reservation. Tests need no
 Forgejo server, Scarcity Router, Prefect, M5-B or private Creatidy infrastructure. Dependency setup
 needs access to the configured package index unless already cached; the tests and example run offline.
 On systems without Make, the individual commands are listed in [CONTRIBUTING.md](CONTRIBUTING.md).
+The complete CI gates are `make check` and `make package-check`: native-sensitive tests run separately,
+and the remaining test suite runs once against the wheel rebuilt from the sdist. During development,
+run the focused tests relevant to the change rather than duplicating the full CI run locally.
 
 SQLite persistence tests require a verified native local Linux filesystem. They use pytest's temporary
 directory by default; if it is on a rejected filesystem, set `CREATIDY_TEST_STORAGE_DIR` to a

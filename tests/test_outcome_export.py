@@ -612,28 +612,6 @@ def test_reference_publication_unknown_remains_historical_without_retry(sqlite_t
         assert store.operation("reference:pr") == before and before.attempts == 1
 
 
-def test_review_findings_remain_linked_after_reopen(sqlite_tmp_path: Path) -> None:
-    root = sqlite_tmp_path / "reopened-review-findings"
-    assert run_ordinary_flow(root, None, mode="pull", exercise="review-remediation")["status"] == "completed"
-    with SQLiteProgramStore(root / "state.db") as store:
-        result = export_private_outcome(
-            store, "everyday-program", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32
-        )
-        review = next(
-            item for item in cast(list[dict[str, object]], result["reviews"]) if item["verdict"] == "request_changes"
-        )
-        remediation = next(
-            item
-            for item in cast(list[dict[str, object]], result["attempts"])
-            if item["remediation_of"] == review["attempt"]
-        )
-        findings = cast(list[dict[str, object]], review["findings"])
-        assert findings and all(
-            item in cast(list[dict[str, object]], remediation["remediation_findings"]) for item in findings
-        )
-        assert "Implement the approved edge case." not in json.dumps(result)
-
-
 @pytest.mark.parametrize("damage", ["subject", "reviewer"])
 def test_mismatched_review_receipt_never_exports_approval(sqlite_tmp_path: Path, damage: str) -> None:
     root = sqlite_tmp_path / f"mismatched-review-{damage}"

@@ -509,8 +509,8 @@ class WorkflowContractTests(unittest.TestCase):
             "Only this explicit `/loop` authority permits merging",
             "re-fetch canonical PR metadata and current canonical develop",
             "approved HEAD/base exactly match current remote and local frozen objects",
-            "empty findings, clean checkout, successful required `make check` and `make package-check`, "
-            "open/unmerged PR and target develop",
+            "empty findings, clean checkout, successful canonical exact-subject CI for required "
+            "`make check` and `make package-check` and audit, open/unmerged PR and target develop",
             "return to FINISH with the SAME counter",
             "Recheck selected issue authority/acceptance/gates/labels",
             "`forgejo-mcp_merge_pull_request`",
