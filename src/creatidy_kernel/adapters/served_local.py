@@ -738,6 +738,26 @@ class LocalOwnerChannel(LocalReadChannel):
         self._approval_binding[0] = value
 
     def _dispatch(self, request: dict[str, object]) -> object:
+        if request.get("action") == "proposal-chunk":
+            if set(request) != {"version", "action", "offset", "proposal_digest"} or self._proposal is None:
+                raise LocalChannelRefused("a host-bound proposal and exact chunk request are required")
+            proposal = self._proposal
+            offset, expected = request["offset"], request["proposal_digest"]
+            if proposal.program_id != self._owner.scope or type(offset) is not int or offset < 0:
+                raise LocalChannelRefused("invalid proposal chunk request")
+            raw = encode(proposal.payload)
+            identity = digest(raw)
+            if offset > len(raw) or (expected != identity and not (offset == 0 and expected is None)):
+                raise LocalChannelRefused("proposal changed or chunk offset invalid")
+            chunk = raw[offset : offset + 8192]
+            return {
+                "version": 1,
+                "digest": identity,
+                "offset": offset,
+                "bytes": len(raw),
+                "data_base64": base64.b64encode(chunk).decode("ascii"),
+                "complete": offset + len(chunk) == len(raw),
+            }
         if request.get("action") == "proposal":
             if set(request) != {"version", "action"} or self._proposal is None:
                 raise LocalChannelRefused("a host-bound proposal is required")
@@ -999,6 +1019,7 @@ class LocalOwnerChannel(LocalReadChannel):
         current = store.find_program(self._owner.scope)
         if (-1 if current is None else current.revision) != revision:
             raise LocalChannelRefused("caller expected revision is stale")
+        self._application.check_proposal_record(proposal)
         store.intent(operation_id, operation_id, exact)
         approved = self._application.approve(
             proposal, decision_id=decision_id, expires_at=expires_at, expected_revision=revision

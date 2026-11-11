@@ -34,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
             "report",
             "stop",
             "proposal",
+            "proposal-chunk",
             "approve",
             "reconcile",
             "start-managed",
@@ -81,6 +82,12 @@ def main(argv: list[str] | None = None) -> int:
                 "after": {"producer": args.producer, "scope": args.scope, "sequence": args.sequence},
             }
         )
+    elif args.action == "proposal-chunk":
+        if args.offset is None or args.collection is not None or args.index is not None:
+            parser.error("proposal-chunk requires --offset and does not accept --collection or --index")
+        if args.offset != 0 and args.proposal_digest is None:
+            parser.error("proposal-chunk continuation requires --proposal-digest")
+        request.update({"offset": args.offset, "proposal_digest": args.proposal_digest})
     elif any(value is not None for value in (args.collection, args.index, args.offset)):
         parser.error("--collection, --index and --offset are only valid for record")
     if args.action == "events":
@@ -90,10 +97,10 @@ def main(argv: list[str] | None = None) -> int:
         request["limit"] = args.limit
     elif args.action != "record" and (args.producer is not None or args.scope is not None or args.sequence is not None):
         parser.error("snapshot does not accept a position")
-    if args.action != "approve" and any(
-        value is not None for value in (args.decision_id, args.expires_at, args.proposal_digest)
-    ):
-        parser.error("only approve accepts --decision-id, --expires-at and --proposal-digest")
+    if args.action != "approve" and (args.decision_id is not None or args.expires_at is not None):
+        parser.error("only approve accepts --decision-id and --expires-at")
+    if args.action not in {"approve", "proposal-chunk"} and args.proposal_digest is not None:
+        parser.error("only approve or proposal-chunk accepts --proposal-digest")
     if args.action != "reconcile" and (args.subject is not None or args.evidence is not None):
         parser.error("only reconcile accepts --subject and --evidence")
     if args.action == "claim":

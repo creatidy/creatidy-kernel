@@ -90,7 +90,13 @@ original claim's existing authorization and workspace-observation handler to sup
 declaration, effective inputs and any original remediation findings. It is not a historical grant of
 authority and can be refused after expiry or revocation. The owner capability also supports `proposal`:
 it returns the complete canonical host-bound proposal payload, its scope and SHA-256 digest, or refuses
-if the proposal is unavailable or the response exceeds the frame limit. It is a read, not approval.
+if the proposal is unavailable or the response exceeds the frame limit. For larger proposals, the
+owner-only `proposal-chunk --offset 0` returns the first 8192 canonical JSON bytes as base64, with
+`digest`, `bytes`, `offset` and `complete`. Continue with `proposal-chunk --offset N --proposal-digest D`,
+using the returned digest and next byte offset; a changed proposal or invalid offset refuses. Clients
+must assemble contiguous bytes, verify the reported total and SHA-256, and decode the entire JSON before
+presenting it for approval. Each frame is bounded; aggregate size and processing are not bounded by this
+protocol. These are reads, not approval.
 The installed client uses `proposal` before `approve --proposal-digest <digest>`; the digest is an
 identity, not an authorization credential. The owner capability accepts `approve`, `reconcile`,
 `start-managed` and `stop`. Mutations require a command ID and caller-observed expected Program revision
@@ -105,6 +111,9 @@ remain stored but the legacy request format cannot replay them through this comm
 fresh authority. Exact duplicate command
 inputs return their original receipt as historical evidence, not renewed permission. If an intent
 exists but its outcome receipt is missing, the response is `unknown` and no automatic repeat occurs.
+The exact proposal artifact is checked before recording a new served approval intent and checked again
+by the application. Its absence refuses before that intent, so an identical retry after reconnect also
+refuses while the artifact remains unavailable; other interruptions after intent still remain `unknown`.
 Cooperative task-scope quiescence is never represented as managed process settlement; a STOP receipt
 can prove at most its one explicitly bound original managed target, not all effects or descendants.
 Worker `start` is limited to pull handoffs; a managed handoff can start only through the original owner's

@@ -544,6 +544,15 @@ def test_owner_approval_checks_caller_expectation_for_absent_program(sqlite_tmp_
     }
 
 
+def test_large_proposal_is_read_in_exact_bounded_chunks(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "large-proposal", None, mode="pull", exercise="served-large-proposal"
+    ) == {
+        "status": "read",
+        "native_sends": 0,
+    }
+
+
 def test_owner_approval_rechecks_absence_after_external_validation(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(
         sqlite_tmp_path / "approve-revision-race", None, mode="pull", exercise="approve-revision-race"

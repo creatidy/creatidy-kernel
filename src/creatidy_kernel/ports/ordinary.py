@@ -258,12 +258,16 @@ class OrdinaryProgram:
         if any(not item.observed_at <= now <= item.fresh_until for item in (*proposal.dependencies, *edges)):
             raise IntakeRefused("original dependency observation expired; refresh and explicitly approve")
 
-    def approve(
-        self, proposal: OrdinaryProposal, *, decision_id: str, expires_at: int, expected_revision: int | None = None
-    ) -> OrdinaryApproval:
+    def check_proposal_record(self, proposal: OrdinaryProposal) -> None:
+        """Require the exact durable proposal used by approval recovery."""
         raw_proposal = encode(proposal.payload)
         if self.store.find_artifact(f"ordinary-program:proposal:{digest(raw_proposal)}", "record") != raw_proposal:
             raise IntakeRefused("exact proposal record is unavailable")
+
+    def approve(
+        self, proposal: OrdinaryProposal, *, decision_id: str, expires_at: int, expected_revision: int | None = None
+    ) -> OrdinaryApproval:
+        self.check_proposal_record(proposal)
         # The caller's expiry is an upper bound. Original producer evidence may
         # expire earlier; bind that bound into the boot-clock work envelope too.
         expires_at = min(

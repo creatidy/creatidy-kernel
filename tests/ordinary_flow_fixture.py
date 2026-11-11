@@ -646,6 +646,125 @@ print("Done")
                 assert reader.read(subject, changed).disposition is Disposition.EQUIVALENCE
                 return {"status": "unassessed"}
             proposal = app.propose("everyday-program", "Receive two native-dependent obligations", selections)
+            if exercise == "served-large-proposal":
+                large = app.propose("everyday-program", ('ż"\\' * 150_000), selections)
+                raw = encode(large.payload)
+                full = json.dumps(
+                    {
+                        "version": 1,
+                        "ok": True,
+                        "result": {
+                            "version": 1,
+                            "scope": large.program_id,
+                            "digest": large.digest,
+                            "proposal": large.payload,
+                        },
+                    },
+                    sort_keys=True,
+                ).encode()
+                assert len(full) > 1024 * 1024 and len(raw) > 1024 * 1024
+                before = (store.history("everyday-program"), store.operations())
+                owner_socket, owner_client = socket.socketpair()
+                with owner_socket, owner_client:
+                    channel = LocalOwnerChannel(
+                        OwnerProjection(store, "everyday-program"), owner_socket, app, None, proposal=large
+                    )
+                    assembled = bytearray()
+                    while len(assembled) < len(raw):
+                        offset = len(assembled)
+                        request = {
+                            "version": 1,
+                            "action": "proposal-chunk",
+                            "offset": offset,
+                            "proposal_digest": None if offset == 0 else large.digest,
+                        }
+                        write_frame(owner_client, encode(request), bound=65536)
+                        channel.serve_once()
+                        frame = read_frame(owner_client, bound=1024 * 1024)
+                        part = json.loads(frame)["result"]
+                        assert part["digest"] == large.digest and part["bytes"] == len(raw)
+                        assert part["offset"] == offset
+                        assembled.extend(base64.b64decode(part["data_base64"], validate=True))
+                        assert part["complete"] == (len(assembled) == len(raw))
+                    assert bytes(assembled) == raw and digest(bytes(assembled)) == large.digest
+                    write_frame(
+                        owner_client,
+                        encode(
+                            {
+                                "version": 1,
+                                "action": "proposal-chunk",
+                                "offset": len(raw),
+                                "proposal_digest": large.digest,
+                            }
+                        ),
+                        bound=65536,
+                    )
+                    channel.serve_once()
+                    assert json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]["complete"] is True
+                assert (store.history("everyday-program"), store.operations()) == before
+                for invalid in (
+                    {"offset": -1, "proposal_digest": large.digest},
+                    {"offset": True, "proposal_digest": large.digest},
+                    {"offset": len(raw) + 1, "proposal_digest": large.digest},
+                    {"offset": 8192, "proposal_digest": "0" * 64},
+                    {"offset": 8192, "proposal_digest": None},
+                ):
+                    owner_socket, owner_client = socket.socketpair()
+                    with owner_socket, owner_client:
+                        channel = LocalOwnerChannel(
+                            OwnerProjection(store, "everyday-program"), owner_socket, app, None, proposal=large
+                        )
+                        write_frame(
+                            owner_client, encode({"version": 1, "action": "proposal-chunk", **invalid}), bound=65536
+                        )
+                        try:
+                            channel.serve_once()
+                        except LocalChannelRefused:
+                            pass
+                        else:
+                            raise AssertionError("invalid proposal chunk accepted")
+                owner_socket, owner_client = socket.socketpair()
+                with owner_socket, owner_client:
+                    changed = replace(large, objective="replacement")
+                    channel = LocalOwnerChannel(
+                        OwnerProjection(store, "everyday-program"), owner_socket, app, None, proposal=changed
+                    )
+                    write_frame(
+                        owner_client,
+                        encode(
+                            {"version": 1, "action": "proposal-chunk", "offset": 8192, "proposal_digest": large.digest}
+                        ),
+                        bound=65536,
+                    )
+                    try:
+                        channel.serve_once()
+                    except LocalChannelRefused:
+                        pass
+                    else:
+                        raise AssertionError("changed proposal allowed continuation")
+                owner_socket, owner_client = socket.socketpair()
+                with owner_socket, owner_client:
+                    channel = LocalOwnerChannel(
+                        OwnerProjection(store, "everyday-program"), owner_socket, app, None, proposal=large
+                    )
+                    write_frame(
+                        owner_client,
+                        encode(
+                            {
+                                "version": 1,
+                                "action": "approve",
+                                "command_id": "large",
+                                "expected_revision": -1,
+                                "decision_id": "large-decision",
+                                "expires_at": int(time.time()) + 900,
+                                "proposal_digest": digest(bytes(assembled)),
+                            }
+                        ),
+                        bound=65536,
+                    )
+                    channel.serve_once()
+                    assert json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]["status"] == "approved"
+                return {"status": "read", "native_sends": 0}
             if exercise in {"served-host-receipts", "served-host-process-create"}:
                 binding = LocalOwnerSession(OwnerProjection(store, "everyday-program"), app, None, proposal=proposal)
                 script = (
@@ -924,6 +1043,9 @@ print("Done")
                 inspected = invoke_owner(["proposal"])
                 assert inspected["proposal"] == json.loads(encode(proposal.payload))
                 assert inspected["digest"] == proposal.digest and inspected["scope"] == proposal.program_id
+                first_chunk = invoke_owner(["proposal-chunk", "--offset", "0"])
+                assert first_chunk["digest"] == proposal.digest
+                assert base64.b64decode(cast(str, first_chunk["data_base64"])) == encode(proposal.payload)[:8192]
                 first = invoke_owner(
                     [
                         "approve",
@@ -1055,6 +1177,23 @@ print("Done")
                             assert (
                                 store.find_artifact("ordinary-program:approval:served-owner-decision", "record") is None
                             )
+                            retry_owner, retry_peer = socket.socketpair()
+                            with retry_owner, retry_peer:
+                                retry = LocalOwnerChannel(
+                                    OwnerProjection(store, "everyday-program"),
+                                    retry_owner,
+                                    app,
+                                    None,
+                                    proposal=replacement,
+                                )
+                                write_frame(retry_peer, wire, bound=65536)
+                                try:
+                                    retry.serve_once()
+                                except LocalChannelRefused:
+                                    pass
+                                else:
+                                    raise AssertionError("unrecorded proposal retry did not refuse")
+                            assert not store.operations("served-command:")
                         else:
                             assert not store.operations("served-command:")
                         return {"status": "refused", "native_sends": 0}

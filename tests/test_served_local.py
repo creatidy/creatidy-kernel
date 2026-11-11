@@ -89,6 +89,7 @@ def test_payload_cannot_claim_owner_identity_or_submit_command(sqlite_tmp_path: 
         b'{"version":1,"action":"snapshot","action":"stop"}',
         b'{"version":1,"action":"stop"}',
         b'{"version":1,"action":"proposal"}',
+        b'{"version":1,"action":"proposal-chunk","offset":0,"proposal_digest":null}',
         b'{"version":1,"action":"claim","command_id":"x","expected_revision":0,"lease_seconds":1,"remediation_of":null}',
     ],
 )
