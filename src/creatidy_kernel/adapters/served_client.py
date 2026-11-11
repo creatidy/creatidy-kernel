@@ -184,8 +184,7 @@ def main(argv: list[str] | None = None) -> int:
             or args.proposal_digest is None
         ):
             parser.error(
-                "approve requires --command-id, --expected-revision, --decision-id, --expires-at, "
-                "and --proposal-digest"
+                "approve requires --command-id, --expected-revision, --decision-id, --expires-at, and --proposal-digest"
             )
         if any(
             value is not None
