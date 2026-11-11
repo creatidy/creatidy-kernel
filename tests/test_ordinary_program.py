@@ -559,6 +559,12 @@ def test_installed_client_reads_large_proposal_across_connections(sqlite_tmp_pat
     ) == {"status": "read", "native_sends": 0}
 
 
+def test_installed_client_replays_legacy_approval_without_granting_new_authority(sqlite_tmp_path: Path) -> None:
+    assert run_ordinary_flow(
+        sqlite_tmp_path / "installed-legacy-approval", None, mode="pull", exercise="served-legacy-installed-client"
+    ) == {"status": "historical", "native_sends": 0}
+
+
 def test_owner_approval_rechecks_absence_after_external_validation(sqlite_tmp_path: Path) -> None:
     assert run_ordinary_flow(
         sqlite_tmp_path / "approve-revision-race", None, mode="pull", exercise="approve-revision-race"
@@ -574,12 +580,26 @@ def test_owner_approval_rechecks_absence_after_external_validation(sqlite_tmp_pa
         "served-proposal-missing",
         "served-proposal-race",
         "served-proposal-unrecorded",
+        "served-scope-missing",
+        "served-scope-tampered",
+        "served-scope-malformed",
+        "served-scope-permissions",
+        "served-scope-budget",
+        "served-scope-verification",
+        "served-scope-execution",
+        "served-scope-final-guard",
+        "served-scope-chunks",
+        "served-scope-legacy-replay",
     ],
 )
 def test_host_bound_approval_uses_exact_proposal_and_expected_revision(sqlite_tmp_path: Path, exercise: str) -> None:
     result = run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise)
     assert result["status"] == (
-        "approved" if exercise in {"served-owner-approve", "served-proposal-race"} else "refused"
+        "approved"
+        if exercise == "served-owner-approve"
+        else "historical"
+        if exercise == "served-scope-legacy-replay"
+        else "refused"
     )
     assert result["native_sends"] == 0
 

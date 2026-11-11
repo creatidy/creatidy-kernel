@@ -740,6 +740,41 @@ class LocalOwnerChannel(LocalReadChannel):
         self._approval_binding[0] = value
 
     def _dispatch(self, request: dict[str, object]) -> object:
+        if request.get("action") in {"approval-scope", "approval-scope-chunk"}:
+            proposal = self._proposal
+            if proposal is None or proposal.program_id != self._owner.scope:
+                raise LocalChannelRefused("a host-bound proposal is required")
+            self._application.check_proposal_record(proposal)
+            raw = encode(self._application.approval_scope(proposal))
+            identity = digest(raw)
+            if request["action"] == "approval-scope":
+                if set(request) != {"version", "action"}:
+                    raise LocalChannelRefused("invalid approval scope request")
+                return {
+                    "version": 1,
+                    "scope": proposal.program_id,
+                    "digest": identity,
+                    "approval_scope": object_from(raw),
+                }
+            if set(request) != {"version", "action", "offset", "scope_digest"}:
+                raise LocalChannelRefused("invalid approval scope chunk request")
+            offset, expected = request["offset"], request["scope_digest"]
+            if (
+                type(offset) is not int
+                or offset < 0
+                or offset > len(raw)
+                or (expected != identity and not (offset == 0 and expected is None))
+            ):
+                raise LocalChannelRefused("approval scope changed or chunk offset invalid")
+            chunk = raw[offset : offset + 8192]
+            return {
+                "version": 1,
+                "digest": identity,
+                "offset": offset,
+                "bytes": len(raw),
+                "data_base64": base64.b64encode(chunk).decode("ascii"),
+                "complete": offset + len(chunk) == len(raw),
+            }
         if request.get("action") == "proposal-chunk":
             if set(request) != {"version", "action", "offset", "proposal_digest"} or self._proposal is None:
                 raise LocalChannelRefused("a host-bound proposal and exact chunk request are required")
@@ -955,7 +990,7 @@ class LocalOwnerChannel(LocalReadChannel):
         return result
 
     def _approve(self, request: dict[str, object]) -> object:
-        if set(request) != {
+        fields = {
             "version",
             "action",
             "command_id",
@@ -963,7 +998,8 @@ class LocalOwnerChannel(LocalReadChannel):
             "decision_id",
             "expires_at",
             "proposal_digest",
-        }:
+        }
+        if set(request) not in (fields, fields | {"scope_digest"}):
             raise LocalChannelRefused("a host-bound proposal and exact approval request are required")
         command_id, revision, decision_id, expires_at, proposal_digest = (
             request["command_id"],
@@ -997,11 +1033,15 @@ class LocalOwnerChannel(LocalReadChannel):
             "scope": self._owner.scope,
             "actor": self._application.owner.actor_id,
             "proposal": proposal_digest,
-            "policy": self._application.policy.digest,
         }
         prior = store.find_operation(operation_id)
         if prior is not None:
-            if prior.effect_key != operation_id or object_from(prior.request_json.encode()).get("request") != exact:
+            recorded = object_from(prior.request_json.encode()).get("request")
+            if type(recorded) is dict:
+                legacy_fields = dict(cast(dict[str, object], recorded))
+                legacy_fields.pop("policy", None)  # Legacy receipts retain their original historical meaning.
+                recorded = legacy_fields
+            if prior.effect_key != operation_id or recorded != exact:
                 raise LocalChannelRefused("command identity already has different input")
             receipt = store.find_artifact(operation_id, "receipt")
             if receipt is None:
@@ -1017,16 +1057,36 @@ class LocalOwnerChannel(LocalReadChannel):
             ):
                 raise LocalChannelRefused("recorded approval receipt is invalid")
             return result
+        scope_digest = request.get("scope_digest")
+        if (
+            type(scope_digest) is not str
+            or len(scope_digest) != 64
+            or any(character not in "0123456789abcdef" for character in scope_digest)
+        ):
+            raise LocalChannelRefused("reviewed approval scope identity is required")
         proposal = self._proposal
         if proposal is None or proposal.program_id != self._owner.scope or proposal.digest != proposal_digest:
             raise LocalChannelRefused("reviewed proposal is no longer bound")
+
+        def guard() -> None:
+            current_proposal = self._proposal
+            if (
+                current_proposal is None
+                or current_proposal.program_id != self._owner.scope
+                or digest(encode(self._application.approval_scope(current_proposal))) != scope_digest
+            ):
+                raise LocalChannelRefused("reviewed approval scope is no longer bound")
+
+        guard()
         current = store.find_program(self._owner.scope)
         if (-1 if current is None else current.revision) != revision:
             raise LocalChannelRefused("caller expected revision is stale")
         self._application.check_proposal_record(proposal)
+        if store.find_artifact(f"ordinary-program:approval:{decision_id}", "record") is not None:
+            raise LocalChannelRefused("approval decision is already recorded; replay its original command")
         store.intent(operation_id, operation_id, exact)
         approved = self._application.approve(
-            proposal, decision_id=decision_id, expires_at=expires_at, expected_revision=revision
+            proposal, decision_id=decision_id, expires_at=expires_at, expected_revision=revision, final_guard=guard
         )
         self._approved = approved
         result: dict[str, object] = {

@@ -2725,6 +2725,7 @@ class SQLiteProgramStore:
         amendment: AmendProgramSpec | None = None,
         records: tuple[tuple[str, dict[str, object], bytes | None], ...] = (),
         validate: Callable[[], None] | None = None,
+        final_guard: Callable[[], None] | None = None,
         expected_revision: int | None = None,
     ) -> Program:
         """Publish one budgeted Program decision, its inert records and binding atomically.
@@ -2808,6 +2809,8 @@ class SQLiteProgramStore:
                     self._insert_intent(key, key, request)
                     if raw is not None:
                         self._finalize_artifact(key, "record", raw)
+                if final_guard is not None:
+                    final_guard()
             return program
 
     def has_work_budget(self, program_id: str) -> bool:

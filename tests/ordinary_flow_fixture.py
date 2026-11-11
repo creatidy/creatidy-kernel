@@ -334,7 +334,6 @@ def replay_host_after_process_restart(root: Path) -> None:
             "scope": "everyday-program",
             "actor": "owner",
             "proposal": object_from(store.artifact("ordinary-program:approval:host-decision", "record"))["proposal"],
-            "policy": policy.digest,
         }
         if saved["boundary"] == "intent":
             unknown = store.operation(unknown_id)
@@ -345,7 +344,6 @@ def replay_host_after_process_restart(root: Path) -> None:
                 "proposal": object_from(store.artifact("ordinary-program:approval:host-decision", "record"))[
                     "proposal"
                 ],
-                "policy": policy.digest,
             }
             assert store.find_artifact(unknown_id, "receipt") is None
             assert store.find_artifact("ordinary-program:approval:interrupted-decision", "record") is None
@@ -747,6 +745,30 @@ print("Done")
                     channel = LocalOwnerChannel(
                         OwnerProjection(store, "everyday-program"), owner_socket, app, None, proposal=large
                     )
+                    scope_bytes = encode(app.approval_scope(large))
+                    scope_digest = digest(scope_bytes)
+                    scope_parts = bytearray()
+                    while len(scope_parts) < len(scope_bytes):
+                        offset = len(scope_parts)
+                        write_frame(
+                            owner_client,
+                            encode(
+                                {
+                                    "version": 1,
+                                    "action": "approval-scope-chunk",
+                                    "offset": offset,
+                                    "scope_digest": None if offset == 0 else scope_digest,
+                                }
+                            ),
+                            bound=65536,
+                        )
+                        channel.serve_once()
+                        part = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
+                        assert part["digest"] == scope_digest and part["offset"] == offset
+                        assert part["bytes"] == len(scope_bytes)
+                        scope_parts.extend(base64.b64decode(part["data_base64"], validate=True))
+                        assert part["complete"] == (len(scope_parts) == len(scope_bytes))
+                    assert len(scope_bytes) > 1024 * 1024 and bytes(scope_parts) == scope_bytes
                     write_frame(
                         owner_client,
                         encode(
@@ -758,6 +780,7 @@ print("Done")
                                 "decision_id": "large-decision",
                                 "expires_at": int(time.time()) + 900,
                                 "proposal_digest": digest(bytes(assembled)),
+                                "scope_digest": scope_digest,
                             }
                         ),
                         bound=65536,
@@ -849,6 +872,109 @@ print("Done")
                 read_chunk(8192, expected, refused=True)
                 proposal_binding.revoke()
                 return {"status": "read", "native_sends": 0}
+            if exercise == "served-legacy-installed-client":
+                binding = LocalOwnerSession(OwnerProjection(store, "everyday-program"), app, None, proposal=proposal)
+                expires = int(time.time()) + 900
+                request = {
+                    "version": 1,
+                    "action": "approve",
+                    "command_id": "legacy-command",
+                    "expected_revision": -1,
+                    "decision_id": "legacy-decision",
+                    "expires_at": expires,
+                    "proposal_digest": proposal.digest,
+                }
+                operation_id = command_prefix("everyday-program") + digest(encode(["owner", "legacy-command"]))
+
+                def invoke(*, refused: bool) -> dict[str, object]:
+                    owner_socket, owner_client = socket.socketpair()
+                    with owner_socket, owner_client:
+                        channel = binding.attach(owner_socket)
+                        process = subprocess.Popen(  # noqa: S603 - Fixed client and synthetic descriptor.
+                            [
+                                sys.executable,
+                                "-I",
+                                "-m",
+                                "creatidy_kernel.adapters.served_client",
+                                "--fd",
+                                str(owner_client.fileno()),
+                                "approve",
+                                "--command-id",
+                                "legacy-command",
+                                "--expected-revision",
+                                "-1",
+                                "--decision-id",
+                                "legacy-decision",
+                                "--expires-at",
+                                str(expires),
+                                "--proposal-digest",
+                                proposal.digest,
+                            ],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            pass_fds=(owner_client.fileno(),),
+                            env={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                        )
+                        try:
+                            assert select.select([owner_socket], [], [], 10)[0]
+                            if refused:
+                                try:
+                                    channel.serve_once()
+                                except LocalChannelRefused:
+                                    pass
+                                else:
+                                    raise AssertionError("unrecorded legacy approval was accepted")
+                            else:
+                                channel.serve_once()
+                            stdout, stderr = process.communicate(timeout=10)
+                            if refused:
+                                assert process.returncode != 0 and not stdout
+                                return {}
+                            assert process.returncode == 0, stderr.decode(errors="replace")
+                            return cast(dict[str, object], json.loads(stdout)["result"])
+                        finally:
+                            if process.poll() is None:
+                                process.kill()
+                                process.wait(timeout=10)
+                            binding.detach(channel)
+
+                before = (store.history("everyday-program"), store.operations())
+                invoke(refused=True)
+                assert (store.history("everyday-program"), store.operations()) == before
+                assert store.find_operation(operation_id) is None
+                assert store.find_program("everyday-program") is None
+                assert store.find_artifact("ordinary-program:approval:legacy-decision", "record") is None
+                store.intent(
+                    operation_id,
+                    operation_id,
+                    {
+                        **request,
+                        "scope": "everyday-program",
+                        "actor": "owner",
+                        "proposal": proposal.digest,
+                        "policy": app.policy.digest,
+                    },
+                )
+                receipt = {
+                    "version": 1,
+                    "status": "approved",
+                    "decision_id": "legacy-decision",
+                    "spec_digest": "historical",
+                    "expires_at": expires,
+                    "authority": "historical-only",
+                }
+                receipt_bytes = encode(receipt)
+                store.finalize_artifact(operation_id, "receipt", receipt_bytes)
+                app.policy = replace(app.policy, paths=app.policy.paths | {"other.py"})
+                before = (store.history("everyday-program"), store.operations())
+                assert invoke(refused=False) == receipt
+                assert (store.history("everyday-program"), store.operations()) == before
+                assert store.artifact(operation_id, "receipt") == receipt_bytes
+                assert store.find_program("everyday-program") is None
+                assert store.find_artifact("ordinary-program:approval:legacy-decision", "record") is None
+                binding.revoke()
+                return {"status": "historical", "native_sends": 0}
             if exercise in {"served-host-receipts", "served-host-process-create"}:
                 binding = LocalOwnerSession(OwnerProjection(store, "everyday-program"), app, None, proposal=proposal)
                 script = (
@@ -924,6 +1050,7 @@ print("Done")
                     "decision_id": "host-decision",
                     "expires_at": int(time.time()) + 900,
                     "proposal_digest": proposal.digest,
+                    "scope_digest": digest(encode(app.approval_scope(proposal))),
                 }
                 if exercise == "served-host-process-create":
                     assert crash_host_boundary in {"receipt", "intent"}
@@ -942,6 +1069,7 @@ print("Done")
                             "decision_id": "interrupted-decision",
                             "expires_at": approval_request["expires_at"],
                             "proposal_digest": proposal.digest,
+                            "scope_digest": digest(encode(app.approval_scope(proposal))),
                         }
 
                     def crash_at_boundary() -> None:
@@ -1030,6 +1158,7 @@ print("Done")
                     "decision_id": "interrupted-decision",
                     "expires_at": approved.expires_at,
                     "proposal_digest": proposal.digest,
+                    "scope_digest": digest(encode(app.approval_scope(proposal))),
                 }
                 interrupted, path = spawn(unknown_request)
                 with patch.object(OrdinaryProgram, "approve", side_effect=OSError("synthetic interruption")):
@@ -1130,6 +1259,10 @@ print("Done")
                 first_chunk = invoke_owner(["proposal-chunk", "--offset", "0"])
                 assert first_chunk["digest"] == proposal.digest
                 assert base64.b64decode(cast(str, first_chunk["data_base64"])) == encode(proposal.payload)[:8192]
+                scope = invoke_owner(["approval-scope"])
+                assert scope["approval_scope"] == json.loads(encode(app.approval_scope(proposal)))
+                scope_chunk = invoke_owner(["approval-scope-chunk", "--offset", "0"])
+                assert scope_chunk["digest"] == scope["digest"]
                 first = invoke_owner(
                     [
                         "approve",
@@ -1143,6 +1276,8 @@ print("Done")
                         str(int(time.time()) + 900),
                         "--proposal-digest",
                         cast(str, inspected["digest"]),
+                        "--scope-digest",
+                        cast(str, scope["digest"]),
                     ]
                 )
                 assert first["status"] == "approved"
@@ -1204,6 +1339,16 @@ print("Done")
                 "served-proposal-missing",
                 "served-proposal-race",
                 "served-proposal-unrecorded",
+                "served-scope-missing",
+                "served-scope-tampered",
+                "served-scope-malformed",
+                "served-scope-permissions",
+                "served-scope-budget",
+                "served-scope-verification",
+                "served-scope-execution",
+                "served-scope-final-guard",
+                "served-scope-legacy-replay",
+                "served-scope-chunks",
             }:
                 owner_socket, owner_client = socket.socketpair()
                 with owner_socket, owner_client:
@@ -1218,6 +1363,7 @@ print("Done")
                         "decision_id": "served-owner-decision",
                         "expires_at": int(time.time()) + 900,
                         "proposal_digest": proposal.digest,
+                        "scope_digest": digest(encode(app.approval_scope(proposal))),
                     }
                     before_read = (store.history("everyday-program"), store.operations())
                     write_frame(owner_client, encode({"version": 1, "action": "proposal"}), bound=65536)
@@ -1230,6 +1376,89 @@ print("Done")
                         "proposal": json.loads(encode(proposal.payload)),
                     }
                     assert (store.history("everyday-program"), store.operations()) == before_read
+                    write_frame(owner_client, encode({"version": 1, "action": "approval-scope"}), bound=65536)
+                    server.serve_once()
+                    scope = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
+                    assert scope == {
+                        "version": 1,
+                        "scope": proposal.program_id,
+                        "digest": request["scope_digest"],
+                        "approval_scope": json.loads(encode(app.approval_scope(proposal))),
+                    }
+                    assert digest(encode(scope["approval_scope"])) == scope["digest"]
+                    if exercise == "served-scope-chunks":
+                        raw_scope = encode(scope["approval_scope"])
+                        assembled_scope = bytearray()
+                        while len(assembled_scope) < len(raw_scope):
+                            offset = len(assembled_scope)
+                            chunk_request = {
+                                "version": 1,
+                                "action": "approval-scope-chunk",
+                                "offset": offset,
+                                "scope_digest": None if offset == 0 else scope["digest"],
+                            }
+                            write_frame(owner_client, encode(chunk_request), bound=65536)
+                            server.serve_once()
+                            part = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
+                            assert part["digest"] == scope["digest"] and part["bytes"] == len(raw_scope)
+                            assert part["offset"] == offset
+                            assembled_scope.extend(base64.b64decode(part["data_base64"], validate=True))
+                            assert part["complete"] == (len(assembled_scope) == len(raw_scope))
+                        assert bytes(assembled_scope) == raw_scope
+                        app.policy = replace(app.policy, paths=app.policy.paths | {"other.py"})
+                        write_frame(
+                            owner_client,
+                            encode(
+                                {
+                                    "version": 1,
+                                    "action": "approval-scope-chunk",
+                                    "offset": 1,
+                                    "scope_digest": scope["digest"],
+                                }
+                            ),
+                            bound=65536,
+                        )
+                        try:
+                            server.serve_once()
+                        except LocalChannelRefused:
+                            pass
+                        else:
+                            raise AssertionError("changed scope allowed chunk continuation")
+                        assert (store.history("everyday-program"), store.operations()) == before_read
+                        return {"status": "refused", "native_sends": 0}
+                    if exercise == "served-scope-legacy-replay":
+                        del request["scope_digest"]
+                        operation_id = command_prefix("everyday-program") + digest(
+                            encode(["owner", request["command_id"]])
+                        )
+                        store.intent(
+                            operation_id,
+                            operation_id,
+                            {
+                                **request,
+                                "scope": "everyday-program",
+                                "actor": "owner",
+                                "proposal": proposal.digest,
+                                "policy": app.policy.digest,
+                            },
+                        )
+                        receipt = {
+                            "version": 1,
+                            "status": "approved",
+                            "decision_id": request["decision_id"],
+                            "spec_digest": "historical",
+                            "expires_at": request["expires_at"],
+                            "authority": "historical-only",
+                        }
+                        store.finalize_artifact(operation_id, "receipt", encode(receipt))
+                        app.policy = replace(app.policy, paths=app.policy.paths | {"other.py"})
+                        before_replay = (store.history("everyday-program"), store.operations())
+                        write_frame(owner_client, encode(request), bound=65536)
+                        server.serve_once()
+                        assert json.loads(read_frame(owner_client, bound=1024 * 1024))["result"] == receipt
+                        assert (store.history("everyday-program"), store.operations()) == before_replay
+                        assert store.find_program("everyday-program") is None
+                        return {"status": "historical", "native_sends": 0}
                     replacement = replace(proposal, objective="A different objective")
                     if exercise == "served-proposal-mismatch":
                         setattr(server, "_proposal", replacement)  # noqa: B010 - Simulate host replacement.
@@ -1240,8 +1469,26 @@ print("Done")
                         inspected_replacement = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
                         assert inspected_replacement["proposal"] == json.loads(encode(replacement.payload))
                         request["proposal_digest"] = inspected_replacement["digest"]
+                        request["scope_digest"] = digest(encode(app.approval_scope(replacement)))
                     if exercise == "served-proposal-missing":
                         del request["proposal_digest"]
+                    if exercise == "served-scope-missing":
+                        del request["scope_digest"]
+                    if exercise == "served-scope-tampered":
+                        request["scope_digest"] = "0" * 64
+                    if exercise == "served-scope-malformed":
+                        request["scope_digest"] = "ABC"
+                    if exercise == "served-scope-permissions":
+                        app.policy = replace(app.policy, paths=app.policy.paths | {"other.py"})
+                    if exercise == "served-scope-budget":
+                        app.policy = replace(app.policy, budget=BudgetPolicy(7, 1))
+                    if exercise == "served-scope-verification":
+                        app.verification = replace(
+                            app.verification, reviewer_required=not app.verification.reviewer_required
+                        )
+                    if exercise == "served-scope-execution":
+                        app.execution_profile = encode({"harness": "replacement"})
+                        app.execution_reference = "basic-harness-policy:" + digest(app.execution_profile)
                     wire = json.dumps(request, sort_keys=True).encode()
                     write_frame(owner_client, wire, bound=65536)
                     if exercise in {
@@ -1249,6 +1496,13 @@ print("Done")
                         "served-proposal-mismatch",
                         "served-proposal-missing",
                         "served-proposal-unrecorded",
+                        "served-scope-missing",
+                        "served-scope-tampered",
+                        "served-scope-malformed",
+                        "served-scope-permissions",
+                        "served-scope-budget",
+                        "served-scope-verification",
+                        "served-scope-execution",
                     }:
                         try:
                             server.serve_once()
@@ -1281,6 +1535,30 @@ print("Done")
                         else:
                             assert not store.operations("served-command:")
                         return {"status": "refused", "native_sends": 0}
+                    if exercise == "served-scope-final-guard":
+                        finalize = cast(
+                            Callable[..., str], inspect.getattr_static(SQLiteProgramStore, "_finalize_artifact")
+                        )
+
+                        def change_inside_transaction(
+                            target: SQLiteProgramStore, key: str, name: str, data: bytes
+                        ) -> str:
+                            result = finalize(target, key, name, data)
+                            if key == "ordinary-program:approval:served-owner-decision" and name == "record":
+                                app.policy = replace(app.policy, paths=app.policy.paths | {"other.py"})
+                            return result
+
+                        with patch.object(SQLiteProgramStore, "_finalize_artifact", change_inside_transaction):
+                            try:
+                                server.serve_once()
+                            except LocalChannelRefused:
+                                pass
+                            else:
+                                raise AssertionError("final guard failed to refuse policy replacement")
+                        assert store.find_program("everyday-program") is None
+                        assert store.find_artifact("ordinary-program:approval:served-owner-decision", "record") is None
+                        assert not store.has_work_budget("everyday-program")
+                        return {"status": "refused", "native_sends": 0}
                     if exercise == "served-proposal-race":
                         original_current = OrdinaryProgram.current
 
@@ -1291,15 +1569,19 @@ print("Done")
                             setattr(server, "_proposal", replacement)  # noqa: B010 - Reentrant host replacement.
 
                         with patch.object(OrdinaryProgram, "current", replace_during_validation):
-                            server.serve_once()
+                            try:
+                                server.serve_once()
+                            except LocalChannelRefused:
+                                pass
+                            else:
+                                raise AssertionError("changed proposal was approved")
+                        assert store.find_program("everyday-program") is None
+                        assert store.find_artifact("ordinary-program:approval:served-owner-decision", "record") is None
+                        return {"status": "refused", "native_sends": 0}
                     else:
                         server.serve_once()
                     result = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
                     assert result["status"] == "approved"
-                    if exercise == "served-proposal-race":
-                        assert app.recover("served-owner-decision").proposal.digest == proposal.digest
-                        assert store.load("everyday-program").spec.objective == proposal.objective
-                        return {"status": "approved", "native_sends": 0}
                     approved_program = store.load("everyday-program")
                     write_frame(owner_client, wire, bound=65536)
                     server.serve_once()
@@ -1348,6 +1630,7 @@ print("Done")
                                 "decision_id": "amended-v2",
                                 "expires_at": approved.expires_at,
                                 "proposal_digest": amended.digest,
+                                "scope_digest": digest(encode(app.approval_scope(amended))),
                             }
                         ),
                         bound=65536,
@@ -1395,6 +1678,7 @@ print("Done")
                         "decision_id": "owner-amend-v1",
                         "expires_at": approved.expires_at,
                         "proposal_digest": amended.digest,
+                        "scope_digest": digest(encode(app.approval_scope(amended))),
                     }
                     wire = json.dumps(request, sort_keys=True).encode()
                     write_frame(owner_client, wire, bound=65536)
