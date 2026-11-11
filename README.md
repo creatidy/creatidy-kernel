@@ -405,7 +405,7 @@ atomically; review and publication reserve alongside their intents. Recovery ret
 counts and unknown work. Successful acceptance releases its logical work slot in the same transaction;
 STOP/expiry still requires the bounded cancellation path's exact witness, not a lease or turn status.
 The separate local work/resource handler below extends this with workspace/session fencing; the
-ordinary SDK composes these boundaries; heterogeneous drivers remain deferred in #105.
+ordinary SDK composes these boundaries; the independently configured drivers are described below.
 
 New delivery rechecks the original Attempt, applicable specification, WorkUnit state, immutable
 Operation binding and current observed resource headroom. Historical reservation/receipt replay is
@@ -736,6 +736,104 @@ an old physical workspace. `make package-check` exercises actual installed pull 
 synthetic dedicated native processes and actual pinned schema-2/3/4 reader refusal outside the checkout.
 The ordinary SDK adds its separately versioned schema-6 controller-preparation boundary; it does not
 enable #57 remote transport, live inference or unapproved Forge effects.
+
+## Independent Project Drivers
+
+`core.drivers` supplies a separate `kernel-driver-subject:v1` opaque external identity codec;
+`ports.drivers.ProjectDrivers` composes independent Work Management, SCM, CI and Knowledge bindings.
+Jira keys are not Kernel Task IDs or universal integers. Provider family, implementation major,
+API version, HTTPS instance including port, tenant, project/namespace, native kind/key/revision
+and rights/provenance remain attributed. A Jira updated string is not a Git commit. Unknown
+revisions and permission-limited 404s are unavailable evidence, not absence or acceptance.
+Legacy `IssueSubject`, `Reference`, frozen tasks and Forgejo/AGit bytes are unchanged.
+
+Executable adapters in `adapters.project_drivers` use the same bounded, no-redirect stdlib HTTPS
+transport in production and tests. The supported first composition is Jira Cloud v3 selected
+issue/native directed links + GitHub REST `2026-03-10` repository/ref/commit/PR/native reviews +
+Jenkins numbered Git-plugin builds + Confluence Cloud v2 pinned page storage content. An independent
+`RepositoryDocumentation` reader reads bounded exact UTF-8 Git blobs through the retained local
+source interface; it does not need Confluence or substitute for inaccessible Confluence content.
+`adapters.forgejo_drivers` exposes version-1 family views and the unchanged native effect facade.
+
+Bindings are explicit trusted-host configuration, not discovered from task URLs. Construct each
+`DriverBinding` or use `binding_from_mapping` with exactly `family`, `implementation`, `version`,
+`origin`, `tenant`, `namespace`, `api_version`, `rights`. Unknown fields/majors refuse. For example:
+
+```python
+scm_binding = binding_from_mapping(
+    {
+        "family": "scm",
+        "implementation": "github",
+        "version": "1",
+        "origin": "https://api.github.com",
+        "tenant": "approved-organization",
+        "namespace": "approved-organization/approved-repository",
+        "api_version": "2026-03-10",
+        "rights": "owner-policy:repository-data-v1",
+    }
+)
+http = DriverHTTP(
+    scm_binding,
+    "/repos/approved-organization/approved-repository",
+    read_authorization=host_read_authorization_header,
+    headers={"X-GitHub-Api-Version": "2026-03-10", "Accept": "application/vnd.github+json"},
+)
+scm = GitHubSCM(http, host_clock, writer_login="approved-native-account")
+```
+
+The example names are trusted-host callbacks/imports, not a new CLI or environment/profile loader.
+Read callbacks return the native complete Authorization header, such as OAuth `Bearer ...` or an
+approved native Basic header. Public reads may omit them. A read-only configuration needs no write
+callback or mutation token. Enable a separate host-held write callback only for an authorized effect;
+neither credentials nor their discovery paths are serialized in bindings, Task input or Operations.
+Jira and Confluence origins are configured independently even when using the same vendor. Jenkins
+also requires a trusted-host `TrustedSCMRemote` mapping of the exact Git URL to the complete SCM
+binding and a host-supplied mapping-evidence reference. This explicit attestation is not independent
+proof of repository identity; do not derive it from a worker, Jenkins response or matching SHA.
+The fact retains the mapping digest. Different URLs are not implicitly equivalent.
+
+`DriverApplication.synchronize` is a trusted host entrance for already accepted work, not the #106
+planner/engine. It uses the original authenticated `WorkOwnership` owner, exact accepted candidate,
+immutable intent, original work budget/deadline, outbox claim, fence, receipt and reconciliation.
+The potentially blocking host `authorize(claim, mutation)` runs once before dispatch and returns an
+ephemeral `DriverEffectGrant` or `None`, not a Boolean. The immutable grant binds that exact claim/effect,
+a positive policy revision, absolute expiry and a host-owned standard-library `threading.Event`.
+Revoke/replacement permanently sets the old Event; never clear it or share the grant with workers.
+After all reads, credential resolution and workspace captures, the existing durable authority/outbox
+cut returns its exact captured decision time. Only grant expiry against that time and the nonblocking
+Event flag are checked before the HTTP opener; no authorizer, clock callback or local preflight runs
+after the cut. Kernel authority, body pins, original deadlines and delivery fences still independently
+apply. Grants are never persisted or accepted from worker input. Workers must not receive drivers,
+credentials, this application object or authorizer callbacks.
+Confluence current-page replacement additionally requires `authorize_draft`, a separate trusted-host
+callback that returns an ephemeral `DriverDraftGrant` bound to the exact claim, mutation and
+`OperationKey`, including request digest. It explicitly permits Confluence's native reconciliation
+to alter or overwrite an unpublished draft, including a concurrent draft. Its independent expiry and
+invalidation Event are checked at the same final durable cut; absence or mismatch refuses the send.
+Never clear or reuse an invalidated Event. Cached receipts remain historical and do not renew either grant.
+Supported native effects are explicit-commit GitHub **COMMENT review append** and server-version-
+conditional Confluence current-page replacement. They are not merge permission. GitHub PR creation/
+PATCH and Jira conditional edits/transitions refuse because their supported REST interfaces do not
+provide the required expected-head/updated CAS. Forgejo AGit remains Forgejo-specific.
+
+Repeated complete visible review scans are not serializable snapshots. Jira visible links always
+need a trusted owner-approved exact `EdgeObligation` with freshness before use as readiness evidence;
+missing/filtered links never become an empty dependency graph, and native Closed never becomes Kernel
+acceptance. No planner derives edges or authority from prose. Unknown/lost mutation replies are not
+automatically retried: marker + native identity/actor/content/revision may reconcile a receipt; absence
+and eventual indexing do not prove nonexecution. Partial SCM/knowledge synchronization remains separate
+visible Operation outcomes, with no saga, compensation or exactly-once claim. Kernel acceptance is
+independent of external synchronization success.
+
+`make package-check` runs `tools/check_drivers.py` from outside the checkout against the installed
+package: real HTTP request/response paths at synthetic local services, mixed bindings, owner-approved
+edge evidence, exact Git documentation, accepted-work publication, lost reply/reopen reconciliation,
+partial synchronization and retained Forgejo reads/AGit facade. It makes **no live account, credential,
+provider, inference or deployment claim**. The named **live provider/profile reception gate** still needs
+owner-authorized account/rights, service/plugin-version and real receipt evidence for each deployment.
+Endpoint/permission/version/terms evidence and native refusals are in
+[contracts](docs/architecture/contracts.md#independent-provider-contracts);
+[migration](docs/architecture/migration.md#independent-driver-migration) forbids automatic ID/scope/trust mapping.
 
 ## Public Operator Surface
 

@@ -125,6 +125,10 @@ with tempfile.TemporaryDirectory(prefix="creatidy-kernel-package-") as directory
         subprocess.run(
             [str(python), "-I", str(ROOT / "tools/check_work_ownership.py"), ownership_directory], cwd=work, check=True
         )
+    with tempfile.TemporaryDirectory(prefix="drivers-", dir=storage_root) as driver_directory:
+        subprocess.run(
+            [str(python), "-I", str(ROOT / "tools/check_drivers.py"), driver_directory], cwd=work, check=True
+        )
     with tempfile.TemporaryDirectory(prefix="served-", dir=storage_root) as served_directory:
         subprocess.run([str(python), "-I", str(ROOT / "tools/check_served.py"), served_directory], cwd=work, check=True)
     with tempfile.TemporaryDirectory(prefix="outcome-", dir=storage_root) as outcome_directory:
