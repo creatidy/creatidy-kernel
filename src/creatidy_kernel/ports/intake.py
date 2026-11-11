@@ -85,6 +85,7 @@ class IntakeStore(ApplicationStore, Protocol):
         amendment: AmendProgramSpec | None = None,
         records: tuple[tuple[str, dict[str, object], bytes | None], ...] = (),
         validate: Callable[[], None] | None = None,
+        final_guard: Callable[[], None] | None = None,
         expected_revision: int | None = None,
     ) -> Program: ...
     def operations(self, prefix: str = "") -> tuple[OperationRecord, ...]: ...

@@ -99,17 +99,26 @@ presenting it for approval. Each frame is bounded; aggregate size and processing
 protocol. The owner session retains one canonical byte snapshot and digest per bound immutable proposal,
 reusing it across channel attachments; replacement invalidates it and revocation discards it. The snapshot
 uses memory proportional to proposal size for the session lifetime. These are reads, not approval.
-The installed client uses `proposal` before `approve --proposal-digest <digest>`; the digest is an
-identity, not an authorization credential. The owner capability accepts `approve`, `reconcile`,
+The owner-only `approval-scope` read returns `{version, scope, digest, approval_scope}`. Its canonical
+version-1 scope contains the full proposal, trusted owner identity and policy payload (including
+permissions and budgets), verification configuration, and execution profile and reference. Its digest
+is SHA-256 of the canonical encoded scope, not of the outer response. For oversized scopes,
+`approval-scope-chunk --offset 0` and subsequent `--offset N --scope-digest D` return contiguous
+base64 chunks with digest, total bytes, offset and completion; clients must assemble and verify the
+complete bytes before presentation. Changed scope or invalid offsets refuse. These reads are not grants.
+The installed client accepts `approve --proposal-digest <digest> --scope-digest <digest>`; neither
+identity is an authorization credential. The owner capability accepts `approve`, `reconcile`,
 `start-managed` and `stop`. Mutations require a command ID and caller-observed expected Program revision
 (`-1` means absent for initial approval). Trusted host composition binds an exact approved proposal,
 claim and managed target where applicable; the request cannot choose them. Approval requires the exact
-digest observed by the caller; missing or mismatched identities refuse even for legacy requests. The
-handler captures one frozen proposal and uses that same object for the journal and application approval,
-so a later host binding replacement cannot switch the approved meaning. Existing authority, revision and
+proposal and scope digests observed by the caller; missing, malformed or mismatched identities refuse new
+approval even for legacy requests. The handler checks the bound scope before intent and again at the
+acceptance transaction's final guard; a changed proposal or material policy refuses rather than switching
+the approved meaning. The trusted host must maintain the owner-thread and policy custody assumptions;
+this is not a hostile-host or cross-process policy synchronization guarantee. Existing authority, revision and
 evidence checks still apply. New approval requires the existing exact producer-recorded proposal artifact
 needed for recovery; an unrecorded host-supplied proposal refuses. Historical pre-change approval receipts
-remain stored but the legacy request format cannot replay them through this command; no old request grants
+remain replayable with their exact original request as historical evidence, but no old request grants
 fresh authority. Exact duplicate command
 inputs return their original receipt as historical evidence, not renewed permission. If an intent
 exists but its outcome receipt is missing, the response is `unknown` and no automatic repeat occurs.

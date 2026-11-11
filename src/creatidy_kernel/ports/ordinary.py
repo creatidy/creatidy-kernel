@@ -264,8 +264,55 @@ class OrdinaryProgram:
         if self.store.find_artifact(f"ordinary-program:proposal:{digest(raw_proposal)}", "record") != raw_proposal:
             raise IntakeRefused("exact proposal record is unavailable")
 
+    def approval_scope(self, proposal: OrdinaryProposal) -> dict[str, object]:
+        """Canonical owner-visible inputs that determine the approval's meaning."""
+        if self.owner.role != "owner" or self.owner.actor_id != self.policy.authority.owner_id:
+            raise IntakeRefused("owner binding is invalid")
+        if (
+            self.verification.reference != self.policy.reference
+            or not self.verification.reviewer_required
+            or not {"paths", "structural", "commands"}.issubset(self.verification.checks)
+            or "independent_review" in self.verification.checks
+            or self.policy.work_budget is None
+            or self.policy.project_budget is None
+            or self.policy.project_id is None
+        ):
+            raise IntakeRefused("verification policy binding is invalid")
+        profile = object_from(self.execution_profile)
+        if (
+            set(profile) != {"harness", "provider", "model", "effort", "trust"}
+            or profile["harness"] not in {"kilo-pull", "codex", "kilo-pull+codex"}
+            or profile["trust"] != "trusted_development"
+            or any(
+                value is not None and (type(value) is not str or not value)
+                for value in (profile["provider"], profile["model"], profile["effort"])
+            )
+            or self.execution_reference != "basic-harness-policy:" + digest(self.execution_profile)
+        ):
+            raise IntakeRefused("execution profile binding is invalid")
+        return {
+            "kind": "ordinary-approval-scope",
+            "version": 1,
+            "owner": self.owner.actor_id,
+            "proposal": proposal.payload,
+            "policy": self.policy.payload(),
+            "verification": {
+                "reference": self.verification.reference.payload(),
+                "checks": list(self.verification.checks),
+                "reviewer_required": self.verification.reviewer_required,
+            },
+            "execution_profile": profile,
+            "execution_reference": self.execution_reference,
+        }
+
     def approve(
-        self, proposal: OrdinaryProposal, *, decision_id: str, expires_at: int, expected_revision: int | None = None
+        self,
+        proposal: OrdinaryProposal,
+        *,
+        decision_id: str,
+        expires_at: int,
+        expected_revision: int | None = None,
+        final_guard: Callable[[], None] | None = None,
     ) -> OrdinaryApproval:
         self.check_proposal_record(proposal)
         # The caller's expiry is an upper bound. Original producer evidence may
@@ -301,6 +348,8 @@ class OrdinaryProgram:
                 raise IntakeRefused("approval identity changed")
             return OrdinaryApproval(proposal, self.policy.digest, decision_id, expires_at, previous)
         self.current(proposal, expires_at)
+        if final_guard is not None:
+            final_guard()
         spec = self._spec(proposal, previous)
         record = {
             "proposal": proposal.digest,
@@ -341,6 +390,7 @@ class OrdinaryProgram:
             amendment=amendment,
             records=((key, {"kind": "ordinary-intake-record", "version": 1, "bytes": raw.decode()}, raw),),
             validate=lambda: self.current(proposal, expires_at),
+            final_guard=final_guard,
             expected_revision=expected_revision,
         )
         return OrdinaryApproval(proposal, self.policy.digest, decision_id, expires_at, program)
