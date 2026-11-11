@@ -528,6 +528,13 @@ does not cancel an Attempt or prove physical settlement. The trusted host must a
 callers before passing a descriptor; this is not a remote authentication or hostile same-UID isolation
 scheme, and no remote listener is enabled by this contract.
 
+For a separately running backend launched by the trusted supervisor, the Linux-only
+`adapters.served_host.launch_owner` and `receive_owner` SDKs provide a version-checked inherited
+owner descriptor with supervisor-configured producer and recipient labels. Those labels are not durable or
+cryptographic identity. The supervisor still binds the exact existing owner session and services it on the
+SQLite owner thread. This is not attachment to an already-running backend, peer authentication or
+hostile same-UID isolation; see the [supervisor contract](docs/architecture/contracts.md#supervisor-launched-owner-backend).
+
 ## Private Outcome SDK
 
 On the SQLite owner thread, `ports.outcome_export.export_private_outcome` reads a versioned local-only

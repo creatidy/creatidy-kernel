@@ -182,6 +182,10 @@ class WorkOwnership:
         self._resources = (workspace.resource, *resources)
         workspace.bind_authority(store.ownership_authority)
 
+    def uses_store(self, store: object) -> bool:
+        """Check the live host composition, not durable producer identity."""
+        return self._store is store
+
     def _bound_caller(self, claim: WorkClaim) -> None:
         if (claim.mode, claim.profile, claim.resources) != (
             self._mode,

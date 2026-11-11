@@ -95,7 +95,7 @@ class LocalDecisionNotifier:
             self._seen.add(identity)
 
 
-def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
@@ -146,6 +146,10 @@ class LocalReadChannel:
     def revoke(self) -> None:
         """The trusted host can close this capability without changing work state."""
         self._channel.close()
+
+    def fileno(self) -> int:
+        """Expose readiness polling without transferring ownership of the socket."""
+        return self._channel.fileno()
 
     def _dispatch(self, request: dict[str, object]) -> object:
         if request.get("action") == "snapshot" and set(request) in (
@@ -242,7 +246,7 @@ class LocalReadChannel:
         self._channel.settimeout(1.0)
         try:
             payload = read_frame(self._channel, bound=MAX_REQUEST)
-            value: object = json.loads(payload, object_pairs_hook=_unique_object)
+            value: object = json.loads(payload, object_pairs_hook=unique_object)
             if type(value) is not dict:
                 raise LocalChannelRefused("request must be an object")
             request = cast(dict[str, object], value)
@@ -662,6 +666,40 @@ class LocalWorkerSession:
         self._handoffs.clear()
 
 
+def _validate_owner_binding(
+    owner: OwnerProjection,
+    application: OrdinaryProgram,
+    approved: OrdinaryApproval | None,
+    proposal: OrdinaryProposal | None,
+    control: WorkOwnership | None,
+    handoff: OrdinaryHandoff | None,
+    managed: OrdinaryManagedRun | None,
+) -> None:
+    store = application.store
+    if (
+        not owner.uses_store(store)
+        or application.owner.role != "owner"
+        or (approved is None and proposal is None)
+        or (approved is not None and approved.program.program_id != owner.scope)
+        or (proposal is not None and proposal.program_id != owner.scope)
+        or ((control is None) != (handoff is None))
+        or (control is not None and not control.uses_store(store))
+        or (handoff is not None and (approved is None or handoff.attempt.program_id != owner.scope))
+        or (
+            managed is not None
+            and (
+                handoff is None
+                or (managed.handoff is not None and managed.handoff != handoff)
+                or managed.client.application is not application
+                or not managed.client.worker.uses_store(store)
+                or not managed.client.control.uses_store(store)
+                or managed.workspace.store is not store
+            )
+        )
+    ):
+        raise LocalChannelRefused("owner composition store or binding differs")
+
+
 class LocalOwnerChannel(LocalReadChannel):
     """Host-bound owner capability; a request cannot supply or elevate a principal."""
 
@@ -678,23 +716,7 @@ class LocalOwnerChannel(LocalReadChannel):
         managed: OrdinaryManagedRun | None = None,
         approval_binding: list[OrdinaryApproval | None] | None = None,
     ) -> None:
-        if (
-            application.owner.role != "owner"
-            or (approved is None and proposal is None)
-            or (approved is not None and approved.program.program_id != owner.scope)
-            or (proposal is not None and proposal.program_id != owner.scope)
-            or ((control is None) != (handoff is None))
-            or (handoff is not None and (approved is None or handoff.attempt.program_id != owner.scope))
-            or (
-                managed is not None
-                and (
-                    handoff is None
-                    or (managed.handoff is not None and managed.handoff != handoff)
-                    or managed.client.application is not application
-                )
-            )
-        ):
-            raise LocalChannelRefused("owner and projection scopes differ")
+        _validate_owner_binding(owner, application, approved, proposal, control, handoff, managed)
         super().__init__(owner, channel)
         self._application = application
         self._approval_binding = [approved] if approval_binding is None else approval_binding
@@ -774,7 +796,11 @@ class LocalOwnerChannel(LocalReadChannel):
             raise LocalChannelRefused("caller expected revision is stale")
         store.intent(operation_id, operation_id, exact)
         self._application.stop(self._approved, reason, expected_revision=revision)
-        settled = self._managed is not None and self._managed.stop(reason) == "cancelled"
+        settled = (
+            self._managed is not None
+            and self._managed.handoff is not None
+            and self._managed.stop(reason) == "cancelled"
+        )
         result: dict[str, object] = {
             "version": 1,
             "status": "accepted",
@@ -828,6 +854,8 @@ class LocalOwnerChannel(LocalReadChannel):
             if object_from(receipt) != result:
                 raise LocalChannelRefused("recorded managed start receipt is invalid")
             return result
+        if self._managed.client.approved != self._approved:
+            raise LocalChannelRefused("managed target approval differs from current host binding")
         program = store.load(self._owner.scope)
         if (
             program.revision != revision
@@ -986,13 +1014,16 @@ class LocalOwnerSession:
         handoff: OrdinaryHandoff | None = None,
         managed: OrdinaryManagedRun | None = None,
     ) -> None:
-        if application.owner.role != "owner" or (approved is None and proposal is None):
-            raise LocalChannelRefused("host-bound owner and approved work or proposal are required")
+        _validate_owner_binding(owner, application, approved, proposal, control, handoff, managed)
         self._owner, self._application = owner, application
         self._approval_binding: list[OrdinaryApproval | None] = [approved]
         self._proposal, self._control, self._handoff, self._managed = proposal, control, handoff, managed
         self._channels: list[LocalOwnerChannel] = []
         self._revoked = False
+
+    @property
+    def scope(self) -> str:
+        return self._owner.scope
 
     def attach(self, channel: socket.socket) -> LocalOwnerChannel:
         if self._revoked or len(self._channels) >= 64:
@@ -1022,4 +1053,3 @@ class LocalOwnerSession:
         self._revoked = True
         for channel in self._channels:
             channel.revoke()
-        self._channels.clear()
