@@ -52,7 +52,12 @@ from creatidy_kernel.adapters.qualified_baseline import JenkinsQualifiedBaseline
 from creatidy_kernel.adapters.qualified_readiness import GitHubJiraLiteralReadiness
 from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.source_cache import source_use
-from creatidy_kernel.adapters.sqlite_store import IdempotencyConflict, OperationConflict, SQLiteProgramStore
+from creatidy_kernel.adapters.sqlite_store import (
+    IdempotencyConflict,
+    OperationConflict,
+    SQLiteProgramStore,
+    validate_local_storage,
+)
 from creatidy_kernel.adapters.task_execution import VerificationCommand
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.domain import AuthorityEnvelope, BudgetPolicy, CancelProgram, PauseProgram, ResumeProgram
@@ -576,8 +581,10 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     transports[1].headers["X-GitHub-Api-Version"] = "2022-11-28"
     assert transports[1].request("GET", "/repos/acme/service/pulls/7")[0] == 403
     transports[1].headers["X-GitHub-Api-Version"] = "2026-03-10"
-    repository = tmp_path / "source"
+    repository = sqlite_tmp_path / "source"
     repository.mkdir()
+    assert repository.resolve().is_relative_to(sqlite_tmp_path.resolve())
+    validate_local_storage(repository)
     reference_git(repository, "init", "--initial-branch=feature")
     (repository / "result.txt").write_text("broken\n" if mode == "baseline-failed" else "original\n")
     reference_git(repository, "add", "result.txt")
@@ -808,7 +815,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                     relevance_reason="work remains",
                 )
             assert store.find_program("qualified-dag") is None
-            assert not (tmp_path / "owned").exists()
+            assert not (sqlite_tmp_path / "owned").exists()
             assert not any(
                 method == "GET"
                 and any(f"/{item}/api/json" in path for item in (12, 13, 14))
@@ -891,7 +898,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             with pytest.raises(IntakeRefused, match=expected_refusal):
                 app.approve(proposal, decision_id=decision, expires_at=now + 28)
             assert store.find_program("qualified-dag") is None
-            assert not (tmp_path / "owned").exists()
+            assert not (sqlite_tmp_path / "owned").exists()
             assert not any(
                 method == "GET"
                 and any(f"/{item}/api/json" in path for item in (12, 13, 14))
@@ -949,9 +956,11 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         with pytest.raises(ValueError):
             app.check(approved)
         context_drift[0] = False
-        protected = tmp_path / "owned"
+        protected = sqlite_tmp_path / "owned"
         protected.mkdir(mode=0o700)
         tree = LocalOwnedWorkspace(protected, "first", create=True)
+        assert tree.path.resolve().is_relative_to(sqlite_tmp_path.resolve())
+        validate_local_storage(tree.path)
         command_marker = tmp_path / "candidate-command-ran"
         workspace = OrdinaryGitWorkspace(
             store,
@@ -981,6 +990,8 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             authority_deadline=approved.expires_at,
             qualified_ci=project.ci,
         )
+        assert workspace.source.resolve().is_relative_to(sqlite_tmp_path.resolve())
+        assert workspace.objects.resolve().is_relative_to(sqlite_tmp_path.resolve())
         connection: CodexStdio | None = None
         if mode == "managed-uncertain":
             peer = tmp_path / "codex-peer.py"
@@ -1059,6 +1070,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             return
         handoff = client.request("first-request", lease_seconds=10)
         assert handoff.attempt.work_unit_id == "first"
+        validate_local_storage(workspace.objects)
         assert workspace.base == source_revision
         assert (tree.path / "result.txt").read_text() == "original\n"
         if mode == "managed-uncertain":
