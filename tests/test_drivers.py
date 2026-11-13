@@ -110,6 +110,51 @@ def services() -> Iterator[SyntheticServices]:
         service.close()
 
 
+@pytest.mark.parametrize(
+    "required",
+    [
+        "strict_routing",
+        "exact_pin_admission",
+        "no_hidden_calls",
+        "hard_inference_quota",
+        "physical_settlement",
+        "provider_key_secrecy",
+        "shell_egress_denial",
+        "outside_workspace_read_denial",
+        "strict_native_expiry",
+        "escaped_descendant_containment",
+    ],
+)
+def test_requested_unsupported_strict_profile_refuses_before_recording(sqlite_tmp_path: Path, required: str) -> None:
+    # These are deliberately unknown demands, not new supported profile fields.
+    clock = Clock()
+    legacy = Scenario()
+    budget = WorkBudgetPolicy(tuple((kind, 10) for kind in WorkKind), 1, 100_000)
+    policy = replace(intake_policy(), work_budget=budget, project_budget=budget, project_id="strict-refusal")
+    profile: dict[str, object] = {
+        "harness": "kilo-pull",
+        "provider": None,
+        "model": None,
+        "effort": None,
+        "trust": "trusted_development",
+        required: True,
+    }
+    with SQLiteProgramStore(sqlite_tmp_path / "strict.db", boot_clock=clock.boot) as store:
+        with patch.object(store, "finalize_artifact", side_effect=AssertionError("refused profile recorded evidence")):
+            with pytest.raises(IntakeRefused, match="closed owner-bound basic harness profile required"):
+                OrdinaryProgram(
+                    store,
+                    OrdinaryIntake(store, legacy.reader, clock.wall),
+                    ForgejoDiscovery(legacy.transport, clock.wall, max_pages=2, freshness_seconds=30),
+                    Principal("owner", "owner"),
+                    policy,
+                    VerificationPolicy(policy.reference, ("paths", "structural", "commands")),
+                    clock.wall,
+                    execution_profile=encode(profile),
+                )
+        assert not store.operations() and store.find_program("strict-refusal") is None
+
+
 def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, sqlite_tmp_path: Path) -> None:
     clock = Clock()
     project, _, _, _ = configured(services, clock)
@@ -541,6 +586,16 @@ def test_qualified_readiness_uses_current_time_without_renewing_evidence(
         "baseline-failed",
         "baseline-unavailable",
         "owner-mismatch",
+        "incomplete-jira",
+        "incomplete-inventory",
+        "unsupported-version",
+        "admission-source",
+        "admission-policy",
+        "admission-dependency",
+        "admission-outage",
+        "admission-expired",
+        "sync-reopen",
+        "sync-ambiguous-reopen",
     ],
 )
 def test_qualified_work_dag_owner_approval_and_reopen(
@@ -595,6 +650,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     services.head = source_revision
     active_workspace: list[OrdinaryGitWorkspace] = []
     context_drift = [False]
+    admission_fault: list[str | None] = [None]
     output_pages = {19: deepcopy(services.page(19, "Output", "<p>unmodified</p>", "fixture original"))}
     output_pages[19]["id"] = "901"
     output_version = [19]
@@ -615,6 +671,17 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         )
         if provider is None or services.requests[-1][3] != tokens[provider]["read" if method == "GET" else "write"]:
             return 403, {"error": "synthetic credential refused"}
+        if admission_fault[0] == "admission-outage" and provider == "jira":
+            return 503, {"error": "synthetic required work provider unavailable"}
+        if admission_fault[0] in {"incomplete-jira", "admission-dependency"} and path.startswith("/rest/api/3/issue/"):
+            status, value = services.route(method, path, body)
+            data = deepcopy(cast(dict[str, object], value))
+            fields = cast(dict[str, object], data["fields"])
+            if admission_fault[0] == "incomplete-jira":
+                fields.pop("issuelinks")
+            else:
+                fields["issuelinks"] = []
+            return status, data
         if context_drift[0] and path.startswith("/wiki/api/v2/pages/900"):
             status, value = services.route(method, path, body)
             data = deepcopy(cast(dict[str, object], value))
@@ -639,6 +706,8 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             version = int(parse_qs(urlsplit(path).query).get("version", [str(output_version[0])])[0])
             return (200, output_pages[version]) if version in output_pages else (404, {})
         if urlsplit(path).path == "/repos/acme/service/pulls":
+            if admission_fault[0] == "incomplete-inventory":
+                return 200, {"message": "incomplete listing, not an empty page"}
             query = parse_qs(urlsplit(path).query)
             assert query["state"] == ["open"] and query["per_page"] == ["100"]
             pull = services.pull()
@@ -822,6 +891,26 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 and auth == tokens["jenkins"]["read"]
                 for method, path, _, auth in services.requests
             )
+            return
+        if mode in {"incomplete-jira", "incomplete-inventory", "unsupported-version"}:
+            original_cut = capture(predecessor, False)
+            admission_fault[0] = mode
+            if mode == "unsupported-version":
+                transports[1].headers["X-GitHub-Api-Version"] = "2022-11-28"
+            if mode == "incomplete-jira":
+                observation = project.work.work("ENG-41")
+                assert not observation.dependencies_complete
+            before = store.operations()
+            with pytest.raises(ValueError):
+                app.prepare_qualified(
+                    "first",
+                    work_declaration(criteria=[first_criterion.criterion]),
+                    original_cut,
+                    source,
+                    relevance_reason="work remains",
+                )
+            assert store.find_program("qualified-dag") is None and store.operations() == before
+            assert not (sqlite_tmp_path / "owned").exists()
             return
         first = app.prepare_qualified(
             "first",
@@ -1037,6 +1126,29 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         active_workspace.append(workspace)
         reviewer = cast(OrdinaryReviewer, MagicMock(authority_deadline=approved.expires_at))
         client = app.client(approved, Principal("worker", "worker"), workspace, worker, control, reviewer)
+        if mode.startswith("admission-"):
+            if mode == "admission-source":
+                services.head = "f" * 40
+            elif mode == "admission-policy":
+                app.policy = replace(policy, effects=policy.effects | {"unapproved-effect"})
+            elif mode == "admission-expired":
+                clock.now = approved.expires_at
+            else:
+                admission_fault[0] = mode
+            before = (store.history("qualified-dag"), store.operations())
+            with pytest.raises(ValueError):
+                client.request("refused-request", lease_seconds=10)
+            assert (store.history("qualified-dag"), store.operations()) == before
+            assert not store.load("qualified-dag").attempts and not store.load("qualified-dag").satisfactions
+            assert not workspace.objects.exists() and not command_marker.exists()
+            assert not cast(MagicMock, reviewer).mock_calls
+            assert not any(
+                method == "GET"
+                and any(f"/{item}/api/json" in path for item in (12, 13, 14))
+                and auth == tokens["jenkins"]["read"]
+                for method, path, _, auth in services.requests
+            )
+            return
         if mode == "preparation-race":
             caller_revision = store.load("qualified-dag").revision
             original_observe = WorkOwnership.observe
@@ -1284,8 +1396,72 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 is EffectStatus.UNKNOWN
             )
             assert store.operation("qualified-sync") == pending
+            history = store.history("qualified-dag")
+            if mode in {"sync-reopen", "sync-ambiguous-reopen"}:
+                store.close()
+                store = stores.enter_context(
+                    SQLiteProgramStore(sqlite_tmp_path / "qualified-dag.db", boot_clock=clock.boot)
+                )
+                app.store = store
+                app.intake = OrdinaryIntake(store, legacy.reader, clock.wall)
+                recovered = app.recover(decision)
+                assert recovered.proposal == approved.proposal and recovered.expires_at == approved.expires_at
+                assert recovered.program == store.load("qualified-dag")
+                assert store.history("qualified-dag") == history
+                assert store.operation("qualified-sync") == pending
+                remediation_control = WorkOwnership(
+                    store,
+                    Principal("owner", "owner"),
+                    remediation_tree,
+                    mode=HandoffMode.PULL,
+                    profile=COOPERATIVE_PROFILE,
+                )
+                synchronization = DriverApplication(
+                    store,
+                    remediation_control,
+                    project,
+                    (scm, knowledge),
+                    clock.wall,
+                    lambda claim, requested: pytest.fail("reconciliation requested fresh effect authority"),
+                    lease_seconds=5,
+                    authorize_draft=lambda claim, requested, key: pytest.fail(
+                        "reconciliation requested fresh draft authority"
+                    ),
+                )
+                if mode == "sync-ambiguous-reopen":
+                    cast(dict[str, object], output_pages[20]["version"])["message"] = "foreign operation"
             clock.now += 6
             receipt = synchronization.synchronize(remediation.claim, "qualified-sync", "qualified-sync", mutation)
+            if mode in {"sync-reopen", "sync-ambiguous-reopen"}:
+                assert receipt.operation == unknown.operation
+                reconciled = store.operation("qualified-sync")
+                assert (reconciled.request_digest, reconciled.fence, reconciled.attempts) == (
+                    pending.request_digest,
+                    pending.fence,
+                    1,
+                )
+                assert store.history("qualified-dag") == history
+                assert app.recover(decision).expires_at == approved.expires_at
+                assert len(store.load("qualified-dag").satisfactions) == 1
+                assert tuple(item.work_unit_id for item in store.load("qualified-dag").ready_work_units) == ("second",)
+                if mode == "sync-ambiguous-reopen":
+                    assert receipt.status is EffectStatus.UNKNOWN
+                    assert store.find_artifact("qualified-sync", "driver-receipt") is None
+                else:
+                    assert receipt.status is EffectStatus.ACCEPTED
+                    assert store.find_artifact("qualified-sync", "driver-receipt") is not None
+                assert (
+                    synchronization.synchronize(remediation.claim, "qualified-sync", "qualified-sync", mutation)
+                    == receipt
+                )
+                assert (
+                    sum(
+                        method == "PUT" and path.startswith("/wiki/api/v2/pages/901")
+                        for method, path, _, _ in services.requests
+                    )
+                    == denied_puts + 1
+                )
+                return
             assert receipt.status is EffectStatus.ACCEPTED
             assert (
                 synchronization.synchronize(remediation.claim, "qualified-sync", "qualified-sync", mutation) == receipt
