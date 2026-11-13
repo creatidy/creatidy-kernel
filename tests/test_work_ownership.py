@@ -484,7 +484,7 @@ def test_claim_records_are_nondispatchable_and_migration_keeps_original_rows(sql
         assert record["generation"] == 1
         assert "workspace_subject" not in json.loads(record["input"])
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
 
 
 @pytest.mark.parametrize("stage", ["complete", "stop"])

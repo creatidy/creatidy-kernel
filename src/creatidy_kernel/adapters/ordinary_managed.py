@@ -88,6 +88,28 @@ class OrdinaryManagedRun:
 
     def start(self, handoff: OrdinaryHandoff, *, expected_revision: int | None = None) -> str:
         app = self.client.application
+        legacy = next(
+            (item for item in self.client.approved.proposal.drafts if item.task_id == handoff.attempt.work_unit_id),
+            None,
+        )
+        qualified = next(
+            (
+                item
+                for item in self.client.approved.proposal.qualified_drafts
+                if item.task_id == handoff.attempt.work_unit_id
+            ),
+            None,
+        )
+        if (legacy is None) == (qualified is None):
+            raise IntakeRefused("exact approved managed source required")
+        if qualified is not None:
+            source = qualified.baseline.source.binding
+            repository = source.origin + "/" + source.namespace + ".git"
+            if self.workspace.repository_url not in {repository, repository.removesuffix(".git")}:
+                raise IntakeRefused("managed workspace differs from approved qualified source")
+        else:
+            assert legacy is not None  # noqa: S101
+            repository = legacy.evidence.subject.origin + "/" + legacy.evidence.subject.repository + ".git"
         self.handoff = handoff
         original = app.store.operation(handoff.claim.operation_id)
         if original.attempts:
@@ -105,15 +127,10 @@ class OrdinaryManagedRun:
         if self.fence is None:
             raise IntakeRefused("cooperative pull claim cannot dispatch managed Runtime")
         operation = app.store.operation(handoff.claim.operation_id)
-        subject = next(
-            item.evidence.subject
-            for item in self.client.approved.proposal.drafts
-            if item.task_id == handoff.attempt.work_unit_id
-        )
         if self.workspace.prepared_revision is None:
             raise IntakeRefused("actual prepared source revision unavailable")
         spec = WorkspaceSpec(
-            subject.origin + "/" + subject.repository + ".git",
+            repository,
             self.workspace.prepared_revision,
             (),
             app.execution_reference,

@@ -64,7 +64,7 @@ from creatidy_kernel.core.served import command_prefix
 from creatidy_kernel.core.work_budget import COUNT_ONLY_WORK, BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _APPLICATION_ID = 0x43544B31
 _DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _LOCAL_FILESYSTEMS = {
@@ -4105,7 +4105,7 @@ class SQLiteProgramStore:
             if (
                 manifest["format"] != "creatidy-kernel-sqlite-backup"
                 or type(manifest["schema_version"]) is not int
-                or manifest["schema_version"] not in (1, 2, 3, 4, 5, 6)
+                or manifest["schema_version"] not in (1, 2, 3, 4, 5, 6, 7)
             ):
                 raise ValueError("unsupported backup manifest")
             with (directory / "kernel.sqlite3").open("rb") as stream:
@@ -4468,6 +4468,8 @@ class SQLiteProgramStore:
             self._backup_before_schema_four(target_schema=5)
         if original_version in (1, 2, 3, 4, 5):
             self._backup_before_schema_four(target_schema=6)
+        if original_version in (1, 2, 3, 4, 5, 6):
+            self._backup_before_schema_four(target_schema=7)
         with self._transaction():
             version = cast(int, self._connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SCHEMA_VERSION:
@@ -4490,10 +4492,16 @@ class SQLiteProgramStore:
             if version == 5:
                 self._migrate_5_to_6()
                 version = 6
+            if version == 6:
+                self._migrate_6_to_7()
+                version = 7
             if version != SCHEMA_VERSION:
                 raise UnsupportedSQLiteConfiguration(f"no migration path from schema version {version}")
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._validate_schema()
+
+    def _migrate_6_to_7(self) -> None:
+        """Fence older readers from qualified proposal authority."""
 
     def _backup_before_schema_four(self, *, target_schema: int = 4) -> None:
         # A content-qualified name reuses the same complete backup after an

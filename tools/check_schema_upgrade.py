@@ -25,6 +25,7 @@ PINNED_PRE_ACCEPTANCE_ID = "88d59fcd594cbf7fd529971a12139628bef9b6a5"  # Exact p
 PINNED_PRE_PUBLICATION_ID = "3ebd84a28c6c3bfcf6ed7f4b1937fc425ae05b13"  # Exact public Git object ID.
 PINNED_PRE_WORKSPACE_ID = "397ee0cb6a11f0638b9b19f48076f34d1d1c69b1"  # Exact public schema-5 pathname-only producer.
 PINNED_PRE_ORDINARY_ID = "b1c9ffca16f06596e5c3afdca3b9893cf7422d8d"  # Exact integrated pre-ordinary reader.
+PINNED_SCHEMA6_ID = "1bcb052e527933b7b2f419ac76017f2d20e88a1e"  # Exact pre-qualified schema-6 reader.
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -143,6 +144,32 @@ else:
     raise AssertionError('upgrade interruption did not occur')
 """
 
+INTERRUPT_SCHEMA7 = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+original = SQLiteProgramStore._migrate_6_to_7
+def interrupted(self):
+    original(self)
+    raise RuntimeError('synthetic schema-7 interruption')
+SQLiteProgramStore._migrate_6_to_7 = interrupted
+try:
+    SQLiteProgramStore(Path(sys.argv[1]))
+except RuntimeError as error:
+    assert str(error) == 'synthetic schema-7 interruption'
+else:
+    raise AssertionError('schema-7 interruption did not occur')
+"""
+
+OPEN_SCHEMA7 = """
+import sys
+from pathlib import Path
+from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+with SQLiteProgramStore(Path(sys.argv[1])) as store:
+    assert store.startup_evidence.schema_version == 7
+    assert store.artifact('legacy-evidence', 'original') == b'synthetic retained original bytes'
+"""
+
 REFUSE_FUTURE = """
 import sys
 from pathlib import Path
@@ -162,7 +189,7 @@ from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 path = Path(sys.argv[1])
 for _ in range(2):
     with SQLiteProgramStore(path) as store:
-        assert store.startup_evidence.schema_version == 6
+        assert store.startup_evidence.schema_version == 7
         assert store.operations() == ()
 """
 
@@ -212,7 +239,7 @@ from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy
 clock = lambda: BootClockReading(100, 1000000000, 'installed-synthetic-boot')
 path = Path(sys.argv[1])
 with SQLiteProgramStore(path, boot_clock=clock) as store:
-    assert store.startup_evidence.schema_version == 6
+    assert store.startup_evidence.schema_version == 7
     program = store.load('reference')
     assert store.artifact('legacy-evidence', 'original') == b'synthetic retained original bytes'
     policy = WorkBudgetPolicy.basic(1, 1, verifications=1, retained_bytes=1024)
@@ -225,7 +252,7 @@ with SQLiteProgramStore(path, boot_clock=clock) as store:
     store.revoke_work_budget('reference', 'synthetic owner stop')
     before = store.work_budget_status('reference')
     bundle = store.backup(path.parent / 'schema-four-backup')
-    assert bundle.schema_version == 6
+    assert bundle.schema_version == 7
 restored = SQLiteProgramStore.restore_backup(bundle, path.parent / 'restored-four.sqlite3')
 with SQLiteProgramStore(restored, boot_clock=clock) as store:
     assert store.work_budget_status('reference') == before
@@ -247,7 +274,7 @@ old_bundle = BackupBundle(backups[0], backups[0] / 'kernel.sqlite3', backups[0] 
                           manifest['database_sha256'], manifest['history_record_count'], old_schema)
 restored = SQLiteProgramStore.restore_backup(old_bundle, path.parent / 'restored-original.sqlite3')
 with SQLiteProgramStore(restored, boot_clock=clock) as store:
-    assert store.startup_evidence.schema_version == 6
+    assert store.startup_evidence.schema_version == 7
     assert not store.has_work_budget('reference')
     assert store.artifact('legacy-evidence', 'original') == b'synthetic retained original bytes'
 """
@@ -584,9 +611,41 @@ with SQLiteProgramStore(directory / 'kernel.sqlite3',boot_clock=clock) as store:
 """
 
 
+def check_schema6(new_python: Path, fixture: Path) -> None:
+    """Exercise the actual pre-qualified reader once in the installed-package proof."""
+    fixture.mkdir()
+    old_python = install_pinned_reader(fixture, commit_id=PINNED_SCHEMA6_ID)
+    path = fixture / "synthetic.sqlite3"
+    subprocess.run([str(old_python), "-I", "-c", CREATE_LEGACY, str(path), "6"], cwd=fixture, check=True)
+    with closing(sqlite3.connect(path)) as original:
+        before = tuple(original.iterdump())
+    subprocess.run([str(new_python), "-I", "-c", INTERRUPT_SCHEMA7, str(path)], cwd=fixture, check=True)
+    with closing(sqlite3.connect(path)) as interrupted:
+        if tuple(interrupted.iterdump()) != before or interrupted.execute("PRAGMA user_version").fetchone()[0] != 6:
+            raise RuntimeError("interrupted schema-7 upgrade changed original state")
+    backups = sorted(fixture.glob(path.name + ".pre-schema-7-*"))
+    if len(backups) != 1:
+        raise RuntimeError("schema-7 upgrade did not retain the original backup")
+    subprocess.run([str(new_python), "-I", "-c", OPEN_SCHEMA7, str(path)], cwd=fixture, check=True)
+    if sorted(fixture.glob(path.name + ".pre-schema-7-*")) != backups:
+        raise RuntimeError("schema-7 upgrade did not reuse its backup")
+    with closing(sqlite3.connect(path)) as upgraded:
+        after = tuple(upgraded.iterdump())
+        if after != before or upgraded.execute("PRAGMA user_version").fetchone()[0] != 7:
+            raise RuntimeError("schema-7 upgrade changed original rows")
+    marker = fixture / "forbidden-effect"
+    subprocess.run([str(old_python), "-I", "-c", REFUSE_DOWNGRADE, str(path), str(marker)], cwd=fixture, check=True)
+    with closing(sqlite3.connect(path)) as refused:
+        if tuple(refused.iterdump()) != after or refused.execute("PRAGMA user_version").fetchone()[0] != 7:
+            raise RuntimeError("schema-6 reader changed schema-7 state")
+    if marker.exists():
+        raise RuntimeError("schema-6 reader dispatched after downgrade")
+
+
 def main(new_python: Path, storage_root: Path, prepared_ordinary: Path | None = None) -> None:
     with tempfile.TemporaryDirectory(prefix="installed-schema-upgrade-", dir=storage_root) as value:
         directory = Path(value)
+        check_schema6(new_python, directory / "schema-6")
         for schema, commit_id in ((2, PINNED_BASE_ID), (3, PINNED_PRECLOCK_ID), (4, PINNED_PREOWNERSHIP_ID)):
             fixture = directory / f"schema-{schema}"
             fixture.mkdir()
@@ -607,7 +666,7 @@ def main(new_python: Path, storage_root: Path, prepared_ordinary: Path | None = 
                 ):
                     raise RuntimeError("interrupted upgrade changed original state")
             backups_before = sorted(fixture.glob(path.name + ".pre-schema-*"))
-            if len(backups_before) != (3 if schema in (2, 3) else 2):
+            if len(backups_before) != (4 if schema in (2, 3) else 3):
                 raise RuntimeError("interrupted upgrade failed to retain original backups")
             subprocess.run(
                 [str(new_python), "-I", "-c", UPGRADE_AND_REVOKE, str(path), str(schema)], cwd=fixture, check=True
@@ -629,7 +688,7 @@ def main(new_python: Path, storage_root: Path, prepared_ordinary: Path | None = 
             with closing(sqlite3.connect(path)) as current:
                 if (
                     tuple(current.iterdump()) != before
-                    or current.execute("PRAGMA user_version").fetchone()[0] != 6
+                    or current.execute("PRAGMA user_version").fetchone()[0] != 7
                     or current.execute("SELECT COUNT(*) FROM delivery_attempts").fetchone()[0] != 0
                 ):
                     raise RuntimeError("downgraded reader changed protected records or dispatched")
@@ -674,7 +733,7 @@ def main(new_python: Path, storage_root: Path, prepared_ordinary: Path | None = 
                 raise RuntimeError("empty database unexpectedly has a schema version")
         subprocess.run([str(new_python), "-I", "-c", OPEN_EMPTY, str(empty)], cwd=future, check=True)
         unversioned = future / "unversioned-nonempty.sqlite3"
-        subprocess.run([str(new_python), "-I", "-c", CREATE_LEGACY, str(unversioned), "6"], cwd=future, check=True)
+        subprocess.run([str(new_python), "-I", "-c", CREATE_LEGACY, str(unversioned), "7"], cwd=future, check=True)
         with closing(sqlite3.connect(unversioned)) as connection:
             connection.execute("PRAGMA user_version=0")
             connection.commit()
@@ -684,7 +743,7 @@ def main(new_python: Path, storage_root: Path, prepared_ordinary: Path | None = 
             if tuple(connection.iterdump()) != before or connection.execute("PRAGMA user_version").fetchone()[0] != 0:
                 raise RuntimeError("unversioned nonempty refusal changed original records")
         path = future / "future.sqlite3"
-        subprocess.run([str(new_python), "-I", "-c", CREATE_LEGACY, str(path), "6"], cwd=future, check=True)
+        subprocess.run([str(new_python), "-I", "-c", CREATE_LEGACY, str(path), "7"], cwd=future, check=True)
         with closing(sqlite3.connect(path)) as connection:
             connection.execute("PRAGMA user_version=999")
             connection.commit()
@@ -876,7 +935,7 @@ def main(new_python: Path, storage_root: Path, prepared_ordinary: Path | None = 
                 raise RuntimeError("pre-ordinary reader changed controller preparation records")
         print(
             f"Installed schema upgrade: actual readers {PINNED_BASE_ID}, {PINNED_PRECLOCK_ID}, "
-            f"{PINNED_PREOWNERSHIP_ID} refuse schema 6; original bytes, v2/v3/v4/v5 backups and artifacts preserved; "
+            f"{PINNED_PREOWNERSHIP_ID} refuse schema 7; original bytes, v2/v3/v4/v5 backups and artifacts preserved; "
             f"original schema-5 claims from {PINNED_INITIAL_OWNERSHIP_ID} replay unchanged "
             "and conflicting work stays fenced."
         )

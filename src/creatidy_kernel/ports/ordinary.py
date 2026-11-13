@@ -6,9 +6,10 @@ Pull and managed start share request/report, Core selection and the same immutab
 Attempt/Operation. There is no hidden planner, alternate scheduler or model loop.
 """
 
+import re
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Protocol, cast
 
 from creatidy_kernel.core.authority import Principal
@@ -24,6 +25,7 @@ from creatidy_kernel.core.domain import (
     StartAttempt,
     WorkUnit,
 )
+from creatidy_kernel.core.drivers import DriverFact, DriverSubject, EdgeObligation, WorkObservation
 from creatidy_kernel.core.execution import Candidate
 from creatidy_kernel.core.intake import (
     Declaration,
@@ -36,9 +38,16 @@ from creatidy_kernel.core.intake import (
     object_from,
 )
 from creatidy_kernel.core.ordinary import DependencyEvidence, OrdinaryProposal
+from creatidy_kernel.core.ordinary_qualified import (
+    QualifiedBaseline,
+    QualifiedDependencyCut,
+    QualifiedDraft,
+    QualifiedReadiness,
+)
 from creatidy_kernel.core.ownership import HandoffMode, WorkClaim
 from creatidy_kernel.core.verification import CandidateResult, EvidenceSubject, ProductReviewRequest, VerificationPolicy
 from creatidy_kernel.ports.application import Collection, receive_candidate, remediation_context
+from creatidy_kernel.ports.drivers import SourceManagement, WorkManagement
 from creatidy_kernel.ports.intake import IntakeStore, OrdinaryIntake, draft_from
 from creatidy_kernel.ports.ownership import OwnershipStore, WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
@@ -68,6 +77,16 @@ class OrdinaryStore(IntakeStore, OwnershipStore, Protocol):
 
 class DependencyReader(Protocol):
     def read_dependencies(self, subject: IssueSubject) -> DependencyEvidence: ...
+
+
+class QualifiedBaselineReader(Protocol):
+    def read_baseline(self, source: DriverSubject, recipe_digest: str) -> QualifiedBaseline | None: ...
+
+
+class QualifiedReadinessReader(Protocol):
+    def read_readiness(
+        self, cut: QualifiedDependencyCut, source: DriverSubject, declaration: Declaration
+    ) -> QualifiedReadiness | None: ...
 
 
 class OrdinaryWorkspace(Protocol):
@@ -112,6 +131,10 @@ class OrdinaryProgram:
         clock: Callable[[], int],
         *,
         execution_profile: bytes,
+        qualified_work: tuple[WorkManagement, ...] = (),
+        qualified_scm: tuple[SourceManagement, ...] = (),
+        qualified_baselines: QualifiedBaselineReader | None = None,
+        qualified_readiness: QualifiedReadinessReader | None = None,
     ) -> None:
         if (
             owner.role != "owner"
@@ -127,6 +150,17 @@ class OrdinaryProgram:
             raise IntakeRefused("trusted owner, finite work envelope and required independent review must be bound")
         self.store, self.intake, self.dependencies = store, intake, dependencies
         self.owner, self.policy, self.verification, self.clock = owner, policy, verification, clock
+        if any(driver.binding.family != "work" for driver in qualified_work) or len(
+            {driver.binding for driver in qualified_work}
+        ) != len(qualified_work):
+            raise IntakeRefused("distinct explicitly bound work drivers required")
+        self.qualified_work = qualified_work
+        if any(driver.binding.family != "scm" for driver in qualified_scm) or len(
+            {driver.binding for driver in qualified_scm}
+        ) != len(qualified_scm):
+            raise IntakeRefused("distinct explicitly bound SCM drivers required")
+        self.qualified_scm, self.qualified_baselines = qualified_scm, qualified_baselines
+        self.qualified_readiness = qualified_readiness
         profile = object_from(execution_profile)
         if (
             set(profile) != {"harness", "provider", "model", "effort", "trust"}
@@ -142,11 +176,175 @@ class OrdinaryProgram:
         self.execution_reference = "basic-harness-policy:" + digest(execution_profile)
         self._record("ordinary-harness:" + digest(execution_profile), {"profile": profile})
 
+    def observe_qualified_dependencies(
+        self,
+        driver: WorkManagement,
+        subject: DriverSubject,
+        classifications: tuple[tuple[str, bool], ...],
+        *,
+        obligation: EdgeObligation | None = None,
+    ) -> QualifiedDependencyCut:
+        """Read an inert qualified cut; this does not approve or admit a Program."""
+        if subject.binding != driver.binding or subject.binding.family != "work" or subject.revision is None:
+            raise IntakeRefused("exact independently bound work subject required")
+        work = driver.work(subject.key)
+        if work.fact.subject != subject:
+            raise IntakeRefused("qualified work subject changed or is unavailable")
+        return QualifiedDependencyCut.capture(work, classifications, self.clock(), obligation=obligation)
+
+    def recheck_qualified_dependencies(self, driver: WorkManagement, cut: QualifiedDependencyCut) -> None:
+        """Reobserve an inert cut without renewing its original freshness or granting authority."""
+        if driver.binding != cut.subject.binding:
+            raise IntakeRefused("qualified work driver binding differs")
+        current = driver.work(cut.subject.key)
+        cut.recheck(current, self.clock())
+
+    def prepare_qualified(
+        self,
+        task_id: str,
+        declaration: Declaration,
+        cut: QualifiedDependencyCut,
+        source: DriverSubject,
+        *,
+        relevance_reason: str,
+        ci_subjects: tuple[DriverSubject, ...] = (),
+    ) -> QualifiedDraft:
+        """Capture inert qualified meaning from explicitly configured trusted producers."""
+        drivers = {driver.binding: driver for driver in self.qualified_scm}
+        driver = drivers.get(source.binding)
+        if (
+            driver is None
+            or source.kind != "ref"
+            or source.revision is None
+            or self.qualified_baselines is None
+            or self.qualified_readiness is None
+        ):
+            raise IntakeRefused("exact SCM ref and baseline producer required")
+        observed = driver.ref(source.key)
+        now = self.clock()
+        observed.require_current(now)
+        if (
+            observed.subject != source
+            or not observed.complete
+            or not observed.qualification
+            or driver.binding != source.binding
+        ):
+            raise IntakeRefused("qualified source observation changed or is incomplete")
+        baseline = self.qualified_baselines.read_baseline(source, digest(encode(declaration.value["recipes"])))
+        if baseline is None or baseline.source != source or not baseline.proof:
+            raise IntakeRefused("exact qualified baseline unavailable")
+        readiness = self.qualified_readiness.read_readiness(cut, source, declaration)
+        if readiness is None:
+            raise IntakeRefused("qualified relevance unavailable")
+        baseline = replace(baseline, observed_at=self._qualified_baseline_age(baseline))
+        readiness = replace(readiness, observed_at=self._qualified_readiness_age(readiness))
+        return QualifiedDraft(
+            task_id,
+            declaration,
+            cut,
+            baseline,
+            readiness,
+            observed.observation_digest,
+            observed.provenance,
+            observed.qualification,
+            observed.observed_at,
+            observed.fresh_until,
+            relevance_reason,
+            ci_subjects,
+        )
+
+    def _qualified_baseline_age(self, baseline: QualifiedBaseline) -> int:
+        return self._qualified_receipt_age("baseline", baseline.meaning, baseline.observed_at)
+
+    def _qualified_readiness_age(self, readiness: QualifiedReadiness) -> int:
+        return self._qualified_receipt_age("readiness", readiness.meaning, readiness.observed_at)
+
+    def _qualified_receipt_age(self, kind: str, meaning: dict[str, object], observed_at: int) -> int:
+        prefix = f"ordinary-program:qualified-{kind}-age:"
+        ages = [observed_at]
+        if kind == "baseline":
+            for operation in self.store.operations("ordinary:"):
+                if not (
+                    operation.operation_id.startswith("ordinary:baseline-age:")
+                    or operation.operation_id.startswith("ordinary:record:ordinary-draft:")
+                    or re.fullmatch(r"ordinary:[A-Za-z0-9_-]+:draft:[1-9][0-9]*", operation.operation_id)
+                ):
+                    continue
+                raw = self.store.find_artifact(operation.operation_id, "record")
+                if raw is None:
+                    raise IntakeRefused("legacy receipt age record is incomplete")
+                request = object_from(encode(object_from(operation.request_json.encode()).get("request")))
+                if (
+                    operation.effect_key != operation.operation_id
+                    or operation.attempts
+                    or request != {"kind": "ordinary-intake-record", "version": 1, "bytes": raw.decode()}
+                ):
+                    raise IntakeRefused("legacy receipt age record differs")
+                value = object_from(raw)
+                if value.get("kind") == "ordinary-draft":
+                    evidence = draft_from(raw).evidence
+                    old_producer, old_reference, age = (
+                        evidence.baseline_producer,
+                        evidence.baseline_reference,
+                        evidence.observed_at,
+                    )
+                elif value.get("kind") == "ordinary-baseline-age":
+                    identity = object_from(encode(value.get("identity")))
+                    if (
+                        set(value) != {"kind", "version", "identity", "observed_at"}
+                        or type(value["version"]) is not int
+                        or value["version"] != 1
+                        or type(value["observed_at"]) is not int
+                        or value["observed_at"] < 0
+                        or operation.operation_id
+                        != "ordinary:baseline-age:" + digest(encode(identity)) + ":" + str(value["observed_at"])
+                    ):
+                        raise IntakeRefused("legacy baseline age record differs")
+                    old_producer, old_reference, age = (
+                        identity.get("baseline_producer"),
+                        identity.get("baseline_reference"),
+                        value["observed_at"],
+                    )
+                else:
+                    raise IntakeRefused("unexpected legacy receipt age record")
+                if (old_producer, old_reference) == (meaning["producer"], meaning["reference"]):
+                    ages.append(age)
+        for operation in self.store.operations(prefix):
+            raw = self.store.find_artifact(operation.operation_id, "record")
+            if raw is None:
+                raise IntakeRefused("qualified receipt age record is incomplete")
+            value = object_from(raw)
+            old_meaning = object_from(encode(value.get("meaning")))
+            request = object_from(encode(object_from(operation.request_json.encode()).get("request")))
+            if (
+                set(value) != {"meaning", "observed_at"}
+                or type(value["observed_at"]) is not int
+                or value["observed_at"] < 0
+                or type(old_meaning.get("producer")) is not str
+                or type(old_meaning.get("reference")) is not str
+                or operation.operation_id != prefix + digest(encode(old_meaning)) + ":" + str(value["observed_at"])
+                or operation.effect_key != operation.operation_id
+                or operation.attempts
+                or request != {"kind": "ordinary-intake-record", "version": 1, "bytes": raw.decode()}
+            ):
+                raise IntakeRefused("qualified receipt age record differs")
+            if (old_meaning["producer"], old_meaning["reference"]) == (meaning["producer"], meaning["reference"]):
+                ages.append(value["observed_at"])
+        earliest = min(ages)
+        if observed_at < min(ages[1:], default=observed_at + 1):
+            self._record(
+                prefix + digest(encode(meaning)) + ":" + str(earliest), {"meaning": meaning, "observed_at": earliest}
+            )
+        return earliest
+
     def propose(
         self,
         program_id: str,
         objective: str,
         selections: tuple[tuple[str, IssueSubject, Declaration], ...],
+        *,
+        qualified_cuts: tuple[QualifiedDependencyCut, ...] = (),
+        qualified_drafts: tuple[QualifiedDraft, ...] = (),
     ) -> OrdinaryProposal:
         drafts: list[Draft] = []
         received: list[DependencyEvidence] = []
@@ -157,7 +355,9 @@ class OrdinaryProgram:
             )
             drafts.append(draft)
             received.append(self.dependencies.read_dependencies(subject))
-        proposal = OrdinaryProposal(program_id, objective, tuple(drafts), tuple(received))
+        proposal = OrdinaryProposal(
+            program_id, objective, tuple(drafts), tuple(received), qualified_cuts, qualified_drafts
+        )
         self._spec(proposal, None)  # Core validates missing references, outputs and finite DAG/cycles.
         self._record(f"ordinary-program:proposal:{proposal.digest}", proposal.payload)
         return proposal
@@ -169,6 +369,10 @@ class OrdinaryProgram:
         return raw
 
     def _spec(self, proposal: OrdinaryProposal, previous: Program | None) -> ProgramSpec:
+        if proposal.qualified_drafts and self.verification.checks[:2] != ("paths", "structural"):
+            raise IntakeRefused("qualified tooling requires path and structural checks first")
+        if any(cut.required for cut in proposal.qualified_cuts):
+            raise IntakeRefused("qualified predecessors cannot yet be mapped to ordinary work units")
         identities = {
             (item.evidence.subject.origin, item.evidence.subject.repository, item.evidence.subject.issue): item.task_id
             for item in proposal.drafts
@@ -186,6 +390,43 @@ class OrdinaryProgram:
                     "required native predecessor is unknown, unsupported or outside the approved finite Program"
                 )
             predecessors = tuple(sorted(identities[item] for item in dependency.required))
+            name = f"meaning:{draft.task_id}"
+            inputs.append(InputBinding(name, "sha256:" + digest(encode(draft.payload()))))
+            units.append(
+                WorkUnit(
+                    draft.task_id,
+                    cast(str, draft.declaration.value["outcome"]),
+                    predecessors,
+                    frozenset(
+                        {
+                            name,
+                            "ordinary-declaration",
+                            "ordinary-harness-policy",
+                            *(f"result:{item}" for item in predecessors),
+                        }
+                    ),
+                    frozenset({f"result:{draft.task_id}"}),
+                    self.verification.checks,
+                    self.policy.reference,
+                )
+            )
+        qualified_ids = {item.cut.subject: item.task_id for item in proposal.qualified_drafts}
+        qualified_by_subject = {item.cut.subject: item for item in proposal.qualified_drafts}
+        for draft in proposal.qualified_drafts:
+            if (not draft.ci_subjects) != ("ci" not in self.verification.checks):
+                raise IntakeRefused("qualified CI check and exact build selection must agree")
+            if any(required not in qualified_ids for required in draft.cut.required):
+                raise IntakeRefused("qualified predecessor is outside the exact approved Program")
+            if any(
+                (
+                    qualified_by_subject[required].baseline.source.binding,
+                    qualified_by_subject[required].baseline.source.revision,
+                )
+                != (draft.baseline.source.binding, draft.baseline.source.revision)
+                for required in draft.cut.required
+            ):
+                raise IntakeRefused("qualified predecessor source repository or base differs")
+            predecessors = tuple(sorted(qualified_ids[item] for item in draft.cut.required))
             name = f"meaning:{draft.task_id}"
             inputs.append(InputBinding(name, "sha256:" + digest(encode(draft.payload()))))
             units.append(
@@ -235,8 +476,56 @@ class OrdinaryProgram:
 
     def current(self, proposal: OrdinaryProposal, expires_at: int) -> None:
         # Complete network/source/history reads before the final pure temporal cut.
+        if proposal.qualified_drafts and self.verification.checks[:2] != ("paths", "structural"):
+            raise IntakeRefused("qualified tooling requires path and structural checks first")
         reads = tuple(self.intake.reader.read(item.evidence.subject, item.declaration) for item in proposal.drafts)
         edges = tuple(self.dependencies.read_dependencies(item.evidence.subject) for item in proposal.drafts)
+        drivers = {driver.binding: driver for driver in self.qualified_work}
+        qualified_reads: list[WorkObservation] = []
+        cuts = (*proposal.qualified_cuts, *(item.cut for item in proposal.qualified_drafts))
+        for cut in cuts:
+            driver = drivers.get(cut.subject.binding)
+            if driver is None or driver.binding != cut.subject.binding:
+                raise IntakeRefused("qualified work driver unavailable or changed")
+            qualified_reads.append(driver.work(cut.subject.key))
+            if driver.binding != cut.subject.binding:
+                raise IntakeRefused("qualified work driver changed during observation")
+        scm = {driver.binding: driver for driver in self.qualified_scm}
+        qualified_sources: list[DriverFact] = []
+        baseline_ages: list[int] = []
+        readiness_ages: list[int] = []
+        readiness_deadlines: list[int] = []
+        for draft in proposal.qualified_drafts:
+            driver = scm.get(draft.baseline.source.binding)
+            if driver is None or self.qualified_baselines is None or self.qualified_readiness is None:
+                raise IntakeRefused("qualified SCM, baseline or relevance producer unavailable")
+            source = driver.ref(draft.baseline.source.key)
+            baseline = self.qualified_baselines.read_baseline(draft.baseline.source, draft.baseline.recipe_digest)
+            readiness = self.qualified_readiness.read_readiness(draft.cut, draft.baseline.source, draft.declaration)
+            if (
+                driver.binding != draft.baseline.source.binding
+                or baseline is None
+                or not baseline.proof
+                or baseline.meaning != draft.baseline.meaning
+                or readiness is None
+                or readiness.meaning != draft.readiness.meaning
+            ):
+                raise IntakeRefused("qualified source or baseline identity changed")
+            baseline_ages.append(self._qualified_baseline_age(baseline))
+            readiness_ages.append(self._qualified_readiness_age(readiness))
+            readiness_deadlines.append(readiness.fresh_until)
+            qualified_sources.append(source)
+            if readiness.owner_actor != self.owner.actor_id:
+                raise IntakeRefused("authenticated owner required")
+            OrdinaryIntake.validate_shared_policy(
+                self.owner,
+                draft.declaration,
+                self.policy,
+                baseline.producer,
+                baseline.reference,
+                baseline.result,
+                readiness.producer,
+            )
         ages: list[int] = []
         for draft, received in zip(proposal.drafts, reads, strict=True):
             self.intake.validate_authority(self.owner, draft, self.policy, received)
@@ -249,6 +538,20 @@ class OrdinaryProgram:
             *(item.observed_at + self.policy.freshness_seconds for item in reads),
             *(age + self.policy.freshness_seconds for age in ages),
             *(item.fresh_until for item in (*proposal.dependencies, *edges)),
+            *(item.fresh_until for item in cuts),
+            *(item.observed_at + self.policy.freshness_seconds for item in cuts),
+            *(item.fact.fresh_until for item in qualified_reads),
+            *(item.fact.observed_at + self.policy.freshness_seconds for item in qualified_reads),
+            *(item.source_fresh_until for item in proposal.qualified_drafts),
+            *(item.source_observed_at + self.policy.freshness_seconds for item in proposal.qualified_drafts),
+            *(item.fresh_until for item in qualified_sources),
+            *(item.observed_at + self.policy.freshness_seconds for item in qualified_sources),
+            *(item.baseline.observed_at + self.policy.freshness_seconds for item in proposal.qualified_drafts),
+            *(item + self.policy.freshness_seconds for item in baseline_ages),
+            *(item.readiness.observed_at + self.policy.freshness_seconds for item in proposal.qualified_drafts),
+            *(item + self.policy.freshness_seconds for item in readiness_ages),
+            *(item.readiness.fresh_until for item in proposal.qualified_drafts),
+            *readiness_deadlines,
         )
         if expires_at > minimum:
             raise IntakeRefused("received evidence narrows the original deadline; explicit approval amendment required")
@@ -257,6 +560,25 @@ class OrdinaryProgram:
             OrdinaryIntake.check_time(draft, self.policy, received, expires_at, age, now)
         if any(not item.observed_at <= now <= item.fresh_until for item in (*proposal.dependencies, *edges)):
             raise IntakeRefused("original dependency observation expired; refresh and explicitly approve")
+        for cut, received in zip(cuts, qualified_reads, strict=True):
+            cut.recheck(received, now)
+        for draft, source, age, ready_age in zip(
+            proposal.qualified_drafts, qualified_sources, baseline_ages, readiness_ages, strict=True
+        ):
+            source.require_current(now)
+            if (
+                source.subject != draft.baseline.source
+                or not source.complete
+                or source.observation_digest != draft.source_digest
+                or source.provenance != draft.source_provenance
+                or source.qualification != draft.source_qualification
+                or not draft.source_observed_at <= now <= draft.source_fresh_until
+                or age > now
+                or draft.baseline.observed_at > now
+                or ready_age > now
+                or draft.readiness.observed_at > now
+            ):
+                raise IntakeRefused("qualified source or baseline changed, expired or is from the future")
 
     def check_proposal_record(self, proposal: OrdinaryProposal) -> None:
         """Require the exact durable proposal used by approval recovery."""
@@ -290,7 +612,7 @@ class OrdinaryProgram:
             or self.execution_reference != "basic-harness-policy:" + digest(self.execution_profile)
         ):
             raise IntakeRefused("execution profile binding is invalid")
-        return {
+        scope: dict[str, object] = {
             "kind": "ordinary-approval-scope",
             "version": 1,
             "owner": self.owner.actor_id,
@@ -304,6 +626,11 @@ class OrdinaryProgram:
             "execution_profile": profile,
             "execution_reference": self.execution_reference,
         }
+        if proposal.qualified_cuts or proposal.qualified_drafts:
+            scope["qualified_work_bindings"] = [asdict(driver.binding) for driver in self.qualified_work]
+        if proposal.qualified_drafts:
+            scope["qualified_scm_bindings"] = [asdict(driver.binding) for driver in self.qualified_scm]
+        return scope
 
     def approve(
         self,
@@ -315,6 +642,11 @@ class OrdinaryProgram:
         final_guard: Callable[[], None] | None = None,
     ) -> OrdinaryApproval:
         self.check_proposal_record(proposal)
+        if any(
+            cut.obligation is not None and cut.obligation.decision_reference != decision_id
+            for cut in (*proposal.qualified_cuts, *(item.cut for item in proposal.qualified_drafts))
+        ):
+            raise IntakeRefused("visible dependency scope must bind this exact owner decision")
         # The caller's expiry is an upper bound. Original producer evidence may
         # expire earlier; bind that bound into the boot-clock work envelope too.
         expires_at = min(
@@ -322,6 +654,14 @@ class OrdinaryProgram:
             *(item.evidence.observed_at + self.policy.freshness_seconds for item in proposal.drafts),
             *(self.intake.baseline_age(item.evidence) + self.policy.freshness_seconds for item in proposal.drafts),
             *(item.fresh_until for item in proposal.dependencies),
+            *(item.fresh_until for item in proposal.qualified_cuts),
+            *(item.cut.fresh_until for item in proposal.qualified_drafts),
+            *(item.cut.observed_at + self.policy.freshness_seconds for item in proposal.qualified_drafts),
+            *(item.source_fresh_until for item in proposal.qualified_drafts),
+            *(item.source_observed_at + self.policy.freshness_seconds for item in proposal.qualified_drafts),
+            *(item.baseline.observed_at + self.policy.freshness_seconds for item in proposal.qualified_drafts),
+            *(item.readiness.observed_at + self.policy.freshness_seconds for item in proposal.qualified_drafts),
+            *(item.readiness.fresh_until for item in proposal.qualified_drafts),
         )
         previous = self.store.find_program(proposal.program_id)
         if expected_revision is not None:
@@ -411,9 +751,13 @@ class OrdinaryProgram:
         record = object_from(self.store.artifact(f"ordinary-program:approval:{decision_id}", "record"))
         raw = self.store.artifact(f"ordinary-program:proposal:{record['proposal']}", "record")
         value = object_from(raw)
+        legacy_fields = {"version", "kind", "program", "objective", "drafts", "dependencies"}
         if (
-            set(value) != {"version", "kind", "program", "objective", "drafts", "dependencies"}
-            or value["version"] != 1
+            type(value.get("version")) is not int
+            or (value["version"] == 1 and set(value) != legacy_fields)
+            or (value["version"] == 2 and set(value) != legacy_fields | {"qualified_cuts"})
+            or (value["version"] == 3 and set(value) != legacy_fields | {"qualified_cuts", "qualified_drafts"})
+            or value["version"] not in (1, 2, 3)
             or value["kind"] != "ordinary-program-proposal"
         ):
             raise IntakeRefused("unsupported historical ordinary proposal")
@@ -432,7 +776,15 @@ class OrdinaryProgram:
                     cast(bool, item["complete"]),
                 )
             )
-        proposal = OrdinaryProposal(cast(str, value["program"]), cast(str, value["objective"]), drafts, tuple(edges))
+        cuts = tuple(
+            QualifiedDependencyCut.parse(encode(item)) for item in cast(list[object], value.get("qualified_cuts", []))
+        )
+        qualified_drafts = tuple(
+            QualifiedDraft.parse(encode(item)) for item in cast(list[object], value.get("qualified_drafts", []))
+        )
+        proposal = OrdinaryProposal(
+            cast(str, value["program"]), cast(str, value["objective"]), drafts, tuple(edges), cuts, qualified_drafts
+        )
         program = self.store.load(proposal.program_id)
         if (
             encode(proposal.payload) != raw
@@ -441,6 +793,10 @@ class OrdinaryProgram:
             or record["issuer"] != self.owner.actor_id
             or record["execution"] != self.execution_reference
             or record["spec"] != program.spec.digest
+            or any(
+                cut.obligation is not None and cut.obligation.decision_reference != decision_id
+                for cut in (*cuts, *(item.cut for item in qualified_drafts))
+            )
         ):
             raise IntakeRefused("historical approval, current policy or specification differs")
         return OrdinaryApproval(proposal, self.policy.digest, decision_id, cast(int, record["expires_at"]), program)
@@ -461,6 +817,11 @@ class OrdinaryProgram:
 
     def check(self, approved: OrdinaryApproval) -> None:
         key = f"ordinary-program:approval:{approved.decision_id}"
+        if any(
+            cut.obligation is not None and cut.obligation.decision_reference != approved.decision_id
+            for cut in (*approved.proposal.qualified_cuts, *(item.cut for item in approved.proposal.qualified_drafts))
+        ):
+            raise IntakeRefused("visible dependency scope differs from owner decision")
 
         def read(program: Program) -> None:
             if (

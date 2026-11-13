@@ -15,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import cast
+from urllib.parse import urlsplit
 
 from creatidy_kernel.adapters.forgejo_transport import GIT_OUTPUT_ERRORS, run_git_bounded
 from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
@@ -26,6 +27,7 @@ from creatidy_kernel.adapters.task_execution import (
     run_verification_command,
 )
 from creatidy_kernel.core.domain import AttemptSpec, InputBinding
+from creatidy_kernel.core.drivers import DriverSubject
 from creatidy_kernel.core.execution import Artifact, ArtifactManifest, Candidate
 from creatidy_kernel.core.intake import IntakeRefused, digest, encode, object_from, strings
 from creatidy_kernel.core.ordinary import OrdinaryProposal
@@ -33,6 +35,7 @@ from creatidy_kernel.core.ownership import WorkClaim
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject
 from creatidy_kernel.core.work_budget import WorkKind
 from creatidy_kernel.ports.application import BudgetedChecks, Collection
+from creatidy_kernel.ports.drivers import ContinuousIntegration
 from creatidy_kernel.ports.ownership import WorkOwnership
 
 
@@ -48,12 +51,14 @@ class OrdinaryGitWorkspace:
         author: tuple[str, str],
         *,
         authority_deadline: int,
+        qualified_ci: ContinuousIntegration | None = None,
         max_bytes: int = 16 * 1024 * 1024,
     ) -> None:
         if not commands or not all(type(item) is VerificationCommand for item in commands) or not all(author):
             raise IntakeRefused("trusted finite verification argv and explicit commit author required")
         self.store, self.workspace, self.source = store, workspace, source
         self.repository_url, self.proposal, self.commands, self.author = repository_url, proposal, commands, author
+        self.qualified_ci = qualified_ci
         self.max_bytes = max_bytes
         if type(authority_deadline) is not int or authority_deadline <= 0:
             raise IntakeRefused("original approved authority deadline required")
@@ -124,7 +129,30 @@ class OrdinaryGitWorkspace:
             if self.workspace.capture()[0] != subject:
                 raise IntakeRefused("prepared workspace changed; preserve and reconcile explicitly")
             return subject
-        draft = next(item for item in self.proposal.drafts if item.task_id == attempt.work_unit_id)
+        draft = next((item for item in self.proposal.drafts if item.task_id == attempt.work_unit_id), None)
+        qualified = next(
+            (item for item in self.proposal.qualified_drafts if item.task_id == attempt.work_unit_id), None
+        )
+        if (draft is None) == (qualified is None):
+            raise IntakeRefused("exact ordinary draft required")
+        if qualified is not None:
+            source = qualified.baseline.source
+            url = urlsplit(self.repository_url)
+            if (
+                url.scheme != "https"
+                or url.username
+                or url.password
+                or url.query
+                or url.fragment
+                or f"{url.scheme}://{url.netloc}" != source.binding.origin
+                or url.path not in {"/" + source.binding.namespace, "/" + source.binding.namespace + ".git"}
+                or source.revision is None
+            ):
+                raise IntakeRefused("workspace source differs from approved qualified SCM binding")
+            source_base = source.revision
+        else:
+            assert draft is not None  # noqa: S101
+            source_base = draft.evidence.subject.base
         empty = object_from(self.workspace.capture()[1])
         if empty["entries"]:
             raise IntakeRefused("new ordinary handoff requires a fresh owned leaf; preserve existing bytes")
@@ -134,16 +162,14 @@ class OrdinaryGitWorkspace:
         self.objects.mkdir(mode=0o700)
         check_current()
         self._git("init", "--bare", "--template=", str(self.objects), source=self.objects.parent)
-        subject = draft.evidence.subject
-        source_base = subject.base
         with source_use(self.source, self.repository_url) as leased:
             validate_checkout(leased)
             check_current()
-            self._git("fetch", "--no-tags", "--no-write-fetch-head", str(leased), subject.base)
-        self.base = subject.base
+            self._git("fetch", "--no-tags", "--no-write-fetch-head", str(leased), source_base)
+        self.base = source_base
         index = self.objects / "controller-index"
         check_current()
-        self._git("read-tree", subject.base, index=index)
+        self._git("read-tree", source_base, index=index)
         program = self.store.load(attempt.program_id)
         deltas: dict[str, bytes] = {}
         ancestry: dict[str, tuple[str, ...]] = {}
@@ -184,8 +210,12 @@ class OrdinaryGitWorkspace:
                     if ancestor not in ancestors:
                         ancestors.append(ancestor)
             prepared = object_from(self.store.artifact("ordinary-workspace:" + producer.attempt_id, "prepared"))
-            if prepared.get("attempt") != producer.digest or prepared.get("base") != source_base:
-                raise IntakeRefused("predecessor preparation differs from its original Attempt or base")
+            if (
+                prepared.get("attempt") != producer.digest
+                or prepared.get("base") != source_base
+                or prepared.get("source") != self.repository_url
+            ):
+                raise IntakeRefused("predecessor preparation differs from its original Attempt, repository or base")
             prior_index = self.objects / ("ancestor-index-" + digest(producer.attempt_id.encode()))
             check_current()
             self._git("read-tree", source_base, index=prior_index)
@@ -215,12 +245,12 @@ class OrdinaryGitWorkspace:
             apply_patch(deltas[producer], index)
         check_current()
         self.input_tree = self._text("write-tree", index=index)
-        if self.input_tree == self._text("rev-parse", subject.base + "^{tree}"):
-            self.prepared_revision = subject.base
+        if self.input_tree == self._text("rev-parse", source_base + "^{tree}"):
+            self.prepared_revision = source_base
         else:
             check_current()
             self.prepared_revision = self._text(
-                "commit-tree", self.input_tree, "-p", subject.base, "-m", "Prepared ordinary inputs " + attempt.digest
+                "commit-tree", self.input_tree, "-p", source_base, "-m", "Prepared ordinary inputs " + attempt.digest
             )
         expected_files: dict[str, tuple[bytes, bytes]] = {}
         expected_directories: set[str] = set()
@@ -417,6 +447,15 @@ class OrdinaryGitWorkspace:
             raise IntakeRefused("exact collected ordinary command owner required")
         attempt, claim, control = self._attempt, self.claim, self.control
         control.candidate_subject(claim)
+        if name == "ci":
+            return BudgetedChecks(
+                self.store,
+                _QualifiedCICheck(self),
+                attempt.program_id,
+                attempt.attempt_id,
+                lambda: int(time.time()),
+                delivery=lambda key, seconds: control.dispatch(claim, key, lease_seconds=seconds),
+            ).check(name, subject)
         if name != "commands":
             # This producer owns only these pure byte/path checks. The existing
             # BudgetedChecks envelope does not wrap physical subprocess execution.
@@ -566,11 +605,25 @@ class OrdinaryGitWorkspace:
     def review_input(self) -> str:
         if self._attempt is None or self._head is None:
             raise IntakeRefused("no collected immutable review subject")
-        draft = next(item for item in self.proposal.drafts if item.task_id == self._attempt.work_unit_id)
+        draft = next((item for item in self.proposal.drafts if item.task_id == self._attempt.work_unit_id), None)
+        qualified = next(
+            (item for item in self.proposal.qualified_drafts if item.task_id == self._attempt.work_unit_id), None
+        )
+        if (draft is None) == (qualified is None):
+            raise IntakeRefused("exact ordinary draft required")
         return encode(
             {
-                "approved": draft.payload(),
+                "approved": draft.payload()
+                if draft is not None
+                else qualified.payload()
+                if qualified is not None
+                else None,
                 "dependencies": [item.meaning for item in self.proposal.dependencies],
+                **(
+                    {"qualified_dependencies": [item.cut.payload for item in self.proposal.qualified_drafts]}
+                    if self.proposal.qualified_drafts
+                    else {}
+                ),
                 "base": self.base,
                 "head": self._head,
                 "candidate_source": object_from(self.workspace.capture()[1]),
@@ -580,9 +633,18 @@ class OrdinaryGitWorkspace:
 
     def pure_check(self, name: str, subject: EvidenceSubject) -> Evidence | None:
         assert self._attempt is not None  # noqa: S101
-        draft = next(item for item in self.proposal.drafts if item.task_id == self._attempt.work_unit_id)
+        draft = next((item for item in self.proposal.drafts if item.task_id == self._attempt.work_unit_id), None)
+        qualified = next(
+            (item for item in self.proposal.qualified_drafts if item.task_id == self._attempt.work_unit_id), None
+        )
+        if (draft is None) == (qualified is None):
+            raise IntakeRefused("exact ordinary draft required")
         if name == "paths":
-            allowed = strings(draft.declaration.value["paths"])
+            declaration = (
+                draft.declaration if draft is not None else qualified.declaration if qualified is not None else None
+            )
+            assert declaration is not None  # noqa: S101
+            allowed = strings(declaration.value["paths"])
             passed = bool(self._paths) and all(
                 any(path == root or path.startswith(root.rstrip("/") + "/") for root in allowed) for path in self._paths
             )
@@ -601,3 +663,70 @@ class _OrdinaryPureChecks:
 
     def check(self, name: str, subject: EvidenceSubject) -> Evidence | None:
         return self.owner.pure_check(name, subject)
+
+
+class _QualifiedCICheck:
+    def __init__(self, owner: OrdinaryGitWorkspace) -> None:
+        self.owner = owner
+
+    def check(self, name: str, subject: EvidenceSubject) -> Evidence | None:
+        owner = self.owner
+        attempt, ci = owner._attempt, owner.qualified_ci  # pyright: ignore[reportPrivateUsage]
+        if name != "ci" or attempt is None or ci is None:
+            return None
+        draft = next((item for item in owner.proposal.qualified_drafts if item.task_id == attempt.work_unit_id), None)
+        if draft is None:
+            return None
+        program = owner.store.load(attempt.program_id)
+        attempts = [item.spec.attempt_id for item in program.attempts if item.spec.work_unit_id == attempt.work_unit_id]
+        if attempt.attempt_id not in attempts:
+            return None
+        ordinal = attempts.index(attempt.attempt_id)
+        if ordinal >= len(draft.ci_subjects):
+            return None
+        ci_subject = draft.ci_subjects[ordinal]
+        if ci.binding != ci_subject.binding:
+            return None
+        binding = draft.baseline.source.binding
+        expected_url = binding.origin + "/" + binding.namespace
+        if subject.repository not in {expected_url, expected_url + ".git"}:
+            return None
+        source = DriverSubject(binding, "commit", subject.head_revision, subject.head_revision)
+        fact = ci.build(ci_subject.key, source)
+        now = int(time.time())
+        if (
+            ci.binding != ci_subject.binding
+            or fact.subject != ci_subject
+            or not fact.complete
+            or fact.related != (source,)
+            or not fact.qualification
+        ):
+            return None
+        fact.require_current(now)
+        native = object_from(fact.native)
+        if fact.subject.binding.implementation != "jenkins":
+            return None
+        passed = native.get("building") is False and native.get("result") == "SUCCESS"
+        payload = encode(
+            {
+                "subject": fact.subject.reference,
+                "source": source.reference,
+                "native": fact.native.hex(),
+                "provenance": fact.provenance,
+                "qualification": fact.qualification,
+            }
+        )
+        reference = owner.store.finalize_artifact(
+            f"runtime:{attempt.attempt_id}", "qualified-ci:" + digest(payload), payload
+        )
+        return Evidence(
+            reference + ":ci",
+            "ci",
+            subject,
+            "qualified-ci-controller",
+            "jenkins-exact:v1",
+            reference,
+            fact.observed_at,
+            fact.fresh_until,
+            passed,
+        )

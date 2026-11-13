@@ -224,6 +224,31 @@ schema 6 before it can write a clock observation or dispatch; an actual pinned r
 interrupted preparation remains retained rather than adopted. This migration does not rewrite old
 claim or source identities and does not provide physical worker settlement.
 
+Qualified cuts in version-2 ordinary proposals introduce SQLite schema 7 as a reader authority
+boundary. Before upgrading any schema-1 through schema-6 database, the store publishes a verified
+`<database>.pre-schema-7-<logical-digest>` backup. The migration changes no prior history or artifact
+bytes; an interrupted transaction leaves the original schema and the verified backup for recovery.
+Schema-6 readers cannot open a schema-7 database, including when no qualified proposal was created.
+The installed package check uses the actual schema-6 reader at `1bcb052e527933b7b2f419ac76017f2d20e88a1e`;
+this is a local synthetic compatibility proof, not a general downgrade path. Version-1 ordinary
+proposal and Forgejo draft encodings remain unchanged. Version-3 ordinary proposals add qualified
+drafts and exact predecessor resolution; unsupported versions refuse rather than being relabelled.
+
+The bounded qualified readiness producer uses the shipped GitHub driver's exact `2026-03-10`
+profile, not a compatibility claim for another GitHub API version. Its all-open repository scan uses
+the documented [list-pull-requests](https://docs.github.com/en/rest/pulls/pulls?apiVersion=2026-03-10#list-pull-requests)
+and [pagination](https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api?apiVersion=2026-03-10)
+interfaces, a finite page cap, detail rereads and two stable scans. An owner-attested credential
+visibility scope is part of the reviewed proof; HTTP 200 alone does not prove visibility. A moving,
+capped, unauthorized, foreign, missing-object or differently based change refuses. The host supplies
+the exact literal content criteria and Jira open-status IDs. Literal equality is not an assertion of
+general semantic equivalence, and two stable observations are not an atomic remote snapshot. The
+Jenkins baseline uses the existing exact-commit CI observation and an explicit host-owned build-to-recipe
+profile, not an inference that a successful build ran an arbitrary recipe. Neither producer grants
+execution authority or causes the controller to run repository code during intake.
+The public OpenAPI source examined for this bounded endpoint is
+[`api.github.com.2026-03-10.yaml` at `bd6df26d2a0104874fe5025a25ebcde356413364`](https://github.com/github/rest-api-description/blob/bd6df26d2a0104874fe5025a25ebcde356413364/descriptions/api.github.com/api.github.com.2026-03-10.yaml#L70819-L70897).
+
 ## Verification Compatibility
 
 Verification changes under #50 preserve the original Task #143/#166 payloads, policy references,

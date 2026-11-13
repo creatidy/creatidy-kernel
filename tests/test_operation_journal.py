@@ -164,7 +164,7 @@ def test_k2a_migration_and_artifacts_survive_bundle_with_manifest(sqlite_tmp_pat
     migrated = SQLiteProgramStore.restore_backup(old_bundle, sqlite_tmp_path / "migrated.sqlite3")
     with SQLiteProgramStore(migrated) as old_restore:
         assert old_restore.load("program-1") == expected
-        assert old_restore.startup_evidence.schema_version == 6
+        assert old_restore.startup_evidence.schema_version == 7
     with SQLiteProgramStore(path) as store:
         assert store.load("program-1") == expected
         assert store.create(spec(), "same-command") == expected

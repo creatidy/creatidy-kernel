@@ -17,6 +17,7 @@ from creatidy_kernel.core.domain import (
     SpecAmendment,
     WorkUnit,
 )
+from creatidy_kernel.core.drivers import DriverSubject
 from creatidy_kernel.core.forge import Observation, Page, Reference
 from creatidy_kernel.core.intake import (
     BaselineSnapshot,
@@ -37,6 +38,7 @@ from creatidy_kernel.core.intake import (
     object_from,
     strings,
 )
+from creatidy_kernel.core.ordinary_qualified import QualifiedBaseline
 from creatidy_kernel.core.resources import Allocation, ResourceRequest
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy
 from creatidy_kernel.ports.program_store import ApplicationStore, OperationRecord, ProgramReadChanged
@@ -355,6 +357,41 @@ class OrdinaryIntake:
             elif inner["kind"] == "ordinary-baseline-age" and inner["identity"] == identity:
                 age = _integer(inner["observed_at"])
                 known_age = age if known_age is None else min(known_age, age)
+        for record in self.store.operations("ordinary-program:qualified-baseline-age:"):
+            raw = self.store.find_artifact(record.operation_id, "record")
+            if raw is None:
+                raise IntakeRefused("qualified baseline age record is incomplete")
+            value = object_from(raw)
+            if set(value) != {"meaning", "observed_at"}:
+                raise IntakeRefused("qualified baseline age record differs")
+            meaning = object_from(encode(value["meaning"]))
+            expected = {"source", "recipe_digest", "producer", "reference", "result"}
+            if set(meaning) not in (expected, expected | {"proof"}):
+                raise IntakeRefused("qualified baseline meaning differs")
+            try:
+                qualified = QualifiedBaseline(
+                    DriverSubject.parse(_text(meaning["source"])),
+                    _text(meaning["recipe_digest"]),
+                    _text(meaning["producer"]),
+                    _text(meaning["reference"]),
+                    _text(meaning["result"]),
+                    _integer(value["observed_at"]),
+                    bytes.fromhex(_text(meaning["proof"])) if "proof" in meaning else b"",
+                )
+            except (ValueError, TypeError) as error:
+                raise IntakeRefused("qualified baseline age record differs") from error
+            request = object_from(encode(object_from(record.request_json.encode()).get("request")))
+            if (
+                qualified.meaning != meaning
+                or record.operation_id
+                != f"ordinary-program:qualified-baseline-age:{digest(encode(meaning))}:{qualified.observed_at}"
+                or record.effect_key != record.operation_id
+                or record.attempts
+                or request != {"kind": "ordinary-intake-record", "version": 1, "bytes": raw.decode()}
+            ):
+                raise IntakeRefused("qualified baseline age record differs")
+            if (qualified.producer, qualified.reference) == (evidence.baseline_producer, evidence.baseline_reference):
+                known_age = qualified.observed_at if known_age is None else min(known_age, qualified.observed_at)
         for task_id in sorted(task_ids):
             for draft in self.history(task_id):
                 old = draft.evidence
@@ -536,16 +573,43 @@ class OrdinaryIntake:
             or current.issue_state != "open"
             or current.disposition is not Disposition.REMAINS
             or current.recipe_digest != digest(encode(draft.declaration.value["recipes"]))
-            or current.baseline_producer not in policy.evidence_producers
-            or current.relevance_producer not in policy.evidence_producers
             or current.relevance_reference != f"sha256:{digest(current.relevance_proof)}"
         ):
             raise IntakeRefused("required current evidence unresolved")
-        if current.baseline_result != "passed" and not (
-            current.baseline_result == "failed" and policy.repair_baseline_reference == current.baseline_reference
+        OrdinaryIntake.validate_shared_policy(
+            principal,
+            draft.declaration,
+            policy,
+            current.baseline_producer,
+            current.baseline_reference,
+            current.baseline_result,
+            current.relevance_producer,
+        )
+
+    @staticmethod
+    def validate_shared_policy(
+        principal: Principal,
+        declaration: Declaration,
+        policy: OwnerPolicy,
+        baseline_producer: str,
+        baseline_reference: str,
+        baseline_result: str,
+        relevance_producer: str,
+    ) -> None:
+        """Apply the same owner, producer, baseline and declaration bounds to either intake."""
+        if (
+            type(principal) is not Principal
+            or principal.role != "owner"
+            or principal.actor_id != policy.authority.owner_id
+        ):
+            raise IntakeRefused("authenticated owner required")
+        if baseline_producer not in policy.evidence_producers or relevance_producer not in policy.evidence_producers:
+            raise IntakeRefused("required current evidence unresolved")
+        if baseline_result != "passed" and not (
+            baseline_result == "failed" and policy.repair_baseline_reference == baseline_reference
         ):
             raise IntakeRefused("baseline unavailable or unrelated failure")
-        data = draft.declaration.value
+        data = declaration.value
         if strings(data["unknowns"]):
             raise IntakeRefused("required meaning remains unknown")
         for name, allowed in (
