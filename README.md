@@ -502,10 +502,41 @@ than being interpreted as success.
 
 The original approved source is materialized only after the shared resource claim. Exact controller
 preparation has its own immutable schema-6 evidence; interrupted preparation and unrecognized workspace
-bytes remain retained and require reconciliation. Schema-5 readers refuse schema 6 before issuing work.
+bytes remain retained and require reconciliation. SQLite schema 7 fences older readers from qualified
+proposal authority; prior schemas are backed up before migration. Schema-5 and schema-6 readers refuse
+the newer schema before issuing work.
 `make package-check` exercises installed pull, managed and mixed two-obligation Programs, reopen,
 remediation, STOP and a lost Forgejo response without a duplicate send. The narrower `task run` command
 below remains limited to frozen TaskSpecs and is not the ordinary SDK.
+
+`OrdinaryProgram.observe_qualified_dependencies` can also read an inert version-1 qualified dependency
+cut using an independently supplied work driver. The cut preserves native bytes, edge identities and
+types, exact qualified subjects, provenance and the distinction between a complete native enumeration
+and a finite visible-scope obligation. Every visible edge must be explicitly classified. This observer
+and `recheck_qualified_dependencies` do not themselves authenticate an obligation or authorize execution.
+An existing Forgejo-based Program proposal may include cuts as additional owner-reviewed context in a
+version-2 proposal. Version-3 proposals can additionally select qualified work as ordinary WorkUnits,
+with required native edges resolved only to exact selected qualified subjects and revisions. The
+independently configured SCM ref, trusted baseline and relevance observations, declarations and cuts
+enter the owner-reviewed scope and are rechecked by the ordinary path. The bounded
+`JenkinsQualifiedBaseline` reader requires a host-configured exact build-to-recipe profile; Jenkins
+success alone does not establish that mapping. Its content-addressed proof exposes that profile,
+the exact build and SCM commit, and the retained native observation to the owner-reviewed proposal.
+Historical qualified baseline records without that proof remain decodable but cannot authorize new work.
+`GitHubJiraLiteralReadiness` requires owner-supplied
+exact literal criteria, Jira open-status IDs, and an explicit repository-visibility attestation. It
+uses the separately version-qualified GitHub REST `2026-03-10` all-open pull-request listing and
+checks each exact head against the criteria. It refuses missing objects, differing base commits,
+incomplete or moving scans, unknown state and unsupported versions. Two stable bounded scans are not
+an atomic remote snapshot, and literal equality is not general semantic equivalence. These producers
+do not execute repository recipes or replace owner approval. Recheck retains original freshness bounds
+and earlier matching legacy or qualified receipt ages. Jira visible
+links remain incomplete; a decision reference alone does not make them complete or prove owner approval.
+An optional Jenkins CI check binds owner-reviewed build slots to each exact candidate commit; CI success
+is one verification input, not task acceptance. Provider synchronization remains a separately authorized
+`DriverApplication` operation, not an automatic consequence of acceptance. Legacy Forgejo draft and
+version-1 proposal bytes are unchanged. The heterogeneous test uses these shipped producers against
+synthetic provider services and host policy; it does not establish live product readiness.
 
 ## Local Owner-Served State
 
