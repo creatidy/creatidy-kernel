@@ -58,6 +58,7 @@ from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.domain import AuthorityEnvelope, BudgetPolicy, CancelProgram, PauseProgram, ResumeProgram
 from creatidy_kernel.core.drivers import (
     DriverDelivery,
+    DriverFact,
     DriverMutation,
     DriverSubject,
     EdgeObligation,
@@ -405,6 +406,122 @@ def test_qualified_readiness_rejects_incomplete_moving_or_equivalent_inventory(
 
     with patch.object(scm.http, "request", contradictory_page):
         assert reader().read_readiness(cut, source, declared) is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["advance-jira", "advance-scm", "advance-context", "expire-cut", "expire-work", "expire-source", "expire-context"],
+)
+def test_qualified_readiness_uses_current_time_without_renewing_evidence(
+    services: SyntheticServices, tmp_path: Path, case: str
+) -> None:
+    clock = Clock()
+    project, scm, knowledge, _ = configured(services, clock)
+    jira = cast(JiraWorkManagement, project.work)
+    jira.ttl = 200
+    scm.ttl = 2 if case == "expire-source" else 30 if case.startswith("advance-") else 200
+    knowledge.ttl = 2 if case == "expire-context" else 30 if case.startswith("advance-") else 200
+    repository = tmp_path / "timed-source"
+    repository.mkdir()
+    reference_git(repository, "init", "--initial-branch=feature")
+    (repository / "result.txt").write_text("original\n")
+    reference_git(repository, "add", "result.txt")
+    reference_git(repository, "commit", "-m", "Synthetic original")
+    services.head = reference_git(repository, "rev-parse", "HEAD").strip()
+    reference_git(repository, "remote", "add", "origin", scm.binding.origin + "/" + scm.binding.namespace + ".git")
+    services.pages[18] = services.page(18, "Earlier", "<p>earlier</p>", "fixture")
+
+    work = project.work.work("ENG-42")
+    cut_deadline = 102 if case == "expire-cut" else 200
+    obligation = EdgeObligation(
+        work.fact.subject, driver_digest([asdict(edge) for edge in work.dependencies]), "owner:scope", cut_deadline
+    )
+    cut = QualifiedDependencyCut.capture(
+        work, tuple(sorted((edge.identity, False) for edge in work.dependencies)), 100, obligation=obligation
+    )
+    source = scm.ref("feature").subject
+    if case == "expire-work":
+        jira.ttl = 2
+    criterion = ContentCriterion("result.txt", b"target\n")
+    declared = declaration(criteria=[criterion.criterion])
+    readiness = GitHubJiraLiteralReadiness(
+        project.work,
+        scm,
+        repository,
+        ((work.fact.subject, (criterion,)),),
+        frozenset({"3"}),
+        ((knowledge, "900", "19"), (knowledge, "900", "18")),
+        Principal("owner", "owner"),
+        "owner:fixture-complete-repository-visibility",
+        clock.wall,
+        max_pages=3,
+    )
+
+    def inventory(_method: str, path: str, _body: object) -> tuple[int, object] | None:
+        return (200, []) if urlsplit(path).path == "/repos/acme/service/pulls" else None
+
+    services.filter = inventory
+    advanced = [False]
+    trigger = {
+        "advance-jira": "/rest/api/3/issue/ENG-42",
+        "advance-scm": "/repos/acme/service/git/ref/heads/feature",
+        "advance-context": "/wiki/api/v2/pages/900",
+    }.get(case, "/repos/acme/service/pulls")
+
+    def advance(_method: str, path: str) -> None:
+        if not advanced[0] and path == trigger:
+            advanced[0] = True
+            clock.now = 101 if case.startswith("advance-") else 103
+
+    services.client_after = advance
+    work_reads: list[WorkObservation] = []
+    source_reads: list[DriverFact] = []
+    context_reads: list[DriverFact] = []
+    original_work, original_ref, original_content = project.work.work, scm.ref, knowledge.content
+
+    def read_work(key: str) -> WorkObservation:
+        result = original_work(key)
+        work_reads.append(result)
+        return result
+
+    def read_ref(key: str) -> DriverFact:
+        result = original_ref(key)
+        source_reads.append(result)
+        return result
+
+    def read_content(key: str, revision: str) -> DriverFact:
+        result = original_content(key, revision)
+        context_reads.append(result)
+        return result
+
+    with (
+        patch.object(project.work, "work", side_effect=read_work),
+        patch.object(scm, "ref", side_effect=read_ref),
+        patch.object(knowledge, "content", side_effect=read_content),
+    ):
+        result = readiness.read_readiness(cut, source, declared)
+
+    assert advanced[0] and len(work_reads) == len(source_reads) == 2 and len(context_reads) == 4
+    if case.startswith("advance-"):
+        assert result is not None and result.observed_at == 100 and cut.fresh_until == 200
+        if case == "advance-jira":
+            assert source_reads[0].observed_at == 101 and source_reads[0].fresh_until == result.fresh_until == 131
+        elif case == "advance-scm":
+            assert source_reads[0].observed_at == 100 and context_reads[0].observed_at == 101
+            assert context_reads[0].fresh_until == 131 and result.fresh_until == 130
+        else:
+            assert context_reads[0].observed_at == 100 and context_reads[1].observed_at == 101
+            assert context_reads[1].fresh_until == 131 and result.fresh_until == 130
+    else:
+        assert result is None and clock.now == 103
+        if case == "expire-cut":
+            assert cut.fresh_until == 102 and work_reads[0].fact.fresh_until > clock.now
+        elif case == "expire-work":
+            assert work_reads[0].fact.fresh_until == 102 and cut.fresh_until == 200
+        elif case == "expire-source":
+            assert source_reads[0].fresh_until == 102 and source_reads[1].observed_at == 103
+        else:
+            assert context_reads[0].fresh_until == 102 and context_reads[2].observed_at == 103
 
 
 @pytest.mark.parametrize(

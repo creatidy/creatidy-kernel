@@ -157,20 +157,20 @@ class GitHubJiraLiteralReadiness:
         try:
             started = self.clock()
             work = self.work.work(cut.subject.key)
-            cut.recheck(work, started)
+            cut.recheck(work, self.clock())
             issue = object_from(work.fact.native)
             status = object_value(object_value(issue.get("fields")).get("status"))
             if status.get("id") not in self.open_status_ids:
                 return None
             initial_source = self.source.ref(source.key)
-            initial_source.require_current(started)
+            initial_source.require_current(self.clock())
             if initial_source.subject != source:
                 return None
             initial_contexts = tuple(driver.content(key, revision) for driver, key, revision in self.contexts)
             for fact, (driver, key, revision), binding in zip(
                 initial_contexts, self.contexts, self.context_bindings, strict=True
             ):
-                fact.require_current(started)
+                fact.require_current(self.clock())
                 if driver.binding != binding or fact.subject != DriverSubject(binding, "page", key, revision):
                     return None
             inventory = self._inventory()
@@ -202,8 +202,8 @@ class GitHubJiraLiteralReadiness:
             closing_work = self.work.work(cut.subject.key)
             closing_contexts = tuple(driver.content(key, revision) for driver, key, revision in self.contexts)
             now = self.clock()
+            cut.recheck(work, now)
             cut.recheck(closing_work, now)
-            closing_source.require_current(now)
             if (
                 closing_inventory is None
                 or [(fact.subject, fact.native) for fact in inventory]
@@ -220,7 +220,14 @@ class GitHubJiraLiteralReadiness:
                 or tuple(driver.binding for driver, _, _ in self.contexts) != self.context_bindings
             ):
                 return None
-            for fact in (*inventory, *closing_inventory, *closing_contexts):
+            for fact in (
+                initial_source,
+                closing_source,
+                *initial_contexts,
+                *closing_contexts,
+                *inventory,
+                *closing_inventory,
+            ):
                 fact.require_current(now)
             proof = encode(
                 {
