@@ -96,7 +96,7 @@ from creatidy_kernel.core.ordinary_qualified import (
 )
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, WorkClaim
-from creatidy_kernel.core.verification import VerificationPolicy
+from creatidy_kernel.core.verification import EvidenceSubject, VerificationPolicy
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.drivers import DriverApplication, DriverDraftGrant, DriverEffectGrant
 from creatidy_kernel.ports.intake import OrdinaryIntake
@@ -520,6 +520,39 @@ def test_qualified_readiness_rejects_incomplete_moving_or_equivalent_inventory(
 
     configured_reader.work_is_open = closed_work
     assert configured_reader.read_readiness(cut, source, declared) is None
+
+    def matching_work(observed: WorkObservation) -> bool:
+        return observed.fact.subject == work.fact.subject
+
+    configured_reader.work_is_open = matching_work
+    change = replace(
+        project.scm.ref(source.key),
+        subject=DriverSubject(scm.binding, "change", "7", source.revision),
+        native=encode({"fixture": "native-format-without-normalized-relationships"}),
+        related=(DriverSubject(scm.binding, "commit", source.revision or "", source.revision),) * 2,
+    )
+    related_scan = replace(scan, items=(change,))
+    configured_reader.inventory = lambda: related_scan
+    stable_related = configured_reader.read_readiness(cut, source, declared)
+    assert stable_related is not None
+    assert json.loads(stable_related.proof)["role_evidence"][-1]["related"] == [
+        subject.reference for subject in change.related
+    ]
+    related_calls = [0]
+
+    def changed_related_only() -> DriverScan:
+        related_calls[0] += 1
+        if related_calls[0] == 1:
+            return related_scan
+        closing = replace(
+            change, related=(change.related[0], replace(change.related[1], key="f" * 40, revision="f" * 40))
+        )
+        assert closing.native == change.native and closing.subject == change.subject
+        return replace(related_scan, items=(closing,))
+
+    configured_reader.inventory = changed_related_only
+    assert configured_reader.read_readiness(cut, source, declared) is None
+    assert related_calls[0] == 2
     for mode in (
         "denied",
         "malformed",
@@ -1301,6 +1334,29 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         )
         assert workspace.source.resolve().is_relative_to(sqlite_tmp_path.resolve())
         assert workspace.objects.resolve().is_relative_to(sqlite_tmp_path.resolve())
+        unapproved_interpretations: list[tuple[str, int]] = []
+
+        def unsafe_ci_interpretation(_: DriverFact, now: int) -> tuple[str, int]:
+            unapproved_interpretations.append(("passed", now))
+            return "passed", now
+
+        if mode == "completion":
+            assert "profile" not in json.loads(proposal.qualified_drafts[0].baseline.proof)
+            for producer in ("different-profile:v1", "jenkins-exact:v1"):
+                unsafe = QualifiedCIProfile(project.ci, project.ci.binding, producer, unsafe_ci_interpretation)
+                with pytest.raises(IntakeRefused, match="interpretation differs from approved profile"):
+                    OrdinaryGitWorkspace(
+                        store,
+                        tree,
+                        repository,
+                        repository_url,
+                        proposal,
+                        workspace.commands,
+                        ("Fixture", "fixture@example.invalid"),
+                        authority_deadline=approved.expires_at,
+                        qualified_ci_profile=unsafe,
+                    )
+            assert not unapproved_interpretations and not workspace.objects.exists()
         if composable:
             before_profile_refusal = store.operations()
             for missing_profile in (
@@ -1586,6 +1642,17 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             assert len(ci_operations) == 1
             evidence = json.loads(store.artifact(ci_operations[0].operation_id, "result"))
             assert evidence["passed"] and evidence["subject"]["head_revision"] == candidate_head
+            if mode == "completion":
+                before_reinterpretation = store.operations()
+                before_ci_requests = len(services.requests)
+                unsafe = QualifiedCIProfile(
+                    project.ci, project.ci.binding, "jenkins-exact:v1", unsafe_ci_interpretation
+                )
+                with patch.object(remediation_workspace, "qualified_ci_profile", unsafe):
+                    checker = ordinary_workspace_module._QualifiedCICheck(remediation_workspace)  # pyright: ignore[reportPrivateUsage]
+                    assert checker.check("ci", EvidenceSubject(**cast(dict[str, str], evidence["subject"]))) is None
+                assert not unapproved_interpretations and len(services.requests) == before_ci_requests
+                assert store.operations() == before_reinterpretation
             ci_reference = evidence["artifact_reference"].removeprefix("sha256:")
             ci_payload = json.loads(
                 store.artifact("runtime:" + remediation.attempt.attempt_id, "qualified-ci:" + ci_reference)

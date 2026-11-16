@@ -28,6 +28,18 @@ class QualifiedCIProfile:
             raise ValueError("exact configured CI interpretation profile required")
         self.ci, self.binding, self.producer, self.interpret = ci, binding, producer, interpret
 
+    def matches_approval(self, proof: bytes) -> bool:
+        approved = object_from(proof).get("profile")
+        if approved is not None:
+            return approved == self.producer
+        # Before configurable profiles shipped, candidate verification always used
+        # this Jenkins contract. Absence is not permission to select a new one.
+        return (
+            self.binding.implementation == "jenkins"
+            and self.producer == "jenkins-exact:v1"
+            and self.interpret is jenkins_result
+        )
+
     def read(
         self, selected: DriverSubject, source: DriverSubject, now: Callable[[], int]
     ) -> tuple[DriverFact, str, int] | None:

@@ -197,16 +197,17 @@ class LiteralReadiness:
             if (
                 closing_inventory is None
                 or [
-                    (fact.subject, fact.native, fact.provenance, fact.qualification, fact.complete)
+                    (fact.subject, fact.native, fact.related, fact.provenance, fact.qualification, fact.complete)
                     for fact in inventory
                 ]
                 != [
-                    (fact.subject, fact.native, fact.provenance, fact.qualification, fact.complete)
+                    (fact.subject, fact.native, fact.related, fact.provenance, fact.qualification, fact.complete)
                     for fact in closing_inventory
                 ]
                 or (
                     initial_source.subject,
                     initial_source.native,
+                    initial_source.related,
                     initial_source.provenance,
                     initial_source.qualification,
                     initial_source.complete,
@@ -214,16 +215,17 @@ class LiteralReadiness:
                 != (
                     closing_source.subject,
                     closing_source.native,
+                    closing_source.related,
                     closing_source.provenance,
                     closing_source.qualification,
                     closing_source.complete,
                 )
                 or [
-                    (fact.subject, fact.native, fact.provenance, fact.qualification, fact.complete)
+                    (fact.subject, fact.native, fact.related, fact.provenance, fact.qualification, fact.complete)
                     for fact in initial_contexts
                 ]
                 != [
-                    (fact.subject, fact.native, fact.provenance, fact.qualification, fact.complete)
+                    (fact.subject, fact.native, fact.related, fact.provenance, fact.qualification, fact.complete)
                     for fact in closing_contexts
                 ]
                 or self.work.binding != self.work_binding
@@ -294,6 +296,7 @@ class LiteralReadiness:
                         "subject": fact.subject.reference,
                         "digest": fact.observation_digest,
                         "provenance": fact.provenance,
+                        "related": [subject.reference for subject in fact.related],
                         "qualification": fact.qualification,
                         "complete": fact.complete,
                     }

@@ -82,8 +82,7 @@ class OrdinaryGitWorkspace:
             profile = self.qualified_ci_profile
             if profile is None or any(selected.binding != profile.binding for selected in draft.ci_subjects):
                 raise IntakeRefused("required candidate CI binding unavailable or incompatible")
-            approved_profile = object_from(draft.baseline.proof).get("profile") if draft.baseline.proof else None
-            if approved_profile is not None and profile.producer != approved_profile:
+            if not draft.baseline.proof or not profile.matches_approval(draft.baseline.proof):
                 raise IntakeRefused("candidate CI interpretation differs from approved profile")
         self.max_bytes = max_bytes
         if type(authority_deadline) is not int or authority_deadline <= 0:
@@ -703,8 +702,7 @@ class _QualifiedCICheck:
         draft = next((item for item in owner.proposal.qualified_drafts if item.task_id == attempt.work_unit_id), None)
         if draft is None:
             return None
-        approved_profile = object_from(draft.baseline.proof).get("profile")
-        if approved_profile is not None and approved_profile != profile.producer:
+        if not profile.matches_approval(draft.baseline.proof):
             return None
         program = owner.store.load(attempt.program_id)
         attempts = [item.spec.attempt_id for item in program.attempts if item.spec.work_unit_id == attempt.work_unit_id]
