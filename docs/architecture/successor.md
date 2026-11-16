@@ -18,6 +18,12 @@ below are historical, not active delivery instructions. #105 remains owner-defer
 heterogeneous-provider acceptance still required for broad #60 completion. Optional managed push
 reception remains profile-specific; no particular harness is mandatory. No product GO is implied.
 
+The #105 deferral above describes the November 8 decision cut, not its later disposition:
+#105/PR #111 and #133/PR #134 are integrated. The [#60 offline recovery report](acceptance-60-offline.md)
+records the later exact-version installed evidence, rejected PR #135 history, qualified-export
+producer/consumer correction and separately unreceived live gate. Historical inventories below are
+not promoted into current product-GO or complete-acceptance claims.
+
 ## Full-Product Delivery Sequence
 
 The [complete backlog publication plan](backlog-alignment.md) gives every open issue's disposition,

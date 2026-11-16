@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import asdict, replace
+from decimal import Decimal
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -60,7 +61,15 @@ from creatidy_kernel.adapters.sqlite_store import (
 )
 from creatidy_kernel.adapters.task_execution import VerificationCommand
 from creatidy_kernel.core.authority import Principal
-from creatidy_kernel.core.domain import AuthorityEnvelope, BudgetPolicy, CancelProgram, PauseProgram, ResumeProgram
+from creatidy_kernel.core.domain import (
+    AttemptSpec,
+    AuthorityEnvelope,
+    BudgetPolicy,
+    CancelProgram,
+    PauseProgram,
+    PrepareAttempt,
+    ResumeProgram,
+)
 from creatidy_kernel.core.drivers import (
     DriverDelivery,
     DriverFact,
@@ -78,12 +87,20 @@ from creatidy_kernel.core.ordinary_qualified import (
     QualifiedDependencyCut,
     QualifiedDraft,
 )
+from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, WorkClaim
 from creatidy_kernel.core.verification import VerificationPolicy
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.drivers import DriverApplication, DriverDraftGrant, DriverEffectGrant
 from creatidy_kernel.ports.intake import OrdinaryIntake
-from creatidy_kernel.ports.ordinary import DependencyReader, OrdinaryProgram, OrdinaryReviewer, OrdinaryStore
+from creatidy_kernel.ports.ordinary import (
+    DependencyReader,
+    OrdinaryProgram,
+    OrdinaryReviewer,
+    OrdinaryStore,
+    proposal_from,
+)
+from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.ownership import WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
 from tools.check_drivers import (
@@ -108,6 +125,51 @@ def services() -> Iterator[SyntheticServices]:
         yield service
     finally:
         service.close()
+
+
+@pytest.mark.parametrize(
+    "required",
+    [
+        "strict_routing",
+        "exact_pin_admission",
+        "no_hidden_calls",
+        "hard_inference_quota",
+        "physical_settlement",
+        "provider_key_secrecy",
+        "shell_egress_denial",
+        "outside_workspace_read_denial",
+        "strict_native_expiry",
+        "escaped_descendant_containment",
+    ],
+)
+def test_requested_unsupported_strict_profile_refuses_before_recording(sqlite_tmp_path: Path, required: str) -> None:
+    # Reused from rejected b2c61bff: unknown demands, not new profile fields.
+    clock = Clock()
+    legacy = Scenario()
+    budget = WorkBudgetPolicy(tuple((kind, 10) for kind in WorkKind), 1, 100_000)
+    policy = replace(intake_policy(), work_budget=budget, project_budget=budget, project_id="strict-refusal")
+    profile: dict[str, object] = {
+        "harness": "kilo-pull",
+        "provider": None,
+        "model": None,
+        "effort": None,
+        "trust": "trusted_development",
+        required: True,
+    }
+    with SQLiteProgramStore(sqlite_tmp_path / "strict.db", boot_clock=clock.boot) as store:
+        with patch.object(store, "finalize_artifact", side_effect=AssertionError("refused profile recorded evidence")):
+            with pytest.raises(IntakeRefused, match="closed owner-bound basic harness profile required"):
+                OrdinaryProgram(
+                    store,
+                    OrdinaryIntake(store, legacy.reader, clock.wall),
+                    ForgejoDiscovery(legacy.transport, clock.wall, max_pages=2, freshness_seconds=30),
+                    Principal("owner", "owner"),
+                    policy,
+                    VerificationPolicy(policy.reference, ("paths", "structural", "commands")),
+                    clock.wall,
+                    execution_profile=encode(profile),
+                )
+        assert not store.operations() and store.find_program("strict-refusal") is None
 
 
 def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, sqlite_tmp_path: Path) -> None:
@@ -182,6 +244,32 @@ def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, 
         assert guards and approved.proposal == proposal
         assert app.recover("decision").proposal == proposal
         app.check(approved)
+        # Actual v1/v2 producer compatibility; no fabricated acceptance or live peers.
+        assert proposal_from(encode(replace(proposal, qualified_cuts=()).payload)).payload["version"] == 1
+        assert proposal_from(encode(proposal.payload)) == proposal
+        active = app.activate(approved)
+        prepared = store.admit(
+            "qualified",
+            "prepare-export",
+            PrepareAttempt(
+                active.revision,
+                "owner",
+                AttemptSpec(
+                    "v2-attempt",
+                    "qualified",
+                    "one",
+                    active.spec.revision,
+                    active.spec.digest,
+                    active.spec.initial_inputs,
+                    context_reference="ordinary-proposal:" + proposal.digest,
+                ),
+            ),
+        )
+        assert len(prepared.attempts) == 1
+        v2_export = export_private_outcome(store, "qualified", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+        native = cast(list[dict[str, object]], v2_export["native_subjects"])
+        assert len(native) == 1 and native[0]["driver"] == "ordinary-proposal-v1"
+        assert cast(list[object], native[0]["qualified_dependencies"])
 
     with SQLiteProgramStore(path, boot_clock=clock.boot) as store:
         app = application(store)
@@ -541,6 +629,17 @@ def test_qualified_readiness_uses_current_time_without_renewing_evidence(
         "baseline-failed",
         "baseline-unavailable",
         "owner-mismatch",
+        "incomplete-jira",
+        "incomplete-inventory",
+        "unsupported-version",
+        "admission-source",
+        "admission-policy",
+        "admission-dependency",
+        "admission-outage",
+        "admission-expired",
+        "sync-reopen",
+        "sync-ambiguous-reopen",
+        "export-unknown",
     ],
 )
 def test_qualified_work_dag_owner_approval_and_reopen(
@@ -595,6 +694,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     services.head = source_revision
     active_workspace: list[OrdinaryGitWorkspace] = []
     context_drift = [False]
+    admission_fault: list[str | None] = [None]
     output_pages = {19: deepcopy(services.page(19, "Output", "<p>unmodified</p>", "fixture original"))}
     output_pages[19]["id"] = "901"
     output_version = [19]
@@ -615,6 +715,17 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         )
         if provider is None or services.requests[-1][3] != tokens[provider]["read" if method == "GET" else "write"]:
             return 403, {"error": "synthetic credential refused"}
+        if admission_fault[0] == "admission-outage" and provider == "jira":
+            return 503, {"error": "synthetic required work provider unavailable"}
+        if admission_fault[0] in {"incomplete-jira", "admission-dependency"} and path.startswith("/rest/api/3/issue/"):
+            status, value = services.route(method, path, body)
+            data = deepcopy(cast(dict[str, object], value))
+            fields = cast(dict[str, object], data["fields"])
+            if admission_fault[0] == "incomplete-jira":
+                fields.pop("issuelinks")
+            else:
+                fields["issuelinks"] = []
+            return status, data
         if context_drift[0] and path.startswith("/wiki/api/v2/pages/900"):
             status, value = services.route(method, path, body)
             data = deepcopy(cast(dict[str, object], value))
@@ -639,6 +750,8 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             version = int(parse_qs(urlsplit(path).query).get("version", [str(output_version[0])])[0])
             return (200, output_pages[version]) if version in output_pages else (404, {})
         if urlsplit(path).path == "/repos/acme/service/pulls":
+            if admission_fault[0] == "incomplete-inventory":
+                return 200, {"message": "incomplete listing, not an empty page"}
             query = parse_qs(urlsplit(path).query)
             assert query["state"] == ["open"] and query["per_page"] == ["100"]
             pull = services.pull()
@@ -822,6 +935,25 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 and auth == tokens["jenkins"]["read"]
                 for method, path, _, auth in services.requests
             )
+            return
+        if mode in {"incomplete-jira", "incomplete-inventory", "unsupported-version"}:
+            original_cut = capture(predecessor, False)
+            admission_fault[0] = mode
+            if mode == "unsupported-version":
+                transports[1].headers["X-GitHub-Api-Version"] = "2022-11-28"
+            if mode == "incomplete-jira":
+                assert not project.work.work("ENG-41").dependencies_complete
+            before = store.operations()
+            with pytest.raises(ValueError):
+                app.prepare_qualified(
+                    "first",
+                    work_declaration(criteria=[first_criterion.criterion]),
+                    original_cut,
+                    source,
+                    relevance_reason="work remains",
+                )
+            assert store.find_program("qualified-dag") is None and store.operations() == before
+            assert not (sqlite_tmp_path / "owned").exists()
             return
         first = app.prepare_qualified(
             "first",
@@ -1037,6 +1169,29 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         active_workspace.append(workspace)
         reviewer = cast(OrdinaryReviewer, MagicMock(authority_deadline=approved.expires_at))
         client = app.client(approved, Principal("worker", "worker"), workspace, worker, control, reviewer)
+        if mode.startswith("admission-"):
+            if mode == "admission-source":
+                services.head = "f" * 40
+            elif mode == "admission-policy":
+                app.policy = replace(policy, effects=policy.effects | {"unapproved-effect"})
+            elif mode == "admission-expired":
+                clock.now = approved.expires_at
+            else:
+                admission_fault[0] = mode
+            before = (store.history("qualified-dag"), store.operations())
+            with pytest.raises(ValueError):
+                client.request("refused-request", lease_seconds=10)
+            assert (store.history("qualified-dag"), store.operations()) == before
+            assert not store.load("qualified-dag").attempts and not store.load("qualified-dag").satisfactions
+            assert not workspace.objects.exists() and not command_marker.exists()
+            assert not cast(MagicMock, reviewer).mock_calls
+            assert not any(
+                method == "GET"
+                and any(f"/{item}/api/json" in path for item in (12, 13, 14))
+                and auth == tokens["jenkins"]["read"]
+                for method, path, _, auth in services.requests
+            )
+            return
         if mode == "preparation-race":
             caller_revision = store.load("qualified-dag").revision
             original_observe = WorkOwnership.observe
@@ -1284,13 +1439,82 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 is EffectStatus.UNKNOWN
             )
             assert store.operation("qualified-sync") == pending
+            history = store.history("qualified-dag")
+            if mode in {"sync-reopen", "sync-ambiguous-reopen"}:
+                store.close()
+                store = stores.enter_context(
+                    SQLiteProgramStore(sqlite_tmp_path / "qualified-dag.db", boot_clock=clock.boot)
+                )
+                app.store = store
+                app.intake = OrdinaryIntake(store, legacy.reader, clock.wall)
+                recovered = app.recover(decision)
+                assert recovered.proposal == approved.proposal and recovered.expires_at == approved.expires_at
+                assert recovered.program == store.load("qualified-dag")
+                assert store.history("qualified-dag") == history and store.operation("qualified-sync") == pending
+                remediation_control = WorkOwnership(
+                    store,
+                    Principal("owner", "owner"),
+                    remediation_tree,
+                    mode=HandoffMode.PULL,
+                    profile=COOPERATIVE_PROFILE,
+                )
+                synchronization = DriverApplication(
+                    store,
+                    remediation_control,
+                    project,
+                    (scm, knowledge),
+                    clock.wall,
+                    lambda claim, requested: pytest.fail("reconciliation requested fresh effect authority"),
+                    lease_seconds=5,
+                    authorize_draft=lambda claim, requested, key: pytest.fail(
+                        "reconciliation requested fresh draft authority"
+                    ),
+                )
+                if mode == "sync-ambiguous-reopen":
+                    cast(dict[str, object], output_pages[20]["version"])["message"] = "foreign operation"
             clock.now += 6
-            receipt = synchronization.synchronize(remediation.claim, "qualified-sync", "qualified-sync", mutation)
-            assert receipt.status is EffectStatus.ACCEPTED
-            assert (
+            receipt = (
+                unknown
+                if mode == "export-unknown"
+                else synchronization.synchronize(remediation.claim, "qualified-sync", "qualified-sync", mutation)
+            )
+            if mode in {"sync-reopen", "sync-ambiguous-reopen"}:
+                assert receipt.operation == unknown.operation
+                reconciled = store.operation("qualified-sync")
+                assert (reconciled.request_digest, reconciled.fence, reconciled.attempts) == (
+                    pending.request_digest,
+                    pending.fence,
+                    1,
+                )
+                assert store.history("qualified-dag") == history
+                assert app.recover(decision).expires_at == approved.expires_at
+                assert len(store.load("qualified-dag").satisfactions) == 1
+                assert tuple(item.work_unit_id for item in store.load("qualified-dag").ready_work_units) == ("second",)
+                if mode == "sync-ambiguous-reopen":
+                    assert receipt.status is EffectStatus.UNKNOWN
+                    assert store.find_artifact("qualified-sync", "driver-receipt") is None
+                else:
+                    assert receipt.status is EffectStatus.ACCEPTED
+                    assert store.find_artifact("qualified-sync", "driver-receipt") is not None
+                assert (
+                    synchronization.synchronize(remediation.claim, "qualified-sync", "qualified-sync", mutation)
+                    == receipt
+                )
+                assert (
+                    sum(
+                        method == "PUT" and path.startswith("/wiki/api/v2/pages/901")
+                        for method, path, _, _ in services.requests
+                    )
+                    == denied_puts + 1
+                )
+                if mode == "sync-ambiguous-reopen":
+                    return
+            if mode != "export-unknown":
+                assert receipt.status is EffectStatus.ACCEPTED
+            assert mode == "export-unknown" or (
                 synchronization.synchronize(remediation.claim, "qualified-sync", "qualified-sync", mutation) == receipt
             )
-            assert store.find_artifact("qualified-sync", "driver-receipt") is not None
+            assert (store.find_artifact("qualified-sync", "driver-receipt") is not None) == (mode != "export-unknown")
             assert (
                 sum(
                     method == "PUT" and path.startswith("/wiki/api/v2/pages/901")
@@ -1372,6 +1596,195 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             assert len(calls) >= 3
         assert store.load("qualified-dag").status.value == "completed"
         assert len(store.load("qualified-dag").satisfactions) == 2
+        original_usage = UsageObservation(
+            "known",
+            remediation.attempt.attempt_id,
+            "synthetic-receipt",
+            "money",
+            "USD",
+            Decimal("2"),
+            Provenance.PROVIDER_REPORT,
+            "synthetic-private-provider",
+            100,
+        )
+        store.record_usage("qualified-sync", original_usage)
+        store.record_usage(
+            "qualified-sync",
+            replace(original_usage, observation_id="corrected", quantity=Decimal("4"), supersedes_id="known"),
+        )
+        store.record_usage(
+            "qualified-sync",
+            replace(
+                original_usage,
+                observation_id="estimate",
+                receipt_id="estimated-receipt",
+                quantity=Decimal("7"),
+                provenance=Provenance.ESTIMATE,
+            ),
+        )
+        store.record_usage(
+            "qualified-sync",
+            replace(original_usage, observation_id="unknown", receipt_id="unknown-receipt", quantity=None),
+        )
+        store.close()
+        store = stores.enter_context(SQLiteProgramStore(sqlite_tmp_path / "qualified-dag.db", boot_clock=clock.boot))
+        original_program = store.load("qualified-dag")
+        before_export = (
+            store.served_change_token(),
+            store.history("qualified-dag"),
+            store.operations(),
+            store.work_budget_status("qualified-dag"),
+        )
+        outcome = export_private_outcome(store, "qualified-dag", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+        assert (
+            export_private_outcome(store, "qualified-dag", owner_policy=PRIVATE_METADATA, pseudonym_key=b"k" * 32)
+            == outcome
+        )
+        assert (
+            store.served_change_token(),
+            store.history("qualified-dag"),
+            store.operations(),
+            store.work_budget_status("qualified-dag"),
+        ) == before_export
+        subjects = cast(list[dict[str, object]], outcome["native_subjects"])
+        attempts = cast(list[dict[str, object]], outcome["attempts"])
+        satisfactions = cast(list[dict[str, object]], outcome["satisfactions"])
+        assert len(subjects) == len(attempts) == 3 and len(satisfactions) == 2
+        assert {item["attempt"] for item in subjects} == {item["id"] for item in attempts}
+        work_subjects = [cast(dict[str, object], item["work"]) for item in subjects]
+        source_subjects = [cast(dict[str, object], item["source"]) for item in subjects]
+        assert len({item["subject"] for item in work_subjects}) == 2
+        assert len({item["subject"] for item in source_subjects}) == 1
+        assert all(item["family"] == "work" for item in work_subjects)
+        assert all(item["family"] == "scm" for item in source_subjects)
+        assert work_subjects[0] == work_subjects[1] and work_subjects[1] != work_subjects[2]
+        assert cast(list[dict[str, object]], subjects[2]["dependencies"])[0]["identity"] == work_subjects[0]["identity"]
+        review_rows = cast(list[dict[str, object]], outcome["reviews"])
+        rejected = next(item for item in review_rows if item["verdict"] == "request_changes")
+        corrected = next(item for item in attempts if item["remediation_of"] is not None)
+        assert corrected["remediation_of"] == rejected["attempt"]
+        prior_findings = cast(list[dict[str, object]], outcome["findings"])
+        expected_findings = {
+            (item["id"], item["fingerprint"]) for item in prior_findings if item["attempt"] == rejected["attempt"]
+        }
+        actual_findings = cast(list[dict[str, object]], corrected["remediation_findings"])
+        assert {(item["id"], item["fingerprint"]) for item in actual_findings} == expected_findings
+        assert all(item in actual_findings for item in cast(list[dict[str, object]], rejected["findings"]))
+        assert all(item["attempt"] in {attempt["id"] for attempt in attempts} for item in satisfactions)
+        effect = cast(list[dict[str, object]], outcome["native_effects"])[0]
+        assert effect["attempt"] == corrected["id"] and effect["work_unit"] == subjects[1]["work_unit"]
+        assert effect["satisfaction"] in {item["id"] for item in satisfactions}
+        assert effect["driver"] == "kernel-driver-effect-v1" and effect["current_remote_state"] is None
+        assert (effect["status"] == "unknown") == (mode == "export-unknown")
+        assert effect["receipt_recorded"] == (mode != "export-unknown")
+        effects = cast(list[dict[str, object]], outcome["effects"])
+        linked = next(item for item in effects if item["operation"] == effect["operation"])
+        assert linked["dispatch_count"] == 1 and linked["observations"]
+        assert bool(linked["reconciliations"]) == (mode != "export-unknown")
+        usage = cast(list[dict[str, object]], outcome["usage_history"])
+        assert len(usage) == 4 and all(
+            item["attempt"] == corrected["id"] and item["operation"] == effect["operation"] for item in usage
+        )
+        old = next(item for item in usage if item["quantity"] == "2")
+        correction = next(item for item in usage if item["quantity"] == "4")
+        assert correction["supersedes"] == old["observation"] and not old["effective"] and correction["effective"]
+        assert next(item for item in usage if item["provenance"] == "estimate")["quantity"] == "7"
+        assert any(item["quantity"] is None for item in usage)
+        totals = cast(list[dict[str, object]], outcome["usage_totals"])
+        assert {item["known_subtotal"] for item in totals} == {"4", "7"}
+        assert all(item["quantity"] is None and item["complete"] is False for item in totals)
+        assert cast(dict[str, object], outcome["coverage"])["complete_cost"] is None
+        rendered = json.dumps(outcome)
+        for sensitive in (
+            "ENG-41",
+            "ENG-42",
+            "acme/service",
+            source_revision,
+            scm.binding.origin,
+            str(repository),
+            "synthetic-private-provider",
+            "synthetic-receipt",
+            "first result",
+            "private parent context",
+            *[token for pair in tokens.values() for token in pair.values()],
+        ):
+            assert sensitive not in rendered
+        corruptions: tuple[dict[str, object], ...] = (
+            {"version": 99},
+            {"version": True},
+            {"drafts": {}},
+            {"qualified_drafts": []},
+            {"extra": "unsupported"},
+        )
+        for change in corruptions:
+            with pytest.raises(ValueError):
+                proposal_from(encode({**proposal.payload, **change}))
+        original_find = store.find_artifact
+        for payload in (b"not-json", encode({**proposal.payload, "program": "foreign-program"})):
+
+            def wrong_proposal(operation: str, name: str, payload: bytes = payload) -> bytes | None:
+                return payload if operation.startswith("ordinary-program:proposal:") else original_find(operation, name)
+
+            with patch.object(
+                store,
+                "find_artifact",
+                side_effect=wrong_proposal,
+            ):
+                with pytest.raises(ValueError):
+                    export_private_outcome(store, "qualified-dag", owner_policy=PRIVATE_METADATA)
+        original_claim = store.outcome_claim_evidence
+
+        def wrong_claim(program: str, command: str) -> dict[str, object]:
+            return {
+                **original_claim(program, command),
+                "original_claim": {"attempt": {"program_id": "foreign-program"}},
+            }
+
+        with patch.object(
+            store,
+            "outcome_claim_evidence",
+            side_effect=wrong_claim,
+        ):
+            with pytest.raises(ValueError, match="driver effect differs"):
+                export_private_outcome(store, "qualified-dag", owner_policy=PRIVATE_METADATA)
+        original_effect = store.outcome_effect_evidence
+        for field in ("owner", "claim_digest", "attempt_digest", "type"):
+
+            def wrong_publication(program: str, operation: str, field: str = field) -> dict[str, object]:
+                evidence = original_effect(program, operation)
+                if operation == "qualified-sync":
+                    evidence["publication"] = {**cast(dict[str, object], evidence["publication"]), field: "foreign"}
+                return evidence
+
+            with patch.object(store, "outcome_effect_evidence", side_effect=wrong_publication):
+                with pytest.raises(ValueError, match="driver effect differs"):
+                    export_private_outcome(store, "qualified-dag", owner_policy=PRIVATE_METADATA)
+        raw_receipt = store.find_artifact("qualified-sync", "driver-receipt")
+        if raw_receipt is not None:
+            wrong_receipt = json.loads(raw_receipt)
+            wrong_receipt["operation"]["operation_id"] = "foreign-operation"
+
+            def mismatched_receipt(operation: str, name: str) -> bytes | None:
+                return (
+                    driver_bytes(wrong_receipt)
+                    if (operation, name) == ("qualified-sync", "driver-receipt")
+                    else original_find(operation, name)
+                )
+
+            with patch.object(
+                store,
+                "find_artifact",
+                side_effect=mismatched_receipt,
+            ):
+                with pytest.raises(ValueError, match="driver receipt differs"):
+                    export_private_outcome(store, "qualified-dag", owner_policy=PRIVATE_METADATA)
+        assert store.load("qualified-dag") == original_program
+        assert (
+            store.served_change_token(),
+            store.history("qualified-dag"),
+            store.operations(),
+            store.work_budget_status("qualified-dag"),
+        ) == before_export
 
 
 def test_qualified_dependency_cut_preserves_jira_visible_scope(services: SyntheticServices) -> None:

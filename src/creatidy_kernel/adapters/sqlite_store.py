@@ -753,6 +753,7 @@ class SQLiteProgramStore:
                 ):
                     raise ValueError("effect is not reserved by the selected Program")
             return {
+                "publication": self._work_record("ownership-publication", operation_id),
                 "deliveries": [
                     dict(row)
                     for row in self._connection.execute(
@@ -815,6 +816,7 @@ class SQLiteProgramStore:
             return {
                 "profile": claim.profile,
                 "original_claim": asdict(claim),
+                "claim_digest": self.operation(self._work_key("ownership-claim", command_key)).request_digest,
                 "resources": [asdict(item) for item in claim.resources],
                 "proofs": proofs,
                 "quarantine": self._work_record("ownership-unknown", command_key),
