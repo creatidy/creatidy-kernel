@@ -132,7 +132,7 @@ class ProjectDrivers:
     def __post_init__(self) -> None:
         if (self.work.binding.family, self.scm.binding.family, self.ci.binding.family) != ("work", "scm", "ci"):
             raise ValueError("independent project family bindings required")
-        if not self.knowledge or any(item.binding.family != "knowledge" for item in self.knowledge):
+        if any(item.binding.family != "knowledge" for item in self.knowledge):
             raise ValueError("explicit knowledge source bindings required")
         if len({item.binding.digest for item in self.knowledge}) != len(self.knowledge):
             raise ValueError("duplicate knowledge bindings")

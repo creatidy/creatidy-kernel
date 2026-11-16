@@ -287,6 +287,8 @@ class OrdinaryProgram:
         baseline = self.qualified_baselines.read_baseline(source, digest(encode(declaration.value["recipes"])))
         if baseline is None or baseline.source != source or not baseline.proof:
             raise IntakeRefused("exact qualified baseline unavailable")
+        if "ci" in self.verification.checks and not ci_subjects:
+            raise IntakeRefused("required candidate CI subjects unavailable")
         readiness = self.qualified_readiness.read_readiness(cut, source, declaration)
         if readiness is None:
             raise IntakeRefused("qualified relevance unavailable")
