@@ -119,6 +119,60 @@ class OrdinaryHandoff:
     claim: WorkClaim
 
 
+def proposal_from(raw: bytes) -> OrdinaryProposal:
+    """Decode original producer bytes without rereading peers or granting authority."""
+    value = object_from(raw)
+    fields = {"version", "kind", "program", "objective", "drafts", "dependencies"}
+    version = value.get("version")
+    if version == 2:
+        fields |= {"qualified_cuts"}
+    elif version == 3:
+        fields |= {"qualified_cuts", "qualified_drafts"}
+    if (
+        type(version) is not int
+        or version not in (1, 2, 3)
+        or set(value) != fields
+        or value.get("kind") != "ordinary-program-proposal"
+        or any(
+            type(value.get(name, [])) is not list
+            for name in ("drafts", "dependencies", "qualified_cuts", "qualified_drafts")
+        )
+    ):
+        raise IntakeRefused("unsupported historical ordinary proposal")
+    try:
+        drafts = tuple(draft_from(encode(item)) for item in cast(list[object], value["drafts"]))
+        edges: list[DependencyEvidence] = []
+        for draft, item in zip(drafts, cast(list[dict[str, object]], value["dependencies"]), strict=True):
+            if item["subject"] != draft.evidence.subject.payload():
+                raise IntakeRefused("historical native dependency subject differs")
+            edges.append(
+                DependencyEvidence(
+                    draft.evidence.subject,
+                    tuple((edge[0], edge[1], edge[2]) for edge in cast(list[tuple[str, str, int]], item["required"])),
+                    cast(str, item["reference"]),
+                    cast(int, item["observed_at"]),
+                    cast(int, item["fresh_until"]),
+                    cast(bool, item["complete"]),
+                )
+            )
+        proposal = OrdinaryProposal(
+            cast(str, value["program"]),
+            cast(str, value["objective"]),
+            drafts,
+            tuple(edges),
+            tuple(
+                QualifiedDependencyCut.parse(encode(item))
+                for item in cast(list[object], value.get("qualified_cuts", []))
+            ),
+            tuple(QualifiedDraft.parse(encode(item)) for item in cast(list[object], value.get("qualified_drafts", []))),
+        )
+        if encode(proposal.payload) != raw:
+            raise IntakeRefused("noncanonical historical ordinary proposal")
+        return proposal
+    except (KeyError, TypeError, IndexError, AttributeError) as error:
+        raise IntakeRefused("malformed historical ordinary proposal") from error
+
+
 class OrdinaryProgram:
     def __init__(
         self,
@@ -750,41 +804,7 @@ class OrdinaryProgram:
         """Read the exact installed decision without discovery or renewed authority."""
         record = object_from(self.store.artifact(f"ordinary-program:approval:{decision_id}", "record"))
         raw = self.store.artifact(f"ordinary-program:proposal:{record['proposal']}", "record")
-        value = object_from(raw)
-        legacy_fields = {"version", "kind", "program", "objective", "drafts", "dependencies"}
-        if (
-            type(value.get("version")) is not int
-            or (value["version"] == 1 and set(value) != legacy_fields)
-            or (value["version"] == 2 and set(value) != legacy_fields | {"qualified_cuts"})
-            or (value["version"] == 3 and set(value) != legacy_fields | {"qualified_cuts", "qualified_drafts"})
-            or value["version"] not in (1, 2, 3)
-            or value["kind"] != "ordinary-program-proposal"
-        ):
-            raise IntakeRefused("unsupported historical ordinary proposal")
-        drafts = tuple(draft_from(encode(item)) for item in cast(list[object], value["drafts"]))
-        edges: list[DependencyEvidence] = []
-        for draft, item in zip(drafts, cast(list[dict[str, object]], value["dependencies"]), strict=True):
-            if item["subject"] != draft.evidence.subject.payload():
-                raise IntakeRefused("historical native dependency subject differs")
-            edges.append(
-                DependencyEvidence(
-                    draft.evidence.subject,
-                    tuple((edge[0], edge[1], edge[2]) for edge in cast(list[tuple[str, str, int]], item["required"])),
-                    cast(str, item["reference"]),
-                    cast(int, item["observed_at"]),
-                    cast(int, item["fresh_until"]),
-                    cast(bool, item["complete"]),
-                )
-            )
-        cuts = tuple(
-            QualifiedDependencyCut.parse(encode(item)) for item in cast(list[object], value.get("qualified_cuts", []))
-        )
-        qualified_drafts = tuple(
-            QualifiedDraft.parse(encode(item)) for item in cast(list[object], value.get("qualified_drafts", []))
-        )
-        proposal = OrdinaryProposal(
-            cast(str, value["program"]), cast(str, value["objective"]), drafts, tuple(edges), cuts, qualified_drafts
-        )
+        proposal = proposal_from(raw)
         program = self.store.load(proposal.program_id)
         if (
             encode(proposal.payload) != raw
@@ -795,7 +815,7 @@ class OrdinaryProgram:
             or record["spec"] != program.spec.digest
             or any(
                 cut.obligation is not None and cut.obligation.decision_reference != decision_id
-                for cut in (*cuts, *(item.cut for item in qualified_drafts))
+                for cut in (*proposal.qualified_cuts, *(item.cut for item in proposal.qualified_drafts))
             )
         ):
             raise IntakeRefused("historical approval, current policy or specification differs")

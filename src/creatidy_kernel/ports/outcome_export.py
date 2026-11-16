@@ -12,19 +12,20 @@ import hmac
 import json
 import re
 import secrets
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from decimal import Decimal, InvalidOperation, localcontext
 from typing import Protocol, cast
 
 from creatidy_kernel.core.deadlines import DeadlineProjection
-from creatidy_kernel.core.domain import Program
+from creatidy_kernel.core.domain import InputBinding, Program
+from creatidy_kernel.core.drivers import DriverMutation, DriverSubject, driver_bytes
 from creatidy_kernel.core.execution import Artifact, ArtifactManifest, Candidate, RuntimeIdentity
 from creatidy_kernel.core.intake import encode
 from creatidy_kernel.core.outcomes import Provenance
 from creatidy_kernel.core.verification import CandidateResult
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.allocation import decode_identity, decode_runtime_receipt_with_group, load_allocation
-from creatidy_kernel.ports.intake import draft_from
+from creatidy_kernel.ports.ordinary import proposal_from
 from creatidy_kernel.ports.program_store import ApplicationStore, OperationRecord
 from creatidy_kernel.ports.verification import decode_product_review_receipt
 
@@ -108,6 +109,25 @@ def export_private_outcome(
         raw = json.dumps([kind, value], ensure_ascii=True, separators=(",", ":")).encode()
         return "hmac-sha256:" + hmac.new(key, raw, hashlib.sha256).hexdigest()
 
+    def qualified_subject(subject: DriverSubject) -> dict[str, object]:
+        return {
+            "codec": "kernel-driver-subject:v1",
+            "subject": ref("driver-subject", subject.reference),
+            "identity": ref("driver-subject", replace(subject, revision=None).reference),
+            "binding": ref("driver-binding", driver_bytes(asdict(subject.binding)).decode()),
+            "family": subject.binding.family,
+            "implementation": ref("driver-implementation", subject.binding.implementation),
+            "version": ref("driver-version", subject.binding.version),
+            "api_version": ref("driver-api", subject.binding.api_version),
+            "origin": ref("origin", subject.binding.origin),
+            "tenant": ref("driver-tenant", subject.binding.tenant),
+            "namespace": ref("driver-namespace", subject.binding.namespace),
+            "rights": ref("driver-rights", subject.binding.rights),
+            "kind": ref("driver-kind", subject.kind),
+            "key": ref("driver-key", replace(subject, revision=None).reference),
+            "revision": ref("revision", subject.revision),
+        }
+
     token = store.served_change_token()
     program: Program = store.load(program_id)
     configured = store.work_budget_revoked(program_id) is not None
@@ -132,21 +152,48 @@ def export_private_outcome(
         raw = store.find_artifact(f"ordinary-program:proposal:{proposal_digest}", "record")
         if raw is None or hashlib.sha256(raw).hexdigest() != proposal_digest:
             raise ValueError("original ordinary proposal evidence is missing or inconsistent")
-        proposal = _mapping(json.loads(raw))
-        drafts = _items(proposal.get("drafts"))
-        if (
-            proposal.get("version") != 1
-            or proposal.get("kind") != "ordinary-program-proposal"
-            or proposal.get("program") != program_id
-        ):
+        proposal = proposal_from(raw)
+        if proposal.program_id != program_id:
             raise ValueError("original ordinary proposal belongs to another Program")
-        matches = [
-            draft_from(json.dumps(item, sort_keys=True, separators=(",", ":")).encode())
-            for item in drafts
-            if item.get("task_id") == attempt.spec.work_unit_id
-        ]
+        if InputBinding("ordinary-declaration", "sha256:" + proposal_digest) not in attempt.spec.effective_inputs:
+            raise ValueError("ordinary proposal differs from its original Attempt")
+        qualified_matches = [item for item in proposal.qualified_drafts if item.task_id == attempt.spec.work_unit_id]
+        if qualified_matches:
+            draft = qualified_matches[0]
+            if (
+                InputBinding(
+                    "meaning:" + draft.task_id, "sha256:" + hashlib.sha256(encode(draft.payload())).hexdigest()
+                )
+                not in attempt.spec.effective_inputs
+            ):
+                raise ValueError("qualified proposal differs from its original Attempt")
+            native_subject_output.append(
+                {
+                    "attempt": ref("attempt", attempt.attempt_id),
+                    "work_unit": ref("work-unit", attempt.spec.work_unit_id),
+                    "driver": "ordinary-proposal-v3",
+                    "proposal": ref("digest", proposal_digest),
+                    "work": qualified_subject(draft.cut.subject),
+                    "source": qualified_subject(draft.baseline.source),
+                    "work_provenance": ref("driver-provenance", draft.cut.provenance),
+                    "source_provenance": ref("driver-provenance", draft.source_provenance),
+                    "baseline": ref("driver-baseline", encode(draft.baseline.payload).decode()),
+                    "dependency_evidence": ref("dependency-cut", encode(draft.cut.payload).decode()),
+                    "dependencies": [qualified_subject(edge.target) for edge in draft.cut.edges],
+                    "current_remote_state": None,
+                }
+            )
+            continue
+        matches = [item for item in proposal.drafts if item.task_id == attempt.spec.work_unit_id]
         if len(matches) != 1:
             raise ValueError("original ordinary WorkUnit has no unique native subject")
+        if (
+            InputBinding(
+                "meaning:" + matches[0].task_id, "sha256:" + hashlib.sha256(encode(matches[0].payload())).hexdigest()
+            )
+            not in attempt.spec.effective_inputs
+        ):
+            raise ValueError("ordinary proposal differs from its original Attempt")
         subject = matches[0].evidence.subject
         subject_key = json.dumps(
             [subject.origin, subject.repository, subject.issue], ensure_ascii=True, separators=(",", ":")
@@ -162,6 +209,20 @@ def export_private_outcome(
                 "repository": ref("native-repository", subject.repository),
                 "branch": ref("branch", subject.branch),
                 "base": ref("revision", subject.base),
+                **(
+                    {
+                        "qualified_dependencies": [
+                            {
+                                "subject": qualified_subject(cut.subject),
+                                "evidence": ref("dependency-cut", encode(cut.payload).decode()),
+                                "dependencies": [qualified_subject(edge.target) for edge in cut.edges],
+                            }
+                            for cut in proposal.qualified_cuts
+                        ]
+                    }
+                    if proposal.qualified_cuts
+                    else {}
+                ),
                 "current_remote_state": None,
             }
         )
@@ -372,6 +433,107 @@ def export_private_outcome(
                         "receipt_recorded": receipt_data is not None,
                         "receipt": ref("native-record", receipt_reference),
                         "receipt_profile": None if receipt_data is None else "forgejo-native-readback:v1",
+                        "current_remote_state": None,
+                    }
+                )
+            elif native_request.get("schema") == "kernel-driver-effect-v1":
+                attempt = attempt_by_id.get(attempt_id)
+                publication = _mapping(effect_evidence.get("publication"))
+                claim_key = native_request.get("claim")
+                if attempt is None or type(claim_key) is not str:
+                    raise ValueError("driver effect lacks original Attempt or claim")
+                claim_evidence = store.outcome_claim_evidence(program_id, claim_key)
+                original_claim = _mapping(claim_evidence.get("original_claim"))
+                original_spec = next(
+                    (item for item in program.spec_history if item.digest == attempt.spec.spec_digest), None
+                )
+                satisfaction = next(
+                    (item for item in program.satisfactions if item.reference_id == publication.get("acceptance")), None
+                )
+                if (
+                    set(native_request)
+                    != {"schema", "target", "action", "fields", "authority_reference", "attempt", "claim", "generation"}
+                    or native_request.get("attempt") != attempt.spec.digest
+                    or original_claim.get("attempt") != asdict(attempt.spec)
+                    or type(native_request.get("generation")) is not int
+                    or native_request["generation"] != original_claim.get("generation")
+                    or publication.get("kind") != "work-budget-record"
+                    or publication.get("type") != "ownership-publication"
+                    or publication.get("claim") != claim_key
+                    or publication.get("claim_digest") != claim_evidence.get("claim_digest")
+                    or publication.get("claimant") != original_claim.get("claimant")
+                    or original_spec is None
+                    or publication.get("owner") != original_spec.authority.owner_id
+                    or publication.get("generation") != original_claim.get("generation")
+                    or publication.get("attempt_digest") != attempt.spec.digest
+                    or publication.get("operation") != operation_id
+                    or publication.get("effect_key") != operation.effect_key
+                    or publication.get("request_digest") != operation.request_digest
+                    or satisfaction is None
+                    or satisfaction.source_attempt_id != attempt_id
+                ):
+                    raise ValueError("driver effect differs from its original accepted subject")
+                target = DriverSubject.parse("kernel-driver-subject:v1:" + driver_bytes(native_request["target"]).hex())
+                fields = native_request["fields"]
+                if type(fields) is not list or any(
+                    type(item) is not list or len(item) != 2 or any(type(value) is not str for value in item)
+                    for item in cast(list[list[object]], fields)
+                ):
+                    raise ValueError("invalid durable driver mutation fields")
+                mutation = DriverMutation(
+                    target,
+                    cast(str, native_request["action"]),
+                    tuple((item[0], item[1]) for item in cast(list[list[str]], fields)),
+                    cast(str, native_request["authority_reference"]),
+                )
+                receipt_data = store.find_artifact(operation_id, "driver-receipt")
+                receipt_status = None
+                receipt_reference = None
+                if receipt_data is not None:
+                    receipt = _mapping(json.loads(receipt_data))
+                    receipt_status = receipt.get("status")
+                    receipt_reference = receipt.get("reference")
+                    if (
+                        set(receipt) != {"status", "operation", "reference", "reason"}
+                        or receipt.get("operation")
+                        != {
+                            "operation_id": operation_id,
+                            "effect_key": operation.effect_key,
+                            "request_digest": operation.request_digest,
+                        }
+                        or receipt_status not in {"accepted", "rejected", "stale", "unknown"}
+                        or (receipt_reference is not None and type(receipt_reference) is not str)
+                        or type(receipt.get("reason")) is not str
+                        or driver_bytes(receipt) != receipt_data
+                        or (
+                            operation.status == "accepted"
+                            and (receipt_status != "accepted" or receipt_reference != operation.accepted_reference)
+                        )
+                        or (operation.status == "rejected" and receipt_status not in {"rejected", "stale"})
+                        or (receipt_status == "accepted") != (operation.status == "accepted")
+                    ):
+                        raise ValueError("driver receipt differs from its original Operation")
+                elif operation.status in {"accepted", "rejected"}:
+                    raise ValueError("terminal driver effect lacks original receipt")
+                native_effects.append(
+                    {
+                        "driver": "kernel-driver-effect-v1",
+                        "operation": ref("operation", operation_id),
+                        "attempt": ref("attempt", attempt_id),
+                        "work_unit": ref("work-unit", attempt.spec.work_unit_id),
+                        "satisfaction": ref("satisfaction", satisfaction.reference_id),
+                        "claim": ref("claim", claim_key),
+                        "generation": native_request["generation"],
+                        "authority_subject": ref("ownership-subject", publication.get("subject")),
+                        "target": qualified_subject(target),
+                        "action": ref("driver-action", mutation.action),
+                        "mutation": ref("driver-mutation", driver_bytes(mutation.request()).decode()),
+                        "authority": ref("driver-authority", mutation.authority_reference),
+                        "status": operation.status,
+                        "receipt_recorded": receipt_data is not None,
+                        "receipt_status": receipt_status,
+                        "receipt": ref("native-record", receipt_reference),
+                        "receipt_profile": None if receipt_data is None else "kernel-driver-receipt-v1",
                         "current_remote_state": None,
                     }
                 )
