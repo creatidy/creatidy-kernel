@@ -415,6 +415,41 @@ def test_status_profile_reconstruction_preserves_proof_not_native_build_age(peer
     assert reconstructed.baseline().read_baseline(source, "different-recipe") is None
 
 
+@pytest.mark.parametrize("mode", ["stable", "changed", "expired", "native-timestamp"])
+def test_status_baseline_latency_preserves_earliest_age_and_exact_evidence(peer: NativePeer, mode: str) -> None:
+    producer = ForgejoStatusVerification(peer.ci, ("trusted-check",), ("trusted:recipe:v1",), "owner:profile")
+    original = producer.build
+    starts: list[int] = []
+
+    def delayed(key: str, source: DriverSubject) -> DriverFact:
+        fact = original(key, source)
+        starts.append(fact.observed_at)
+        peer.clock.now += 30 if mode == "expired" and len(starts) == 2 else 1
+        if mode == "changed" and len(starts) == 1:
+            peer.mode = "failure"
+        return fact
+
+    profile = producer.profile()
+    if mode == "native-timestamp":
+        profile = QualifiedCIProfile(producer, producer.binding, producer.producer, profile.interpret)
+    reader = ConfiguredQualifiedBaseline(
+        profile, DriverSubject(producer.binding, "build", producer.key, None), producer.recipes, peer.clock.wall
+    )
+    with patch.object(producer, "build", side_effect=delayed):
+        result = reader.read_baseline(
+            DriverSubject(peer.scm.binding, "ref", "develop", BASE), digest(encode(producer.recipes))
+        )
+    assert starts == [100, 101]
+    if mode == "stable":
+        assert result is not None and result.result == "passed" and result.observed_at == 100
+        assert json.loads(result.proof)["timestamp_kind"] == "observation"
+        assert profile.matches_approval(result.proof)
+        native = QualifiedCIProfile(producer, producer.binding, producer.producer, profile.interpret)
+        assert not native.matches_approval(result.proof)
+    else:
+        assert result is None
+
+
 @pytest.mark.parametrize("mode", ["normal", "run-denied", "run-wrong-sha", "run-wrong-repository"])
 def test_actions_aggregate_is_not_checkout_attempt_or_step_proof(peer: NativePeer, mode: str) -> None:
     peer.mode = mode

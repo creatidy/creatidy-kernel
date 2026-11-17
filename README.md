@@ -567,7 +567,11 @@ status collections and plugs into `QualifiedCIProfile`/`ConfiguredQualifiedBasel
 build key is a configured selection, not a native build ID. It refuses missing/duplicate required
 contexts, pending/unknown results, mismatched subjects and configuration drift. Native status evidence
 is not Forgejo Actions run attestation or trusted local execution. Its observation age is retrieval
-age, not a manufactured build timestamp. Cross-provider CI source binding requires an explicit
+age, not a manufactured build timestamp. This observation-time profile compares exact repeated native
+evidence and retains the earliest retrieval age, even across second boundaries; the default native
+build-timestamp profile still requires identical result times. Timestamp semantics are bound in the
+approved proof, and original age/nonrenewal and both observations' freshness remain enforced.
+Cross-provider CI source binding requires an explicit
 `TrustedSCMRemote` mapping; matching branch names, project names or bare SHAs alone do not configure it.
 Work, source and CI roles may still use different instances and authorities.
 `ForgejoCI.run` separately retains native Actions run metadata for the exact recorded commit and

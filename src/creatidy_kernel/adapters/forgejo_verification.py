@@ -46,6 +46,7 @@ class ForgejoStatusVerification:
                 "recipes": list(self.recipes),
                 "decision": self.decision_reference,
                 "remote_mapping": self.ci.mapping_digest,
+                "timestamp_kind": "observation",
             }
         )
 
@@ -114,7 +115,7 @@ class ForgejoStatusVerification:
         return ("passed" if all(result == "passed" for result in required.values()) else "failed", fact.observed_at)
 
     def profile(self) -> QualifiedCIProfile:
-        return QualifiedCIProfile(self, self.binding, self.producer, self._result)
+        return QualifiedCIProfile(self, self.binding, self.producer, self._result, timestamp_kind="observation")
 
     def baseline(self) -> ConfiguredQualifiedBaseline:
         return ConfiguredQualifiedBaseline(
