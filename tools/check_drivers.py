@@ -117,6 +117,7 @@ class SyntheticServices:
         self.after: Callable[[str, str], None] | None = None
         self.client_after: Callable[[str, str], None] | None = None
         self.forge_pr: dict[str, object] | None = None
+        self.response_headers: dict[str, str] = {}
         services = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -153,6 +154,8 @@ class SyntheticServices:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(content)))
                 self.send_header("X-Jenkins", "2.479.3")
+                for name, value in services.response_headers.items():
+                    self.send_header(name, value)
                 if status == 302:
                     self.send_header("Location", "https://unconfigured.example.invalid/stolen")
                 self.end_headers()

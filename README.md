@@ -552,6 +552,41 @@ retain their original proof formats. Synthetic role substitution proves this com
 native support for additional providers; reusable native roles and the final installed combination
 matrix remain separate deliveries.
 
+Forgejo role evidence reuses the existing facade and scoped HTTPS transport. Work Management now
+retains native dependency direction and cross-repository subjects through `ForgejoDiscovery`;
+permission-limited, moving, truncated and unsupported observations remain incomplete. `ForgejoSCM`
+reads full immutable commit IDs, bounded open-change inventories and native reviews. Review scans
+require native total-count metadata: Forgejo filters pending reviews after pagination, so an empty
+visible page does not establish exhaustion. Missing/hidden records refuse completeness; native
+`stale`, `dismissed`, `official`, state and reviewed commit remain separate evidence, never Kernel
+acceptance. The transport's original two-value `request` contract and all legacy effect paths remain
+unchanged; its optional header-bearing read makes pagination evidence available without another client.
+
+`ForgejoStatusVerification` binds explicitly trusted recipe/context mappings to existing exact-commit
+status collections and plugs into `QualifiedCIProfile`/`ConfiguredQualifiedBaseline`. Its portable
+build key is a configured selection, not a native build ID. It refuses missing/duplicate required
+contexts, pending/unknown results, mismatched subjects and configuration drift. Native status evidence
+is not Forgejo Actions run attestation or trusted local execution. Its observation age is retrieval
+age, not a manufactured build timestamp. Cross-provider CI source binding requires an explicit
+`TrustedSCMRemote` mapping; matching branch names, project names or bare SHAs alone do not configure it.
+Work, source and CI roles may still use different instances and authorities.
+`ForgejoCI.run` separately retains native Actions run metadata for the exact recorded commit and
+repository. At the v13 compatibility pin, actual checkout, completed run jobs, job attempts and
+required-step results are unavailable through these native APIs. Run metadata therefore remains
+explicitly incomplete for qualified verification, even when its aggregate native status is success;
+it cannot satisfy a stronger mandatory Actions capability or the final #60 positive matrix by itself.
+
+These read contracts were checked against Forgejo `v13.0.1`, commit
+`714b88f8b2947125ef829329744ce0a3cce48690` ([commit converter](https://codeberg.org/forgejo/forgejo/src/commit/714b88f8b2947125ef829329744ce0a3cce48690/services/convert/git_commit.go),
+[native reviews](https://codeberg.org/forgejo/forgejo/src/commit/714b88f8b2947125ef829329744ce0a3cce48690/routers/api/v1/repo/pull_review.go),
+[dependencies](https://codeberg.org/forgejo/forgejo/src/commit/714b88f8b2947125ef829329744ce0a3cce48690/routers/api/v1/repo/issue_dependency.go),
+[Actions metadata](https://codeberg.org/forgejo/forgejo/src/commit/714b88f8b2947125ef829329744ce0a3cce48690/routers/api/v1/repo/action.go)).
+That commit API reports `commit.tree.sha` as a commit ID; this implementation does not assert a tree
+object from that field. This is source-verified compatibility plus synthetic offline conformance,
+not live-server version/permission attestation or final #60 matrix acceptance. Native conditional
+work/review/CI mutations not exposed by these roles remain unavailable; legacy conditional Git/AGit
+effects continue only through their existing authorization path.
+
 ## Local Owner-Served State
 
 For a running trusted-local controller, construct `OwnerProjection` with its existing
