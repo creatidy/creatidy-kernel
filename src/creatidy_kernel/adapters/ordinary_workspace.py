@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 from creatidy_kernel.adapters.forgejo_transport import GIT_OUTPUT_ERRORS, run_git_bounded
 from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
+from creatidy_kernel.adapters.qualified_baseline import QualifiedCIProfile, jenkins_result
 from creatidy_kernel.adapters.source_cache import source_use, validate_checkout
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.adapters.task_execution import (
@@ -52,6 +53,7 @@ class OrdinaryGitWorkspace:
         *,
         authority_deadline: int,
         qualified_ci: ContinuousIntegration | None = None,
+        qualified_ci_profile: QualifiedCIProfile | None = None,
         max_bytes: int = 16 * 1024 * 1024,
     ) -> None:
         if not commands or not all(type(item) is VerificationCommand for item in commands) or not all(author):
@@ -59,6 +61,29 @@ class OrdinaryGitWorkspace:
         self.store, self.workspace, self.source = store, workspace, source
         self.repository_url, self.proposal, self.commands, self.author = repository_url, proposal, commands, author
         self.qualified_ci = qualified_ci
+        if (
+            qualified_ci_profile is not None
+            and qualified_ci is not None
+            and qualified_ci_profile.ci is not qualified_ci
+        ):
+            raise IntakeRefused("candidate CI profile differs from configured CI driver")
+        self.qualified_ci_profile = qualified_ci_profile
+        if self.qualified_ci_profile is None and qualified_ci is not None:
+            # Historical Programs retain their exact Jenkins interpretation, not a
+            # default interpretation for a newly configured provider.
+            if qualified_ci.binding.implementation != "jenkins":
+                raise IntakeRefused("explicit candidate CI interpretation profile required")
+            self.qualified_ci_profile = QualifiedCIProfile(
+                qualified_ci, qualified_ci.binding, "jenkins-exact:v1", jenkins_result
+            )
+        for draft in proposal.qualified_drafts:
+            if not draft.ci_subjects:
+                continue
+            profile = self.qualified_ci_profile
+            if profile is None or any(selected.binding != profile.binding for selected in draft.ci_subjects):
+                raise IntakeRefused("required candidate CI binding unavailable or incompatible")
+            if not draft.baseline.proof or not profile.matches_approval(draft.baseline.proof):
+                raise IntakeRefused("candidate CI interpretation differs from approved profile")
         self.max_bytes = max_bytes
         if type(authority_deadline) is not int or authority_deadline <= 0:
             raise IntakeRefused("original approved authority deadline required")
@@ -671,11 +696,13 @@ class _QualifiedCICheck:
 
     def check(self, name: str, subject: EvidenceSubject) -> Evidence | None:
         owner = self.owner
-        attempt, ci = owner._attempt, owner.qualified_ci  # pyright: ignore[reportPrivateUsage]
-        if name != "ci" or attempt is None or ci is None:
+        attempt, profile = owner._attempt, owner.qualified_ci_profile  # pyright: ignore[reportPrivateUsage]
+        if name != "ci" or attempt is None or profile is None:
             return None
         draft = next((item for item in owner.proposal.qualified_drafts if item.task_id == attempt.work_unit_id), None)
         if draft is None:
+            return None
+        if not profile.matches_approval(draft.baseline.proof):
             return None
         program = owner.store.load(attempt.program_id)
         attempts = [item.spec.attempt_id for item in program.attempts if item.spec.work_unit_id == attempt.work_unit_id]
@@ -685,28 +712,18 @@ class _QualifiedCICheck:
         if ordinal >= len(draft.ci_subjects):
             return None
         ci_subject = draft.ci_subjects[ordinal]
-        if ci.binding != ci_subject.binding:
+        if profile.binding != ci_subject.binding:
             return None
         binding = draft.baseline.source.binding
         expected_url = binding.origin + "/" + binding.namespace
         if subject.repository not in {expected_url, expected_url + ".git"}:
             return None
         source = DriverSubject(binding, "commit", subject.head_revision, subject.head_revision)
-        fact = ci.build(ci_subject.key, source)
-        now = int(time.time())
-        if (
-            ci.binding != ci_subject.binding
-            or fact.subject != ci_subject
-            or not fact.complete
-            or fact.related != (source,)
-            or not fact.qualification
-        ):
+        received = profile.read(ci_subject, source, lambda: int(time.time()))
+        if received is None:
             return None
-        fact.require_current(now)
-        native = object_from(fact.native)
-        if fact.subject.binding.implementation != "jenkins":
-            return None
-        passed = native.get("building") is False and native.get("result") == "SUCCESS"
+        fact, result, _ = received
+        passed = result == "passed"
         payload = encode(
             {
                 "subject": fact.subject.reference,
@@ -724,7 +741,7 @@ class _QualifiedCICheck:
             "ci",
             subject,
             "qualified-ci-controller",
-            "jenkins-exact:v1",
+            profile.producer,
             reference,
             fact.observed_at,
             fact.fresh_until,

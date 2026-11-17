@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import native_kilo_fixture
 import pytest
+from composable_fixture import SyntheticCI, SyntheticDocument, SyntheticWork, synthetic_ci_result
 from native_kilo_fixture import review_peer
 from ordinary_flow_fixture import CODEX_PEER
 from test_intake import SUBJECT, Scenario, Transport, declaration
@@ -49,8 +50,13 @@ from creatidy_kernel.adapters.project_drivers import (
     TrustedSCMRemote,
     binding_from_mapping,
 )
-from creatidy_kernel.adapters.qualified_baseline import JenkinsQualifiedBaseline
-from creatidy_kernel.adapters.qualified_readiness import GitHubJiraLiteralReadiness
+from creatidy_kernel.adapters.qualified_baseline import (
+    ConfiguredQualifiedBaseline,
+    JenkinsQualifiedBaseline,
+    QualifiedCIProfile,
+    jenkins_result,
+)
+from creatidy_kernel.adapters.qualified_readiness import GitHubJiraLiteralReadiness, LiteralReadiness
 from creatidy_kernel.adapters.reference import reference_git
 from creatidy_kernel.adapters.source_cache import source_use
 from creatidy_kernel.adapters.sqlite_store import (
@@ -74,6 +80,7 @@ from creatidy_kernel.core.drivers import (
     DriverDelivery,
     DriverFact,
     DriverMutation,
+    DriverScan,
     DriverSubject,
     EdgeObligation,
     WorkObservation,
@@ -89,7 +96,7 @@ from creatidy_kernel.core.ordinary_qualified import (
 )
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, WorkClaim
-from creatidy_kernel.core.verification import VerificationPolicy
+from creatidy_kernel.core.verification import EvidenceSubject, VerificationPolicy
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.drivers import DriverApplication, DriverDraftGrant, DriverEffectGrant
 from creatidy_kernel.ports.intake import OrdinaryIntake
@@ -341,11 +348,48 @@ def test_jenkins_qualified_baseline_requires_exact_stable_native_evidence(servic
         assert reader.read_baseline(source, recipe) is None
 
 
+@pytest.mark.parametrize(
+    "fault", ["binding", "source", "partial", "stale", "future", "assurance", "pending", "unknown", "recipe"]
+)
+def test_configured_ci_profile_refuses_incompatible_evidence(services: SyntheticServices, fault: str) -> None:
+    clock = Clock()
+    project, _, _, _ = configured(services, clock)
+    ci = SyntheticCI(project.ci)
+    selected = DriverSubject(ci.binding, "build", "12", None)
+    source_ref = project.scm.ref("feature").subject
+    source = DriverSubject(source_ref.binding, "commit", source_ref.revision or "", source_ref.revision)
+    original = ci.build("12", source)
+    profile = QualifiedCIProfile(ci, ci.binding, "synthetic-ci-profile:v2", synthetic_ci_result)
+    assert profile.read(selected, source, clock.wall) is not None
+    changed = original
+    if fault == "binding":
+        changed = replace(original, subject=replace(original.subject, binding=replace(ci.binding, tenant="other")))
+    elif fault == "source":
+        changed = replace(original, related=(replace(source, key="f" * 40, revision="f" * 40),))
+    elif fault == "partial":
+        changed = replace(original, complete=False)
+    elif fault == "stale":
+        changed = replace(original, observed_at=1, fresh_until=99)
+    elif fault == "future":
+        changed = replace(original, observed_at=101)
+    elif fault == "assurance":
+        changed = replace(original, qualification="unverified-local-result")
+    elif fault == "pending":
+        changed = replace(original, native=encode({"active": True, "outcome": "SUCCESS", "at": 1000}))
+    elif fault == "unknown":
+        changed = replace(original, presence=Presence.UNKNOWN)
+    recipe = ("trusted:recipe:v1",)
+    reader = ConfiguredQualifiedBaseline(profile, selected, recipe, clock.wall)
+    with patch.object(ci, "build", return_value=changed):
+        assert reader.read_baseline(source_ref, digest(encode(("other",) if fault == "recipe" else recipe))) is None
+    assert original == ci.build("12", source)
+
+
 def test_qualified_readiness_rejects_incomplete_moving_or_equivalent_inventory(
     services: SyntheticServices, tmp_path: Path
 ) -> None:
     clock = Clock()
-    project, scm, _, _ = configured(services, clock)
+    project, scm, knowledge, _ = configured(services, clock)
     repository = tmp_path / "readiness-source"
     repository.mkdir()
     reference_git(repository, "init", "--initial-branch=feature")
@@ -435,6 +479,97 @@ def test_qualified_readiness_rejects_incomplete_moving_or_equivalent_inventory(
     assert positive_proof["visibility_attestation"] == "owner:fixture-complete-repository-visibility"
     assert positive_proof["inventory_scope"]["scope"] == "all-open-changes-in-repository"
     assert positive_proof["inventory_scope"]["equivalence"] == "host-configured-exact-file-content-only"
+    optional_project = replace(project, knowledge=())
+    assert optional_project.knowledge == ()
+    scan = DriverScan(
+        (), True, True, "all-open-changes-in-repository:" + scm.binding.digest, 100, 120, "fixture-repeated-not-atomic"
+    )
+    configured_reader = LiteralReadiness(
+        project.work,
+        scm,
+        repository,
+        ((work.fact.subject, (criterion,)),),
+        frozenset({"3"}),
+        (),
+        Principal("owner", "owner"),
+        "owner:explicit-repository-visibility",
+        clock.wall,
+        max_pages=3,
+        inventory=lambda: scan,
+        work_is_open=lambda observed: observed.fact.subject == work.fact.subject,
+        producer="fixture-generic-readiness:v1",
+        context_subjects=(),
+    )
+    optional = configured_reader.read_readiness(cut, source, declared)
+    assert optional is not None and json.loads(optional.proof)["contexts"] == []
+    assert json.loads(optional.proof)["scan_evidence"][0]["qualification"] == scan.qualification
+    for bad in (
+        replace(scan, complete=False),
+        replace(scan, stable=False),
+        replace(scan, scope="unbound"),
+        replace(scan, observed_at=101),
+        replace(scan, fresh_until=99),
+        replace(scan, qualification="unavailable"),
+    ):
+        configured_reader.inventory = lambda selected=bad: selected
+        assert configured_reader.read_readiness(cut, source, declared) is None
+    configured_reader.inventory = lambda: scan
+
+    def closed_work(_: WorkObservation) -> bool:
+        return False
+
+    configured_reader.work_is_open = closed_work
+    assert configured_reader.read_readiness(cut, source, declared) is None
+
+    def matching_work(observed: WorkObservation) -> bool:
+        return observed.fact.subject == work.fact.subject
+
+    configured_reader.work_is_open = matching_work
+    change = replace(
+        project.scm.ref(source.key),
+        subject=DriverSubject(scm.binding, "change", "7", source.revision),
+        native=encode({"fixture": "native-format-without-normalized-relationships"}),
+        related=(DriverSubject(scm.binding, "commit", source.revision or "", source.revision),) * 2,
+    )
+    related_scan = replace(scan, items=(change,))
+    configured_reader.inventory = lambda: related_scan
+    stable_related = configured_reader.read_readiness(cut, source, declared)
+    assert stable_related is not None
+    assert json.loads(stable_related.proof)["role_evidence"][-1]["related"] == [
+        subject.reference for subject in change.related
+    ]
+    unavailable_item = replace(change, qualification="unavailable")
+    assert unavailable_item.complete and unavailable_item.presence is Presence.FOUND
+    configured_reader.inventory = lambda: replace(related_scan, items=(unavailable_item,))
+    assert configured_reader.read_readiness(cut, source, declared) is None
+    configured_reader.inventory = lambda: scan
+    required_context = knowledge.content("900", "19")
+    configured_reader.contexts = ((knowledge, "900", "19"),)
+    configured_reader.context_bindings = (knowledge.binding,)
+    configured_reader.context_subjects = (required_context.subject,)
+    with patch.object(knowledge, "content", return_value=replace(required_context, qualification="unavailable")):
+        assert configured_reader.read_readiness(cut, source, declared) is None
+    configured_reader.contexts = ()
+    configured_reader.context_bindings = ()
+    configured_reader.context_subjects = ()
+    current_source = scm.ref(source.key)
+    with patch.object(scm, "ref", return_value=replace(current_source, qualification="unavailable")):
+        assert configured_reader.read_readiness(cut, source, declared) is None
+    related_calls = [0]
+
+    def changed_related_only() -> DriverScan:
+        related_calls[0] += 1
+        if related_calls[0] == 1:
+            return related_scan
+        closing = replace(
+            change, related=(change.related[0], replace(change.related[1], key="f" * 40, revision="f" * 40))
+        )
+        assert closing.native == change.native and closing.subject == change.subject
+        return replace(related_scan, items=(closing,))
+
+    configured_reader.inventory = changed_related_only
+    assert configured_reader.read_readiness(cut, source, declared) is None
+    assert related_calls[0] == 2
     for mode in (
         "denied",
         "malformed",
@@ -621,6 +756,8 @@ def test_qualified_readiness_uses_current_time_without_renewing_evidence(
     "mode",
     [
         "completion",
+        "composition-work",
+        "composition-ci-context",
         "path-gate",
         "semantic-gate",
         "stop",
@@ -652,6 +789,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     monkeypatch.setattr(task_execution_module, "time", deterministic_time)
     monkeypatch.setattr(native_kilo_fixture, "time", deterministic_time)
     project, scm, knowledge, transports = configured(services, clock)
+    native_work = project.work
     tokens = {
         name: {"read": f"Bearer {name}-fixture-read", "write": f"Bearer {name}-fixture-write"}
         for name in ("jira", "github", "jenkins", "confluence")
@@ -824,6 +962,12 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     denied_puts = sum(
         method == "PUT" and path.startswith("/wiki/api/v2/pages/901") for method, path, _, _ in services.requests
     )
+    composable = mode.startswith("composition-")
+    if composable:
+        project = replace(project, work=SyntheticWork(native_work, "https://work.separate.invalid:8443"))
+    if mode == "composition-ci-context":
+        project = replace(project, ci=SyntheticCI(project.ci))
+    context_driver = SyntheticDocument(knowledge) if mode == "composition-ci-context" else knowledge
     selected = project.work.work("ENG-42")
     predecessor = project.work.work("ENG-41")
     source = project.scm.ref("feature").subject
@@ -845,8 +989,20 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     def work_declaration(**changes: object) -> Declaration:
         return declaration(recipes=[recipe], **changes)
 
-    baselines = JenkinsQualifiedBaseline(
-        project.ci, DriverSubject(project.ci.binding, "build", "11", None), (recipe,), clock.wall
+    ci_profile = QualifiedCIProfile(
+        project.ci,
+        project.ci.binding,
+        "synthetic-ci-profile:v2" if mode == "composition-ci-context" else "jenkins-exact:v1",
+        synthetic_ci_result if mode == "composition-ci-context" else jenkins_result,
+    )
+    baselines = (
+        ConfiguredQualifiedBaseline(
+            ci_profile, DriverSubject(project.ci.binding, "build", "11", None), (recipe,), clock.wall
+        )
+        if composable
+        else JenkinsQualifiedBaseline(
+            project.ci, DriverSubject(project.ci.binding, "build", "11", None), (recipe,), clock.wall
+        )
     )
     baseline = baselines.read_baseline(source, digest(encode(work_declaration().value["recipes"])))
     if mode != "baseline-unavailable":
@@ -856,17 +1012,57 @@ def test_qualified_work_dag_owner_approval_and_reopen(
 
     first_criterion = ContentCriterion("result.txt", b"approved exact result\nedge-case addressed\n")
     second_criterion = ContentCriterion("result.txt", b"second result\n")
-    readiness = GitHubJiraLiteralReadiness(
-        project.work,
+    native_readiness = GitHubJiraLiteralReadiness(
+        native_work,
         scm,
         repository,
-        ((predecessor.fact.subject, (first_criterion,)), (selected.fact.subject, (second_criterion,))),
+        (
+            (replace(predecessor.fact.subject, binding=native_work.binding), (first_criterion,)),
+            (replace(selected.fact.subject, binding=native_work.binding), (second_criterion,)),
+        ),
         frozenset({"3"}),
         ((knowledge, "900", "19"),),
         Principal("other-owner" if mode == "owner-mismatch" else "owner", "owner"),
         "owner:fixture-complete-repository-visibility",
         clock.wall,
         max_pages=3,
+    )
+
+    def inventory() -> DriverScan:
+        facts = native_readiness._inventory()  # pyright: ignore[reportPrivateUsage] - Actual bounded fixture inventory, not fabricated absence.
+        return DriverScan(
+            facts or (),
+            facts is not None,
+            facts is not None,
+            "all-open-changes-in-repository:" + scm.binding.digest,
+            clock.wall(),
+            clock.wall() + 30,
+            "synthetic-two-bounded-reads-not-snapshot",
+        )
+
+    readiness = (
+        LiteralReadiness(
+            project.work,
+            scm,
+            repository,
+            ((predecessor.fact.subject, (first_criterion,)), (selected.fact.subject, (second_criterion,))),
+            frozenset({"active"}),
+            ((context_driver, "900", "19"),),
+            Principal("owner", "owner"),
+            "owner:fixture-complete-repository-visibility",
+            clock.wall,
+            max_pages=3,
+            inventory=inventory,
+            work_is_open=lambda work: json.loads(work.fact.native).get("stage") == "active",
+            producer="configured-literal-readiness:fixture-v1",
+            context_subjects=(
+                DriverSubject(
+                    context_driver.binding, "document" if mode == "composition-ci-context" else "page", "900", "19"
+                ),
+            ),
+        )
+        if composable
+        else native_readiness
     )
 
     budget = WorkBudgetPolicy(tuple((kind, 20) for kind in WorkKind), 3, 4_000_000)
@@ -878,7 +1074,12 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         project_id="qualified-project",
         recipes=intake_policy().recipes | {recipe},
         evidence_producers=intake_policy().evidence_producers
-        | {"jenkins-qualified-baseline:v1", "github-jira-literal-readiness:v1"},
+        | {
+            "jenkins-qualified-baseline:v1",
+            "github-jira-literal-readiness:v1",
+            ci_profile.producer,
+            readiness.producer,
+        },
         authority=AuthorityEnvelope(
             "owner",
             max_attempts=4,
@@ -977,7 +1178,34 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         )
         assert QualifiedDraft.parse(encode(second.payload())) == second
         context_subject = DriverSubject.parse(json.loads(first.readiness.proof)["contexts"][0]["subject"])
-        assert context_subject == DriverSubject(knowledge.binding, "page", "900", "19")
+        assert context_subject == DriverSubject(
+            context_driver.binding, "document" if mode == "composition-ci-context" else "page", "900", "19"
+        )
+        if composable:
+            before_missing = store.operations()
+            current_context = context_driver.content("900", "19")
+            with patch.object(
+                context_driver, "content", return_value=replace(current_context, qualification="unavailable")
+            ):
+                with pytest.raises(IntakeRefused, match="qualified relevance unavailable"):
+                    app.prepare_qualified(
+                        "unavailable-context",
+                        work_declaration(criteria=[first_criterion.criterion]),
+                        capture(predecessor, False),
+                        source,
+                        relevance_reason="work remains",
+                        ci_subjects=(DriverSubject(project.ci.binding, "build", "12", None),),
+                    )
+            assert store.find_program("unavailable-context") is None and not (sqlite_tmp_path / "owned").exists()
+            with pytest.raises(IntakeRefused, match="required candidate CI subjects unavailable"):
+                app.prepare_qualified(
+                    "missing-ci",
+                    work_declaration(criteria=[first_criterion.criterion]),
+                    capture(predecessor, False),
+                    source,
+                    relevance_reason="work remains",
+                )
+            assert store.operations() == before_missing
         with pytest.raises(IntakeRefused, match="outside the exact approved Program"):
             app.propose("missing-predecessor", "deliver", (), qualified_drafts=(second,))
         other_binding = replace(predecessor.fact.subject.binding, origin="https://other-jira.invalid:8443")
@@ -1084,6 +1312,18 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             == 90
         )
         app.check(approved)
+        if composable:
+            original_work_binding = project.work.binding
+            with patch.object(project.work, "binding", replace(original_work_binding, namespace="changed-project")):
+                with pytest.raises(IntakeRefused, match="work driver unavailable or changed"):
+                    app.check(approved)
+            assert isinstance(readiness, LiteralReadiness)
+            original_inventory = readiness.inventory
+            readiness.inventory = lambda: replace(original_inventory(), complete=False)
+            with pytest.raises(IntakeRefused, match="baseline identity changed"):
+                app.check(approved)
+            readiness.inventory = original_inventory
+            app.check(approved)
         context_drift[0] = True
         with pytest.raises(ValueError):
             app.check(approved)
@@ -1121,9 +1361,52 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             ("Fixture", "fixture@example.invalid"),
             authority_deadline=approved.expires_at,
             qualified_ci=project.ci,
+            qualified_ci_profile=ci_profile if composable else None,
         )
         assert workspace.source.resolve().is_relative_to(sqlite_tmp_path.resolve())
         assert workspace.objects.resolve().is_relative_to(sqlite_tmp_path.resolve())
+        unapproved_interpretations: list[tuple[str, int]] = []
+
+        def unsafe_ci_interpretation(_: DriverFact, now: int) -> tuple[str, int]:
+            unapproved_interpretations.append(("passed", now))
+            return "passed", now
+
+        if mode == "completion":
+            assert "profile" not in json.loads(proposal.qualified_drafts[0].baseline.proof)
+            for producer in ("different-profile:v1", "jenkins-exact:v1"):
+                unsafe = QualifiedCIProfile(project.ci, project.ci.binding, producer, unsafe_ci_interpretation)
+                with pytest.raises(IntakeRefused, match="interpretation differs from approved profile"):
+                    OrdinaryGitWorkspace(
+                        store,
+                        tree,
+                        repository,
+                        repository_url,
+                        proposal,
+                        workspace.commands,
+                        ("Fixture", "fixture@example.invalid"),
+                        authority_deadline=approved.expires_at,
+                        qualified_ci_profile=unsafe,
+                    )
+            assert not unapproved_interpretations and not workspace.objects.exists()
+        if composable:
+            before_profile_refusal = store.operations()
+            for missing_profile in (
+                None,
+                QualifiedCIProfile(project.ci, project.ci.binding, "changed-profile:v1", ci_profile.interpret),
+            ):
+                with pytest.raises(IntakeRefused, match="candidate CI"):
+                    OrdinaryGitWorkspace(
+                        store,
+                        tree,
+                        repository,
+                        repository_url,
+                        proposal,
+                        workspace.commands,
+                        ("Fixture", "fixture@example.invalid"),
+                        authority_deadline=approved.expires_at,
+                        qualified_ci_profile=missing_profile,
+                    )
+            assert store.operations() == before_profile_refusal and not workspace.objects.exists()
         connection: CodexStdio | None = None
         if mode == "managed-uncertain":
             peer = tmp_path / "codex-peer.py"
@@ -1331,6 +1614,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 ("Fixture", "fixture@example.invalid"),
                 authority_deadline=approved.expires_at,
                 qualified_ci=project.ci,
+                qualified_ci_profile=ci_profile if composable else None,
             )
             remediation_worker = WorkOwnership(
                 store,
@@ -1389,6 +1673,17 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             assert len(ci_operations) == 1
             evidence = json.loads(store.artifact(ci_operations[0].operation_id, "result"))
             assert evidence["passed"] and evidence["subject"]["head_revision"] == candidate_head
+            if mode == "completion":
+                before_reinterpretation = store.operations()
+                before_ci_requests = len(services.requests)
+                unsafe = QualifiedCIProfile(
+                    project.ci, project.ci.binding, "jenkins-exact:v1", unsafe_ci_interpretation
+                )
+                with patch.object(remediation_workspace, "qualified_ci_profile", unsafe):
+                    checker = ordinary_workspace_module._QualifiedCICheck(remediation_workspace)  # pyright: ignore[reportPrivateUsage]
+                    assert checker.check("ci", EvidenceSubject(**cast(dict[str, str], evidence["subject"]))) is None
+                assert not unapproved_interpretations and len(services.requests) == before_ci_requests
+                assert store.operations() == before_reinterpretation
             ci_reference = evidence["artifact_reference"].removeprefix("sha256:")
             ci_payload = json.loads(
                 store.artifact("runtime:" + remediation.attempt.attempt_id, "qualified-ci:" + ci_reference)
@@ -1553,6 +1848,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 ("Fixture", "fixture@example.invalid"),
                 authority_deadline=approved.expires_at,
                 qualified_ci=project.ci,
+                qualified_ci_profile=ci_profile if composable else None,
             )
             second_worker = WorkOwnership(
                 store, Principal("worker", "worker"), second_tree, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
@@ -1732,11 +2028,11 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             ):
                 with pytest.raises(ValueError):
                     export_private_outcome(store, "qualified-dag", owner_policy=PRIVATE_METADATA)
-        original_claim = store.outcome_claim_evidence
+        claim_evidence = store.outcome_claim_evidence
 
         def wrong_claim(program: str, command: str) -> dict[str, object]:
             return {
-                **original_claim(program, command),
+                **claim_evidence(program, command),
                 "original_claim": {"attempt": {"program_id": "foreign-program"}},
             }
 

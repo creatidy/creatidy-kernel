@@ -538,6 +538,20 @@ is one verification input, not task acceptance. Provider synchronization remains
 version-1 proposal bytes are unchanged. The heterogeneous test uses these shipped producers against
 synthetic provider services and host policy; it does not establish live product readiness.
 
+Trusted hosts can alternatively compose `LiteralReadiness`, `ConfiguredQualifiedBaseline` and
+`QualifiedCIProfile` with independently selected work, SCM, CI and context implementations. The host
+supplies the version-qualified native open-work predicate, a complete bounded change inventory scoped
+to the exact SCM binding, exact context subjects, and the native CI result/age/assurance interpreter.
+These are trusted policy inputs, never callbacks selected by issue or worker content. The common
+ordinary approval, claims, candidate checks, review/remediation, acceptance and recovery handlers are
+unchanged. Candidate CI must match its approved binding and interpretation profile; no generic green
+status, branch name or local result is promoted to external attestation. An empty optional context
+selection is retained as empty, without substituting Confluence or fetching another source. Required
+context must instead be explicitly selected and received. Historical Jira/GitHub and Jenkins producers
+retain their original proof formats. Synthetic role substitution proves this composition seam, not
+native support for additional providers; reusable native roles and the final installed combination
+matrix remain separate deliveries.
+
 ## Local Owner-Served State
 
 For a running trusted-local controller, construct `OwnerProjection` with its existing
