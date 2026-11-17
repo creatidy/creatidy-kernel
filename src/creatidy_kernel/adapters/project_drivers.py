@@ -744,12 +744,15 @@ class RepositoryDocumentation:
         if (source.binding.origin, source.binding.repository) != (binding.origin, binding.namespace):
             raise ValueError("repository documentation source binding differs")
         self.binding, self.source, self.clock, self.ttl = binding, source, clock, ttl
+        self._source_configuration = (binding, source.binding, source.repository)
 
     def content(self, key: str, revision: str) -> DriverFact:
         oid(revision)
         now = self.clock()
+        if (self.binding, self.source.binding, self.source.repository) != self._source_configuration:
+            return unavailable_fact(self.binding, "document", key, now, 0)
         data = self.source.read(revision, key)
-        if data is None:
+        if data is None or (self.binding, self.source.binding, self.source.repository) != self._source_configuration:
             return unavailable_fact(self.binding, "document", key, now, 0)
         return native_fact(
             self.binding,

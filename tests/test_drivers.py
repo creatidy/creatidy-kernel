@@ -40,6 +40,7 @@ from creatidy_kernel.adapters.forgejo_discovery import ForgejoDiscovery
 from creatidy_kernel.adapters.forgejo_drivers import ForgejoCI
 from creatidy_kernel.adapters.intake import GitContentSource
 from creatidy_kernel.adapters.kilo_review import NativeKiloReview
+from creatidy_kernel.adapters.local_verification import TrustedLocalVerification
 from creatidy_kernel.adapters.ordinary_managed import OrdinaryManagedRun
 from creatidy_kernel.adapters.ordinary_workspace import OrdinaryGitWorkspace
 from creatidy_kernel.adapters.owned_workspace import LocalOwnedWorkspace
@@ -77,6 +78,7 @@ from creatidy_kernel.core.domain import (
     ResumeProgram,
 )
 from creatidy_kernel.core.drivers import (
+    DriverBinding,
     DriverDelivery,
     DriverFact,
     DriverMutation,
@@ -110,6 +112,7 @@ from creatidy_kernel.ports.ordinary import (
 from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.ownership import WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
+from creatidy_kernel.ports.verification import VerificationProfile
 from tools.check_drivers import (
     BASE,
     HEAD,
@@ -1701,6 +1704,94 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             assert len(ci_operations) == 1
             evidence = json.loads(store.artifact(ci_operations[0].operation_id, "result"))
             assert evidence["passed"] and evidence["subject"]["head_revision"] == candidate_head
+            if mode == "completion":
+                local_binding = DriverBinding(
+                    "ci",
+                    "trusted-local",
+                    "1",
+                    "https://local-owner.example.test",
+                    "owner",
+                    "ordinary-local-checks",
+                    "owned-command-v1",
+                    "owner:original-command-receipts-read",
+                )
+                local_subject = EvidenceSubject(**cast(dict[str, str], evidence["subject"]))
+                recorded = remediation_workspace.recorded_commands(local_subject)
+                assert recorded is not None
+                local_commands = remediation_workspace.commands
+                local = TrustedLocalVerification(
+                    local_binding,
+                    remediation_workspace,
+                    local_commands,
+                    app.verification,
+                    VerificationProfile.TRUSTED_DEVELOPMENT,
+                    clock.wall,
+                )
+                before_local_read = store.operations()
+                assert local.check("commands", local_subject) == recorded[0]
+                local_mapping = TrustedSCMRemote(
+                    remediation_workspace.repository_url, project.scm.binding, "owner:local-source-binding"
+                )
+                local_baseline = local.baseline(
+                    local_subject, local_mapping, ("local:original-recipe",), "owner:exact-local-recipe"
+                )
+                local_source = DriverSubject(project.scm.binding, "ref", "received-exact-candidate", candidate_head)
+                local_recipe_digest = digest(encode(("local:original-recipe",)))
+                baseline_evidence = local_baseline.read_baseline(local_source, local_recipe_digest)
+                assert baseline_evidence is not None and baseline_evidence.result == "passed"
+                assert baseline_evidence.observed_at == recorded[0].observed_at
+                assert json.loads(baseline_evidence.proof)["evidence"] == asdict(recorded[0])
+                assert (
+                    local_baseline.read_baseline(replace(local_source, revision="f" * 40), local_recipe_digest) is None
+                )
+                cold = OrdinaryGitWorkspace(
+                    store,
+                    remediation_workspace.workspace,
+                    remediation_workspace.source,
+                    remediation_workspace.repository_url,
+                    proposal,
+                    local_commands,
+                    remediation_workspace.author,
+                    authority_deadline=approved.expires_at,
+                    qualified_ci_profile=remediation_workspace.qualified_ci_profile,
+                )
+                cold_local = TrustedLocalVerification(
+                    local_binding,
+                    cold,
+                    local_commands,
+                    app.verification,
+                    VerificationProfile.TRUSTED_DEVELOPMENT,
+                    clock.wall,
+                )
+                assert cold.claim is None and cold.control is None
+                assert cold_local.check("commands", local_subject) == recorded[0]
+                assert local.check("ci", local_subject) is None
+                assert local.check("commands", replace(local_subject, head_revision="f" * 40)) is None
+                expired_local = TrustedLocalVerification(
+                    local_binding,
+                    remediation_workspace,
+                    local_commands,
+                    app.verification,
+                    VerificationProfile.TRUSTED_DEVELOPMENT,
+                    lambda: recorded[0].fresh_until + 1,
+                )
+                assert expired_local.check("commands", local_subject) is None
+                with pytest.raises(UnsupportedForge, match="sandbox or external CI"):
+                    TrustedLocalVerification(
+                        local_binding,
+                        remediation_workspace,
+                        local_commands,
+                        app.verification,
+                        VerificationProfile.LINUX_BUBBLEWRAP,
+                        clock.wall,
+                    )
+                with patch.object(
+                    remediation_workspace,
+                    "commands",
+                    tuple(replace(item, timeout_seconds=item.timeout_seconds + 1) for item in local_commands),
+                ):
+                    assert local.check("commands", local_subject) is None
+                assert store.operations() == before_local_read
             if mode == "completion":
                 before_reinterpretation = store.operations()
                 before_ci_requests = len(services.requests)

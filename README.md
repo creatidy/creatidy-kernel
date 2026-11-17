@@ -839,6 +839,68 @@ Jenkins numbered Git-plugin builds + Confluence Cloud v2 pinned page storage con
 source interface; it does not need Confluence or substitute for inaccessible Confluence content.
 `adapters.forgejo_drivers` exposes version-1 family views and the unchanged native effect facade.
 
+Additional independently selectable read roles reuse the same ports and ordinary lifecycle:
+
+- `GitHubIssues` (`github-issues`, REST `2026-03-10`) reads exact issues and repeated bounded native
+  `blocked_by` lists, preserving numeric IDs, node IDs, directions and cross-repository targets.
+  Native page exhaustion proves only caller-visible scope, not hidden-edge absence. A fresh exact
+  owner `EdgeObligation` remains required; issue prose, summary counts and native Closed grant nothing.
+- `GitHubActionsCI` (`github-actions`, REST `2026-03-10`) binds the full source commit, repository ID,
+  native run ID, explicit native run attempt and complete bounded attempt-specific jobs. Missing
+  attempt identity, skipped/missing required jobs or steps, inaccessible pages, ambiguous executions,
+  forks, changed observations and mismatched source/workflow bytes refuse qualified verification.
+- `ForgejoActionsCI` (`forgejo-actions`, declared `16.0.0` compatibility) binds native run/job IDs and
+  each job's own attempt, handle and task ID. It never invents a shared run-attempt number. Native
+  aggregate success with a skipped required job is not sufficient. Forgejo has no structured native
+  step-result API at this pin: a profile requiring that capability refuses before reads, rather than
+  parsing log text into an attestation. These are source-verified compatibility profiles, not a live
+  server-version or permission attestation and not an assumed `>=16` compatibility range.
+
+`ActionsRecipe` is trusted, finite workflow/recipe selection: exact workflow path/content SHA-256,
+native workflow ID, full push ref, required job-name labels and optional required native step names,
+plus explicit decision/visibility references. Labels never replace retained native job identities;
+duplicate labels refuse, and Forgejo's unavailable native workflow-job key remains unavailable.
+Both Actions roles verify exact-commit workflow blob bytes and bind the profile in the existing
+`QualifiedCIProfile`/`ConfiguredQualifiedBaseline`. Forgejo push payload/ref/repository/commit must
+agree; successful exact-commit directory listings establish `.forgejo`, `.gitea`, `.github` workflow
+directory precedence instead of guessing from the filename. Separate CI/source repositories or
+authorities require explicit `TrustedSCMRemote`, checked against native CI repository identity.
+Only push/top-level workflow profiles are supported here; pull-request and reusable-workflow provenance
+are not inferred. Native rerun attempts are read under their exact provider identities; dispatch,
+rerun and cancel effects are not supplied. Native execution records and selected step statuses are
+not an independent observation of the actual worktree, immutable external-action resolution,
+hostile-worker isolation, billing or universal gate coverage. Required stronger unavailable evidence
+cannot be replaced by a green aggregate or another role.
+
+`TrustedLocalVerification` (`trusted-local`, `owned-command-v1`) is a selectable existing
+`CheckProducer`, not an external CI run. It reads genuine finalized `OrdinaryGitWorkspace` command
+receipts with exact core subject, configured recipe/policy and explicit `TRUSTED_DEVELOPMENT` profile.
+It preserves the original Evidence producer, artifact identity and age, performs no execution,
+creates no new receipt/grant, and does not upgrade local results into a sandbox or provider attestation.
+The existing application still owns command dispatch, budget/fence/group settlement and acceptance.
+An explicit exact-source/recipe mapping can project an already recorded genuine local result into the
+existing `QualifiedBaseline` port, without inventing a provider run identity or rerunning code.
+Historical receipt reads also work after reconstructing the workspace SDK object, without restoring
+an execution claim; they remain historical evidence, never new execution or acceptance authority.
+
+`LocalDocumentKnowledge` (`local-documents`, `file-snapshot-v1`) reads only an explicitly selected
+native root and authorized relative keys, with finite byte/path limits, no-follow directory/file
+descriptors and closing source/permission checks. Snapshot revisions are actual `sha256:` content
+digests, not fabricated provider versions. Symlinks, hardlinks, special files, replacement, disappearance,
+revocation and source/configuration drift remain unavailable; no Confluence/network fallback or document
+management service is introduced. Its binding's HTTPS origin identifies the trusted owner instance,
+not a fetched URL. `RepositoryDocumentation` retains immutable Git-blob semantics and additionally
+refuses changed source configuration; working-tree removal alone does not withdraw an immutable blob.
+
+Native contract provenance: GitHub OpenAPI `2026-03-10`,
+[`c9c95fe34ced05fe076001f5c55704742bc8e7f8`](https://raw.githubusercontent.com/github/rest-api-description/c9c95fe34ced05fe076001f5c55704742bc8e7f8/descriptions/api.github.com/api.github.com.2026-03-10.json),
+and Forgejo v16.0.0
+[`07ba27a02b8db81be78e336f8597a355c04adb18`](https://codeberg.org/forgejo/forgejo/src/commit/07ba27a02b8db81be78e336f8597a355c04adb18/routers/api/v1/repo/action.go)
+([native wire types](https://codeberg.org/forgejo/forgejo/src/commit/07ba27a02b8db81be78e336f8597a355c04adb18/modules/structs/action.go),
+[push workflow selection](https://codeberg.org/forgejo/forgejo/src/commit/07ba27a02b8db81be78e336f8597a355c04adb18/services/actions/notifier_helper.go)).
+These factual API inspections and synthetic installed-package conformance do not establish live
+interoperability, product GO or the final integrated #60 matrix.
+
 Bindings are explicit trusted-host configuration, not discovered from task URLs. Construct each
 `DriverBinding` or use `binding_from_mapping` with exactly `family`, `implementation`, `version`,
 `origin`, `tenant`, `namespace`, `api_version`, `rights`. Unknown fields/majors refuse. For example:
