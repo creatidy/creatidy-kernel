@@ -2706,7 +2706,7 @@ def test_forgejo_ci_refuses_different_source_repository(field: str, value: str) 
     ci = binding("ci", "forgejo-facade", "acme/service", "1")
     source = replace(ci, family="scm")
     forge = cast(ForgejoForge, SimpleNamespace(binding=ForgeBinding(ci.origin, ci.namespace)))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="exact SCM repository or trusted mapping required"):
         ForgejoCI(forge, ci, replace(source, **{field: value}), Clock().wall)
 
 

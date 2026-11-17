@@ -403,7 +403,6 @@ class ForgejoCI:
         max_pages: int = 20,
         remote_mapping: TrustedSCMRemote | None = None,
     ) -> None:
-        self.repository = _binding(forge, binding, "ci")
         native_source = (
             source_binding.family,
             source_binding.implementation,
@@ -431,6 +430,7 @@ class ForgejoCI:
             or remote_mapping.remote != binding.origin + "/" + binding.namespace + ".git"
         ):
             raise ValueError("Forgejo CI trusted remote mapping differs")
+        self.repository = _binding(forge, binding, "ci")
         self.forge, self.binding, self.source_binding, self.clock = forge, binding, source_binding, clock
         self.max_pages = max_pages
         self.mapping_digest = None if remote_mapping is None else driver_digest(asdict(remote_mapping))
