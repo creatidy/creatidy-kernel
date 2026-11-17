@@ -389,7 +389,7 @@ def test_qualified_readiness_rejects_incomplete_moving_or_equivalent_inventory(
     services: SyntheticServices, tmp_path: Path
 ) -> None:
     clock = Clock()
-    project, scm, _, _ = configured(services, clock)
+    project, scm, knowledge, _ = configured(services, clock)
     repository = tmp_path / "readiness-source"
     repository.mkdir()
     reference_git(repository, "init", "--initial-branch=feature")
@@ -538,6 +538,23 @@ def test_qualified_readiness_rejects_incomplete_moving_or_equivalent_inventory(
     assert json.loads(stable_related.proof)["role_evidence"][-1]["related"] == [
         subject.reference for subject in change.related
     ]
+    unavailable_item = replace(change, qualification="unavailable")
+    assert unavailable_item.complete and unavailable_item.presence is Presence.FOUND
+    configured_reader.inventory = lambda: replace(related_scan, items=(unavailable_item,))
+    assert configured_reader.read_readiness(cut, source, declared) is None
+    configured_reader.inventory = lambda: scan
+    required_context = knowledge.content("900", "19")
+    configured_reader.contexts = ((knowledge, "900", "19"),)
+    configured_reader.context_bindings = (knowledge.binding,)
+    configured_reader.context_subjects = (required_context.subject,)
+    with patch.object(knowledge, "content", return_value=replace(required_context, qualification="unavailable")):
+        assert configured_reader.read_readiness(cut, source, declared) is None
+    configured_reader.contexts = ()
+    configured_reader.context_bindings = ()
+    configured_reader.context_subjects = ()
+    current_source = scm.ref(source.key)
+    with patch.object(scm, "ref", return_value=replace(current_source, qualification="unavailable")):
+        assert configured_reader.read_readiness(cut, source, declared) is None
     related_calls = [0]
 
     def changed_related_only() -> DriverScan:
@@ -1166,6 +1183,20 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         )
         if composable:
             before_missing = store.operations()
+            current_context = context_driver.content("900", "19")
+            with patch.object(
+                context_driver, "content", return_value=replace(current_context, qualification="unavailable")
+            ):
+                with pytest.raises(IntakeRefused, match="qualified relevance unavailable"):
+                    app.prepare_qualified(
+                        "unavailable-context",
+                        work_declaration(criteria=[first_criterion.criterion]),
+                        capture(predecessor, False),
+                        source,
+                        relevance_reason="work remains",
+                        ci_subjects=(DriverSubject(project.ci.binding, "build", "12", None),),
+                    )
+            assert store.find_program("unavailable-context") is None and not (sqlite_tmp_path / "owned").exists()
             with pytest.raises(IntakeRefused, match="required candidate CI subjects unavailable"):
                 app.prepare_qualified(
                     "missing-ci",

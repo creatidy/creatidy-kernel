@@ -123,7 +123,7 @@ class LiteralReadiness:
                 fact.subject.binding != self.source_binding
                 or fact.subject.kind != "change"
                 or not fact.complete
-                or not fact.qualification
+                or fact.qualification in {"", "unavailable"}
             ):
                 return None
         self._scans.append(scan)
@@ -148,18 +148,27 @@ class LiteralReadiness:
             started = self.clock()
             work = self.work.work(cut.subject.key)
             cut.recheck(work, self.clock())
-            if not self.work_is_open(work):
+            if not work.fact.complete or work.fact.qualification in {"", "unavailable"} or not self.work_is_open(work):
                 return None
             initial_source = self.source.ref(source.key)
             initial_source.require_current(self.clock())
-            if initial_source.subject != source:
+            if (
+                initial_source.subject != source
+                or not initial_source.complete
+                or initial_source.qualification in {"", "unavailable"}
+            ):
                 return None
             initial_contexts = tuple(driver.content(key, revision) for driver, key, revision in self.contexts)
             for fact, (driver, _, _), expected, binding in zip(
                 initial_contexts, self.contexts, self.context_subjects, self.context_bindings, strict=True
             ):
                 fact.require_current(self.clock())
-                if driver.binding != binding or fact.subject != expected or not fact.complete or not fact.qualification:
+                if (
+                    driver.binding != binding
+                    or fact.subject != expected
+                    or not fact.complete
+                    or fact.qualification in {"", "unavailable"}
+                ):
                     return None
             inventory = self._inventory()
             if inventory is None:
