@@ -85,7 +85,8 @@ class GitHubIssues:
             scans: list[list[dict[str, object]]] = []
             scan_complete = True
             qualification = (
-                "repeated-visible-blocked-by;not-snapshot;hidden-edge-visibility-unproved;owner-edge-obligation-required"
+                "repeated-visible-blocked-by;not-snapshot;"
+                "hidden-edge-visibility-unproved;owner-edge-obligation-required"
             )
             for _ in range(2):
                 items: list[dict[str, object]] = []
