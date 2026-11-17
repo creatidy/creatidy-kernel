@@ -385,6 +385,34 @@ def test_configured_ci_profile_refuses_incompatible_evidence(services: Synthetic
     assert original == ci.build("12", source)
 
 
+def test_native_jenkins_baseline_retains_timestamp_across_retrieval_latency(services: SyntheticServices) -> None:
+    clock = Clock()
+    project, scm, _, _ = configured(services, clock)
+    original = project.ci.build
+    starts: list[int] = []
+
+    def delayed(key: str, source: DriverSubject) -> DriverFact:
+        fact = original(key, source)
+        starts.append(fact.observed_at)
+        clock.now += 1
+        return fact
+
+    profile = QualifiedCIProfile(project.ci, project.ci.binding, "jenkins-exact:v1", jenkins_result)
+    reader = ConfiguredQualifiedBaseline(
+        profile, DriverSubject(project.ci.binding, "build", "12", None), ("recipe",), clock.wall
+    )
+    source = scm.ref("feature").subject
+    with patch.object(project.ci, "build", side_effect=delayed):
+        result = reader.read_baseline(source, digest(encode(("recipe",))))
+    assert starts == [100, 101]
+    assert result is not None and result.observed_at == 1
+    assert "timestamp_kind" not in json.loads(result.proof) and profile.matches_approval(result.proof)
+    observed = QualifiedCIProfile(
+        project.ci, project.ci.binding, profile.producer, jenkins_result, timestamp_kind="observation"
+    )
+    assert not observed.matches_approval(result.proof)
+
+
 def test_qualified_readiness_rejects_incomplete_moving_or_equivalent_inventory(
     services: SyntheticServices, tmp_path: Path
 ) -> None:
@@ -2706,7 +2734,7 @@ def test_forgejo_ci_refuses_different_source_repository(field: str, value: str) 
     ci = binding("ci", "forgejo-facade", "acme/service", "1")
     source = replace(ci, family="scm")
     forge = cast(ForgejoForge, SimpleNamespace(binding=ForgeBinding(ci.origin, ci.namespace)))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="exact SCM repository or trusted mapping required"):
         ForgejoCI(forge, ci, replace(source, **{field: value}), Clock().wall)
 
 

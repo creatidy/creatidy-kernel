@@ -2,6 +2,7 @@
 """Receive a host-configured Jenkins baseline without executing repository code."""
 
 from collections.abc import Callable
+from typing import Literal
 
 from creatidy_kernel.core.drivers import DriverBinding, DriverFact, DriverSubject
 from creatidy_kernel.core.forge import Presence
@@ -23,13 +24,21 @@ class QualifiedCIProfile:
         binding: DriverBinding,
         producer: str,
         interpret: Callable[[DriverFact, int], tuple[str, int] | None],
+        *,
+        timestamp_kind: Literal["native", "observation"] = "native",
     ) -> None:
         if binding != ci.binding or binding.family != "ci" or not producer.strip() or producer == "unknown":
             raise ValueError("exact configured CI interpretation profile required")
         self.ci, self.binding, self.producer, self.interpret = ci, binding, producer, interpret
+        if timestamp_kind not in {"native", "observation"}:
+            raise ValueError("explicit CI timestamp semantics required")
+        self.timestamp_kind = timestamp_kind
 
     def matches_approval(self, proof: bytes) -> bool:
-        approved = object_from(proof).get("profile")
+        value = object_from(proof)
+        if value.get("timestamp_kind", "native") != self.timestamp_kind:
+            return False
+        approved = value.get("profile")
         if approved is not None:
             return approved == self.producer
         # Before configurable profiles shipped, candidate verification always used
@@ -52,6 +61,7 @@ class QualifiedCIProfile:
             or source.revision is None
             or source.key != source.revision
             or self.ci.binding != self.binding
+            or self.timestamp_kind not in {"native", "observation"}
         ):
             return None
         fact = self.ci.build(selected.key, source)
@@ -72,6 +82,8 @@ class QualifiedCIProfile:
             or type(result[1]) is not int
             or not 0 <= result[1] <= at
             or self.ci.binding != self.binding
+            or self.timestamp_kind == "observation"
+            and result[1] != fact.observed_at
         ):
             return None
         return fact, result[0], result[1]
@@ -114,6 +126,7 @@ class ConfiguredQualifiedBaseline:
         if source.kind != "ref" or source.revision is None or recipe_digest != digest(encode(self.recipes)):
             return None
         commit = DriverSubject(source.binding, "commit", source.revision, source.revision)
+        timestamp_kind = self.profile.timestamp_kind
         try:
             first = self.profile.read(self.build, commit, self.clock)
             second = self.profile.read(self.build, commit, self.clock)
@@ -124,28 +137,40 @@ class ConfiguredQualifiedBaseline:
             now = self.clock()
             fact.require_current(now)
             closing.require_current(now)
-            if (fact.subject, fact.native, fact.provenance, fact.qualification, result, observed_at) != (
+            if (fact.subject, fact.native, fact.provenance, fact.qualification, result) != (
                 closing.subject,
                 closing.native,
                 closing.provenance,
                 closing.qualification,
                 closing_result,
-                closing_at,
             ):
                 return None
-            proof = encode(
-                {
-                    "build": self.build.reference,
-                    "source": commit.reference,
-                    "recipes": list(self.recipes),
-                    "native": fact.native.hex(),
-                    "provenance": fact.provenance,
-                    "qualification": fact.qualification,
-                    "profile": self.profile.producer,
-                }
-            )
+            if (
+                self.profile.timestamp_kind != timestamp_kind
+                or timestamp_kind == "native"
+                and observed_at != closing_at
+            ):
+                return None
+            proof_value: dict[str, object] = {
+                "build": self.build.reference,
+                "source": commit.reference,
+                "recipes": list(self.recipes),
+                "native": fact.native.hex(),
+                "provenance": fact.provenance,
+                "qualification": fact.qualification,
+                "profile": self.profile.producer,
+            }
+            if timestamp_kind == "observation":
+                proof_value["timestamp_kind"] = timestamp_kind
+            proof = encode(proof_value)
             return QualifiedBaseline(
-                source, recipe_digest, self.profile.producer, "sha256:" + digest(proof), result, observed_at, proof
+                source,
+                recipe_digest,
+                self.profile.producer,
+                "sha256:" + digest(proof),
+                result,
+                min(observed_at, closing_at),
+                proof,
             )
         except (OSError, ValueError, TypeError, OverflowError):
             return None

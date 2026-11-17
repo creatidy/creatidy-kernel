@@ -129,6 +129,12 @@ class HTTPSForgejoTransport:
         return False
 
     def request(self, method: str, path: str, body: Mapping[str, object] | None = None) -> tuple[int, object]:
+        status, payload, _ = self.request_with_headers(method, path, body)
+        return status, payload
+
+    def request_with_headers(
+        self, method: str, path: str, body: Mapping[str, object] | None = None
+    ) -> tuple[int, object, dict[str, str]]:
         prefix = f"/repos/{self.binding.repository}"
         if (
             method not in {"GET", "POST"}
@@ -175,10 +181,13 @@ class HTTPSForgejoTransport:
                     with self.opener.open(request, timeout=self.timeout) as response:
                         status = response.status
                         content = response.read(self.max_bytes + 1)
+                        native_headers = cast(Mapping[str, str], getattr(response, "headers", None) or {})
+                        headers = {key.lower(): value for key, value in native_headers.items()}
                 except HTTPError as error:
                     with error:
                         status = error.code
                         content = error.read(self.max_bytes + 1)
+                        headers = {key.lower(): value for key, value in (error.headers or {}).items()}
                 if len(content) > self.max_bytes:
                     raise OSError("forge HTTP response exceeds safe limit")
                 try:
@@ -187,7 +196,7 @@ class HTTPSForgejoTransport:
                     payload = None
         except (URLError, TimeoutError) as error:
             raise OSError("forge HTTP outcome unknown") from error
-        return status, payload
+        return status, payload, headers
 
 
 # Other native driver adapters share only these transport mechanisms, not Forgejo semantics.
