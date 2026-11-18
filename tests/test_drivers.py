@@ -66,7 +66,7 @@ from creatidy_kernel.adapters.sqlite_store import (
     SQLiteProgramStore,
     validate_local_storage,
 )
-from creatidy_kernel.adapters.task_execution import VerificationCommand
+from creatidy_kernel.adapters.task_execution import OwnedVerificationCommand, VerificationCommand
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.domain import (
     AttemptSpec,
@@ -819,6 +819,24 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     monkeypatch.setattr(ordinary_workspace_module, "time", deterministic_time)
     monkeypatch.setattr(task_execution_module, "time", deterministic_time)
     monkeypatch.setattr(native_kilo_fixture, "time", deterministic_time)
+    if mode == "completion":
+        original_command = ordinary_workspace_module.run_verification_command
+
+        def command_then_advance(
+            workspace: Path,
+            command: VerificationCommand,
+            repeat: int,
+            supplied: Mapping[str, str],
+            authorized: Callable[[], bool],
+            max_bytes: int,
+            *,
+            owner: OwnedVerificationCommand | None = None,
+        ) -> dict[str, object]:
+            result = original_command(workspace, command, repeat, supplied, authorized, max_bytes, owner=owner)
+            clock.now += 1
+            return result
+
+        monkeypatch.setattr(ordinary_workspace_module, "run_verification_command", command_then_advance)
     project, scm, knowledge, transports = configured(services, clock)
     native_work = project.work
     tokens = {
@@ -1386,7 +1404,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                         ),
                     ),
                     10,
-                    1,
+                    2 if mode == "completion" else 1,
                 ),
             ),
             ("Fixture", "fixture@example.invalid"),
@@ -1718,6 +1736,9 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 local_subject = EvidenceSubject(**cast(dict[str, str], evidence["subject"]))
                 recorded = remediation_workspace.recorded_commands(local_subject)
                 assert recorded is not None
+                local_times = [run["observed_at"] for run in json.loads(recorded[1])["runs"]]
+                assert len(local_times) == 2 and local_times[0] < local_times[1]
+                assert recorded[0].observed_at == max(local_times)
                 local_commands = remediation_workspace.commands
                 local = TrustedLocalVerification(
                     local_binding,

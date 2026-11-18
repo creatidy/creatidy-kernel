@@ -110,14 +110,16 @@ class TrustedLocalVerification:
                 or result.get("output_exhausted") is not False
                 or type(result.get("exit_code")) is not int
                 or type(at) is not int
-                or not evidence.observed_at <= at <= now
+                or not 0 < at <= evidence.observed_at
             ):
                 return None
             stamps.append(at)
             passed = passed and result["exit_code"] == 0
+        # The existing producer timestamps the aggregate at the last completion,
+        # not the first command; reading history must retain that original time.
         if (
             not stamps
-            or min(stamps) != evidence.observed_at
+            or max(stamps) != evidence.observed_at
             or evidence.passed != passed
             or self._configuration() != self.configuration
         ):
