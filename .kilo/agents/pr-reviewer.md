@@ -162,11 +162,27 @@ Review correctness,
 regressions, architecture, tests, temporal/provenance behavior under adversarial
 valid typed inputs, security/privacy and reuse/license evidence where relevant.
 Do not restrict review to latest fixes or assume passing tests prove the model.
+Inspect every changed hunk and relevant surrounding code against issue requirements,
+accepted decisions, architecture and producer contracts. Assess material regressions,
+edge cases, introduced security/privacy risks and test adequacy. Prioritize P0/P1 and
+material P2 with concrete consequences; cosmetic or speculative observations alone
+are not blocking findings. Unchanged source, provenance/license evidence and producer
+context need deeper inspection only for material questions raised by this PR, not an
+unrelated dependency audit, full-repository security audit or complete producer-environment
+reconstruction. Mandatory implementation/security/producer/release gates remain binding.
 Independently inspect canonical CI evidence: identify the actual tested checkout,
 verify successful required `make check`, `make package-check` and audit steps for
 the current subject, and treat missing, pending, stale, failed or ambiguous evidence
-as a limitation, never a pass. Do not repeat the complete CI gates locally merely for
-review. Run only inspected safe validation through the allowlist, in the clean exact checkout.
+as a limitation, never a pass. Verify authoritative exact-HEAD CI status and applicable
+required checks. If status is available but job-level detail is unavailable, retain
+the verified status and report that narrower gap; unavailable job detail alone does
+not invalidate the status or require COMMENT. Never claim unobserved steps or waive
+required integration evidence. Do not repeat the complete CI gates locally merely for
+review. Targeted local investigations are optional for suspected material defects or
+uncertainty; an unavailable optional check does not automatically require COMMENT.
+Unresolved material uncertainty still prevents APPROVE. Local test setup is required
+only for chosen checks, not for source/CI-only review. Run only inspected safe validation
+through the allowlist, in the clean exact checkout.
 Use the allowlisted `env -i ... make -C <supplied-checkout>` commands: they provide
 synthetic HOME/TMPDIR, minimum PATH/locale, offline mode and only the pre-existing locked dependency cache;
 they omit the owner's ambient environment, SSH/cloud/provider/model/Forge/browser
@@ -181,7 +197,7 @@ untrusted tests safe.
 Classify a missing tool/runtime, dependency, filesystem, environment, unsafe current-
 process test path or inaccessible public-source connector as review infrastructure,
 not a finding or owner decision. Before returning an incomplete verdict, diagnose and
-use available authorized read paths differently: for public claims, inspect the exact
+use available authorized read paths differently: for material public claims, inspect the exact
 cited pinned revision independently (prefer immutable revision URLs through the
 public reader when available); for execution, use the locked/offline checks and safe
 synthetic fixtures. Split source verification from test execution when appropriate.
