@@ -485,6 +485,19 @@ class OrdinaryGitWorkspace:
         )
         if retained_evidence is None:
             return None
+        prepared = self.store.find_artifact("ordinary-workspace:" + attempt_id, "prepared")
+        if prepared is None:
+            raise IntakeRefused("original prepared command recipe unavailable")
+        original = object_from(prepared)
+        expected = {
+            "version": 1,
+            "attempt": attempts[0].digest,
+            "source": self.repository_url,
+            "base": subject.base_revision,
+            "commands": [asdict(command) for command in self.commands],
+        }
+        if any(encode(original.get(key)) != encode(value) for key, value in expected.items()):
+            raise IntakeRefused("original prepared command recipe differs")
         value = object_from(retained_evidence)
         raw_subject = cast(dict[str, object], value.get("subject", {}))
         if set(raw_subject) != set(asdict(subject)):

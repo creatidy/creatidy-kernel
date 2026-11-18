@@ -1786,6 +1786,47 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 )
                 assert cold.claim is None and cold.control is None
                 assert cold_local.check("commands", local_subject) == recorded[0]
+                different_commands = tuple(replace(item, timeout_seconds=1) for item in local_commands)
+                assert different_commands != local_commands
+                different = OrdinaryGitWorkspace(
+                    store,
+                    remediation_workspace.workspace,
+                    remediation_workspace.source,
+                    remediation_workspace.repository_url,
+                    proposal,
+                    different_commands,
+                    remediation_workspace.author,
+                    authority_deadline=approved.expires_at,
+                    qualified_ci_profile=remediation_workspace.qualified_ci_profile,
+                )
+                different_local = TrustedLocalVerification(
+                    local_binding,
+                    different,
+                    different_commands,
+                    app.verification,
+                    VerificationProfile.TRUSTED_DEVELOPMENT,
+                    clock.wall,
+                )
+                with pytest.raises(IntakeRefused, match="original prepared command recipe"):
+                    different_local.check("commands", local_subject)
+                different_baseline = different_local.baseline(
+                    local_subject, local_mapping, ("local:original-recipe",), "owner:exact-local-recipe"
+                )
+                with pytest.raises(IntakeRefused, match="original prepared command recipe"):
+                    different_baseline.read_baseline(local_source, local_recipe_digest)
+                assert different.claim is None and different.control is None
+                assert cold_local.check("commands", local_subject) == recorded[0]
+                original_artifact_lookup = store.find_artifact
+
+                def without_prepared(operation_id: str, name: str) -> bytes | None:
+                    return None if name == "prepared" else original_artifact_lookup(operation_id, name)
+
+                with patch.object(store, "find_artifact", side_effect=without_prepared):
+                    with pytest.raises(IntakeRefused, match="original prepared command recipe unavailable"):
+                        cold_local.check("commands", local_subject)
+                    with pytest.raises(IntakeRefused, match="original prepared command recipe unavailable"):
+                        local_baseline.read_baseline(local_source, local_recipe_digest)
+                assert cold_local.check("commands", local_subject) == recorded[0]
                 assert local.check("ci", local_subject) is None
                 assert local.check("commands", replace(local_subject, head_revision="f" * 40)) is None
                 expired_local = TrustedLocalVerification(
