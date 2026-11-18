@@ -467,10 +467,77 @@ class OrdinaryGitWorkspace:
             passed,
         )
 
+    def recorded_commands(self, subject: EvidenceSubject) -> tuple[Evidence, bytes] | None:
+        """Read existing immutable command receipts; never dispatch or grant authority."""
+        program = self.store.find_program(self.proposal.program_id)
+        if (
+            program is None
+            or subject.repository != self.repository_url
+            or subject.spec_digest not in {spec.digest for spec in (*program.spec_history, program.spec)}
+        ):
+            return None
+        attempts = [attempt.spec for attempt in program.attempts if attempt.spec.digest == subject.attempt_digest]
+        if len(attempts) != 1:
+            return None
+        attempt_id = attempts[0].attempt_id
+        retained_evidence = self.store.find_artifact(
+            f"runtime:{attempt_id}", "command-evidence:" + digest(encode(asdict(subject)))
+        )
+        if retained_evidence is None:
+            return None
+        prepared = self.store.find_artifact("ordinary-workspace:" + attempt_id, "prepared")
+        if prepared is None:
+            raise IntakeRefused("original prepared command recipe unavailable")
+        original = object_from(prepared)
+        expected = {
+            "version": 1,
+            "attempt": attempts[0].digest,
+            "source": self.repository_url,
+            "base": subject.base_revision,
+            "commands": [asdict(command) for command in self.commands],
+        }
+        if any(encode(original.get(key)) != encode(value) for key, value in expected.items()):
+            raise IntakeRefused("original prepared command recipe differs")
+        value = object_from(retained_evidence)
+        raw_subject = cast(dict[str, object], value.get("subject", {}))
+        if set(raw_subject) != set(asdict(subject)):
+            raise IntakeRefused("retained command Evidence subject is malformed")
+        retained = Evidence(
+            cast(str, value["evidence_id"]),
+            cast(str, value["check"]),
+            EvidenceSubject(**cast(dict[str, str], raw_subject)),
+            cast(str, value["producer"]),
+            cast(str, value["tool_version"]),
+            cast(str, value["artifact_reference"]),
+            cast(int, value["observed_at"]),
+            cast(int, value["fresh_until"]),
+            cast(bool, value["passed"]),
+            cast(str | None, value.get("reviewer_session")),
+        )
+        if retained.subject != subject or retained.check != "commands" or encode(asdict(retained)) != retained_evidence:
+            raise IntakeRefused("retained command Evidence differs from the exact candidate")
+        reference = retained.artifact_reference
+        if (
+            not reference.startswith("sha256:")
+            or len(reference) != 71
+            or any(char not in "0123456789abcdef" for char in reference[7:])
+        ):
+            raise IntakeRefused("retained command result content address is malformed")
+        payload = self.store.artifact(f"runtime:{attempt_id}", "commands:" + reference[7:])
+        if "sha256:" + digest(payload) != reference:
+            raise IntakeRefused("retained command result content address differs")
+        return retained, payload
+
     def check(self, name: str, subject: EvidenceSubject) -> Evidence | None:
         if self._attempt is None or self.claim is None or self.control is None or self._head != subject.head_revision:
             raise IntakeRefused("exact collected ordinary command owner required")
         attempt, claim, control = self._attempt, self.claim, self.control
+        if (
+            subject.attempt_digest != attempt.digest
+            or subject.repository != self.repository_url
+            or subject.base_revision != self.base
+        ):
+            raise IntakeRefused("exact original command/check subject required")
         control.candidate_subject(claim)
         if name == "ci":
             return BudgetedChecks(
@@ -493,27 +560,9 @@ class OrdinaryGitWorkspace:
                 delivery=lambda key, seconds: control.dispatch(claim, key, lease_seconds=seconds),
             ).check(name, subject)
         evidence_name = "command-evidence:" + digest(encode(asdict(subject)))
-        retained_evidence = self.store.find_artifact(f"runtime:{attempt.attempt_id}", evidence_name)
-        if retained_evidence is not None:
-            value = object_from(retained_evidence)
-            raw_subject = cast(dict[str, object], value.get("subject", {}))
-            if set(raw_subject) != set(asdict(subject)):
-                raise IntakeRefused("retained command Evidence subject is malformed")
-            retained = Evidence(
-                cast(str, value["evidence_id"]),
-                cast(str, value["check"]),
-                EvidenceSubject(**cast(dict[str, str], raw_subject)),
-                cast(str, value["producer"]),
-                cast(str, value["tool_version"]),
-                cast(str, value["artifact_reference"]),
-                cast(int, value["observed_at"]),
-                cast(int, value["fresh_until"]),
-                cast(bool, value["passed"]),
-                cast(str | None, value.get("reviewer_session")),
-            )
-            if retained.subject != subject or retained.check != name or encode(asdict(retained)) != retained_evidence:
-                raise IntakeRefused("retained command Evidence differs from the exact candidate")
-            return retained
+        recorded = self.recorded_commands(subject)
+        if recorded is not None:
+            return recorded[0]
         boundary = self.pure_check("paths", subject)
         integrity = self.pure_check("structural", subject)
         if boundary is None or integrity is None or not boundary.passed or not integrity.passed:
