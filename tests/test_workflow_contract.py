@@ -392,6 +392,30 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("Parent makes no edits/branch switches while it runs", loop)
         self.assertIn("Any HEAD/base change invalidates approval", loop)
 
+    def test_practical_review_scope_ci_and_optional_checks(self) -> None:
+        reviewer = text(".kilo/agents/pr-reviewer.md")
+        for requirement in (
+            "every changed hunk and relevant surrounding code",
+            "issue requirements, accepted decisions, architecture and producer contracts",
+            "introduced security/privacy risks and test adequacy",
+            "Prioritize P0/P1 and material P2",
+            "only for material questions raised by this PR",
+            "Mandatory implementation/security/producer/release gates remain binding",
+            "Verify authoritative exact-HEAD CI status and applicable required checks",
+            "unavailable job detail alone does not invalidate the status or require COMMENT",
+            "Never claim unobserved steps or waive required integration evidence",
+            "Do not repeat the complete CI gates locally merely for review",
+            "Targeted local investigations are optional",
+            "an unavailable optional check does not automatically require COMMENT",
+            "Unresolved material uncertainty still prevents APPROVE",
+            "Local test setup is required only for chosen checks",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, reviewer)
+        validation = text(".kilo/rules/validation.md")
+        self.assertIn("only for chosen optional reviewer checks", validation)
+        self.assertIn("Required implementation validation is unchanged", validation)
+
     def test_review_admits_matching_private_mcp_refs_and_prepared_objects(self) -> None:
         evidence: dict[str, object] = {
             "canonical_repository": "Creatidy/creatidy-kernel",

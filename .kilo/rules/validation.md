@@ -34,9 +34,10 @@
   executed validation/results and genuine unresolved decisions/blockers. Distinguish
   change-caused failures from unrelated/environmental blockers; no claim
   of passing checks, push or PR creation without successful evidence.
-- Parent prepares a clean exact PR HEAD and existing offline locked development
-  environment before invoking a reviewer under AGENTS.md's conversational-independence
-  policy. Use a normal checkout by default; a specific owner-authorized task may use
+- Parent prepares a clean exact PR HEAD under AGENTS.md's conversational-independence
+  policy. Prepare an offline locked development environment only for chosen optional
+  reviewer checks, not as a source/CI-only review prerequisite. Required implementation
+  validation is unchanged. Use a normal checkout by default; a specific owner-authorized task may use
   one isolated temporary worktree to preserve
   concurrent work. No switching/editing of the reviewed checkout during review.
   Reviewer independently verifies canonical repository/PR/ref commits through
