@@ -294,7 +294,7 @@ application. It does not implement alternate Program transitions or inject satis
 | --- | --- | --- |
 | 1 | Forgejo Issues / Forgejo SCM / Forgejo Actions / repository files | `Q[forgejo-forgejo-actions-git]`: native Forgejo issue/dependency and SCM scans, qualified Actions and exact local Git blob. Read-only role configuration refuses an unconfigured synchronization effect before authorization. Legacy Forgejo AGit is separately retained, not a qualified cross-driver CAS. |
 | 2 | Forgejo Issues / GitHub SCM / GitHub Actions / repository files | `Q[forgejo-github-actions-git]`: Forgejo issue identity and its native dependency cut remain independent of GitHub Git objects, native run/attempt and exact documentation blob. Exact-commit GitHub COMMENT effect only after separate authorization. |
-| 3 | GitHub Issues / GitHub SCM / GitHub Actions / repository files | `Q[github-github-actions-git]`: separate planning repository/reader and source repository, owner-qualified visible `blocked_by` evidence; configured Actions binding, exact Git blob and separately authorized GitHub COMMENT. |
+| 3 | GitHub Issues / GitHub SCM / GitHub Actions / repository files | `Q[github-github-actions-git]`: separate planning repository/reader and source repository, owner-qualified visible `blocked_by` evidence; configured Actions binding, exact Git blob and separately authorized GitHub COMMENT, including lost-response recovery after SQLite reopen. |
 | 4 | Jira / GitHub SCM / Jenkins / Confluence | `Q[completion]` and `Q[sync-reopen]` on this wheel: visible Jira links plus owner obligation; exact Jenkins build/source/recipe; Confluence version/draft authorization, one send, lost reply and original Operation recovery. Also receives original trusted-local command evidence without reinterpreting it as external CI. |
 | 5 | GitHub Issues / GitHub SCM / GitHub Actions / independent local documents | `Q[github-github-actions-local]`: substitutes only knowledge relative to cell 3, using `LocalDocumentKnowledge`, authorized exact key and SHA-256 snapshot, not a repository/Confluence fallback. Same obligations, Attempts and authorized GitHub COMMENT. |
 | 6 | Missing, incompatible, unsupported or unverified required capabilities | The four new `Q` cells refuse a missing or changed CI profile, changed knowledge binding, incomplete dependency/inventory reads, wrong evidence and stale approval without replacing existing authority. They verify unsupported GitHub change mutation or absent Forgejo effect configuration separately. Historical matrix cells 8, 9, 13, 30-32 retain additional bounded version, optional/native capability and strict profile refusals. |
@@ -349,6 +349,16 @@ satisfaction. The export exposes no raw source revision or any of the three cand
 text, paths or synthetic credentials used in the composition.
 No aggregate cost is inferred. The GitHub COMMENT is an authorized synthetic native effect, not
 product review, conditional PR update, merge or write authority for the other providers.
+
+Cell 3 additionally passed a focused installed run (39.54 seconds) in which the synthetic GitHub
+service persisted the exact authorized COMMENT on candidate B and then dropped the reply. The
+original Operation and private export remained `unknown`, without a receipt, after closing and
+reopening SQLite. A mismatched native actor did not settle it. The original native record then
+settled the same Operation by read-only reconciliation, with exactly one COMMENT POST in the
+delivery, no write credential, no new grant, and no renewed deadline. Both private exports preserve
+the same Operation, Attempt, WorkUnit and satisfaction references without revealing raw revisions
+or credentials. The resolved export adds the receipt and reconciliation evidence without replacing
+the original unknown observation. This is synthetic recovery, not evidence of live GitHub writes.
 
 ### Evidence Reuse And Live Cut
 

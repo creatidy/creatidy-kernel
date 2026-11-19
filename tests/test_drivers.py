@@ -2393,6 +2393,17 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                     assert native_times[workspace.collected[1].head] < native_times[candidate_head]
                 assert DriverSubject.parse(ci_payload["subject"]).key == actions_key
                 synced_effect = None
+                lost_comment = mode == "github-github-actions-git"
+                lost_delivery = None
+                uncertain = None
+                unknown_effect = None
+                operation_id = "actions-sync"
+                export_key = b"k" * 32
+
+                def exported_ref(kind: str, identifier: str) -> str:
+                    encoded = json.dumps([kind, identifier], separators=(",", ":")).encode()
+                    return "hmac-sha256:" + hmac.digest(export_key, encoded, "sha256").hex()
+
                 usage_operation = ci_operations[0].operation_id
                 if reception:
                     original_usage = UsageObservation(
@@ -2434,21 +2445,36 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                             assert claim == remediation.claim and requested == mutation
                             return DriverEffectGrant(claim, requested, 1, approved.expires_at, Event())
 
-                        sync = DriverApplication(store, remediation_control, project, (scm,), clock.wall, grant)
+                        sync = DriverApplication(
+                            store,
+                            remediation_control,
+                            project,
+                            (scm,),
+                            clock.wall,
+                            grant,
+                            lease_seconds=1 if lost_comment else 60,
+                        )
                         with pytest.raises(UnsupportedForge):
                             sync.synchronize(
                                 remediation.claim, "forbidden", "forbidden", replace(mutation, action="update_change")
                             )
                         sync_head[0] = candidate_head  # The synthetic native change already points at accepted B.
+                        send_start = len(services.requests)
                         try:
-                            receipt = sync.synchronize(remediation.claim, "actions-sync", "actions-sync", mutation)
-                            synced_effect = next(
-                                item for item in store.operations() if item.accepted_reference == receipt.reference
-                            )
-                            assert receipt.status is EffectStatus.ACCEPTED
-                            assert (
-                                sync.synchronize(remediation.claim, "actions-sync", "actions-sync", mutation) == receipt
-                            )
+                            if lost_comment:
+                                services.lost.add("POST")
+                            receipt = sync.synchronize(remediation.claim, operation_id, operation_id, mutation)
+                            synced_effect = store.operation(operation_id)
+                            if lost_comment:
+                                assert receipt.status is EffectStatus.UNKNOWN and receipt.reference is None
+                                lost_delivery = (mutation, receipt.operation, send_start)
+                                assert synced_effect.status == "unknown" and synced_effect.accepted_reference is None
+                                assert store.find_artifact(operation_id, "driver-receipt") is None
+                            else:
+                                assert receipt.status is EffectStatus.ACCEPTED
+                                assert (
+                                    sync.synchronize(remediation.claim, operation_id, operation_id, mutation) == receipt
+                                )
                         finally:
                             sync_head[0] = None
                         assert services.reviews[:-1] == before_reviews
@@ -2509,16 +2535,95 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                         "execution"
                     ]
                 )
-                export_key = b"k" * 32
+                if lost_comment:
+                    assert synced_effect is not None and lost_delivery is not None
+                    mutation, original_key, send_start = lost_delivery
+                    original = synced_effect
+                    assert store.operation(operation_id) == original and original.status == "unknown"
+                    assert store.find_artifact(operation_id, "driver-receipt") is None
+                    uncertain = export_private_outcome(
+                        store, "qualified-dag", owner_policy=PRIVATE_METADATA, pseudonym_key=export_key
+                    )
+                    (unknown_effect,) = cast(list[dict[str, object]], uncertain["native_effects"])
+                    assert (
+                        unknown_effect["status"],
+                        unknown_effect["receipt_recorded"],
+                        unknown_effect["receipt"],
+                    ) == (
+                        "unknown",
+                        False,
+                        None,
+                    )
+                    assert unknown_effect["receipt_status"] is None and unknown_effect["current_remote_state"] is None
+                    assert original.lease_until is not None
+                    clock.now = max(clock.now, original.lease_until)
+                    assert clock.now < approved.expires_at
+                    recovered_control = WorkOwnership(
+                        store,
+                        Principal("owner", "owner"),
+                        remediation_tree,
+                        mode=HandoffMode.PULL,
+                        profile=COOPERATIVE_PROFILE,
+                    )
+
+                    def no_grant(claim: WorkClaim, requested: DriverMutation) -> DriverEffectGrant:
+                        pytest.fail("reconciliation requested fresh authority")
+
+                    readback = DriverApplication(store, recovered_control, project, (scm,), clock.wall, no_grant)
+                    posted = services.reviews[-1]
+                    original_actor = posted["user"]
+                    request_count = len(services.requests)
+                    sync_head[0] = candidate_head
+                    try:
+                        with patch.object(transports[1], "write_authorization", None):
+                            posted["user"] = {"login": "fixture-foreign-reviewer"}
+                            wrong = readback.synchronize(remediation.claim, operation_id, operation_id, mutation)
+                            assert wrong.status is EffectStatus.UNKNOWN and wrong.reference is None
+                            assert store.operation(operation_id).status == "unknown"
+                            assert store.find_artifact(operation_id, "driver-receipt") is None
+                            posted["user"] = original_actor
+                            found = readback.synchronize(remediation.claim, operation_id, operation_id, mutation)
+                    finally:
+                        posted["user"] = original_actor
+                        sync_head[0] = None
+                    assert found.status is EffectStatus.ACCEPTED and found.operation == original_key
+                    assert all(item[0] == "GET" for item in services.requests[request_count:])
+                    posts = [
+                        item
+                        for item in services.requests[send_start:]
+                        if item[0] == "POST" and urlsplit(item[1]).path == "/repos/acme/service/pulls/7/reviews"
+                    ]
+                    assert len(posts) == 1 and json.loads(posts[0][2])["event"] == "COMMENT"
+                    synced_effect = store.operation(operation_id)
+                    assert synced_effect.accepted_reference == found.reference
+                    assert (
+                        synced_effect.operation_id,
+                        synced_effect.effect_key,
+                        synced_effect.request_digest,
+                        synced_effect.fence,
+                        synced_effect.attempts,
+                    ) == (
+                        original.operation_id,
+                        original.effect_key,
+                        original.request_digest,
+                        original.fence,
+                        1,
+                    )
+                    prior_operations = {op.operation_id for op in operations}
+                    assert all(
+                        op.operation_id.startswith(
+                            ("work-budget:v1:ownership-settlement:", "work-budget:v1:settlement:")
+                        )
+                        for op in store.operations()
+                        if op.operation_id not in prior_operations
+                    )
+                    assert app.recover(decision).expires_at == approved.expires_at
+                    assert store.history("qualified-dag") == history
+                    operations = store.operations()
                 outcome = export_private_outcome(
                     store, "qualified-dag", owner_policy=PRIVATE_METADATA, pseudonym_key=export_key
                 )
                 if reception:
-
-                    def exported_ref(kind: str, identifier: str) -> str:
-                        encoded = json.dumps([kind, identifier], separators=(",", ":")).encode()
-                        return "hmac-sha256:" + hmac.digest(export_key, encoded, "sha256").hex()
-
                     subjects = cast(list[dict[str, object]], outcome["native_subjects"])
                     attempts = cast(list[dict[str, object]], outcome["attempts"])
                     satisfactions = cast(list[dict[str, object]], outcome["satisfactions"])
@@ -2616,12 +2721,43 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                             for row in cast(list[dict[str, object]], outcome["effects"])
                             if row["operation"] == effect["operation"]
                         )
-                        assert linked["dispatch_count"] == 1 and not linked["reconciliations"]
+                        assert linked["dispatch_count"] == 1
                         assert synced_effect.accepted_reference is not None
                         receipt_ref = exported_ref("effect-receipt", synced_effect.accepted_reference)
                         assert linked["receipt"] == receipt_ref
                         (observation,) = cast(list[dict[str, object]], linked["observations"])
-                        assert (observation["kind"], observation["reference"]) == ("accepted", receipt_ref)
+                        if lost_comment:
+                            assert uncertain is not None and unknown_effect is not None
+                            settled_fields = {
+                                "status",
+                                "receipt_recorded",
+                                "receipt_status",
+                                "receipt",
+                                "receipt_profile",
+                            }
+                            assert {k: v for k, v in unknown_effect.items() if k not in settled_fields} == {
+                                k: v for k, v in effect.items() if k not in settled_fields
+                            }
+                            assert effect["work_unit"] == exported_ref("work-unit", "first")
+                            assert uncertain["satisfactions"] == outcome["satisfactions"]
+                            (unknown_link,) = [
+                                row
+                                for row in cast(list[dict[str, object]], uncertain["effects"])
+                                if row["operation"] == effect["operation"]
+                            ]
+                            assert unknown_link["dispatch_count"] == 1 and unknown_link["receipt"] is None
+                            assert unknown_link["observations"] == linked["observations"]
+                            assert (observation["kind"], observation["reference"]) == ("unknown", None)
+                            assert not unknown_link["reconciliations"]
+                            assert [
+                                row["outcome"] for row in cast(list[dict[str, object]], linked["reconciliations"])
+                            ] == [
+                                "unknown",
+                                "found",
+                            ]
+                        else:
+                            assert not linked["reconciliations"]
+                            assert (observation["kind"], observation["reference"]) == ("accepted", receipt_ref)
                     else:
                         assert not effects
                 rendered = json.dumps(outcome)
@@ -2643,6 +2779,8 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                     *published_objects,
                 ):
                     assert sensitive not in rendered
+                    if uncertain is not None:
+                        assert sensitive not in json.dumps(uncertain)
                 assert store.history("qualified-dag") == history and store.operations() == operations
                 cold = OrdinaryGitWorkspace(
                     store,
