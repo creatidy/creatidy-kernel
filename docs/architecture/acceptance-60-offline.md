@@ -360,7 +360,8 @@ original Operation and private export remained `unknown`, without a receipt, aft
 reopening SQLite. A mismatched native actor did not settle it. The original native record then
 settled the same Operation by read-only reconciliation, with exactly one COMMENT POST in the
 delivery, no write credential, no new grant, and no renewed deadline. Both private exports preserve
-the same Operation, Attempt, WorkUnit and satisfaction references without revealing raw revisions
+the same Operation, Attempt, WorkUnit and satisfaction references, and identify the exact
+authorized GitHub change at candidate B, without revealing raw revisions
 or credentials. The reconciled receipt, SQLite and the settled export are checked against the exact
 review ID persisted by the peer. The export pseudonymizes that receipt and preserves the original
 unknown observation. This is synthetic recovery, not evidence of live GitHub writes.

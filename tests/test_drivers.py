@@ -2797,6 +2797,11 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                         if lost_comment:
                             assert uncertain is not None and unknown_effect is not None
                             assert expected_native_review is not None
+                            assert lost_delivery is not None
+                            expected_target = DriverSubject(scm.binding, "change", "7", candidate_head)
+                            assert lost_delivery[0].target == expected_target
+                            assert_exported_subject(unknown_effect["target"], expected_target)
+                            assert_exported_subject(effect["target"], expected_target)
                             assert effect["receipt_status"] == "accepted"
                             assert effect["receipt"] == exported_ref("native-record", expected_native_review)
                             assert effect["receipt_profile"] == "kernel-driver-receipt-v1"
