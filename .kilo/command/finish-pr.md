@@ -18,7 +18,7 @@ INCLUDING the initial review, COMMENT, invalidated reviews and corrected retries
 Use a higher ceiling only under the [review ceiling rule](../rules/10-task-system.md#review-ceiling).
 Before the first review verify `.task_progress.md` is Git-locally excluded, then
 append a delivery ledger keyed by issue/PR (and `/loop` invocation ID if applicable).
-Before EVERY task dispatch verify the next ordinal is within the applicable ceiling,
+Before EVERY reviewer dispatch verify the next ordinal is within the applicable ceiling,
 then reserve/persist it with frozen SHAs and pending result. Record returned verdict,
 remediation commits and checks.
 Reinvoking `/finish-pr`, changing phase, reviewer task, model or session MUST reuse
@@ -55,18 +55,21 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    current clean branch in this same checkout by default; a separate environment
    requires concrete technical necessity under AGENTS.md. The parent must not edit/switch
    branches while the reviewer is active.
-   A missing native task/agent is a review-infrastructure failure: diagnose it and
-   try an authorized independent read-only reviewer path with the same exact-HEAD
-   contract. Never self-review, lower the contract, or use an unapproved service.
-3. If the owner set a pre-review condition, verify and record that it is met on the
-   frozen subject before reserving or dispatching the next ordinal. Spawn a fresh foreground
-   native `task` with `subagent_type: pr-reviewer`,
+3. Before either native or alternate reviewer dispatch, verify and record that
+   any owner-imposed pre-review condition is met on the frozen subject. Do not
+   dispatch if this cannot be verified. Check the applicable ceiling and persist
+   the next ordinal before dispatching either path, including retries.
+   Spawn a fresh foreground native `task` with `subagent_type: pr-reviewer`,
    `background: false`, no `task_id`. Supply only PR URL/number, exact expected
    HEAD/base and whole-PR review instructions with this checkout path.
    Do not supply past findings, implementation reasoning or a requested outcome.
    The agent owns the result contract/model. Parse its JSON and require the exact
    frozen SHAs and valid field types/verdict. Consume returned findings directly.
    Recheck local HEAD/clean status; a changed or dirty checkout invalidates review.
+   A missing native task/agent is a review-infrastructure failure: diagnose it and
+   try an authorized independent read-only reviewer path with the same exact-HEAD
+   contract, only through the same pre-dispatch checks and reservation above.
+   Never self-review, lower the contract, or use an unapproved service.
 4. Re-fetch PR metadata and canonical develop. APPROVE with empty findings,
    matching current HEAD/base SHAs, clean checkout, successful required validation
    and still open/unmerged develop target yields READY_TO_MERGE / APPROVE. Never merge.

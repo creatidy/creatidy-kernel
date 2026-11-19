@@ -33,6 +33,7 @@ findings or owner decisions. Diagnose and change the execution condition before 
 attempt: for example use a sanitized environment, synthetic HOME/cache/temp, clean
 ephemeral container when suitable, exact pinned public source checkout, split source
 inspection from test execution, or another authorized independent reviewer path.
+All reviewer dispatches, including alternate paths and retries, use the gate below.
 Do not weaken required execution-safety protections, permissions, validation,
 exact-HEAD checks or independence; never self-review. Return a precise BLOCKED only after no authorized alternative
 remains, without an artificial owner question. Distinguish this from findings and

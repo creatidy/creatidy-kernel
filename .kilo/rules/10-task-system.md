@@ -95,9 +95,11 @@
 The default maximum is 10 whole-PR review invocations per issue delivery. Every
 dispatch counts, including the initial review, COMMENT, invalidated reviews,
 infrastructure failures and corrected retries, regardless of entry point.
-Before each dispatch, confirm the next ordinal is within the applicable ceiling
-and reserve it in the existing excluded delivery ledger. Do not make remediation
-patches that cannot receive a fresh review within that ceiling.
+Before each native or alternate reviewer dispatch, including retries, verify any
+owner-imposed pre-review condition on the frozen subject, confirm the next ordinal
+is within the applicable ceiling, and reserve it in the existing excluded delivery
+ledger. Do not make remediation patches that cannot receive a fresh review within
+that ceiling.
 
 Raise the ceiling only with verified explicit owner authorization for the exact
 canonical issue and its existing PR, stating a finite increased maximum in total

@@ -502,7 +502,7 @@ class WorkflowContractTests(unittest.TestCase):
         for requirement in (
             "by default at most 10 whole-PR review invocations per issue delivery",
             "INCLUDING the initial review, COMMENT, invalidated reviews and corrected retries",
-            "Before EVERY task dispatch verify the next ordinal is within the applicable ceiling, "
+            "Before EVERY reviewer dispatch verify the next ordinal is within the applicable ceiling, "
             "then reserve/persist it",
             "Reinvoking `/finish-pr`, changing phase, reviewer task, model or session "
             "MUST reuse the same delivery counter",
@@ -550,16 +550,19 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("After these checks and ledger reconciliation", prior_to_remediation)
         self.assertIn("only if the applicable ceiling has room for a fresh review", after)
         self.assertIn("return through step 2 for fresh exact-subject CI and review", after)
-        self.assertIn(
-            "verify and record that it is met on the frozen subject before reserving or dispatching the next ordinal",
-            after.split("Spawn a fresh foreground", 1)[0],
-        )
+        dispatch_gate = after.split("Spawn a fresh foreground", 1)[0]
+        self.assertIn("Before either native or alternate reviewer dispatch", dispatch_gate)
+        self.assertIn("any owner-imposed pre-review condition is met on the frozen subject", dispatch_gate)
+        self.assertIn("persist the next ordinal before dispatching either path", dispatch_gate)
+        self.assertNotIn("try an authorized independent read-only reviewer path", dispatch_gate)
+        self.assertIn("only through the same pre-dispatch checks and reservation above", after)
         loop = text(".kilo/command/loop.md")
         self.assertIn("verify a matching owner exception with remaining attempts", loop)
         self.assertIn("No dispatch beyond the applicable ceiling or unreviewable further patches", loop)
         standalone = text(".kilo/command/review-pr.md").split("Invoke `task`", 1)[0]
         for requirement in (
             "10-task-system.md#review-ceiling)",
+            "All reviewer dispatches, including alternate paths and retries, use the gate below",
             "Reconcile the existing issue/PR review history",
             "next ordinal is within the applicable ceiling",
             "pre-review condition on the frozen subject",
