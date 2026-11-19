@@ -43,6 +43,15 @@ head/base refs through read-only Forgejo MCP, then match those commit IDs to the
 primary-prepared clean local Git objects and inspect the complete merge-base-to-HEAD
 diff. Anonymous Git transport is not a prerequisite or reviewer operation.
 
+Before invoking the reviewer, apply the [review ceiling rule](../rules/10-task-system.md#review-ceiling)
+in the primary context. Reconcile the existing issue/PR review history, confirm the
+next ordinal is within the applicable ceiling, and verify any owner-imposed pre-review
+condition on the frozen subject. Do not dispatch if a gate is unmet or a stopped
+delivery lacks explicit owner permission to resume. Verify the
+local ledger is Git-excluded, reserve the next ordinal there with frozen SHAs and a
+pending result before dispatch, and retain the outcome even if unusable. Only the
+primary records this local bookkeeping; the reviewer remains read-only.
+
 Invoke `task` with `subagent_type: pr-reviewer`, `background: false`, no `task_id`.
 Pass only the PR number/URL, expected HEAD/base and fresh whole-PR review
 instructions including this checkout path. Do not pass implementation

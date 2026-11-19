@@ -557,6 +557,15 @@ class WorkflowContractTests(unittest.TestCase):
         loop = text(".kilo/command/loop.md")
         self.assertIn("verify a matching owner exception with remaining attempts", loop)
         self.assertIn("No dispatch beyond the applicable ceiling or unreviewable further patches", loop)
+        standalone = text(".kilo/command/review-pr.md").split("Invoke `task`", 1)[0]
+        for requirement in (
+            "10-task-system.md#review-ceiling)",
+            "Reconcile the existing issue/PR review history",
+            "next ordinal is within the applicable ceiling",
+            "pre-review condition on the frozen subject",
+            "reserve the next ordinal there with frozen SHAs and a pending result before dispatch",
+        ):
+            self.assertIn(requirement, standalone)
 
     def test_exact_approval_and_loop_only_pr_merge(self) -> None:
         finish = text(".kilo/command/finish-pr.md")
