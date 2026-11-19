@@ -77,6 +77,7 @@ def launch_owner(
         or not argv
         or not os.path.isabs(argv[0])
         or not scope
+        or (version == 2 and type(scope) is not str)
         or scope != session.scope
         or not _valid_binding(producer)
         or not _valid_binding(recipient)
@@ -181,6 +182,8 @@ def _receive_owner(
         }
         operations = None
         if allow_v2 and not legacy_encoding and fields.get("contract") == PROVISIONING_V2:
+            if type(fields.get("scope")) is not str:
+                raise LocalChannelRefused("invalid owner scope")
             expected["contract"] = PROVISIONING_V2
             operations = _parse_operations(fields.pop("operations", None))
         if type(fields.get("wire_version")) is not int or fields != expected:

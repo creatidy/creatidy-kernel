@@ -20,13 +20,12 @@ import textwrap
 import threading
 import time
 from collections.abc import Callable, Generator
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from sqlite3 import DatabaseError, OperationalError
 from typing import cast
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
@@ -66,6 +65,7 @@ from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import (
     AttemptSpec,
     AuthorityEnvelope,
+    AuthorityViolation,
     BudgetPolicy,
     DomainAction,
     PauseProgram,
@@ -138,7 +138,6 @@ def forge_service(
     initial_comments: int = 0,
     duplicate_comment: bool = False,
     baseline_status: str = "success",
-    alternate_baseline: bool = False,
 ) -> Generator[tuple[str, dict[str, object]]]:
     created = datetime.now(UTC).isoformat()
     prs: list[dict[str, object]] = []
@@ -220,10 +219,11 @@ def forge_service(
                     ]
                 )
             elif path.startswith("/commits/") and path.endswith("/statuses"):
-                rows = [{"id": 1, "context": "ci/baseline", "status": baseline_status, "created_at": created}]
-                if alternate_baseline:
-                    rows.append({"id": 2, "context": "ci/other", "status": baseline_status, "created_at": created})
-                self.reply(rows if page == 1 else [])
+                self.reply(
+                    [{"id": 1, "context": "ci/baseline", "status": baseline_status, "created_at": created}]
+                    if page == 1
+                    else []
+                )
             elif path == "/branches/develop":
                 self.reply({"name": "develop", "commit": {"id": state["base"]}})
             elif path == "/pulls":
@@ -432,18 +432,13 @@ def run_ordinary_flow(
         forge_service(
             base,
             lose_comment_reply=exercise == "lost-reply",
-            unrelated_branch=exercise in {"branch-pr", "ambiguous-pr", "served-operations-intake-scan-bound"},
+            unrelated_branch=exercise in {"branch-pr", "ambiguous-pr"},
             lose_pr_reply=exercise in {"branch-pr", "ambiguous-pr"},
             copied_marker=exercise == "ambiguous-pr",
             diamond=exercise in {"diamond", "diamond-conflict", "diamond-inherited"},
             initial_comments=31 if exercise == "many-comments" else 241 if exercise == "oversized-comments" else 0,
             duplicate_comment=exercise == "duplicate-comments",
             baseline_status=exercise.removeprefix("baseline-") if exercise.startswith("baseline-") else "success",
-            alternate_baseline=exercise
-            in {
-                "served-operations-baseline-context-reread",
-                "served-operations-baseline-replacement",
-            },
         ) as (endpoint, native_state),
         review_peer(
             root / "native",
@@ -651,6 +646,74 @@ print("Done")
                 assert reader.read(subject, changed).disposition is Disposition.EQUIVALENCE
                 return {"status": "unassessed"}
             proposal = app.propose("everyday-program", "Receive two native-dependent obligations", selections)
+            if exercise.startswith("served-operations-"):
+                case = exercise.removeprefix("served-operations-")
+                if case == "unrecorded":
+                    proposal = replace(proposal, objective="Readable without an approval binding")
+                if case == "invalid-policy":
+                    app.verification = replace(app.verification, reviewer_required=False)
+                if case == "out-of-policy":
+                    app.policy = replace(app.policy, effects=frozenset())
+                session = LocalOwnerSession(OwnerProjection(store, proposal.program_id), app, None, proposal=proposal)
+                script = textwrap.dedent("""\
+                    import json, sys
+                    from creatidy_kernel.adapters.served_host import receive_owner_operations
+                    from creatidy_kernel.adapters.served_local import read_frame, write_frame
+
+                    case, proposal_digest = sys.argv[1:3]
+                    sock, ops = receive_owner_operations(int(sys.argv[-1]), expected_scope='everyday-program',
+                        expected_producer='fixture-producer', expected_recipient='fixture-backend')
+                    with sock:
+                        expected = {'snapshot', 'record', 'events', 'proposal', 'proposal-chunk'}
+                        if case in {'enabled', 'out-of-policy'}:
+                            expected |= {'approval-scope', 'approval-scope-chunk', 'approve'}
+                        assert ops == (None if case == 'legacy' else expected)
+                        def request(action, **fields):
+                            payload = json.dumps(dict(version=1, action=action, **fields)).encode()
+                            write_frame(sock, payload, bound=65536)
+                            return json.loads(read_frame(sock, bound=1048576, timeout=10))['result']
+                        assert request('proposal-chunk', offset=0, proposal_digest=None)['digest'] == proposal_digest
+                        if case == 'enabled':
+                            scope = request('approval-scope-chunk', offset=0, scope_digest=None)['digest']
+                            receipt = request('approve', command_id='advertised', decision_id='advertised-decision',
+                                expected_revision=-1, expires_at=int(sys.argv[3]), proposal_digest=proposal_digest,
+                                scope_digest=scope)
+                            assert receipt['status'] == 'approved' and receipt['authority'] == 'historical-only'
+                    """)
+                before = (store.history(proposal.program_id), store.operations())
+                with (
+                    patch.object(reader, "read", side_effect=AssertionError("launch read intake evidence")),
+                    patch.object(
+                        discovery, "read_dependencies", side_effect=AssertionError("launch read dependencies")
+                    ),
+                    patch.object(read_http, "request", side_effect=AssertionError("launch called a provider")),
+                    patch.object(store, "intent", side_effect=AssertionError("launch wrote an intent")),
+                    patch.object(store, "finalize_artifact", side_effect=AssertionError("launch wrote an artifact")),
+                ):
+                    launched = launch_owner(
+                        session,
+                        [sys.executable, "-I", "-c", script, case, proposal.digest, str(int(time.time()) + 900)],
+                        environment={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                        scope=proposal.program_id,
+                        producer="fixture-producer",
+                        recipient="fixture-backend",
+                        version=1 if case == "legacy" else 2,
+                    )
+                try:
+                    for _ in range(3 if case == "enabled" else 1):
+                        assert select.select([launched.channel.fileno()], [], [], 10)[0]
+                        launched.serve_once()
+                    assert launched.process.wait(timeout=10) == 0
+                finally:
+                    launched.close()
+                    if launched.process.poll() is None:
+                        launched.process.kill()
+                        launched.process.wait(timeout=10)
+                if case == "enabled":
+                    assert app.recover("advertised-decision").proposal == proposal
+                    return {"status": "approved", "native_sends": 0}
+                assert (store.history(proposal.program_id), store.operations()) == before
+                return {"status": "read", "native_sends": 0}
             if exercise == "served-large-proposal":
                 large = app.propose("everyday-program", ('ż"\\' * 150_000), selections)
                 raw = encode(large.payload)
@@ -982,220 +1045,6 @@ print("Done")
                 assert store.find_artifact("ordinary-program:approval:legacy-decision", "record") is None
                 binding.revoke()
                 return {"status": "historical", "native_sends": 0}
-            if exercise.startswith("served-operations-"):
-                case = exercise.removeprefix("served-operations-")
-                if case in {"legacy", "unrecorded"}:
-                    proposal = replace(proposal, objective="Unrecorded proposal remains readable")
-                if case == "implemented":
-                    for subject, selection in zip(subjects, selections, strict=True):
-                        declaration = selection[2]
-                        snapshot = reader.snapshot(subject, declaration)
-                        reader.review(
-                            subject,
-                            declaration,
-                            expected_snapshot=reader.snapshot_digest(snapshot, declaration),
-                            disposition=Disposition.IMPLEMENTED,
-                            decision_id=f"implemented-{subject.issue}",
-                            reason="Synthetic owner judgement",
-                        )
-                    proposal = app.propose(proposal.program_id, proposal.objective, selections)
-                scope_digest = digest(encode(app.approval_scope(proposal)))
-                if case == "invalid-policy":
-                    app.verification = replace(app.verification, reviewer_required=False)
-                if case == "restricted-policy":
-                    app.policy = replace(app.policy, effects=frozenset())
-                    app.check_proposal_record(proposal)
-                    assert app.approval_scope(proposal)  # Valid binding, but this proposal is out of policy.
-                if case == "strict-work-budget":
-                    assert app.policy.work_budget is not None
-                    app.policy = replace(app.policy, work_budget=replace(app.policy.work_budget, strict_inference=True))
-                if case == "strict-project-budget":
-                    assert app.policy.project_budget is not None
-                    app.policy = replace(
-                        app.policy, project_budget=replace(app.policy.project_budget, strict_inference=True)
-                    )
-                if case == "existing-project-budget":
-                    app.approve(proposal, decision_id="existing-project", expires_at=int(time.time()) + 900)
-                    proposal = app.propose(
-                        "new-program",
-                        proposal.objective,
-                        tuple((f"new-{unit}", subject, declaration) for unit, subject, declaration in selections),
-                    )
-                    assert app.policy.project_budget is not None
-                    original_budget = app.policy.project_budget
-                    app.policy = replace(
-                        app.policy,
-                        project_budget=replace(original_budget, retained_bytes=original_budget.retained_bytes + 1),
-                    )
-                if case == "baseline-context":
-                    baseline.contexts = frozenset({"ci/other"})
-                if case in {"baseline-context-reread", "baseline-replacement"}:
-                    if case == "baseline-replacement":
-                        selected_baseline = ForgejoBaseline(read_http, recipes, frozenset({"ci/other"}))
-                        reader.observer.baseline = selected_baseline
-                    else:
-                        baseline.contexts = frozenset({"ci/other"})
-                        selected_baseline = baseline
-                    for draft in proposal.drafts:
-                        evidence = draft.evidence
-                        reread = selected_baseline.read_baseline(evidence.subject, evidence.recipe_digest)
-                        assert reread is not None
-                        assert (reread.reference, reread.result) == (
-                            evidence.baseline_reference,
-                            evidence.baseline_result,
-                        )
-                if case == "baseline-scan-bound":
-                    baseline.max_pages = 1
-                if case == "intake-scan-bound":
-                    assessed = object_from(proposal.drafts[0].evidence.relevance_proof)
-                    native = object_from(encode(assessed["received_native_snapshot"]))
-                    assert '"change_read":"initial"' in cast(str, native["relevance_proof"])
-                    reader.observer.max_pages = 1
-                if case == "dependency-scan-bound":
-                    assert any(observation.required for observation in proposal.dependencies)
-                    discovery.max_pages = 1
-                if case == "pending-budget-origin":
-                    with patch.object(app, "current", side_effect=[None, RuntimeError("interrupted approval")]):
-                        try:
-                            app.approve(proposal, decision_id="interrupted-origin", expires_at=int(time.time()) + 900)
-                        except RuntimeError as error:
-                            assert str(error) == "interrupted approval"
-                        else:
-                            raise AssertionError("approval was not interrupted")
-                    assert store.find_program(proposal.program_id) is None
-                    assert store.operations("work-budget:v1:clock-origin:")
-                    proposal = app.propose(proposal.program_id, "Changed objective after interruption", selections)
-                if case == "baseline-unobserved":
-                    reader.observer.baseline = ForgejoBaseline(read_http, recipes, frozenset({"ci/baseline"}))
-                if case == "baseline-age-loss":
-                    evidence = proposal.drafts[0].evidence
-                    app.intake.baseline_age(replace(evidence, observed_at=evidence.observed_at - 1))
-                    age = store.operations("ordinary:baseline-age:")[0]
-                    raw = store.artifact(age.operation_id, "record")
-                    (root / "state.db.artifacts" / digest(raw)).unlink()
-                if case == "artifact-loss":
-                    app.check_proposal_record(proposal)
-                    (root / "state.db.artifacts" / proposal.digest).unlink()
-                if case == "assessment-loss":
-                    app.check_proposal_record(proposal)
-                    assessment = store.operations("ordinary-source-review:")[0]
-                    raw = store.artifact(assessment.operation_id, "record")
-                    (root / "state.db.artifacts" / digest(raw)).unlink()
-                interrupted_key = None
-                if case == "interrupted-amendment":
-                    original = proposal.drafts[0]
-                    with patch.object(
-                        store, "finalize_artifact", side_effect=RuntimeError("draft publication interrupted")
-                    ):
-                        try:
-                            app.intake.prepare(
-                                original.task_id,
-                                original.evidence.subject,
-                                Declaration(encode({**original.declaration.value, "context": ["interrupted update"]})),
-                                expected_parent=original.digest,
-                            )
-                        except RuntimeError as error:
-                            assert str(error) == "draft publication interrupted"
-                        else:
-                            raise AssertionError("draft publication was not interrupted")
-                    pending = [
-                        op.operation_id
-                        for op in store.operations("ordinary:")
-                        if store.find_artifact(op.operation_id, "record") is None
-                    ]
-                    assert len(pending) == 1
-                    interrupted_key = pending[0]
-                binding = LocalOwnerSession(OwnerProjection(store, proposal.program_id), app, None, proposal=proposal)
-                before = (store.history(proposal.program_id), store.operations())
-                request = {
-                    "version": 1,
-                    "action": "approve",
-                    "command_id": "advertised-approval",
-                    "expected_revision": -1,
-                    "decision_id": "advertised-decision",
-                    "expires_at": int(time.time()) + 900,
-                    "proposal_digest": proposal.digest,
-                    "scope_digest": scope_digest,
-                }
-                script = textwrap.dedent("""\
-                    import json, sys
-                    from creatidy_kernel.adapters.served_host import receive_owner_operations
-                    from creatidy_kernel.adapters.served_local import write_frame, read_frame
-
-                    case, approval = sys.argv[1], json.loads(sys.argv[2])
-                    def read(s):
-                        return json.loads(read_frame(s, bound=1048576, timeout=10))['result']
-                    def write(s, **request):
-                        write_frame(s, json.dumps(dict(version=1, **request)).encode(), bound=65536)
-
-                    s, ops = receive_owner_operations(int(sys.argv[-1]), expected_scope=sys.argv[3],
-                        expected_producer='fixture-producer', expected_recipient='fixture-backend')
-                    with s:
-                        expected = {'snapshot', 'events', 'record', 'proposal', 'proposal-chunk'}
-                        approve = {'approval-scope', 'approval-scope-chunk', 'approve'}
-                        if case in ('enabled', 'revoked'):
-                            expected |= approve
-                        assert ops == (None if case == 'legacy' else expected)
-                        write(s, action='proposal-chunk', offset=0, proposal_digest=None)
-                        assert read(s)['digest'] == approval['proposal_digest']
-                        if ops is not None and approve <= ops:
-                            write(s, action='approval-scope-chunk', offset=0, scope_digest=None)
-                            assert read(s)['digest'] == approval['scope_digest']
-                            write_frame(s, json.dumps(approval).encode(), bound=65536)
-                            if case == 'revoked':
-                                try:
-                                    assert s.recv(1) == b''
-                                except ConnectionResetError:
-                                    pass
-                            else:
-                                receipt = read(s)
-                                assert receipt['status'] == 'approved' and receipt['authority'] == 'historical-only'
-                """)
-                read_failure = {
-                    "artifact-io": PermissionError("synthetic approval read failure"),
-                    "artifact-sqlite": OperationalError("synthetic approval database read failure"),
-                    "artifact-database": DatabaseError("synthetic malformed SQLite page"),
-                }.get(case)
-                with (
-                    patch.object(store, "find_artifact", side_effect=read_failure)
-                    if read_failure is not None
-                    else nullcontext(),
-                    patch.object(read_http, "request", side_effect=AssertionError("launch observed provider")),
-                    patch.object(store, "finalize_artifact", side_effect=AssertionError("launch wrote an artifact")),
-                ):
-                    launched = launch_owner(
-                        binding,
-                        [sys.executable, "-I", "-c", script, case, json.dumps(request), proposal.program_id],
-                        environment={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
-                        scope=proposal.program_id,
-                        producer="fixture-producer",
-                        recipient="fixture-backend",
-                        version=1 if case == "legacy" else 2,
-                    )
-                try:
-                    for _ in range(2 if case in {"enabled", "revoked"} else 1):
-                        assert select.select([launched.channel.fileno()], [], [], 10)[0]
-                        launched.serve_once()
-                    if case in {"enabled", "revoked"}:
-                        assert select.select([launched.channel.fileno()], [], [], 10)[0]
-                        if case == "revoked":
-                            binding.revoke()
-                            assert launched.channel.fileno() == -1
-                        else:
-                            launched.serve_once()
-                    assert launched.process.wait(timeout=10) == 0
-                finally:
-                    launched.close()
-                    if launched.process.poll() is None:
-                        launched.process.kill()
-                        launched.process.wait(timeout=10)
-                if case == "enabled":
-                    assert app.recover("advertised-decision").proposal.digest == proposal.digest
-                    return {"status": "approved", "native_sends": 0}
-                assert (store.history(proposal.program_id), store.operations()) == before
-                if interrupted_key is not None:
-                    assert store.find_artifact(interrupted_key, "record") is None
-                return {"status": "read", "native_sends": 0}
             if exercise in {"served-host-receipts", "served-host-process-create"}:
                 binding = LocalOwnerSession(OwnerProjection(store, "everyday-program"), app, None, proposal=proposal)
                 script = (
@@ -1884,8 +1733,14 @@ print("Done")
                     binding.detach(final)
                 assert store.load("everyday-program").status is ProgramStatus.CANCELLED
                 return {"status": "stopped", "native_sends": 0}
-            if exercise == "served-owner-amend":
+            if exercise in {"served-owner-amend", "served-owner-amend-foreign"}:
                 amended = app.propose("everyday-program", "A revised owner-approved objective", selections)
+                foreign = exercise == "served-owner-amend-foreign"
+                if foreign:
+                    app.owner = Principal("other-owner", "owner")
+                    app.policy = replace(
+                        owner_policy, authority=AuthorityEnvelope("other-owner", frozenset(DomainAction), 6)
+                    )
                 owner_socket, owner_client = socket.socketpair()
                 with owner_socket, owner_client:
                     server = LocalOwnerChannel(
@@ -1903,6 +1758,23 @@ print("Done")
                     }
                     wire = json.dumps(request, sort_keys=True).encode()
                     write_frame(owner_client, wire, bound=65536)
+                    if foreign:
+                        before = store.history(amended.program_id)
+                        try:
+                            server.serve_once()
+                        except AuthorityViolation as error:
+                            assert str(error) == "an owner decision is required"
+                        else:
+                            raise AssertionError("non-owner amended the existing Program")
+                        assert store.load(amended.program_id) == approved.program
+                        assert store.history(amended.program_id) == before
+                        assert store.find_artifact("ordinary-program:approval:owner-amend-v1", "record") is None
+                        key = command_prefix(amended.program_id) + digest(
+                            encode(["other-owner", "owner-amend-command"])
+                        )
+                        assert store.find_artifact(key, "receipt") is None
+                        assert not native_state["sends"]
+                        return {"status": "refused", "native_sends": 0}
                     server.serve_once()
                     result = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
                     assert result["status"] == "approved" and result["expires_at"] == approved.expires_at

@@ -45,7 +45,6 @@ from creatidy_kernel.core.intake import (
     Declaration,
     Disposition,
     Draft,
-    IntakeEvidence,
     IntakeRefused,
     IssueSubject,
     OwnerPolicy,
@@ -149,8 +148,6 @@ class Transport(SyntheticForgeTransport):
 
 
 class Content:
-    binding = ForgeBinding(SUBJECT.origin, SUBJECT.repository)
-
     def __init__(self) -> None:
         self.results: dict[str, bool | None] = {"b" * 40: False, "a" * 40: True}
 
@@ -179,14 +176,6 @@ class Baseline:
             self.reference,
             self.result,
             self.observed_at,
-        )
-
-    def supports_baseline(self, evidence: IntakeEvidence) -> bool:
-        return (
-            not self.unknown
-            and evidence.subject == self.subject
-            and evidence.baseline_producer == self.producer
-            and self.recipe_digest in (None, evidence.recipe_digest)
         )
 
 

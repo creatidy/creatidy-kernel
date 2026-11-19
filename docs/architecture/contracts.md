@@ -189,32 +189,19 @@ An invalid greeting closes the descriptor; it is not treated as legacy. A valid 
 discovery request or try another frame. An otherwise valid legacy proposal connection remains usable
 for its already-known reads, including `proposal-chunk`.
 
-Descriptor v2 advertises `snapshot`, `record` and `events`; it adds `proposal` and `proposal-chunk` together for
-a bound proposal. `approval-scope`, `approval-scope-chunk` and `approve` appear together only with
-both proposal reads, the exact producer-recorded proposal, a valid material approval-scope binding,
-a proposal within the bound policy's static limits, and local evidence that the configured intake
-and dependency readers cover its subjects, retained pull-request and dependency scans, baseline recipe,
-and any literal criteria. Unsupported budgets, conflicting stored bindings, and prepared clock origins for a
-different specification do not advertise approval. The Forgejo status baseline reader verifies scan
-bounds and context selection against its bounded in-memory observations from
-normal baseline reads. Each draft must also have been newly recorded by the active intake instance with
-the same baseline reader. Restarted intake, replaced readers, evicted observations, and drafts without
-this local binding remain read-only, even if a later read reproduces the same status digest. A reader used
-under different status context selections no longer supplies discovery evidence, because the same digest
-can represent both. Retained baseline-age evidence must be readable without recovery.
-Any qualified dependency cuts must have configured work bindings and agree on a wire-valid decision
-reference when one is required. This supports
-proposal payload versions 1 and 2. Proposal payload v3 (qualified drafts) remains readable, but its
-baseline and readiness reader ports cannot attest local applicability, so its approval is not
-advertised. This does not disable the existing approval handlers.
-Read-only discovery is also the result for unrecorded or out-of-policy proposals, unreadable approval
-evidence, or missing required bindings. These checks use retained evidence and host configuration,
-not provider calls, recovery writes or freshness checks. Descriptor v2 declares only read and approval operations.
-Lifecycle commands (`stop`, `reconcile`, `start-managed`) are not in the declaration; their existing
-interfaces are unchanged.
-These are launch-time supported operations, not guarantees that a request, revision, target or effect
-is current or admissible. The declaration is not updated in-band. The producer writes operation names
-sorted; their order is not significant to the receiver.
+Descriptor v2 always advertises `snapshot`, `record` and `events`. A bound proposal adds `proposal`
+and `proposal-chunk`. The approval trio (`approval-scope`, `approval-scope-chunk`, `approve`) is added
+only when the attached channel has the exact producer-recorded proposal and the application's
+approval configuration is bound, including the required qualified drivers when used. A missing
+approval binding does not remove otherwise available reads. Payload version and whether a proposal
+was prepared before a restart are not themselves capability restrictions. The declaration contains
+only read and approval operations, not lifecycle commands (`stop`, `reconcile`, `start-managed`).
+
+The greeting answers which protocol operations the producer supports, not whether a particular
+approval will be accepted. It does not call providers, infer scan completeness, verify retained
+intake evidence, recover records, or predict current Program ownership, revision, policy compliance
+or deadline. A supported operation can still be refused. The declaration is not updated in-band;
+the producer writes operation names sorted, but their order is not significant to the receiver.
 
 Console must enable its approval flow only after validating v2 and finding both `approval-scope-chunk`
 and `approve`. Otherwise it remains read-only on verified read operations and does not probe scope,

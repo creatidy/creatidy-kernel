@@ -5,7 +5,6 @@ import copy
 import hmac
 import json
 import os
-import select
 import sys
 import tempfile
 import time
@@ -68,8 +67,6 @@ from creatidy_kernel.adapters.qualified_baseline import (
 )
 from creatidy_kernel.adapters.qualified_readiness import GitHubJiraLiteralReadiness, LiteralReadiness
 from creatidy_kernel.adapters.reference import reference_git
-from creatidy_kernel.adapters.served_host import launch_owner
-from creatidy_kernel.adapters.served_local import LocalOwnerSession
 from creatidy_kernel.adapters.source_cache import source_use
 from creatidy_kernel.adapters.sqlite_store import (
     IdempotencyConflict,
@@ -104,7 +101,6 @@ from creatidy_kernel.core.drivers import (
 from creatidy_kernel.core.execution import OperationKey
 from creatidy_kernel.core.forge import EffectStatus, Presence, UnsupportedForge
 from creatidy_kernel.core.intake import ContentCriterion, Declaration, IntakeRefused, digest, encode
-from creatidy_kernel.core.ordinary import OrdinaryProposal
 from creatidy_kernel.core.ordinary_qualified import (
     QualifiedDependencyCut,
     QualifiedDraft,
@@ -125,7 +121,6 @@ from creatidy_kernel.ports.ordinary import (
 from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.ownership import WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
-from creatidy_kernel.ports.served import OwnerProjection
 from creatidy_kernel.ports.verification import VerificationProfile, decode_product_review_receipt
 from tools.check_drivers import (
     BASE,
@@ -196,48 +191,6 @@ def test_requested_unsupported_strict_profile_refuses_before_recording(sqlite_tm
         assert not store.operations() and store.find_program("strict-refusal") is None
 
 
-def _assert_supervised_proposal_support(
-    store: SQLiteProgramStore, app: OrdinaryProgram, proposal: OrdinaryProposal, root: Path, *, approval: bool
-) -> None:
-    scope = proposal.program_id
-    before = (store.history(scope), store.operations())
-    script = """
-import json, sys
-from creatidy_kernel.adapters.served_host import receive_owner_operations
-from creatidy_kernel.adapters.served_local import read_frame, write_frame
-
-channel, operations = receive_owner_operations(int(sys.argv[-1]), expected_scope=sys.argv[1],
-    expected_producer='qualified-producer', expected_recipient='test-backend')
-with channel:
-    expected = {'snapshot', 'record', 'events', 'proposal', 'proposal-chunk'}
-    if sys.argv[2] == 'True':
-        expected |= {'approval-scope', 'approval-scope-chunk', 'approve'}
-    assert operations == expected
-    write_frame(channel, b'{"version":1,"action":"proposal-chunk","offset":0,"proposal_digest":null}', bound=65536)
-    assert json.loads(read_frame(channel, bound=1048576))['result']['digest'] == sys.argv[3]
-"""
-    session = LocalOwnerSession(OwnerProjection(store, scope), app, None, proposal=proposal)
-    launched = launch_owner(
-        session,
-        [sys.executable, "-I", "-c", script, scope, str(approval), proposal.digest],
-        environment={"HOME": str(root), "PATH": os.defpath},
-        scope=scope,
-        producer="qualified-producer",
-        recipient="test-backend",
-        version=2,
-    )
-    try:
-        assert select.select([launched.channel.fileno()], [], [], 10)[0]
-        launched.serve_once()
-        assert launched.process.wait(timeout=10) == 0
-    finally:
-        launched.close()
-        if launched.process.poll() is None:
-            launched.process.kill()
-            launched.process.wait(timeout=10)
-    assert (store.history(scope), store.operations()) == before
-
-
 def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, sqlite_tmp_path: Path) -> None:
     clock = Clock()
     project, _, _, _ = configured(services, clock)
@@ -288,25 +241,6 @@ def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, 
         with pytest.raises(IntakeRefused, match="cannot yet be mapped"):
             app.propose("qualified", "deliver", (("one", SUBJECT, declaration()),), qualified_cuts=(unresolved,))
         proposal = app.propose("qualified", "deliver", (("one", SUBJECT, declaration()),), qualified_cuts=(cut,))
-        second_work = project.work.work("ENG-41")
-        second_obligation = EdgeObligation(
-            second_work.fact.subject, driver_digest([asdict(edge) for edge in second_work.dependencies]), "other", 120
-        )
-        second_cut = QualifiedDependencyCut.capture(
-            second_work,
-            tuple(sorted((edge.identity, False) for edge in second_work.dependencies)),
-            100,
-            obligation=second_obligation,
-        )
-        conflicting = app.propose(
-            "conflicting", "deliver", (("two", SUBJECT, declaration()),), qualified_cuts=(cut, second_cut)
-        )
-        oversized = app.propose(
-            "oversized-decision",
-            "deliver",
-            (("three", SUBJECT, declaration()),),
-            qualified_cuts=(replace(cut, obligation=replace(obligation, decision_reference="a" * 257)),),
-        )
         assert proposal.payload["version"] == 2
         assert app.approval_scope(proposal)["proposal"] == proposal.payload
         assert app.approval_scope(proposal)["qualified_work_bindings"] == [asdict(project.work.binding)]
@@ -356,34 +290,13 @@ def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, 
         assert len(native) == 1 and native[0]["driver"] == "ordinary-proposal-v1"
         assert cast(list[object], native[0]["qualified_dependencies"])
 
-        provider_requests = tuple(services.requests)
-        with (
-            patch.object(scenario.reader, "read", side_effect=AssertionError("launch observed intake")),
-            patch.object(dependencies, "read_dependencies", side_effect=AssertionError("launch observed dependencies")),
-        ):
-            _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=True)
-            with patch.object(app, "qualified_work", ()):
-                _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
-            _assert_supervised_proposal_support(store, app, conflicting, sqlite_tmp_path, approval=False)
-            _assert_supervised_proposal_support(store, app, oversized, sqlite_tmp_path, approval=False)
-            with patch.object(scenario.reader, "binding", replace(scenario.reader.binding, repository="team/other")):
-                _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
-            with patch.object(dependencies, "binding", replace(dependencies.binding, repository="team/other")):
-                _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
-            with patch.object(scenario.transport, "supports_reads", False):
-                _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
-            for criterion in (
-                replace(scenario.reader.criteria[0], path="other.txt"),
-                replace(scenario.reader.criteria[0], expected=b"different content"),
-            ):
-                with patch.object(scenario.reader, "criteria", (criterion,)):
-                    _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
-        assert tuple(services.requests) == provider_requests
-
     with SQLiteProgramStore(path, boot_clock=clock.boot) as store:
         app = application(store)
         recovered = app.recover("decision")
         assert recovered.proposal == proposal
+        before = tuple(services.requests)
+        app.check_approval_provisioning(proposal)
+        assert tuple(services.requests) == before
         app.check(recovered)
         services.filter = lambda _method, _path, _body: (403, {})
         with pytest.raises(ValueError):
@@ -392,8 +305,9 @@ def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, 
         unavailable = application(store, configured_work=False)
         assert unavailable.recover("decision").proposal == proposal
         with pytest.raises(IntakeRefused, match="driver unavailable"):
+            unavailable.check_approval_provisioning(proposal)
+        with pytest.raises(IntakeRefused, match="driver unavailable"):
             unavailable.check(recovered)
-        _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
         app.stop(recovered, "owner revoked")
         with pytest.raises(ValueError):
             app.check(recovered)
@@ -917,7 +831,6 @@ _INSTALLED_ACTIONS_COMPOSITIONS = {
         "sync-reopen",
         "sync-ambiguous-reopen",
         "export-unknown",
-        "served-operations-v3",
         "actions-github",
         "actions-forgejo",
         *_INSTALLED_ACTIONS_COMPOSITIONS,
@@ -1768,15 +1681,12 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         )
         approved = app.recover(decision)
         assert approved.proposal == proposal
-        if mode == "served-operations-v3":
-            before_requests = tuple(services.requests)
-            _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
-            app.verification = VerificationPolicy(policy.reference, ("paths", "structural", "commands"))
-            with pytest.raises(IntakeRefused, match="qualified CI check and exact build selection"):
-                app._spec(proposal, None)  # pyright: ignore[reportPrivateUsage]
-            _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
-            assert tuple(services.requests) == before_requests
-            return
+        before = tuple(services.requests)
+        app.check_approval_provisioning(proposal)
+        with patch.object(app, "qualified_baselines", None):
+            with pytest.raises(IntakeRefused, match="baseline or relevance producer unavailable"):
+                app.check_approval_provisioning(proposal)
+        assert tuple(services.requests) == before
         assert app._qualified_baseline_age(replace(first.baseline, observed_at=100)) == 90  # pyright: ignore[reportPrivateUsage]
         assert (
             OrdinaryIntake(store, later_legacy.reader, clock.wall).baseline_age(

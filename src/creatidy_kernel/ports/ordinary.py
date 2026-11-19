@@ -10,7 +10,7 @@ import re
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass, replace
-from typing import Protocol, cast, runtime_checkable
+from typing import Protocol, cast
 
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.domain import (
@@ -46,14 +46,9 @@ from creatidy_kernel.core.ordinary_qualified import (
 )
 from creatidy_kernel.core.ownership import HandoffMode, WorkClaim
 from creatidy_kernel.core.verification import CandidateResult, EvidenceSubject, ProductReviewRequest, VerificationPolicy
-from creatidy_kernel.core.work_budget import WorkBudgetPolicy
 from creatidy_kernel.ports.application import Collection, receive_candidate, remediation_context
 from creatidy_kernel.ports.drivers import SourceManagement, WorkManagement
-from creatidy_kernel.ports.intake import (
-    IntakeStore,
-    OrdinaryIntake,
-    draft_from,
-)
+from creatidy_kernel.ports.intake import IntakeStore, OrdinaryIntake, draft_from
 from creatidy_kernel.ports.ownership import OwnershipStore, WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
 from creatidy_kernel.ports.verification import (
@@ -65,10 +60,6 @@ from creatidy_kernel.ports.verification import (
 
 
 class OrdinaryStore(IntakeStore, OwnershipStore, Protocol):
-    def supports_work_budget(
-        self, spec: ProgramSpec, project_id: str, project: WorkBudgetPolicy, task: WorkBudgetPolicy
-    ) -> bool: ...
-
     def work_budget_status(self, program_id: str) -> dict[str, object]: ...
     def report_revision_guard(self, program_id: str, revision: int) -> AbstractContextManager[None]: ...
     def work_decision_time(self, program_id: str) -> int: ...
@@ -86,11 +77,6 @@ class OrdinaryStore(IntakeStore, OwnershipStore, Protocol):
 
 class DependencyReader(Protocol):
     def read_dependencies(self, subject: IssueSubject) -> DependencyEvidence: ...
-
-
-@runtime_checkable
-class DependencyApplicability(Protocol):
-    def supports_dependencies(self, evidence: DependencyEvidence) -> bool: ...
 
 
 class QualifiedBaselineReader(Protocol):
@@ -659,37 +645,27 @@ class OrdinaryProgram:
             raise IntakeRefused("exact proposal record is unavailable")
 
     def check_approval_provisioning(self, proposal: OrdinaryProposal) -> None:
-        """Check the static approval binding without observing providers or granting authority."""
-        if proposal.qualified_drafts:
-            # These reader ports expose observations, not a local applicability declaration.
-            raise IntakeRefused("qualified draft approval support cannot be verified at launch")
+        """Check the bound approval surface, not whether any request would be accepted."""
+        self.check_proposal_record(proposal)
         self.approval_scope(proposal)
-        policy = self.policy
-        if (
-            policy.project_id is None
-            or policy.project_budget is None
-            or policy.work_budget is None
-            or not self.store.supports_work_budget(
-                self._spec(proposal, self.store.find_program(proposal.program_id)),
-                policy.project_id,
-                policy.project_budget,
-                policy.work_budget,
-            )
+        if any(
+            budget is not None and budget.strict_inference
+            for budget in (self.policy.project_budget, self.policy.work_budget)
         ):
-            raise IntakeRefused("work budget cannot bind to the configured Program and project")
-        work_bindings = {driver.binding for driver in self.qualified_work}
-        if any(cut.subject.binding not in work_bindings for cut in proposal.qualified_cuts):
+            raise IntakeRefused("strict inference bounds unavailable for the installed profiles")
+        work = {driver.binding for driver in self.qualified_work}
+        if any(cut.subject.binding not in work for cut in proposal.qualified_cuts) or any(
+            draft.cut.subject.binding not in work for draft in proposal.qualified_drafts
+        ):
             raise IntakeRefused("qualified work driver unavailable or changed")
-        decisions = {cut.obligation.decision_reference for cut in proposal.qualified_cuts if cut.obligation is not None}
-        if len(decisions) > 1:
-            raise IntakeRefused("qualified cuts require conflicting owner decisions")
-        dependencies = self.dependencies
-        if not isinstance(dependencies, DependencyApplicability):
-            raise IntakeRefused("local reader applicability is not available")
-        for draft, dependency in zip(proposal.drafts, proposal.dependencies, strict=True):
-            if dependencies.supports_dependencies(dependency) is not True:
-                raise IntakeRefused("configured readers do not cover this proposal")
-            self.intake.check_retained_authority(self.owner, draft, self.policy)
+        if proposal.qualified_drafts:
+            scm = {driver.binding for driver in self.qualified_scm}
+            if (
+                self.qualified_baselines is None
+                or self.qualified_readiness is None
+                or any(draft.baseline.source.binding not in scm for draft in proposal.qualified_drafts)
+            ):
+                raise IntakeRefused("qualified SCM, baseline or relevance producer unavailable")
 
     def approval_scope(self, proposal: OrdinaryProposal) -> dict[str, object]:
         """Canonical owner-visible inputs that determine the approval's meaning."""

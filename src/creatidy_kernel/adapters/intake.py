@@ -1,23 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qualified Forge reads and bounded literal-content relevance; no recipe execution."""
 
-import json
 import os
 import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import cast
 
 from creatidy_kernel.adapters.forge_refs import ForgeBinding, oid
-from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.core.forge import Presence, Reference
 from creatidy_kernel.core.intake import (
     ContentCriterion,
     Declaration,
     Disposition,
-    Draft,
     IntakeEvidence,
     IntakeRefused,
     IssueSubject,
@@ -25,7 +21,7 @@ from creatidy_kernel.core.intake import (
     encode,
     strings,
 )
-from creatidy_kernel.ports.intake import BaselineApplicability, BaselineReader, ContentSource, IntakeForge
+from creatidy_kernel.ports.intake import BaselineReader, ContentSource, IntakeForge
 
 
 class GitContentSource:
@@ -218,15 +214,6 @@ class ForgejoOrdinaryEvidence:
         self.producer = "forgejo-ordinary-evidence:v1"
 
     def read(self, subject: IssueSubject, declaration: Declaration) -> IntakeEvidence:
-        return self._observer(subject).read(subject, declaration)
-
-    def supports_evidence(self, draft: Draft) -> bool:
-        return self._observer(draft.evidence.subject).supports_evidence(draft)
-
-    def approval_observer(self) -> object:
-        return self.baseline
-
-    def _observer(self, subject: IssueSubject) -> "ForgeIntakeEvidence":
         return ForgeIntakeEvidence(
             self.forge,
             self.binding,
@@ -236,7 +223,7 @@ class ForgejoOrdinaryEvidence:
             self.producer,
             self.clock,
             max_pages=self.max_pages,
-        )
+        ).read(subject, declaration)
 
 
 class ForgeIntakeEvidence:
@@ -271,65 +258,6 @@ class ForgeIntakeEvidence:
         self.producer = producer
         self.clock = clock
         self.max_pages = max_pages
-
-    def supports_evidence(self, draft: Draft) -> bool:
-        return (
-            not self.inventory_only
-            and self.producer == draft.evidence.relevance_producer
-            and tuple(item.criterion for item in self.criteria) == strings(draft.declaration.value["criteria"])
-            and self.supports_snapshot(draft.evidence)
-            and self._matches_retained_criteria(draft.evidence)
-            and self.supports_pr_inventory(draft.evidence.relevance_proof)
-        )
-
-    def approval_observer(self) -> object:
-        return self.baseline
-
-    def supports_pr_inventory(self, raw: bytes) -> bool:
-        try:
-            proof: object = json.loads(raw)
-        except (ValueError, RecursionError):
-            return False
-        if not isinstance(proof, list):
-            return False
-        entries = [cast(dict[str, object], item) for item in cast(list[object], proof) if isinstance(item, dict)]
-        for phase in ("initial", "closing"):
-            if not any(entry.get("scan") == phase and entry.get("complete") is True for entry in entries):
-                return False
-            # A producer may paginate below its requested limit. Budget for one item per page and the terminator.
-            if sum(entry.get("change_read") == phase for entry in entries) >= self.max_pages:
-                return False
-        return True
-
-    def _criteria_binding(self) -> list[dict[str, str]]:
-        return [
-            {"criterion": item.criterion, "path": item.path, "expected_digest": digest(item.expected)}
-            for item in self.criteria
-        ]
-
-    def _matches_retained_criteria(self, evidence: IntakeEvidence) -> bool:
-        try:
-            proof: object = json.loads(evidence.relevance_proof)
-        except (ValueError, RecursionError):
-            return False
-        if not isinstance(proof, list) or not proof:
-            return False
-        initial = cast(list[object], proof)[0]
-        return (
-            isinstance(initial, dict) and cast(dict[str, object], initial).get("criteria") == self._criteria_binding()
-        )
-
-    def supports_snapshot(self, evidence: IntakeEvidence) -> bool:
-        subject = evidence.subject
-        return (
-            self.binding == ForgeBinding(subject.origin, subject.repository)
-            and isinstance(self.forge, ForgejoForge)
-            and self.forge.binding == self.forge.http.binding == self.binding
-            and self.forge.http.supports_reads
-            and getattr(self.source, "binding", None) == self.binding
-            and isinstance(self.baseline, BaselineApplicability)
-            and self.baseline.supports_baseline(evidence) is True
-        )
 
     def _scan(self, repository: Reference) -> tuple[tuple[Reference, ...], Disposition | None]:
         cursor = None
@@ -390,7 +318,10 @@ class ForgeIntakeEvidence:
                     "source": subject.base,
                     "content_result": implemented,
                     **({"owner_review_tree_available": source_readable is True} if self.inventory_only else {}),
-                    "criteria": self._criteria_binding(),
+                    "criteria": [
+                        {"criterion": item.criterion, "path": item.path, "expected_digest": digest(item.expected)}
+                        for item in self.criteria
+                    ],
                 }
             )
             refs, incomplete = self._scan(repository)
