@@ -3,6 +3,7 @@ import json
 import os
 import select
 import socket
+import struct
 import subprocess
 import sys
 import textwrap
@@ -16,7 +17,14 @@ from test_sqlite_store import sqlite_tmp_path as sqlite_tmp_path
 
 from creatidy_kernel.adapters.ordinary_managed import OrdinaryManagedRun
 from creatidy_kernel.adapters.reference import reference_spec
-from creatidy_kernel.adapters.served_host import PROVISIONING, LaunchedOwner, launch_owner, receive_owner
+from creatidy_kernel.adapters.served_host import (
+    PROVISIONING,
+    PROVISIONING_V2,
+    LaunchedOwner,
+    launch_owner,
+    receive_owner,
+    receive_owner_operations,
+)
 from creatidy_kernel.adapters.served_local import (
     LocalChannelRefused,
     LocalOwnerChannel,
@@ -32,7 +40,8 @@ from creatidy_kernel.ports.ownership import OwnedWorkspace, WorkOwnership
 from creatidy_kernel.ports.served import OwnerProjection
 
 
-def test_launched_consumer_receives_and_uses_owner_descriptor(sqlite_tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", [1, 2])
+def test_launched_consumer_receives_and_uses_owner_descriptor(sqlite_tmp_path: Path, version: int) -> None:
     with SQLiteProgramStore(sqlite_tmp_path / "provision.db") as store:
         program = store.create(reference_spec(), "create")
         before = (store.history(program.program_id), store.operations())
@@ -40,21 +49,25 @@ def test_launched_consumer_receives_and_uses_owner_descriptor(sqlite_tmp_path: P
         approval = cast(OrdinaryApproval, SimpleNamespace(program=program))
         session = LocalOwnerSession(OwnerProjection(store, program.program_id), app, approval)
         script = (
-            "import json,sys; from creatidy_kernel.adapters.served_host import receive_owner; "
+            "import json,sys; from creatidy_kernel.adapters.served_host import receive_owner,receive_owner_operations; "
             "from creatidy_kernel.adapters.served_local import write_frame,read_frame; "
-            "s=receive_owner(int(sys.argv[-1]),expected_scope=sys.argv[1],"
+            "fd=int(sys.argv[-1]); binding=dict(expected_scope=sys.argv[1],"
             "expected_producer='producer-a',expected_recipient='backend-a'); "
+            "\nif sys.argv[2]=='1': s=receive_owner(fd,**binding)"
+            "\nelse:\n s,ops=receive_owner_operations(fd,**binding)"
+            "\n assert ops=={'snapshot','record','events'}\n"
             'write_frame(s,b\'{"version":1,"action":"snapshot"}\',bound=65536); '
             "r=json.loads(read_frame(s,bound=1048576)); "
             "assert r['result']['scope']==sys.argv[1]; s.close()"
         )
         launched = launch_owner(
             session,
-            [sys.executable, "-I", "-c", script, program.program_id],
+            [sys.executable, "-I", "-c", script, program.program_id, str(version)],
             environment={"HOME": str(sqlite_tmp_path), "PATH": os.defpath, "LANG": "C.UTF-8"},
             scope=program.program_id,
             producer="producer-a",
             recipient="backend-a",
+            version=version,
         )
         try:
             assert select.select([launched.channel.fileno()], [], [], 10)[0]
@@ -257,6 +270,107 @@ def test_consumer_refuses_incompatible_greetings(payload: bytes) -> None:
             assert sender.recv(1) == b""
         except ConnectionResetError:
             pass
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"contract": PROVISIONING},  # v1 cannot be augmented.
+        {"contract": "creatidy-kernel-owner-descriptor-v3"},
+        {"wire_version": 2},
+        {"wire_version": True},
+        {"role": "worker"},
+        {"scope": "other"},
+        {"producer": "producer-b"},
+        {"recipient": "backend-b"},
+        {"extra": None},
+        {"operations": None},
+        {"operations": "approve"},
+        {"operations": ["snapshot", "record", "events", "approve"]},
+        {"operations": ["snapshot", "record", "events", "snapshot"]},
+        {"operations": ["snapshot", "record", "events", "unknown"]},
+        {"operations": ["snapshot", "record", "events", "reconcile"]},
+        {"operations": ["snapshot", "record", "events", ["approve"]]},
+    ],
+)
+def test_operations_receiver_refuses_invalid_declaration(override: dict[str, object]) -> None:
+    sender, receiver = socket.socketpair()
+    with sender, receiver:
+        payload = {
+            "contract": PROVISIONING_V2,
+            "wire_version": 1,
+            "role": "owner",
+            "scope": "p",
+            "producer": "producer-a",
+            "recipient": "backend-a",
+            "operations": ["snapshot", "record", "events"],
+            **override,
+        }
+        write_frame(sender, json.dumps(payload).encode(), bound=65536)
+        with pytest.raises(LocalChannelRefused):
+            receive_owner_operations(
+                receiver.detach(), expected_scope="p", expected_producer="producer-a", expected_recipient="backend-a"
+            )
+        assert sender.recv(1) == b""
+
+
+def test_v2_receiver_refuses_connected_nonstream_and_closes_descriptor() -> None:
+    sender, receiver = socket.socketpair(type=socket.SOCK_SEQPACKET)
+    with sender, receiver:
+        payload = json.dumps(
+            {
+                "contract": PROVISIONING_V2,
+                "wire_version": 1,
+                "role": "owner",
+                "scope": "p",
+                "producer": "producer-a",
+                "recipient": "backend-a",
+                "operations": ["snapshot", "record", "events"],
+            }
+        ).encode()
+        # Deliver the two parts separately so the legacy framing can read both packets.
+        sender.sendall(struct.pack("!I", len(payload)))
+        sender.sendall(payload)
+        fd = receiver.detach()
+        with pytest.raises(LocalChannelRefused, match="not a local stream"):
+            receive_owner_operations(
+                fd, expected_scope="p", expected_producer="producer-a", expected_recipient="backend-a"
+            )
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-32-le", "utf-8-sig"])
+@pytest.mark.parametrize("contract", [PROVISIONING, PROVISIONING_V2])
+def test_non_utf8_json_encoding_is_legacy_v1_only(encoding: str, contract: str) -> None:
+    payload: dict[str, object] = {
+        "contract": contract,
+        "wire_version": 1,
+        "role": "owner",
+        "scope": "p",
+        "producer": "producer-a",
+        "recipient": "backend-a",
+    }
+    if contract == PROVISIONING_V2:
+        payload["operations"] = ["snapshot", "record", "events"]
+    sender, receiver = socket.socketpair()
+    with sender, receiver:
+        write_frame(sender, json.dumps(payload).encode(encoding), bound=65536)
+        if contract == PROVISIONING_V2:
+            with pytest.raises(LocalChannelRefused):
+                receive_owner_operations(
+                    receiver.detach(),
+                    expected_scope="p",
+                    expected_producer="producer-a",
+                    expected_recipient="backend-a",
+                )
+        else:
+            channel, operations = receive_owner_operations(
+                receiver.detach(), expected_scope="p", expected_producer="producer-a", expected_recipient="backend-a"
+            )
+            with channel:
+                assert operations is None
+        assert sender.recv(1) == b""
 
 
 def test_receiver_closes_revoked_channel_and_rejects_version() -> None:

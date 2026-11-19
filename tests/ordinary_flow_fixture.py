@@ -16,6 +16,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from collections.abc import Callable, Generator
@@ -64,6 +65,7 @@ from creatidy_kernel.core.deadlines import BootClockReading
 from creatidy_kernel.core.domain import (
     AttemptSpec,
     AuthorityEnvelope,
+    AuthorityViolation,
     BudgetPolicy,
     DomainAction,
     PauseProgram,
@@ -644,6 +646,74 @@ print("Done")
                 assert reader.read(subject, changed).disposition is Disposition.EQUIVALENCE
                 return {"status": "unassessed"}
             proposal = app.propose("everyday-program", "Receive two native-dependent obligations", selections)
+            if exercise.startswith("served-operations-"):
+                case = exercise.removeprefix("served-operations-")
+                if case == "unrecorded":
+                    proposal = replace(proposal, objective="Readable without an approval binding")
+                if case == "invalid-policy":
+                    app.verification = replace(app.verification, reviewer_required=False)
+                if case == "out-of-policy":
+                    app.policy = replace(app.policy, effects=frozenset())
+                session = LocalOwnerSession(OwnerProjection(store, proposal.program_id), app, None, proposal=proposal)
+                script = textwrap.dedent("""\
+                    import json, sys
+                    from creatidy_kernel.adapters.served_host import receive_owner_operations
+                    from creatidy_kernel.adapters.served_local import read_frame, write_frame
+
+                    case, proposal_digest = sys.argv[1:3]
+                    sock, ops = receive_owner_operations(int(sys.argv[-1]), expected_scope='everyday-program',
+                        expected_producer='fixture-producer', expected_recipient='fixture-backend')
+                    with sock:
+                        expected = {'snapshot', 'record', 'events', 'proposal', 'proposal-chunk'}
+                        if case in {'enabled', 'out-of-policy'}:
+                            expected |= {'approval-scope', 'approval-scope-chunk', 'approve'}
+                        assert ops == (None if case == 'legacy' else expected)
+                        def request(action, **fields):
+                            payload = json.dumps(dict(version=1, action=action, **fields)).encode()
+                            write_frame(sock, payload, bound=65536)
+                            return json.loads(read_frame(sock, bound=1048576, timeout=10))['result']
+                        assert request('proposal-chunk', offset=0, proposal_digest=None)['digest'] == proposal_digest
+                        if case == 'enabled':
+                            scope = request('approval-scope-chunk', offset=0, scope_digest=None)['digest']
+                            receipt = request('approve', command_id='advertised', decision_id='advertised-decision',
+                                expected_revision=-1, expires_at=int(sys.argv[3]), proposal_digest=proposal_digest,
+                                scope_digest=scope)
+                            assert receipt['status'] == 'approved' and receipt['authority'] == 'historical-only'
+                    """)
+                before = (store.history(proposal.program_id), store.operations())
+                with (
+                    patch.object(reader, "read", side_effect=AssertionError("launch read intake evidence")),
+                    patch.object(
+                        discovery, "read_dependencies", side_effect=AssertionError("launch read dependencies")
+                    ),
+                    patch.object(read_http, "request", side_effect=AssertionError("launch called a provider")),
+                    patch.object(store, "intent", side_effect=AssertionError("launch wrote an intent")),
+                    patch.object(store, "finalize_artifact", side_effect=AssertionError("launch wrote an artifact")),
+                ):
+                    launched = launch_owner(
+                        session,
+                        [sys.executable, "-I", "-c", script, case, proposal.digest, str(int(time.time()) + 900)],
+                        environment={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                        scope=proposal.program_id,
+                        producer="fixture-producer",
+                        recipient="fixture-backend",
+                        version=1 if case == "legacy" else 2,
+                    )
+                try:
+                    for _ in range(3 if case == "enabled" else 1):
+                        assert select.select([launched.channel.fileno()], [], [], 10)[0]
+                        launched.serve_once()
+                    assert launched.process.wait(timeout=10) == 0
+                finally:
+                    launched.close()
+                    if launched.process.poll() is None:
+                        launched.process.kill()
+                        launched.process.wait(timeout=10)
+                if case == "enabled":
+                    assert app.recover("advertised-decision").proposal == proposal
+                    return {"status": "approved", "native_sends": 0}
+                assert (store.history(proposal.program_id), store.operations()) == before
+                return {"status": "read", "native_sends": 0}
             if exercise == "served-large-proposal":
                 large = app.propose("everyday-program", ('ż"\\' * 150_000), selections)
                 raw = encode(large.payload)
@@ -1663,8 +1733,14 @@ print("Done")
                     binding.detach(final)
                 assert store.load("everyday-program").status is ProgramStatus.CANCELLED
                 return {"status": "stopped", "native_sends": 0}
-            if exercise == "served-owner-amend":
+            if exercise in {"served-owner-amend", "served-owner-amend-foreign"}:
                 amended = app.propose("everyday-program", "A revised owner-approved objective", selections)
+                foreign = exercise == "served-owner-amend-foreign"
+                if foreign:
+                    app.owner = Principal("other-owner", "owner")
+                    app.policy = replace(
+                        owner_policy, authority=AuthorityEnvelope("other-owner", frozenset(DomainAction), 6)
+                    )
                 owner_socket, owner_client = socket.socketpair()
                 with owner_socket, owner_client:
                     server = LocalOwnerChannel(
@@ -1682,6 +1758,23 @@ print("Done")
                     }
                     wire = json.dumps(request, sort_keys=True).encode()
                     write_frame(owner_client, wire, bound=65536)
+                    if foreign:
+                        before = store.history(amended.program_id)
+                        try:
+                            server.serve_once()
+                        except AuthorityViolation as error:
+                            assert str(error) == "an owner decision is required"
+                        else:
+                            raise AssertionError("non-owner amended the existing Program")
+                        assert store.load(amended.program_id) == approved.program
+                        assert store.history(amended.program_id) == before
+                        assert store.find_artifact("ordinary-program:approval:owner-amend-v1", "record") is None
+                        key = command_prefix(amended.program_id) + digest(
+                            encode(["other-owner", "owner-amend-command"])
+                        )
+                        assert store.find_artifact(key, "receipt") is None
+                        assert not native_state["sends"]
+                        return {"status": "refused", "native_sends": 0}
                     server.serve_once()
                     result = json.loads(read_frame(owner_client, bound=1024 * 1024))["result"]
                     assert result["status"] == "approved" and result["expires_at"] == approved.expires_at

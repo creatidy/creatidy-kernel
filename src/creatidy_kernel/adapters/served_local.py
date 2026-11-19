@@ -3,18 +3,20 @@
 
 import base64
 import json
+import logging
 import re
 import socket
 import struct
 import time
 from collections.abc import Callable
 from dataclasses import asdict
+from sqlite3 import DatabaseError, ProgrammingError
 from typing import cast
 
 from creatidy_kernel.adapters.ordinary_managed import OrdinaryManagedRun
-from creatidy_kernel.adapters.sqlite_store import IdempotencyConflict
+from creatidy_kernel.adapters.sqlite_store import CorruptHistory, IdempotencyConflict
 from creatidy_kernel.core.domain import AttemptStatus
-from creatidy_kernel.core.intake import digest, encode, object_from
+from creatidy_kernel.core.intake import IntakeRefused, digest, encode, object_from
 from creatidy_kernel.core.ownership import HandoffMode
 from creatidy_kernel.core.served import ProgressPosition, command_prefix
 from creatidy_kernel.ports.ordinary import (
@@ -29,6 +31,9 @@ from creatidy_kernel.ports.served import OwnerProjection, ServedSnapshot
 
 MAX_REQUEST = 65536
 MAX_RESPONSE = 1024 * 1024
+OWNER_READS = frozenset({"snapshot", "record", "events"})
+PROPOSAL_READS = frozenset({"proposal", "proposal-chunk"})
+APPROVAL_OPERATIONS = frozenset({"approval-scope", "approval-scope-chunk", "approve"})
 SNAPSHOT_COLLECTIONS = frozenset(
     {"work_units", "attempts", "reservations", "commands", "claims", "correlations", "decisions", "usage_subtotals"}
 )
@@ -730,6 +735,25 @@ class LocalOwnerChannel(LocalReadChannel):
     def approved(self) -> OrdinaryApproval | None:
         """Return the host-bound approval; it is never serialized to a client."""
         return self._approval_binding[0]
+
+    def supported_operations(self) -> frozenset[str]:
+        """Advertise the read/approval surface, not lifecycle commands or command admissibility."""
+        if self.fileno() < 0:
+            raise LocalChannelRefused("owner capability is closed")
+        proposal = self._proposal
+        if proposal is None:
+            return OWNER_READS
+        reads = OWNER_READS | PROPOSAL_READS
+        try:
+            self._application.check_approval_provisioning(proposal)
+        except IntakeRefused:
+            return reads
+        except ProgrammingError:
+            raise
+        except (CorruptHistory, OSError, DatabaseError):
+            logging.getLogger(__name__).warning("Owner approval discovery could not verify the bound proposal")
+            return reads
+        return reads | APPROVAL_OPERATIONS
 
     @property
     def _approved(self) -> OrdinaryApproval | None:

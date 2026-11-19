@@ -169,6 +169,51 @@ controller, and any managed workspace and managed worker/control bindings to ref
 in-process store object. This prevents accidental cross-store composition even for equal Program scopes;
 it is not a durable database identity or authentication of the host's chosen store.
 
+#### Owner Operation Declaration
+
+For a backend that supports discovery, the trusted supervisor selects `launch_owner(..., version=2)`.
+This changes only the **first producer-to-backend frame**, not the descriptor or request protocol.
+It is the same bounded length-prefixed UTF-8 JSON greeting with exactly seven fields: `contract`
+(`creatidy-kernel-owner-descriptor-v2`), `wire_version` (integer `1`), `role` (`owner`), `scope`,
+`producer`, `recipient`, and `operations` (an array of unique operation names). The supervisor must
+still configure scope and both labels independently of the received frame. The declaration belongs
+only to this descriptor; it must not be reused across reconnects, scopes, producers or recipients.
+
+`receive_owner_operations` is the Kernel reference receiver. It reads one greeting and sends nothing.
+It returns the validated socket and operation set for v2, or the same validated socket and `None`
+for exact v1. `launch_owner` still defaults to v1; `receive_owner` remains v1-only for existing
+callers. A v2-aware backend verifies the exact field set, contract, integer wire version, role, scope
+and both labels on a connected Unix stream, rejecting duplicates, unknown versions or names, and
+inconsistent operation sets.
+An invalid greeting closes the descriptor; it is not treated as legacy. A valid v1 greeting means
+**no verified approval support** even on a newer Kernel using the default launch. Do not send a
+discovery request or try another frame. An otherwise valid legacy proposal connection remains usable
+for its already-known reads, including `proposal-chunk`.
+
+Descriptor v2 always advertises `snapshot`, `record` and `events`. A bound proposal adds `proposal`
+and `proposal-chunk`. The approval trio (`approval-scope`, `approval-scope-chunk`, `approve`) is added
+only when the attached channel has the exact producer-recorded proposal and the application's
+approval configuration is bound, including the required qualified drivers and compatible verification
+configuration when used. A missing approval binding does not remove otherwise available reads.
+Payload version and whether a proposal
+was prepared before a restart are not themselves capability restrictions. The declaration contains
+only read and approval operations, not lifecycle commands (`stop`, `reconcile`, `start-managed`).
+
+The greeting answers which protocol operations the producer supports, not whether a particular
+approval will be accepted. It does not call providers, infer scan completeness, verify retained
+intake evidence, recover records, or predict current Program ownership, revision, policy compliance
+or deadline. A supported operation can still be refused. The declaration is not updated in-band;
+the producer writes operation names sorted, but their order is not significant to the receiver.
+
+Console must enable its approval flow only after validating v2 and finding both `approval-scope-chunk`
+and `approve`. Otherwise it remains read-only on verified read operations and does not probe scope,
+submit or replay an approval. An unknown or invalid greeting permits no use of that descriptor. The
+declaration does not grant authority or change existing handlers: approval still requires the exact
+subject, expected revision, proposal and reviewed scope digests and current producer-side authority
+checks. Exact replay still returns historical evidence or `unknown`, not fresh authority or proof of
+effect. A revoked channel cannot be reused even with a previously verified declaration. The raw
+`creatidy-kernel-client --fd` path for directly attached descriptors is unchanged.
+
 The owner thread polls `launched.channel.fileno()` and calls `launched.serve_once()` when readable; it
 detaches the channel if serving fails, including EOF. The host must also call `launched.close()` in a
 `finally` when a child exits, a launch is replaced, or the host stops polling it; merely observing process

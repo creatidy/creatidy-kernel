@@ -610,10 +610,15 @@ def test_interleaved_owner_channels_keep_amended_approval(sqlite_tmp_path: Path)
     ) == {"status": "stopped", "native_sends": 0}
 
 
-def test_host_bound_amendment_preserves_original_deadline_and_replays(sqlite_tmp_path: Path) -> None:
-    assert run_ordinary_flow(
-        sqlite_tmp_path / "served-owner-amend", None, mode="pull", exercise="served-owner-amend"
-    ) == {"status": "amended", "native_sends": 0}
+@pytest.mark.parametrize("suffix,status", [("", "amended"), ("-foreign", "refused")])
+def test_host_bound_amendment_preserves_owner_deadline_and_replay(
+    sqlite_tmp_path: Path, suffix: str, status: str
+) -> None:
+    exercise = "served-owner-amend" + suffix
+    assert run_ordinary_flow(sqlite_tmp_path / exercise, None, mode="pull", exercise=exercise) == {
+        "status": status,
+        "native_sends": 0,
+    }
 
 
 def test_lost_agit_reply_ignores_unrelated_branch_pr_without_duplicate_write(sqlite_tmp_path: Path) -> None:
@@ -634,6 +639,14 @@ def test_separate_owner_clients_share_host_bound_approval(sqlite_tmp_path: Path)
     assert run_ordinary_flow(
         sqlite_tmp_path / "served-owner-multi-client", None, mode="pull", exercise="served-owner-multi-client"
     ) == {"status": "stopped", "native_sends": 0}
+
+
+@pytest.mark.parametrize("case", ["enabled", "legacy", "unrecorded", "invalid-policy", "out-of-policy"])
+def test_supervisor_advertises_bound_operations_without_probing(sqlite_tmp_path: Path, case: str) -> None:
+    assert run_ordinary_flow(sqlite_tmp_path / case, None, mode="pull", exercise="served-operations-" + case) == {
+        "status": "approved" if case == "enabled" else "read",
+        "native_sends": 0,
+    }
 
 
 def test_supervisor_launch_receipts_and_current_authority(sqlite_tmp_path: Path) -> None:

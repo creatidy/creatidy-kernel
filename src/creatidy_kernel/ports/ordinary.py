@@ -426,9 +426,16 @@ class OrdinaryProgram:
         self.store.finalize_artifact(key, "record", raw)
         return raw
 
-    def _spec(self, proposal: OrdinaryProposal, previous: Program | None) -> ProgramSpec:
+    def _check_qualified_verification_order(self, proposal: OrdinaryProposal) -> None:
         if proposal.qualified_drafts and self.verification.checks[:2] != ("paths", "structural"):
             raise IntakeRefused("qualified tooling requires path and structural checks first")
+
+    def _check_qualified_ci_selection(self, draft: QualifiedDraft) -> None:
+        if (not draft.ci_subjects and draft.ci_profile is None) != ("ci" not in self.verification.checks):
+            raise IntakeRefused("qualified CI check and exact build selection must agree")
+
+    def _spec(self, proposal: OrdinaryProposal, previous: Program | None) -> ProgramSpec:
+        self._check_qualified_verification_order(proposal)
         if any(cut.required for cut in proposal.qualified_cuts):
             raise IntakeRefused("qualified predecessors cannot yet be mapped to ordinary work units")
         identities = {
@@ -471,8 +478,7 @@ class OrdinaryProgram:
         qualified_ids = {item.cut.subject: item.task_id for item in proposal.qualified_drafts}
         qualified_by_subject = {item.cut.subject: item for item in proposal.qualified_drafts}
         for draft in proposal.qualified_drafts:
-            if (not draft.ci_subjects and draft.ci_profile is None) != ("ci" not in self.verification.checks):
-                raise IntakeRefused("qualified CI check and exact build selection must agree")
+            self._check_qualified_ci_selection(draft)
             if any(required not in qualified_ids for required in draft.cut.required):
                 raise IntakeRefused("qualified predecessor is outside the exact approved Program")
             if any(
@@ -534,8 +540,7 @@ class OrdinaryProgram:
 
     def current(self, proposal: OrdinaryProposal, expires_at: int) -> None:
         # Complete network/source/history reads before the final pure temporal cut.
-        if proposal.qualified_drafts and self.verification.checks[:2] != ("paths", "structural"):
-            raise IntakeRefused("qualified tooling requires path and structural checks first")
+        self._check_qualified_verification_order(proposal)
         reads = tuple(self.intake.reader.read(item.evidence.subject, item.declaration) for item in proposal.drafts)
         edges = tuple(self.dependencies.read_dependencies(item.evidence.subject) for item in proposal.drafts)
         drivers = {driver.binding: driver for driver in self.qualified_work}
@@ -643,6 +648,32 @@ class OrdinaryProgram:
         raw_proposal = encode(proposal.payload)
         if self.store.find_artifact(f"ordinary-program:proposal:{digest(raw_proposal)}", "record") != raw_proposal:
             raise IntakeRefused("exact proposal record is unavailable")
+
+    def check_approval_provisioning(self, proposal: OrdinaryProposal) -> None:
+        """Check the bound approval surface, not whether any request would be accepted."""
+        self.check_proposal_record(proposal)
+        self.approval_scope(proposal)
+        if any(
+            budget is not None and budget.strict_inference
+            for budget in (self.policy.project_budget, self.policy.work_budget)
+        ):
+            raise IntakeRefused("strict inference bounds unavailable for the installed profiles")
+        work = {driver.binding for driver in self.qualified_work}
+        if any(cut.subject.binding not in work for cut in proposal.qualified_cuts) or any(
+            draft.cut.subject.binding not in work for draft in proposal.qualified_drafts
+        ):
+            raise IntakeRefused("qualified work driver unavailable or changed")
+        if proposal.qualified_drafts:
+            self._check_qualified_verification_order(proposal)
+            for draft in proposal.qualified_drafts:
+                self._check_qualified_ci_selection(draft)
+            scm = {driver.binding for driver in self.qualified_scm}
+            if (
+                self.qualified_baselines is None
+                or self.qualified_readiness is None
+                or any(draft.baseline.source.binding not in scm for draft in proposal.qualified_drafts)
+            ):
+                raise IntakeRefused("qualified SCM, baseline or relevance producer unavailable")
 
     def approval_scope(self, proposal: OrdinaryProposal) -> dict[str, object]:
         """Canonical owner-visible inputs that determine the approval's meaning."""
