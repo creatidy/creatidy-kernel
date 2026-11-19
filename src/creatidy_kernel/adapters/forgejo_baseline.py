@@ -23,7 +23,8 @@ class ForgejoBaseline:
             raise ValueError("finite trusted native baseline profile required")
         self.http, self.recipes, self.contexts, self.max_pages = http, recipes, contexts, max_pages
         self.binding = http.binding
-        self._observed_profiles: dict[tuple[IssueSubject, str, str, str], tuple[frozenset[str], int]] = {}
+        self._discovery_contexts: frozenset[str] | None = contexts
+        self._observed_profiles: dict[tuple[IssueSubject, str, str, str], int] = {}
 
     def _read(self, subject: IssueSubject) -> tuple[list[dict[str, object]], int] | None:
         result: list[dict[str, object]] = []
@@ -71,11 +72,14 @@ class ForgejoBaseline:
             and evidence.baseline_producer == self._PRODUCER
             and self._supports(evidence.subject, evidence.recipe_digest)
             and profile is not None
-            and profile[0] == self.contexts
-            and profile[1] <= self.max_pages
+            and self._discovery_contexts == self.contexts
+            and profile <= self.max_pages
         )
 
     def read_baseline(self, subject: IssueSubject, recipe_digest: str) -> BaselineSnapshot | None:
+        if self._discovery_contexts != self.contexts:
+            # A row digest can alias observations made under different context selections.
+            self._discovery_contexts = None
         if not self._supports(subject, recipe_digest):
             return None
         try:
@@ -105,7 +109,7 @@ class ForgejoBaseline:
             # The retained reference hashes rows, but does not identify the status selection or scan bound.
             key = (subject, recipe_digest, reference, result)
             self._observed_profiles.pop(key, None)
-            self._observed_profiles[key] = (self.contexts, max(pages, closing[1]))
+            self._observed_profiles[key] = max(pages, closing[1])
             if len(self._observed_profiles) > self._DISCOVERY_HISTORY:
                 del self._observed_profiles[next(iter(self._observed_profiles))]
             return BaselineSnapshot(subject, recipe_digest, self._PRODUCER, reference, result, observed)

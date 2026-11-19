@@ -10,7 +10,7 @@ import re
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass, replace
-from typing import Protocol, cast
+from typing import Protocol, cast, runtime_checkable
 
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.domain import (
@@ -53,7 +53,6 @@ from creatidy_kernel.ports.intake import (
     EvidenceApplicability,
     IntakeStore,
     OrdinaryIntake,
-    SubjectApplicability,
     draft_from,
 )
 from creatidy_kernel.ports.ownership import OwnershipStore, WorkOwnership
@@ -68,7 +67,7 @@ from creatidy_kernel.ports.verification import (
 
 class OrdinaryStore(IntakeStore, OwnershipStore, Protocol):
     def supports_work_budget(
-        self, program_id: str, project_id: str, project: WorkBudgetPolicy, task: WorkBudgetPolicy
+        self, spec: ProgramSpec, project_id: str, project: WorkBudgetPolicy, task: WorkBudgetPolicy
     ) -> bool: ...
 
     def work_budget_status(self, program_id: str) -> dict[str, object]: ...
@@ -88,6 +87,11 @@ class OrdinaryStore(IntakeStore, OwnershipStore, Protocol):
 
 class DependencyReader(Protocol):
     def read_dependencies(self, subject: IssueSubject) -> DependencyEvidence: ...
+
+
+@runtime_checkable
+class DependencyApplicability(Protocol):
+    def supports_dependencies(self, evidence: DependencyEvidence) -> bool: ...
 
 
 class QualifiedBaselineReader(Protocol):
@@ -667,7 +671,10 @@ class OrdinaryProgram:
             or policy.project_budget is None
             or policy.work_budget is None
             or not self.store.supports_work_budget(
-                proposal.program_id, policy.project_id, policy.project_budget, policy.work_budget
+                self._spec(proposal, self.store.find_program(proposal.program_id)),
+                policy.project_id,
+                policy.project_budget,
+                policy.work_budget,
             )
         ):
             raise IntakeRefused("work budget cannot bind to the configured Program and project")
@@ -678,12 +685,12 @@ class OrdinaryProgram:
         if len(decisions) > 1:
             raise IntakeRefused("qualified cuts require conflicting owner decisions")
         reader, dependencies = self.intake.reader, self.dependencies
-        if not isinstance(reader, EvidenceApplicability) or not isinstance(dependencies, SubjectApplicability):
+        if not isinstance(reader, EvidenceApplicability) or not isinstance(dependencies, DependencyApplicability):
             raise IntakeRefused("local reader applicability is not available")
-        for draft in proposal.drafts:
+        for draft, dependency in zip(proposal.drafts, proposal.dependencies, strict=True):
             if (
                 reader.supports_evidence(draft) is not True
-                or dependencies.supports_subject(draft.evidence.subject) is not True
+                or dependencies.supports_dependencies(dependency) is not True
             ):
                 raise IntakeRefused("configured readers do not cover this proposal")
             self.intake.check_retained_authority(self.owner, draft, self.policy)

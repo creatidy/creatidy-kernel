@@ -193,12 +193,15 @@ Descriptor v2 advertises `snapshot`, `record` and `events`; it adds `proposal` a
 a bound proposal. `approval-scope`, `approval-scope-chunk` and `approve` appear together only with
 both proposal reads, the exact producer-recorded proposal, a valid material approval-scope binding,
 a proposal within the bound policy's static limits, and local evidence that the configured intake
-and dependency readers cover its subjects, baseline recipe, and any literal criteria. Unsupported
-or conflicting stored project/work budgets do not advertise approval. The Forgejo status baseline
-reader verifies scan bounds and context selection against its bounded in-memory observations from
+and dependency readers cover its subjects, retained dependency observations, baseline recipe, and any
+literal criteria. Unsupported budgets, conflicting stored bindings, and prepared clock origins for a
+different specification do not advertise approval. The Forgejo status baseline reader verifies scan
+bounds and context selection against its bounded in-memory observations from
 normal baseline reads; a new reader or an evicted observation cannot prove that an old status
-digest applies and therefore leaves discovery read-only. Any qualified dependency cuts must
-have configured work bindings and agree on a wire-valid decision reference when one is required. This supports
+digest applies and therefore leaves discovery read-only. A reader used under different status context
+selections no longer supplies discovery evidence, because the same digest can represent both.
+Any qualified dependency cuts must have configured work bindings and agree on a wire-valid decision
+reference when one is required. This supports
 proposal payload versions 1 and 2. Proposal payload v3 (qualified drafts) remains readable, but its
 baseline and readiness reader ports cannot attest local applicability, so its approval is not
 advertised. This does not disable the existing approval handlers.

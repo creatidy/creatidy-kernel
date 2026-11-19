@@ -2820,10 +2820,15 @@ class SQLiteProgramStore:
         return self._work_binding(program_id) is not None
 
     def supports_work_budget(
-        self, program_id: str, project_id: str, project: WorkBudgetPolicy, task: WorkBudgetPolicy
+        self, spec: ProgramSpec, project_id: str, project: WorkBudgetPolicy, task: WorkBudgetPolicy
     ) -> bool:
         """Check immutable budget bindings without preparing clocks or accepting work."""
         self._assert_writer_thread()
+        program_id = spec.program_id
+        try:
+            self.pending_work_projection(spec)
+        except BudgetRefused:
+            return False
         existing = self._work_binding(program_id)
         project_record = self._work_record("project", project_id)
         current = self.find_program(program_id)

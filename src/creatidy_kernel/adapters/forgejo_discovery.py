@@ -201,9 +201,12 @@ class ForgejoDiscovery:
             raise ValueError("exact positive native issue number required")
         return self._observe(f"/repos/{self.binding.repository}/issues/{number}/dependencies", dependencies=True)
 
-    def supports_subject(self, subject: IssueSubject) -> bool:
+    def supports_dependencies(self, evidence: DependencyEvidence) -> bool:
+        subject = evidence.subject
         return (
-            self.http.supports_reads
+            evidence.complete
+            and len(evidence.required) <= (self.max_pages - 1) * self.page_size
+            and self.http.supports_reads
             and self.http.binding == self.binding
             and (subject.origin, subject.repository)
             == (

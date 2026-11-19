@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from sqlite3 import OperationalError
+from sqlite3 import DatabaseError, OperationalError
 from typing import cast
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
@@ -138,6 +138,7 @@ def forge_service(
     initial_comments: int = 0,
     duplicate_comment: bool = False,
     baseline_status: str = "success",
+    alternate_baseline: bool = False,
 ) -> Generator[tuple[str, dict[str, object]]]:
     created = datetime.now(UTC).isoformat()
     prs: list[dict[str, object]] = []
@@ -219,11 +220,10 @@ def forge_service(
                     ]
                 )
             elif path.startswith("/commits/") and path.endswith("/statuses"):
-                self.reply(
-                    [{"id": 1, "context": "ci/baseline", "status": baseline_status, "created_at": created}]
-                    if page == 1
-                    else []
-                )
+                rows = [{"id": 1, "context": "ci/baseline", "status": baseline_status, "created_at": created}]
+                if alternate_baseline:
+                    rows.append({"id": 2, "context": "ci/other", "status": baseline_status, "created_at": created})
+                self.reply(rows if page == 1 else [])
             elif path == "/branches/develop":
                 self.reply({"name": "develop", "commit": {"id": state["base"]}})
             elif path == "/pulls":
@@ -439,6 +439,7 @@ def run_ordinary_flow(
             initial_comments=31 if exercise == "many-comments" else 241 if exercise == "oversized-comments" else 0,
             duplicate_comment=exercise == "duplicate-comments",
             baseline_status=exercise.removeprefix("baseline-") if exercise.startswith("baseline-") else "success",
+            alternate_baseline=exercise == "served-operations-baseline-context-reread",
         ) as (endpoint, native_state),
         review_peer(
             root / "native",
@@ -1024,8 +1025,32 @@ print("Done")
                     )
                 if case == "baseline-context":
                     baseline.contexts = frozenset({"ci/other"})
+                if case == "baseline-context-reread":
+                    baseline.contexts = frozenset({"ci/other"})
+                    for draft in proposal.drafts:
+                        evidence = draft.evidence
+                        reread = baseline.read_baseline(evidence.subject, evidence.recipe_digest)
+                        assert reread is not None
+                        assert (reread.reference, reread.result) == (
+                            evidence.baseline_reference,
+                            evidence.baseline_result,
+                        )
                 if case == "baseline-scan-bound":
                     baseline.max_pages = 1
+                if case == "dependency-scan-bound":
+                    assert any(observation.required for observation in proposal.dependencies)
+                    discovery.max_pages = 1
+                if case == "pending-budget-origin":
+                    with patch.object(app, "current", side_effect=[None, RuntimeError("interrupted approval")]):
+                        try:
+                            app.approve(proposal, decision_id="interrupted-origin", expires_at=int(time.time()) + 900)
+                        except RuntimeError as error:
+                            assert str(error) == "interrupted approval"
+                        else:
+                            raise AssertionError("approval was not interrupted")
+                    assert store.find_program(proposal.program_id) is None
+                    assert store.operations("work-budget:v1:clock-origin:")
+                    proposal = app.propose(proposal.program_id, "Changed objective after interruption", selections)
                 if case == "baseline-unobserved":
                     reader.observer.baseline = ForgejoBaseline(read_http, recipes, frozenset({"ci/baseline"}))
                 if case == "artifact-loss":
@@ -1109,6 +1134,7 @@ print("Done")
                 read_failure = {
                     "artifact-io": PermissionError("synthetic approval read failure"),
                     "artifact-sqlite": OperationalError("synthetic approval database read failure"),
+                    "artifact-database": DatabaseError("synthetic malformed SQLite page"),
                 }.get(case)
                 with (
                     patch.object(store, "find_artifact", side_effect=read_failure)

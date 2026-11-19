@@ -10,7 +10,7 @@ import struct
 import time
 from collections.abc import Callable
 from dataclasses import asdict
-from sqlite3 import OperationalError
+from sqlite3 import DatabaseError, ProgrammingError
 from typing import TypeGuard, cast
 
 from creatidy_kernel.adapters.ordinary_managed import OrdinaryManagedRun
@@ -758,7 +758,9 @@ class LocalOwnerChannel(LocalReadChannel):
                 self._application.check_approval_provisioning(proposal)
             except IntakeRefused:
                 pass  # Proposal reads don't require approval evidence or policy.
-            except (CorruptHistory, OSError, OperationalError):
+            except ProgrammingError:
+                raise
+            except (CorruptHistory, OSError, DatabaseError):
                 logging.getLogger(__name__).warning("Owner approval discovery could not verify stored evidence")
             else:
                 operations.update(APPROVAL_OPERATIONS)

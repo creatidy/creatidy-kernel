@@ -57,11 +57,6 @@ class EvidenceApplicability(Protocol):
 
 
 @runtime_checkable
-class SubjectApplicability(Protocol):
-    def supports_subject(self, subject: IssueSubject) -> bool: ...
-
-
-@runtime_checkable
 class BaselineApplicability(Protocol):
     def supports_baseline(self, evidence: IntakeEvidence) -> bool: ...
 
