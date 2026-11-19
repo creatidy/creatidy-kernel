@@ -155,7 +155,7 @@ def _receive_owner(
             or not _valid_binding(expected_recipient)
         ):
             raise LocalChannelRefused("unsupported provisioning version or scope")
-        if channel.family != socket.AF_UNIX or channel.type & socket.SOCK_STREAM != socket.SOCK_STREAM:
+        if channel.family != socket.AF_UNIX or channel.type != socket.SOCK_STREAM:
             raise LocalChannelRefused("inherited descriptor is not a local stream")
         channel.getpeername()
         raw = read_frame(channel, bound=65536)

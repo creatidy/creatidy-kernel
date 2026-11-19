@@ -5,6 +5,7 @@ import copy
 import hmac
 import json
 import os
+import select
 import sys
 import tempfile
 import time
@@ -67,6 +68,8 @@ from creatidy_kernel.adapters.qualified_baseline import (
 )
 from creatidy_kernel.adapters.qualified_readiness import GitHubJiraLiteralReadiness, LiteralReadiness
 from creatidy_kernel.adapters.reference import reference_git
+from creatidy_kernel.adapters.served_host import launch_owner
+from creatidy_kernel.adapters.served_local import LocalOwnerSession
 from creatidy_kernel.adapters.source_cache import source_use
 from creatidy_kernel.adapters.sqlite_store import (
     IdempotencyConflict,
@@ -121,6 +124,7 @@ from creatidy_kernel.ports.ordinary import (
 from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.ownership import WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
+from creatidy_kernel.ports.served import OwnerProjection
 from creatidy_kernel.ports.verification import VerificationProfile, decode_product_review_receipt
 from tools.check_drivers import (
     BASE,
@@ -1686,6 +1690,41 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         with patch.object(app, "qualified_baselines", None):
             with pytest.raises(IntakeRefused, match="baseline or relevance producer unavailable"):
                 app.check_approval_provisioning(proposal)
+        if mode == "sync-reopen":
+            # The exact proposal remains readable after changing only the local verification configuration.
+            script = """\
+import json, sys
+from creatidy_kernel.adapters.served_host import receive_owner_operations
+from creatidy_kernel.adapters.served_local import read_frame, write_frame
+
+sock, ops = receive_owner_operations(int(sys.argv[-1]), expected_scope=sys.argv[1],
+    expected_producer='qualified-kernel', expected_recipient='backend')
+with sock:
+    assert ops == {'snapshot', 'record', 'events', 'proposal', 'proposal-chunk'}, ops
+    write_frame(sock, b'{"version":1,"action":"proposal-chunk","offset":0,"proposal_digest":null}', bound=65536)
+    assert json.loads(read_frame(sock, bound=1048576))['result']['digest'] == sys.argv[2]
+"""
+            session = LocalOwnerSession(OwnerProjection(store, proposal.program_id), app, approved, proposal=proposal)
+            for checks in [("commands", "paths", "structural", "ci"), ("paths", "structural", "commands")]:
+                with patch.object(app, "verification", VerificationPolicy(policy.reference, checks)):
+                    launched = launch_owner(
+                        session,
+                        [sys.executable, "-I", "-c", script, proposal.program_id, proposal.digest],
+                        environment={"HOME": str(sqlite_tmp_path), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                        scope=proposal.program_id,
+                        producer="qualified-kernel",
+                        recipient="backend",
+                        version=2,
+                    )
+                try:
+                    assert select.select([launched.channel.fileno()], [], [], 10)[0]
+                    launched.serve_once()
+                    assert launched.process.wait(timeout=10) == 0
+                finally:
+                    launched.close()
+                    if launched.process.poll() is None:
+                        launched.process.kill()
+                        launched.process.wait(timeout=10)
         assert tuple(services.requests) == before
         assert app._qualified_baseline_age(replace(first.baseline, observed_at=100)) == 90  # pyright: ignore[reportPrivateUsage]
         assert (

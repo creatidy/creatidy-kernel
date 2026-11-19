@@ -183,7 +183,8 @@ only to this descriptor; it must not be reused across reconnects, scopes, produc
 It returns the validated socket and operation set for v2, or the same validated socket and `None`
 for exact v1. `launch_owner` still defaults to v1; `receive_owner` remains v1-only for existing
 callers. A v2-aware backend verifies the exact field set, contract, integer wire version, role, scope
-and both labels, rejecting duplicates, unknown versions or names, and inconsistent operation sets.
+and both labels on a connected Unix stream, rejecting duplicates, unknown versions or names, and
+inconsistent operation sets.
 An invalid greeting closes the descriptor; it is not treated as legacy. A valid v1 greeting means
 **no verified approval support** even on a newer Kernel using the default launch. Do not send a
 discovery request or try another frame. An otherwise valid legacy proposal connection remains usable
@@ -192,8 +193,9 @@ for its already-known reads, including `proposal-chunk`.
 Descriptor v2 always advertises `snapshot`, `record` and `events`. A bound proposal adds `proposal`
 and `proposal-chunk`. The approval trio (`approval-scope`, `approval-scope-chunk`, `approve`) is added
 only when the attached channel has the exact producer-recorded proposal and the application's
-approval configuration is bound, including the required qualified drivers when used. A missing
-approval binding does not remove otherwise available reads. Payload version and whether a proposal
+approval configuration is bound, including the required qualified drivers and compatible verification
+configuration when used. A missing approval binding does not remove otherwise available reads.
+Payload version and whether a proposal
 was prepared before a restart are not themselves capability restrictions. The declaration contains
 only read and approval operations, not lifecycle commands (`stop`, `reconcile`, `start-managed`).
 

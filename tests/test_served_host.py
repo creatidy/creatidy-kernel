@@ -3,6 +3,7 @@ import json
 import os
 import select
 import socket
+import struct
 import subprocess
 import sys
 import textwrap
@@ -311,6 +312,32 @@ def test_operations_receiver_refuses_invalid_declaration(override: dict[str, obj
                 receiver.detach(), expected_scope="p", expected_producer="producer-a", expected_recipient="backend-a"
             )
         assert sender.recv(1) == b""
+
+
+def test_v2_receiver_refuses_connected_nonstream_and_closes_descriptor() -> None:
+    sender, receiver = socket.socketpair(type=socket.SOCK_SEQPACKET)
+    with sender, receiver:
+        payload = json.dumps(
+            {
+                "contract": PROVISIONING_V2,
+                "wire_version": 1,
+                "role": "owner",
+                "scope": "p",
+                "producer": "producer-a",
+                "recipient": "backend-a",
+                "operations": ["snapshot", "record", "events"],
+            }
+        ).encode()
+        # Deliver the two parts separately so the legacy framing can read both packets.
+        sender.sendall(struct.pack("!I", len(payload)))
+        sender.sendall(payload)
+        fd = receiver.detach()
+        with pytest.raises(LocalChannelRefused, match="not a local stream"):
+            receive_owner_operations(
+                fd, expected_scope="p", expected_producer="producer-a", expected_recipient="backend-a"
+            )
+        with pytest.raises(OSError):
+            os.fstat(fd)
 
 
 @pytest.mark.parametrize("encoding", ["utf-16-le", "utf-32-le", "utf-8-sig"])
