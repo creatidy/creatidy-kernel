@@ -303,6 +303,24 @@ def test_native_execution_identity_excludes_access_metadata(role_peer: RolePeer)
     assert profile.execution_identity(distinct) != identity
 
 
+def test_forgejo_unrelated_job_rerun_does_not_change_execution_identity() -> None:
+    peer = RolePeer("forgejo")
+    try:
+        ci = peer.ci()
+        source = DriverSubject(peer.source, "commit", HEAD, HEAD)
+        fact = ci.build(ci.key, source)
+        profile = ci.profile()
+        assert profile.execution_identity is not None
+        native = json.loads(fact.native)
+        native["jobs"].append({"id": 900, "attempt": 1, "task_id": 901, "handle": "unrelated"})
+        before = replace(fact, native=encode(native))
+        native["jobs"][-1].update({"attempt": 2, "task_id": 902, "handle": "unrelated-rerun"})
+        after = replace(fact, native=encode(native))
+        assert profile.execution_identity(before) == profile.execution_identity(after)
+    finally:
+        peer.services.close()
+
+
 @pytest.mark.parametrize("role_peer", ["github", "forgejo"], indirect=True)
 @pytest.mark.parametrize(
     "mode",

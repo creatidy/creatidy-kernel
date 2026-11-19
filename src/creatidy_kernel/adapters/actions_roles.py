@@ -253,21 +253,11 @@ def _result(fact: DriverFact, now: int, configuration: bytes) -> tuple[str, int]
 def _execution_identity(fact: DriverFact) -> bytes:
     value = object_from(fact.native)
     run = object_value(value["run"])
-    # GitHub reruns have a run attempt; Forgejo v16 has per-job attempts instead.
+    # Forgejo v16 has per-job attempts, not a trustworthy aggregate run attempt.
     if fact.subject.binding.implementation == "github-actions":
         identity: object = {"run": run["id"], "attempt": run["run_attempt"]}
     else:
-        identity = {
-            "run": run["id"],
-            "jobs": sorted(
-                (
-                    (job["id"], job["attempt"], job["task_id"], job["handle"])
-                    for item in list_value(value["jobs"])
-                    for job in (object_value(item),)
-                ),
-                key=lambda item: int(str(item[0])),
-            ),
-        }
+        identity = {"run": run["id"]}
     binding = fact.subject.binding
     return encode(
         {

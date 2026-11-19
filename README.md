@@ -561,7 +561,10 @@ Each candidate still receives fresh exact-commit native observations through the
 verification path. A durable version-2 receipt binds configuration, native execution identity,
 WorkUnit/Attempt and candidate, and cannot be reassigned to another Attempt. Duplicate reads retain
 their original observation/freshness interval; native results predating the approved source cut refuse.
-GitHub run/attempt identities and Forgejo v16 run/per-job attempt identities remain distinct. This
+GitHub run/attempt identities and Forgejo v16 run/per-job attempt identities remain distinct. Forgejo
+requires a separate native run per Kernel Attempt; rerunning jobs within the same run cannot provide a
+new attribution, even when a required job was rerun. This conservative limitation prevents unrelated
+job reruns from disguising reused required results. This
 read-only capability does not dispatch or rerun Actions, attest the actual native worktree, supply
 Forgejo structured steps, or complete the separate #60 acceptance matrix.
 
