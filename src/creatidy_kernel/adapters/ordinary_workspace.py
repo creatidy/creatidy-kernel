@@ -12,7 +12,7 @@ import stat
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
@@ -77,11 +77,16 @@ class OrdinaryGitWorkspace:
                 qualified_ci, qualified_ci.binding, "jenkins-exact:v1", jenkins_result
             )
         for draft in proposal.qualified_drafts:
-            if not draft.ci_subjects:
+            selections = (draft.ci_profile,) if draft.ci_profile is not None else draft.ci_subjects
+            if not selections:
                 continue
             profile = self.qualified_ci_profile
-            if profile is None or any(selected.binding != profile.binding for selected in draft.ci_subjects):
+            if profile is None or any(selected.binding != profile.binding for selected in selections):
                 raise IntakeRefused("required candidate CI binding unavailable or incompatible")
+            if draft.ci_profile is not None and (
+                profile.reusable_selection != draft.ci_profile or profile.execution_identity is None
+            ):
+                raise IntakeRefused("required candidate CI reusable profile unavailable or changed")
             if not draft.baseline.proof or not profile.matches_approval(draft.baseline.proof):
                 raise IntakeRefused("candidate CI interpretation differs from approved profile")
         self.max_bytes = max_bytes
@@ -758,9 +763,21 @@ class _QualifiedCICheck:
         if attempt.attempt_id not in attempts:
             return None
         ordinal = attempts.index(attempt.attempt_id)
-        if ordinal >= len(draft.ci_subjects):
-            return None
-        ci_subject = draft.ci_subjects[ordinal]
+        if draft.ci_profile is not None:
+            if profile.reusable_selection != draft.ci_profile or profile.execution_identity is None:
+                return None
+            if (
+                subject.attempt_digest != attempt.digest
+                or subject.spec_digest != attempt.spec_digest
+                or subject.head_revision != owner._head  # pyright: ignore[reportPrivateUsage]
+                or subject.base_revision != owner.base
+            ):
+                return None
+            ci_subject = draft.ci_profile
+        else:
+            if ordinal >= len(draft.ci_subjects):
+                return None
+            ci_subject = draft.ci_subjects[ordinal]
         if profile.binding != ci_subject.binding:
             return None
         binding = draft.baseline.source.binding
@@ -771,17 +788,63 @@ class _QualifiedCICheck:
         received = profile.read(ci_subject, source, lambda: int(time.time()))
         if received is None:
             return None
-        fact, result, _ = received
+        fact, result, result_at = received
         passed = result == "passed"
-        payload = encode(
-            {
-                "subject": fact.subject.reference,
-                "source": source.reference,
-                "native": fact.native.hex(),
-                "provenance": fact.provenance,
-                "qualification": fact.qualification,
-            }
-        )
+        value: dict[str, object] = {
+            "subject": fact.subject.reference,
+            "source": source.reference,
+            "native": fact.native.hex(),
+            "provenance": fact.provenance,
+            "qualification": fact.qualification,
+        }
+        if draft.ci_profile is not None:
+            if result_at < draft.source_observed_at:
+                return None
+            assert profile.execution_identity is not None  # noqa: S101
+            execution = digest(profile.execution_identity(fact))
+            value.update(
+                {
+                    "version": 2,
+                    "attempt": asdict(attempt),
+                    "candidate": asdict(subject),
+                    "profile": profile.producer,
+                    "execution": execution,
+                    "result_at": result_at,
+                }
+            )
+            runtime = f"runtime:{attempt.attempt_id}"
+            for operation in owner.store.operations("runtime:"):
+                previous = owner.store.find_artifact(operation.operation_id, "qualified-ci-execution")
+                if previous is None:
+                    continue
+                saved = object_from(previous)
+                if operation.operation_id != runtime:
+                    if saved["execution"] == execution:
+                        return None
+                    continue
+                if encode(saved["receipt"]) != encode(value):
+                    return None
+                observed_at, fresh_until = saved["observed_at"], saved["fresh_until"]
+                if (
+                    type(observed_at) is not int
+                    or type(fresh_until) is not int
+                    or not observed_at <= int(time.time()) <= fresh_until
+                ):
+                    return None
+                fact = replace(fact, observed_at=observed_at, fresh_until=fresh_until)
+            owner.store.finalize_artifact(
+                runtime,
+                "qualified-ci-execution",
+                encode(
+                    {
+                        "execution": execution,
+                        "receipt": value,
+                        "observed_at": fact.observed_at,
+                        "fresh_until": fact.fresh_until,
+                    }
+                ),
+            )
+        payload = encode(value)
         reference = owner.store.finalize_artifact(
             f"runtime:{attempt.attempt_id}", "qualified-ci:" + digest(payload), payload
         )

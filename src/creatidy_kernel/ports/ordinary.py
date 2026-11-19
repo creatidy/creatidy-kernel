@@ -262,6 +262,7 @@ class OrdinaryProgram:
         *,
         relevance_reason: str,
         ci_subjects: tuple[DriverSubject, ...] = (),
+        ci_profile: DriverSubject | None = None,
     ) -> QualifiedDraft:
         """Capture inert qualified meaning from explicitly configured trusted producers."""
         drivers = {driver.binding: driver for driver in self.qualified_scm}
@@ -287,7 +288,7 @@ class OrdinaryProgram:
         baseline = self.qualified_baselines.read_baseline(source, digest(encode(declaration.value["recipes"])))
         if baseline is None or baseline.source != source or not baseline.proof:
             raise IntakeRefused("exact qualified baseline unavailable")
-        if "ci" in self.verification.checks and not ci_subjects:
+        if "ci" in self.verification.checks and not ci_subjects and ci_profile is None:
             raise IntakeRefused("required candidate CI subjects unavailable")
         readiness = self.qualified_readiness.read_readiness(cut, source, declaration)
         if readiness is None:
@@ -307,6 +308,7 @@ class OrdinaryProgram:
             observed.fresh_until,
             relevance_reason,
             ci_subjects,
+            ci_profile,
         )
 
     def _qualified_baseline_age(self, baseline: QualifiedBaseline) -> int:
@@ -469,7 +471,7 @@ class OrdinaryProgram:
         qualified_ids = {item.cut.subject: item.task_id for item in proposal.qualified_drafts}
         qualified_by_subject = {item.cut.subject: item for item in proposal.qualified_drafts}
         for draft in proposal.qualified_drafts:
-            if (not draft.ci_subjects) != ("ci" not in self.verification.checks):
+            if (not draft.ci_subjects and draft.ci_profile is None) != ("ci" not in self.verification.checks):
                 raise IntakeRefused("qualified CI check and exact build selection must agree")
             if any(required not in qualified_ids for required in draft.cut.required):
                 raise IntakeRefused("qualified predecessor is outside the exact approved Program")

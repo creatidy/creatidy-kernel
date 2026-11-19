@@ -25,12 +25,14 @@ import pytest
 from composable_fixture import SyntheticCI, SyntheticDocument, SyntheticWork, synthetic_ci_result
 from native_kilo_fixture import review_peer
 from ordinary_flow_fixture import CODEX_PEER
+from test_actions_work_roles import RolePeer
 from test_intake import SUBJECT, Scenario, Transport, declaration
 from test_intake import policy as intake_policy
 from test_sqlite_store import sqlite_tmp_path as sqlite_tmp_path
 
 import creatidy_kernel.adapters.ordinary_workspace as ordinary_workspace_module
 import creatidy_kernel.adapters.task_execution as task_execution_module
+from creatidy_kernel.adapters.actions_roles import ForgejoActionsCI, GitHubActionsCI
 from creatidy_kernel.adapters.codex_runtime import CodexOwnedSessionWitness
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
 from creatidy_kernel.adapters.driver_http import object_value
@@ -71,6 +73,7 @@ from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.domain import (
     AttemptSpec,
     AuthorityEnvelope,
+    BudgetExceeded,
     BudgetPolicy,
     CancelProgram,
     PauseProgram,
@@ -98,7 +101,7 @@ from creatidy_kernel.core.ordinary_qualified import (
 )
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, WorkClaim
-from creatidy_kernel.core.verification import EvidenceSubject, VerificationPolicy
+from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.drivers import DriverApplication, DriverDraftGrant, DriverEffectGrant
 from creatidy_kernel.ports.intake import OrdinaryIntake
@@ -808,6 +811,8 @@ def test_qualified_readiness_uses_current_time_without_renewing_evidence(
         "sync-reopen",
         "sync-ambiguous-reopen",
         "export-unknown",
+        "actions-github",
+        "actions-forgejo",
     ],
 )
 def test_qualified_work_dag_owner_approval_and_reopen(
@@ -1035,6 +1040,62 @@ def test_qualified_work_dag_owner_approval_and_reopen(
 
     recipe = "fixture:baseline-has-readable-original:v1"
 
+    actions = mode.startswith("actions-")
+    actions_peer: RolePeer | None = None
+    actions_ci: GitHubActionsCI | ForgejoActionsCI | None = None
+    actions_key = ""
+    actions_fault: list[str | None] = [None]
+    executions: dict[str, int] = {}
+    if actions:
+        actions_peer = RolePeer(mode.removeprefix("actions-"))
+        actions_peer.clock.now = clock.now
+        actions_peer.recipe = replace(actions_peer.recipe, recipes=(recipe,))
+        mapping = TrustedSCMRemote(repository_url, project.scm.binding, "owner:exact-Actions-SCM-mapping")
+        actions_ci = (
+            GitHubActionsCI(
+                actions_peer.http, project.scm.binding, actions_peer.recipe, clock.wall, remote_mapping=mapping
+            )
+            if actions_peer.provider == "github"
+            else ForgejoActionsCI(
+                actions_peer.native.forge,
+                actions_peer.binding,
+                project.scm.binding,
+                actions_peer.recipe,
+                clock.wall,
+                remote_mapping=mapping,
+            )
+        )
+        actions_peer.clock = clock
+        actions_key = actions_ci.key
+        original_route = actions_peer.route
+
+        def actions_route(method: str, path: str, body: object) -> tuple[int, object] | None:
+            assert actions_peer is not None
+            parsed = urlsplit(path)
+            if parsed.path.endswith("/actions/runs"):
+                head = parse_qs(parsed.query)["head_sha"][0]
+                actions_peer.head = head
+                actions_peer.run_id = executions.setdefault(head, len(executions) + 11)
+                if actions_fault[0] != "stale":
+                    actions_peer.result_stamp = (
+                        "1970-01-01T00:01:35Z" if head == source_revision else "1970-01-01T00:01:40Z"
+                    )
+                if actions_fault[0] in {"old-receipt", "reused-native-identity"}:
+                    assert active_workspace and workspace.collected is not None
+                    actions_peer.run_id = executions[workspace.collected[1].head]
+                    if actions_fault[0] == "old-receipt":
+                        actions_peer.head = workspace.collected[1].head
+            if actions_fault[0] == "interrupted-read" and "/jobs" in parsed.path:
+                return 503, {"error": "synthetic interrupted native read"}
+            result = original_route(method, path, body)
+            if parsed.path.endswith(actions_peer.prefix) and result is not None:
+                value = cast(dict[str, object], result[1])
+                value["clone_url"] = repository_url
+            return result
+
+        actions_peer.services.filter = actions_route
+        project = replace(project, ci=actions_ci)
+
     def work_declaration(**changes: object) -> Declaration:
         return declaration(recipes=[recipe], **changes)
 
@@ -1044,11 +1105,16 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         "synthetic-ci-profile:v2" if mode == "composition-ci-context" else "jenkins-exact:v1",
         synthetic_ci_result if mode == "composition-ci-context" else jenkins_result,
     )
+    if actions_ci is not None:
+        ci_profile = actions_ci.profile()
     baselines = (
         ConfiguredQualifiedBaseline(
-            ci_profile, DriverSubject(project.ci.binding, "build", "11", None), (recipe,), clock.wall
+            ci_profile,
+            DriverSubject(project.ci.binding, "build", actions_key if actions else "11", None),
+            (recipe,),
+            clock.wall,
         )
-        if composable
+        if composable or actions
         else JenkinsQualifiedBaseline(
             project.ci, DriverSubject(project.ci.binding, "build", "11", None), (recipe,), clock.wall
         )
@@ -1117,7 +1183,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     budget = WorkBudgetPolicy(tuple((kind, 20) for kind in WorkKind), 3, 4_000_000)
     policy = replace(
         intake_policy(),
-        budget=BudgetPolicy(4, 1),
+        budget=BudgetPolicy(2 if actions else 4, 1),
         work_budget=budget,
         project_budget=budget,
         project_id="qualified-project",
@@ -1131,12 +1197,14 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         },
         authority=AuthorityEnvelope(
             "owner",
-            max_attempts=4,
+            max_attempts=2 if actions else 4,
             trusted_satisfaction_issuers=frozenset({"verifier"}),
             delegated_actor_ids=frozenset({"worker"}),
         ),
     )
     with ExitStack() as stores:
+        if actions_peer is not None:
+            stores.callback(actions_peer.services.close)
         store = stores.enter_context(SQLiteProgramStore(sqlite_tmp_path / "qualified-dag.db", boot_clock=clock.boot))
         legacy = Scenario()
         if baseline is not None:
@@ -1212,9 +1280,14 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             source,
             relevance_reason="work remains",
             ci_subjects=(
-                DriverSubject(project.ci.binding, "build", "12", None),
-                DriverSubject(project.ci.binding, "build", "14", None),
+                ()
+                if actions
+                else (
+                    DriverSubject(project.ci.binding, "build", "12", None),
+                    DriverSubject(project.ci.binding, "build", "14", None),
+                )
             ),
+            ci_profile=DriverSubject(project.ci.binding, "build", actions_key, None) if actions else None,
         )
         assert first.baseline.observed_at == 95
         second = app.prepare_qualified(
@@ -1223,9 +1296,25 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             capture(selected, True),
             source,
             relevance_reason="work remains",
-            ci_subjects=(DriverSubject(project.ci.binding, "build", "13", None),),
+            ci_subjects=() if actions else (DriverSubject(project.ci.binding, "build", "13", None),),
+            ci_profile=DriverSubject(project.ci.binding, "build", actions_key, None) if actions else None,
         )
         assert QualifiedDraft.parse(encode(second.payload())) == second
+        if actions:
+            assert first.payload()["version"] == 2
+            assert first.ci_profile is not None
+            historical = replace(first, ci_profile=None, ci_subjects=(first.ci_profile,))
+            assert historical.payload()["version"] == 1
+            assert QualifiedDraft.parse(encode(historical.payload())) == historical
+            with pytest.raises(ValueError, match="invalid qualified draft"):
+                replace(first, ci_subjects=(first.ci_profile,))
+            for invalid in (
+                {**first.payload(), "version": 1},
+                {**historical.payload(), "version": 2},
+                {**first.payload(), "version": 99},
+            ):
+                with pytest.raises(ValueError, match="unsupported qualified draft"):
+                    QualifiedDraft.parse(encode(invalid))
         context_subject = DriverSubject.parse(json.loads(first.readiness.proof)["contexts"][0]["subject"])
         assert context_subject == DriverSubject(
             context_driver.binding, "document" if mode == "composition-ci-context" else "page", "900", "19"
@@ -1410,7 +1499,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             ("Fixture", "fixture@example.invalid"),
             authority_deadline=approved.expires_at,
             qualified_ci=project.ci,
-            qualified_ci_profile=ci_profile if composable else None,
+            qualified_ci_profile=ci_profile if composable or actions else None,
         )
         assert workspace.source.resolve().is_relative_to(sqlite_tmp_path.resolve())
         assert workspace.objects.resolve().is_relative_to(sqlite_tmp_path.resolve())
@@ -1437,11 +1526,16 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                         qualified_ci_profile=unsafe,
                     )
             assert not unapproved_interpretations and not workspace.objects.exists()
-        if composable:
+        if composable or actions:
             before_profile_refusal = store.operations()
             for missing_profile in (
                 None,
                 QualifiedCIProfile(project.ci, project.ci.binding, "changed-profile:v1", ci_profile.interpret),
+                *(
+                    (QualifiedCIProfile(project.ci, project.ci.binding, ci_profile.producer, ci_profile.interpret),)
+                    if actions
+                    else ()
+                ),
             ):
                 with pytest.raises(IntakeRefused, match="candidate CI"):
                     OrdinaryGitWorkspace(
@@ -1663,7 +1757,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 ("Fixture", "fixture@example.invalid"),
                 authority_deadline=approved.expires_at,
                 qualified_ci=project.ci,
-                qualified_ci_profile=ci_profile if composable else None,
+                qualified_ci_profile=ci_profile if composable or actions else None,
             )
             remediation_worker = WorkOwnership(
                 store,
@@ -1710,7 +1804,77 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 remediation_control.observe(remediation.claim),
                 evidence="owner receives exact remediation bytes",
             )
-            assert remediation_client.report(remediation) == "accepted"
+            if actions:
+                real_ci_check = ordinary_workspace_module._QualifiedCICheck.check  # pyright: ignore[reportPrivateUsage]
+
+                def check_adversarial_ci(
+                    checker: ordinary_workspace_module._QualifiedCICheck,  # pyright: ignore[reportPrivateUsage]
+                    name: str,
+                    subject: EvidenceSubject,  # pyright: ignore[reportPrivateUsage]
+                ) -> Evidence | None:
+                    assert actions_peer is not None
+                    before = (store.history("qualified-dag"), store.operations(), len(calls))
+                    for changed_subject in (
+                        replace(subject, attempt_digest="foreign-attempt"),
+                        replace(subject, head_revision="f" * 40),
+                        replace(subject, repository="https://foreign.example/other/repo"),
+                    ):
+                        assert real_ci_check(checker, name, changed_subject) is None
+                    with patch.object(ci_profile, "producer", "unapproved-profile"):
+                        assert real_ci_check(checker, name, subject) is None
+                    assert actions_ci is not None
+                    with patch.object(actions_ci, "recipe", replace(actions_ci.recipe, recipes=("unapproved",))):
+                        assert real_ci_check(checker, name, subject) is None
+                    with patch.object(actions_ci, "_read", side_effect=OSError("interrupted read")):
+                        assert real_ci_check(checker, name, subject) is None
+                    for fault in (
+                        "old-receipt",
+                        "reused-native-identity",
+                        "interrupted-read",
+                        "fork",
+                        "wrong-workflow",
+                        "pending",
+                        "missing-job",
+                        "ambiguous",
+                        "changed-job",
+                        "workflow-changed",
+                        "stale",
+                    ):
+                        actions_fault[0] = fault
+                        actions_peer.mode = fault
+                        actions_peer.reads.clear()
+                        actions_peer.result_stamp = (
+                            "1970-01-01T00:00:01Z" if fault == "stale" else "1970-01-01T00:01:35Z"
+                        )
+                        assert real_ci_check(checker, name, subject) is None, fault
+                        assert (store.history("qualified-dag"), store.operations(), len(calls)) == before
+                        assert not store.load("qualified-dag").satisfactions
+                        remediation_worker.check_current(remediation.claim)
+                    actions_fault[0] = None
+                    actions_peer.mode = "success"
+                    actions_peer.result_stamp = "1970-01-01T00:01:35Z"
+                    finalize = store.finalize_artifact
+
+                    def interrupted_receipt(operation: str, artifact: str, data: bytes) -> str:
+                        if artifact.startswith("qualified-ci:"):
+                            raise OSError("interrupted receipt publication after durable native attribution")
+                        return finalize(operation, artifact, data)
+
+                    with patch.object(store, "finalize_artifact", side_effect=interrupted_receipt):
+                        with pytest.raises(OSError, match="interrupted receipt"):
+                            real_ci_check(checker, name, subject)
+                    clock.now += 1
+                    result = real_ci_check(checker, name, subject)
+                    assert result is not None
+                    assert result.observed_at == now
+                    clock.now += 1
+                    assert real_ci_check(checker, name, subject) == result
+                    return result
+
+                with patch.object(ordinary_workspace_module._QualifiedCICheck, "check", check_adversarial_ci):  # pyright: ignore[reportPrivateUsage]
+                    assert remediation_client.report(remediation) == "accepted"
+            else:
+                assert remediation_client.report(remediation) == "accepted"
             assert remediation_workspace.collected is not None
             candidate_head = remediation_workspace.collected[1].head
             assert workspace.collected is not None and workspace.collected[1].head != candidate_head
@@ -1829,13 +1993,14 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 assert cold_local.check("commands", local_subject) == recorded[0]
                 assert local.check("ci", local_subject) is None
                 assert local.check("commands", replace(local_subject, head_revision="f" * 40)) is None
+                recorded_fresh_until = recorded[0].fresh_until
                 expired_local = TrustedLocalVerification(
                     local_binding,
                     remediation_workspace,
                     local_commands,
                     app.verification,
                     VerificationProfile.TRUSTED_DEVELOPMENT,
-                    lambda: recorded[0].fresh_until + 1,
+                    lambda: recorded_fresh_until + 1,
                 )
                 assert expired_local.check("commands", local_subject) is None
                 with pytest.raises(UnsupportedForge, match="sandbox or external CI"):
@@ -1870,6 +2035,63 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 store.artifact("runtime:" + remediation.attempt.attempt_id, "qualified-ci:" + ci_reference)
             )
             assert DriverSubject.parse(ci_payload["source"]).revision == candidate_head
+            if actions:
+                assert workspace.collected is not None
+                assert actions_peer is not None
+                assert executions[workspace.collected[1].head] != executions[candidate_head]
+                assert DriverSubject.parse(ci_payload["subject"]).key == actions_key
+                with pytest.raises(BudgetExceeded, match="attempt admission limit"):
+                    remediation_client.request("beyond-finite-authority", lease_seconds=10)
+                history = store.history("qualified-dag")
+                operations = store.operations()
+                store.close()
+                store = stores.enter_context(
+                    SQLiteProgramStore(sqlite_tmp_path / "qualified-dag.db", boot_clock=clock.boot)
+                )
+                app.store = store
+                app.intake = OrdinaryIntake(store, legacy.reader, clock.wall)
+                recovered = app.recover(decision)
+                assert recovered.proposal == proposal and recovered.expires_at == approved.expires_at
+                assert store.history("qualified-dag") == history and store.operations() == operations
+                assert len(recovered.program.satisfactions) == 1
+                assert len(recovered.program.attempts) == 2
+                assert recovered.program.attempts[-1].spec.remediation_of == handoff.attempt.attempt_id
+                assert len(calls) == 2
+                assert ci_payload["attempt"]["attempt_id"] == remediation.attempt.attempt_id
+                assert ci_payload["attempt"]["work_unit_id"] == "first"
+                assert ci_payload["candidate"] == evidence["subject"]
+                assert (
+                    ci_payload["execution"]
+                    != json.loads(store.artifact("runtime:" + handoff.attempt.attempt_id, "qualified-ci-execution"))[
+                        "execution"
+                    ]
+                )
+                outcome = export_private_outcome(store, "qualified-dag", owner_policy=PRIVATE_METADATA)
+                rendered = json.dumps(outcome)
+                for sensitive in (candidate_head, actions_key, actions_peer.binding.origin, str(repository)):
+                    assert sensitive not in rendered
+                assert store.history("qualified-dag") == history and store.operations() == operations
+                cold = OrdinaryGitWorkspace(
+                    store,
+                    remediation_tree,
+                    repository,
+                    repository_url,
+                    proposal,
+                    workspace.commands,
+                    ("Fixture", "fixture@example.invalid"),
+                    authority_deadline=approved.expires_at,
+                    qualified_ci_profile=ci_profile,
+                )
+                cold.restore(remediation.attempt)
+                checker = ordinary_workspace_module._QualifiedCICheck(cold)  # pyright: ignore[reportPrivateUsage]
+                cold_evidence = checker.check("ci", EvidenceSubject(**cast(dict[str, str], evidence["subject"])))
+                assert cold_evidence is not None and asdict(cold_evidence) == evidence
+                clock.now = approved.expires_at
+                with pytest.raises(ValueError):
+                    app.check(recovered)
+                assert store.operations() == operations and app.recover(decision).expires_at == approved.expires_at
+                assert all(request[0] == "GET" for request in actions_peer.services.requests)
+                return
             assert DriverSubject.parse(ci_payload["subject"]).key == "14"
             wrong_source = DriverSubject(scm.binding, "commit", "f" * 40, "f" * 40)
             assert project.ci.build("14", wrong_source).presence is not Presence.FOUND

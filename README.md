@@ -552,6 +552,19 @@ retain their original proof formats. Synthetic role substitution proves this com
 native support for additional providers; reusable native roles and the final installed combination
 matrix remain separate deliveries.
 
+For candidate CI, `prepare_qualified(ci_profile=...)` explicitly selects a reusable approved
+configuration instead of the historical `ci_subjects` list of per-Attempt build slots. The selections
+are mutually exclusive. This opt-in writes qualified draft version 2; version-1 drafts retain their
+original bytes and slot semantics, and older readers reject version 2 rather than broadening approval.
+Actions profiles expose their exact `reusable_selection`; approval requires no future native run ID.
+Each candidate still receives fresh exact-commit native observations through the same ordinary
+verification path. A durable version-2 receipt binds configuration, native execution identity,
+WorkUnit/Attempt and candidate, and cannot be reassigned to another Attempt. Duplicate reads retain
+their original observation/freshness interval; native results predating the approved source cut refuse.
+GitHub run/attempt identities and Forgejo v16 run/per-job attempt identities remain distinct. This
+read-only capability does not dispatch or rerun Actions, attest the actual native worktree, supply
+Forgejo structured steps, or complete the separate #60 acceptance matrix.
+
 Forgejo role evidence reuses the existing facade and scoped HTTPS transport. Work Management now
 retains native dependency direction and cross-repository subjects through `ForgejoDiscovery`;
 permission-limited, moving, truncated and unsupported observations remain incomplete. `ForgejoSCM`

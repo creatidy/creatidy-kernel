@@ -250,6 +250,27 @@ def _result(fact: DriverFact, now: int, configuration: bytes) -> tuple[str, int]
     return result, at
 
 
+def _execution_identity(fact: DriverFact) -> bytes:
+    value = object_from(fact.native)
+    run = object_value(value["run"])
+    # GitHub reruns have a run attempt; Forgejo v16 has per-job attempts instead.
+    if fact.subject.binding.implementation == "github-actions":
+        identity: object = {"run": run["id"], "attempt": run["run_attempt"]}
+    else:
+        identity = {
+            "run": run["id"],
+            "jobs": sorted(
+                (
+                    (job["id"], job["attempt"], job["task_id"], job["handle"])
+                    for item in list_value(value["jobs"])
+                    for job in (object_value(item),)
+                ),
+                key=lambda item: int(str(item[0])),
+            ),
+        }
+    return encode({"binding": asdict(fact.subject.binding), "execution": identity})
+
+
 class GitHubActionsCI:
     def __init__(
         self,
@@ -505,7 +526,12 @@ class GitHubActionsCI:
 
     def profile(self) -> QualifiedCIProfile:
         return QualifiedCIProfile(
-            self, self.binding, self.producer, lambda fact, now: _result(fact, now, self.configuration)
+            self,
+            self.binding,
+            self.producer,
+            lambda fact, now: _result(fact, now, self.configuration),
+            reusable_selection=DriverSubject(self.binding, "build", self.key, None),
+            execution_identity=_execution_identity,
         )
 
     def baseline(self) -> ConfiguredQualifiedBaseline:
@@ -806,7 +832,12 @@ class ForgejoActionsCI:
 
     def profile(self) -> QualifiedCIProfile:
         return QualifiedCIProfile(
-            self, self.binding, self.producer, lambda fact, now: _result(fact, now, self.configuration)
+            self,
+            self.binding,
+            self.producer,
+            lambda fact, now: _result(fact, now, self.configuration),
+            reusable_selection=DriverSubject(self.binding, "build", self.key, None),
+            execution_identity=_execution_identity,
         )
 
     def baseline(self) -> ConfiguredQualifiedBaseline:

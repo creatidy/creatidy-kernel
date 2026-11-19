@@ -37,6 +37,8 @@ class RolePeer:
         self.services, self.clock = self.native.services, self.native.clock
         self.services.filter = self.route
         self.provider, self.mode = provider, mode
+        self.head, self.run_id = HEAD, 11
+        self.result_stamp = STAMP
         self.reads: dict[str, int] = {}
         self.source = (
             self.native.scm.binding
@@ -103,12 +105,12 @@ class RolePeer:
         }
 
     def run(self) -> dict[str, object]:
-        sha = "f" * 40 if self.mode == "wrong-sha" else HEAD
+        sha = "f" * 40 if self.mode == "wrong-sha" else self.head
         if self.provider == "github":
             value: dict[str, object] = {
-                "id": 11,
+                "id": self.run_id,
                 "run_attempt": 1,
-                "workflow_id": 19,
+                "workflow_id": 20 if self.mode == "wrong-workflow" else 19,
                 "path": self.recipe.workflow_path,
                 "head_sha": sha,
                 "head_branch": "verify",
@@ -117,7 +119,7 @@ class RolePeer:
                 "conclusion": "failure" if self.mode == "failure" else "success",
                 "repository": self.repository(),
                 "head_repository": self.repository(),
-                "updated_at": STAMP,
+                "updated_at": self.result_stamp,
             }
             if self.mode == "missing-attempt":
                 value.pop("run_attempt")
@@ -132,8 +134,8 @@ class RolePeer:
         if self.mode == "payload-mismatch":
             payload["after"] = "f" * 40
         return {
-            "id": 11,
-            "workflow_id": "verify.yml",
+            "id": self.run_id,
+            "workflow_id": "foreign.yml" if self.mode == "wrong-workflow" else "verify.yml",
             "commit_sha": sha,
             "event": "push",
             "trigger_event": "push",
@@ -143,7 +145,7 @@ class RolePeer:
             "need_approval": False,
             "status": "running" if self.mode == "pending" else "failure" if self.mode == "failure" else "success",
             "started": "1970-01-01T00:01:30Z",
-            "stopped": "1970-01-01T00:02:00Z" if self.mode == "future-result" else STAMP,
+            "stopped": "1970-01-01T00:02:00Z" if self.mode == "future-result" else self.result_stamp,
         }
 
     def jobs(self, resource: str) -> list[dict[str, object]]:
@@ -159,32 +161,32 @@ class RolePeer:
                 steps[1]["conclusion"] = "skipped"
             return [
                 {
-                    "id": 101,
-                    "run_id": 12 if self.mode == "other-run" else 11,
+                    "id": 100 + self.run_id,
+                    "run_id": self.run_id + 1 if self.mode == "other-run" else self.run_id,
                     "run_attempt": 2 if changed or self.mode == "wrong-attempt" else 1,
-                    "head_sha": HEAD,
+                    "head_sha": self.head,
                     "name": "trusted gate",
-                    "url": self.binding.origin + self.prefix + "/actions/jobs/101",
-                    "run_url": self.binding.origin + self.prefix + "/actions/runs/11",
+                    "url": self.binding.origin + self.prefix + f"/actions/jobs/{100 + self.run_id}",
+                    "run_url": self.binding.origin + self.prefix + f"/actions/runs/{self.run_id}",
                     "status": "completed",
                     "conclusion": "skipped"
                     if self.mode == "skipped-job"
                     else "failure"
                     if self.mode == "failure"
                     else "success",
-                    "completed_at": "1970-01-01T00:02:00Z" if self.mode == "future-result" else STAMP,
+                    "completed_at": "1970-01-01T00:02:00Z" if self.mode == "future-result" else self.result_stamp,
                     "steps": steps,
                 }
             ]
         return [
             {
-                "id": 101,
-                "run_id": 12 if self.mode == "other-run" else 11,
+                "id": 100 + self.run_id,
+                "run_id": self.run_id + 1 if self.mode == "other-run" else self.run_id,
                 "repo_id": 71,
                 "owner_id": 8,
                 "attempt": 2 if changed else 1,
                 "handle": "native-handle-2" if changed else "native-handle-1",
-                "task_id": 202 if changed else 201,
+                "task_id": 200 + self.run_id + (1 if changed else 0),
                 "name": "trusted gate",
                 "status": "skipped"
                 if self.mode == "skipped-job"
@@ -243,12 +245,12 @@ class RolePeer:
                 "workflow_runs": rows,
                 "total_count": len(rows) + (1 if self.mode == "incomplete-count" else 0),
             }
-        if resource in {"/actions/runs/11", "/actions/runs/11/attempts/1"}:
+        if resource in {f"/actions/runs/{self.run_id}", f"/actions/runs/{self.run_id}/attempts/1"}:
             value = self.run()
             if self.mode == "future-result" and self.provider == "forgejo":
                 value["stopped"] = "1970-01-01T00:02:00Z"
             return 200, value
-        if resource in {"/actions/runs/11/jobs", "/actions/runs/11/attempts/1/jobs"}:
+        if resource in {f"/actions/runs/{self.run_id}/jobs", f"/actions/runs/{self.run_id}/attempts/1/jobs"}:
             rows = self.jobs(resource)
             if self.provider == "forgejo":
                 return 200, rows
@@ -262,7 +264,7 @@ class RolePeer:
             directory = resource.removeprefix("/contents/")
             return 200, [{"name": "workflows", "path": directory + "/workflows", "type": "dir"}]
         if resource.startswith("/contents/"):
-            assert query.get("ref") == [HEAD]
+            assert query.get("ref") == [self.head]
             raw = b"changed workflow" if self.mode == "workflow-changed" else WORKFLOW
             blob = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw, usedforsecurity=False).hexdigest()
             return 200, {
