@@ -541,6 +541,16 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIn(requirement, rule)
         for path in ("AGENTS.md", ".kilo/command/finish-pr.md", ".kilo/command/loop.md"):
             self.assertIn("10-task-system.md#review-ceiling)", text(path))
+        finish = text(".kilo/command/finish-pr.md")
+        reentry = finish.split("1. Fetch actual PR metadata", 1)[1].split("2. Require", 1)[0]
+        for requirement in (
+            "After verifying current refs and reconciling the ledger",
+            "resumes at step 5 with the retained findings",
+            "only if the applicable ceiling has room for a fresh review",
+            "pre-review condition is met before reserving or dispatching the next ordinal",
+            "return through step 2 for fresh exact-subject CI and review",
+        ):
+            self.assertIn(requirement, reentry)
         loop = text(".kilo/command/loop.md")
         self.assertIn("verify a matching owner exception with remaining attempts", loop)
         self.assertIn("No dispatch beyond the applicable ceiling or unreviewable further patches", loop)

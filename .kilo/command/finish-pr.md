@@ -36,6 +36,12 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    branch. Never stash/reset or overwrite others' work. Diagnose dirty/diverged state;
    use a clean authorized worktree when that resolves ordinary checkout contention.
    It is not an owner decision unless resolving it requires an owner-controlled action.
+   After verifying current refs and reconciling the ledger, a verified owner restart
+   that requires changes before the next review resumes at step 5 with the retained
+   findings, only if the applicable ceiling has room for a fresh review. Use those
+   findings for remediation, not as a current verdict. Record evidence that the
+   owner's pre-review condition is met before reserving or dispatching the next ordinal.
+   After remediation, return through step 2 for fresh exact-subject CI and review.
 2. Require the current PR branch to be clean and match MCP HEAD. Freeze exact
    HEAD, base and merge base; verify canonical CI has successfully run required
    `make check` and `make package-check` and audit on the exact delivery subject,
