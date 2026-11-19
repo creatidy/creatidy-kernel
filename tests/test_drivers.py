@@ -107,7 +107,7 @@ from creatidy_kernel.core.ordinary_qualified import (
 )
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, WorkClaim
-from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
+from creatidy_kernel.core.verification import CandidateResult, Evidence, EvidenceSubject, VerificationPolicy
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.drivers import DriverApplication, DriverDraftGrant, DriverEffectGrant, Knowledge
 from creatidy_kernel.ports.intake import OrdinaryIntake
@@ -2315,7 +2315,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             )
             assert DriverSubject.parse(ci_payload["source"]).revision == candidate_head
 
-            def finish_second() -> None:
+            def finish_second() -> tuple[str, str]:
                 second_tree = LocalOwnedWorkspace(protected, "second", create=True)
                 second_workspace = OrdinaryGitWorkspace(
                     store,
@@ -2384,11 +2384,18 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 )
                 assert second_client.report(second_handoff) == "accepted"
                 assert len(calls) == 3
+                assert second_workspace.collected is not None
+                candidate, collection = second_workspace.collected
+                outputs = tuple(
+                    (name, "candidate.patch") for name in sorted(approved.program.spec.work_unit("second").outputs)
+                )
+                return CandidateResult(f"candidate:{candidate.attempt_id}", candidate, outputs).digest, collection.head
 
             if actions:
                 assert workspace.collected is not None
                 assert actions_peer is not None
                 assert executions[workspace.collected[1].head] != executions[candidate_head]
+                dependent_candidate = None
                 if reception:
                     assert native_times[workspace.collected[1].head] < native_times[candidate_head]
                 assert DriverSubject.parse(ci_payload["subject"]).key == actions_key
@@ -2501,7 +2508,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                         )
                         with pytest.raises(ValueError, match="effect driver not configured"):
                             sync.synchronize(remediation.claim, "actions-sync", "actions-sync", mutation)
-                    finish_second()
+                    dependent_candidate = finish_second()
                     assert store.load("qualified-dag").status.value == "completed"
                     assert len(executions) == 4  # one baseline plus three independently collected candidates
                 else:
@@ -2644,6 +2651,32 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                     dependent_id = exported_ref("attempt", recovered.program.attempts[-1].spec.attempt_id)
                     reviews = {row["attempt"]: row for row in cast(list[dict[str, object]], outcome["reviews"])}
                     assert set(reviews) == {rejected_id, corrected_id, dependent_id}
+                    assert dependent_candidate is not None
+                    first_outputs = tuple(
+                        (name, "candidate.patch") for name in sorted(approved.program.spec.work_unit("first").outputs)
+                    )
+                    expected_candidates = {dependent_id: dependent_candidate}
+                    for attempt_id, collected in (
+                        (rejected_id, workspace.collected),
+                        (corrected_id, remediation_workspace.collected),
+                    ):
+                        assert collected is not None
+                        candidate, collection = collected
+                        expected_candidates[attempt_id] = (
+                            CandidateResult(f"candidate:{candidate.attempt_id}", candidate, first_outputs).digest,
+                            collection.head,
+                        )
+                    candidates = cast(list[dict[str, object]], outcome["candidates"])
+                    assert len(candidates) == len(expected_candidates)
+                    assert {(row["attempt"], row["candidate"], row["head"]) for row in candidates} == {
+                        (attempt_id, exported_ref("candidate", candidate_digest), exported_ref("revision", head))
+                        for attempt_id, (candidate_digest, head) in expected_candidates.items()
+                    }
+                    for attempt_id, (candidate_digest, head) in expected_candidates.items():
+                        assert (reviews[attempt_id]["candidate"], reviews[attempt_id]["head"]) == (
+                            exported_ref("candidate", candidate_digest),
+                            exported_ref("revision", head),
+                        )
                     assert reviews[rejected_id]["verdict"] == "request_changes"
                     assert all(reviews[item]["verdict"] == "approve" for item in (corrected_id, dependent_id))
                     corrected_attempt = next(row for row in attempts if row["id"] == corrected_id)
