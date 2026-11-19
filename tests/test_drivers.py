@@ -2397,6 +2397,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 lost_delivery = None
                 uncertain = None
                 unknown_effect = None
+                expected_native_review = None
                 operation_id = "actions-sync"
                 export_key = b"k" * 32
 
@@ -2571,6 +2572,10 @@ def test_qualified_work_dag_owner_approval_and_reopen(
 
                     readback = DriverApplication(store, recovered_control, project, (scm,), clock.wall, no_grant)
                     posted = services.reviews[-1]
+                    expected_native_review = DriverSubject(
+                        scm.binding, "review", f"{mutation.target.key}/{posted['id']}", None
+                    ).reference
+                    assert posted["id"] not in {review["id"] for review in before_reviews}
                     original_actor = posted["user"]
                     request_count = len(services.requests)
                     sync_head[0] = candidate_head
@@ -2587,6 +2592,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                         posted["user"] = original_actor
                         sync_head[0] = None
                     assert found.status is EffectStatus.ACCEPTED and found.operation == original_key
+                    assert found.reference == expected_native_review
                     assert all(item[0] == "GET" for item in services.requests[request_count:])
                     posts = [
                         item
@@ -2595,7 +2601,11 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                     ]
                     assert len(posts) == 1 and json.loads(posts[0][2])["event"] == "COMMENT"
                     synced_effect = store.operation(operation_id)
-                    assert synced_effect.accepted_reference == found.reference
+                    assert synced_effect.accepted_reference == expected_native_review
+                    assert (
+                        json.loads(store.artifact(operation_id, "driver-receipt"))["reference"]
+                        == expected_native_review
+                    )
                     assert (
                         synced_effect.operation_id,
                         synced_effect.effect_key,
@@ -2728,6 +2738,10 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                         (observation,) = cast(list[dict[str, object]], linked["observations"])
                         if lost_comment:
                             assert uncertain is not None and unknown_effect is not None
+                            assert expected_native_review is not None
+                            assert effect["receipt_status"] == "accepted"
+                            assert effect["receipt"] == exported_ref("native-record", expected_native_review)
+                            assert effect["receipt_profile"] == "kernel-driver-receipt-v1"
                             settled_fields = {
                                 "status",
                                 "receipt_recorded",
@@ -2761,6 +2775,9 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                     else:
                         assert not effects
                 rendered = json.dumps(outcome)
+                if uncertain is not None:
+                    assert expected_native_review is not None
+                    assert all(expected_native_review not in data for data in (rendered, json.dumps(uncertain)))
                 for sensitive in (
                     candidate_head,
                     actions_key,

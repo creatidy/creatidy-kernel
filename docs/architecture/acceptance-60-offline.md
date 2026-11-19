@@ -350,15 +350,16 @@ text, paths or synthetic credentials used in the composition.
 No aggregate cost is inferred. The GitHub COMMENT is an authorized synthetic native effect, not
 product review, conditional PR update, merge or write authority for the other providers.
 
-Cell 3 additionally passed a focused installed run (39.54 seconds) in which the synthetic GitHub
+Cell 3 additionally passed a focused installed run (38.78 seconds) in which the synthetic GitHub
 service persisted the exact authorized COMMENT on candidate B and then dropped the reply. The
 original Operation and private export remained `unknown`, without a receipt, after closing and
 reopening SQLite. A mismatched native actor did not settle it. The original native record then
 settled the same Operation by read-only reconciliation, with exactly one COMMENT POST in the
 delivery, no write credential, no new grant, and no renewed deadline. Both private exports preserve
 the same Operation, Attempt, WorkUnit and satisfaction references without revealing raw revisions
-or credentials. The resolved export adds the receipt and reconciliation evidence without replacing
-the original unknown observation. This is synthetic recovery, not evidence of live GitHub writes.
+or credentials. The reconciled receipt, SQLite and the settled export are checked against the exact
+review ID persisted by the peer. The export pseudonymizes that receipt and preserves the original
+unknown observation. This is synthetic recovery, not evidence of live GitHub writes.
 
 ### Evidence Reuse And Live Cut
 
