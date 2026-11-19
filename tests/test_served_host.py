@@ -312,6 +312,39 @@ def test_operations_receiver_refuses_invalid_declaration(override: dict[str, obj
         assert sender.recv(1) == b""
 
 
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-32-le", "utf-8-sig"])
+@pytest.mark.parametrize("contract", [PROVISIONING, PROVISIONING_V2])
+def test_non_utf8_json_encoding_is_legacy_v1_only(encoding: str, contract: str) -> None:
+    payload: dict[str, object] = {
+        "contract": contract,
+        "wire_version": 1,
+        "role": "owner",
+        "scope": "p",
+        "producer": "producer-a",
+        "recipient": "backend-a",
+    }
+    if contract == PROVISIONING_V2:
+        payload["operations"] = ["snapshot", "record", "events"]
+    sender, receiver = socket.socketpair()
+    with sender, receiver:
+        write_frame(sender, json.dumps(payload).encode(encoding), bound=65536)
+        if contract == PROVISIONING_V2:
+            with pytest.raises(LocalChannelRefused):
+                receive_owner_operations(
+                    receiver.detach(),
+                    expected_scope="p",
+                    expected_producer="producer-a",
+                    expected_recipient="backend-a",
+                )
+        else:
+            channel, operations = receive_owner_operations(
+                receiver.detach(), expected_scope="p", expected_producer="producer-a", expected_recipient="backend-a"
+            )
+            with channel:
+                assert operations is None
+        assert sender.recv(1) == b""
+
+
 def test_receiver_closes_revoked_channel_and_rejects_version() -> None:
     sender, receiver = socket.socketpair()
     with sender:

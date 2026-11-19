@@ -983,6 +983,10 @@ print("Done")
                 scope_digest = digest(encode(app.approval_scope(proposal)))
                 if case == "invalid-policy":
                     app.verification = replace(app.verification, reviewer_required=False)
+                if case == "restricted-policy":
+                    app.policy = replace(app.policy, effects=frozenset())
+                    app.check_proposal_record(proposal)
+                    assert app.approval_scope(proposal)  # Valid binding, but this proposal is out of policy.
                 binding = LocalOwnerSession(OwnerProjection(store, proposal.program_id), app, None, proposal=proposal)
                 before = (store.history(proposal.program_id), store.operations())
                 request = {

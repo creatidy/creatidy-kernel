@@ -191,8 +191,9 @@ for its already-known reads, including `proposal-chunk`.
 
 V2 advertises `snapshot`, `record` and `events`; it adds `proposal` and `proposal-chunk` together for
 a bound proposal. `approval-scope`, `approval-scope-chunk` and `approve` appear together only with
-both proposal reads, the exact producer-recorded proposal and a valid material approval-scope binding.
-For example, a readable unrecorded proposal or invalid approval policy does not advertise approval.
+both proposal reads, the exact producer-recorded proposal, a valid material approval-scope binding and
+a proposal within the bound policy's static limits. Readable unrecorded or out-of-policy proposals do
+not advertise approval. These checks use retained evidence, not provider calls or freshness checks.
 An original bound approval adds `stop`; an exact ownership/handoff binding adds `reconcile` (requires
 `stop`); a managed binding for that approval adds `start-managed` (requires `reconcile`). These are
 launch-time supported operations, not guarantees that a request, revision, target or effect is current

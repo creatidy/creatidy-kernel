@@ -158,8 +158,14 @@ def _receive_owner(
             raise LocalChannelRefused("inherited descriptor is not a local stream")
         channel.getpeername()
         raw = read_frame(channel, bound=65536)
+        legacy_encoding = False
         try:
-            value: object = json.loads(raw, object_pairs_hook=unique_object)
+            try:
+                value: object = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+            except (UnicodeError, json.JSONDecodeError):
+                # Only the original v1 decoder accepted JSON encoding auto-detection.
+                value = json.loads(raw, object_pairs_hook=unique_object)
+                legacy_encoding = True
         except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
             raise LocalChannelRefused("malformed owner greeting") from error
         if type(value) is not dict:
@@ -174,11 +180,7 @@ def _receive_owner(
             "recipient": expected_recipient,
         }
         operations = None
-        if allow_v2 and fields.get("contract") == PROVISIONING_V2:
-            try:
-                raw.decode("utf-8")
-            except UnicodeError as error:
-                raise LocalChannelRefused("malformed owner greeting") from error
+        if allow_v2 and not legacy_encoding and fields.get("contract") == PROVISIONING_V2:
             expected["contract"] = PROVISIONING_V2
             operations = _parse_operations(fields.pop("operations", None))
         if type(fields.get("wire_version")) is not int or fields != expected:

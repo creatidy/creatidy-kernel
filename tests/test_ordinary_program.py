@@ -636,7 +636,7 @@ def test_separate_owner_clients_share_host_bound_approval(sqlite_tmp_path: Path)
     ) == {"status": "stopped", "native_sends": 0}
 
 
-@pytest.mark.parametrize("case", ["enabled", "legacy", "unrecorded", "invalid-policy", "revoked"])
+@pytest.mark.parametrize("case", ["enabled", "legacy", "unrecorded", "invalid-policy", "restricted-policy", "revoked"])
 def test_supervisor_advertises_bound_operations_without_probing(sqlite_tmp_path: Path, case: str) -> None:
     assert run_ordinary_flow(sqlite_tmp_path / case, None, mode="pull", exercise="served-operations-" + case) == {
         "status": "approved" if case == "enabled" else "read",

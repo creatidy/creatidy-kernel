@@ -644,6 +644,32 @@ class OrdinaryProgram:
         if self.store.find_artifact(f"ordinary-program:proposal:{digest(raw_proposal)}", "record") != raw_proposal:
             raise IntakeRefused("exact proposal record is unavailable")
 
+    def check_approval_provisioning(self, proposal: OrdinaryProposal) -> None:
+        """Check the static approval binding without observing providers or granting authority."""
+        self.check_proposal_record(proposal)
+        self.approval_scope(proposal)
+        for draft in proposal.drafts:
+            evidence = draft.evidence
+            OrdinaryIntake.validate_shared_policy(
+                self.owner,
+                draft.declaration,
+                self.policy,
+                evidence.baseline_producer,
+                evidence.baseline_reference,
+                evidence.baseline_result,
+                evidence.relevance_producer,
+            )
+        for draft in proposal.qualified_drafts:
+            OrdinaryIntake.validate_shared_policy(
+                self.owner,
+                draft.declaration,
+                self.policy,
+                draft.baseline.producer,
+                draft.baseline.reference,
+                draft.baseline.result,
+                draft.readiness.producer,
+            )
+
     def approval_scope(self, proposal: OrdinaryProposal) -> dict[str, object]:
         """Canonical owner-visible inputs that determine the approval's meaning."""
         if self.owner.role != "owner" or self.owner.actor_id != self.policy.authority.owner_id:

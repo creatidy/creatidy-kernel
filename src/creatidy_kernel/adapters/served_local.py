@@ -743,8 +743,7 @@ class LocalOwnerChannel(LocalReadChannel):
         if proposal is not None:
             operations.update(PROPOSAL_READS)
             try:
-                self._application.check_proposal_record(proposal)
-                self._application.approval_scope(proposal)
+                self._application.check_approval_provisioning(proposal)
             except IntakeRefused:
                 pass  # Proposal reads don't require approval evidence or policy.
             else:
