@@ -3,6 +3,7 @@
 
 import base64
 import json
+import logging
 import re
 import socket
 import struct
@@ -12,7 +13,7 @@ from dataclasses import asdict
 from typing import cast
 
 from creatidy_kernel.adapters.ordinary_managed import OrdinaryManagedRun
-from creatidy_kernel.adapters.sqlite_store import IdempotencyConflict
+from creatidy_kernel.adapters.sqlite_store import CorruptHistory, IdempotencyConflict
 from creatidy_kernel.core.domain import AttemptStatus
 from creatidy_kernel.core.intake import IntakeRefused, digest, encode, object_from
 from creatidy_kernel.core.ownership import HandoffMode
@@ -743,9 +744,14 @@ class LocalOwnerChannel(LocalReadChannel):
         if proposal is not None:
             operations.update(PROPOSAL_READS)
             try:
+                self._application.check_proposal_record(proposal)
                 self._application.check_approval_provisioning(proposal)
             except IntakeRefused:
                 pass  # Proposal reads don't require approval evidence or policy.
+            except CorruptHistory:
+                logging.getLogger(__name__).warning(
+                    "Owner approval discovery could not verify stored evidence", exc_info=True
+                )
             else:
                 operations.update(APPROVAL_OPERATIONS)
         return frozenset(operations)

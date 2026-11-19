@@ -980,6 +980,19 @@ print("Done")
                 case = exercise.removeprefix("served-operations-")
                 if case in {"legacy", "unrecorded"}:
                     proposal = replace(proposal, objective="Unrecorded proposal remains readable")
+                if case == "implemented":
+                    for subject, selection in zip(subjects, selections, strict=True):
+                        declaration = selection[2]
+                        snapshot = reader.snapshot(subject, declaration)
+                        reader.review(
+                            subject,
+                            declaration,
+                            expected_snapshot=reader.snapshot_digest(snapshot, declaration),
+                            disposition=Disposition.IMPLEMENTED,
+                            decision_id=f"implemented-{subject.issue}",
+                            reason="Synthetic owner judgement",
+                        )
+                    proposal = app.propose(proposal.program_id, proposal.objective, selections)
                 scope_digest = digest(encode(app.approval_scope(proposal)))
                 if case == "invalid-policy":
                     app.verification = replace(app.verification, reviewer_required=False)
@@ -987,6 +1000,9 @@ print("Done")
                     app.policy = replace(app.policy, effects=frozenset())
                     app.check_proposal_record(proposal)
                     assert app.approval_scope(proposal)  # Valid binding, but this proposal is out of policy.
+                if case == "artifact-loss":
+                    app.check_proposal_record(proposal)
+                    (root / "state.db.artifacts" / proposal.digest).unlink()
                 binding = LocalOwnerSession(OwnerProjection(store, proposal.program_id), app, None, proposal=proposal)
                 before = (store.history(proposal.program_id), store.operations())
                 request = {

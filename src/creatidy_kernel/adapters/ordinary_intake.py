@@ -17,6 +17,7 @@ from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.intake import (
     Declaration,
     Disposition,
+    Draft,
     IntakeEvidence,
     IntakeRefused,
     IssueSubject,
@@ -56,6 +57,14 @@ class OwnerReviewedForgejoEvidence:
             inventory_only=True,
         )
         self.baseline = baseline
+
+    def supports_evidence(self, draft: Draft) -> bool:
+        evidence = draft.evidence
+        if self.producer != evidence.relevance_producer or not self.observer.supports_snapshot(evidence):
+            return False
+        proof = object_from(evidence.relevance_proof)
+        assessment = proof.get("owner_assessment")
+        return isinstance(assessment, dict) and cast(dict[str, object], assessment).get("issuer") == self.owner.actor_id
 
     def snapshot(self, subject: IssueSubject, declaration: Declaration) -> IntakeEvidence:
         return self.observer.read(subject, declaration)

@@ -14,6 +14,7 @@ from creatidy_kernel.core.intake import (
     ContentCriterion,
     Declaration,
     Disposition,
+    Draft,
     IntakeEvidence,
     IntakeRefused,
     IssueSubject,
@@ -21,7 +22,7 @@ from creatidy_kernel.core.intake import (
     encode,
     strings,
 )
-from creatidy_kernel.ports.intake import BaselineReader, ContentSource, IntakeForge
+from creatidy_kernel.ports.intake import BaselineApplicability, BaselineReader, ContentSource, IntakeForge
 
 
 class GitContentSource:
@@ -214,6 +215,12 @@ class ForgejoOrdinaryEvidence:
         self.producer = "forgejo-ordinary-evidence:v1"
 
     def read(self, subject: IssueSubject, declaration: Declaration) -> IntakeEvidence:
+        return self._observer(subject).read(subject, declaration)
+
+    def supports_evidence(self, draft: Draft) -> bool:
+        return self._observer(draft.evidence.subject).supports_evidence(draft)
+
+    def _observer(self, subject: IssueSubject) -> "ForgeIntakeEvidence":
         return ForgeIntakeEvidence(
             self.forge,
             self.binding,
@@ -223,7 +230,7 @@ class ForgejoOrdinaryEvidence:
             self.producer,
             self.clock,
             max_pages=self.max_pages,
-        ).read(subject, declaration)
+        )
 
 
 class ForgeIntakeEvidence:
@@ -258,6 +265,24 @@ class ForgeIntakeEvidence:
         self.producer = producer
         self.clock = clock
         self.max_pages = max_pages
+
+    def supports_evidence(self, draft: Draft) -> bool:
+        return (
+            not self.inventory_only
+            and self.producer == draft.evidence.relevance_producer
+            and tuple(item.criterion for item in self.criteria) == strings(draft.declaration.value["criteria"])
+            and self.supports_snapshot(draft.evidence)
+        )
+
+    def supports_snapshot(self, evidence: IntakeEvidence) -> bool:
+        subject = evidence.subject
+        return (
+            self.binding == ForgeBinding(subject.origin, subject.repository)
+            and getattr(self.forge, "binding", None) == self.binding
+            and getattr(self.source, "binding", None) == self.binding
+            and isinstance(self.baseline, BaselineApplicability)
+            and self.baseline.supports_baseline(evidence) is True
+        )
 
     def _scan(self, repository: Reference) -> tuple[tuple[Reference, ...], Disposition | None]:
         cursor = None

@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import cast
 
 from creatidy_kernel.adapters.forgejo import HTTPTransport
-from creatidy_kernel.core.intake import BaselineSnapshot, IssueSubject, digest, encode
+from creatidy_kernel.core.intake import BaselineSnapshot, IntakeEvidence, IssueSubject, digest, encode
 
 
 class ForgejoBaseline:
@@ -51,12 +51,20 @@ class ForgejoBaseline:
                 result.append({field: row[field] for field in ("id", "context", "status", "created_at")})
         return None
 
+    def _supports(self, subject: IssueSubject, recipe_digest: str) -> bool:
+        return (
+            (subject.origin, subject.repository) == (self.binding.origin, self.binding.repository)
+            and self.http.binding == self.binding
+            and recipe_digest == digest(encode(self.recipes))
+        )
+
+    def supports_baseline(self, evidence: IntakeEvidence) -> bool:
+        return evidence.baseline_producer == "forgejo-status-baseline:v13.0.1" and self._supports(
+            evidence.subject, evidence.recipe_digest
+        )
+
     def read_baseline(self, subject: IssueSubject, recipe_digest: str) -> BaselineSnapshot | None:
-        if (
-            (subject.origin, subject.repository) != (self.binding.origin, self.binding.repository)
-            or self.http.binding != self.binding
-            or recipe_digest != digest(encode(self.recipes))
-        ):
+        if not self._supports(subject, recipe_digest):
             return None
         try:
             rows = self._read(subject)

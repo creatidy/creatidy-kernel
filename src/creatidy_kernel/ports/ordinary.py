@@ -48,7 +48,13 @@ from creatidy_kernel.core.ownership import HandoffMode, WorkClaim
 from creatidy_kernel.core.verification import CandidateResult, EvidenceSubject, ProductReviewRequest, VerificationPolicy
 from creatidy_kernel.ports.application import Collection, receive_candidate, remediation_context
 from creatidy_kernel.ports.drivers import SourceManagement, WorkManagement
-from creatidy_kernel.ports.intake import IntakeStore, OrdinaryIntake, draft_from
+from creatidy_kernel.ports.intake import (
+    EvidenceApplicability,
+    IntakeStore,
+    OrdinaryIntake,
+    SubjectApplicability,
+    draft_from,
+)
 from creatidy_kernel.ports.ownership import OwnershipStore, WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
 from creatidy_kernel.ports.verification import (
@@ -649,22 +655,23 @@ class OrdinaryProgram:
         if proposal.qualified_drafts:
             # These reader ports expose observations, not a local applicability declaration.
             raise IntakeRefused("qualified draft approval support cannot be verified at launch")
-        self.check_proposal_record(proposal)
         self.approval_scope(proposal)
         work_bindings = {driver.binding for driver in self.qualified_work}
         if any(cut.subject.binding not in work_bindings for cut in proposal.qualified_cuts):
             raise IntakeRefused("qualified work driver unavailable or changed")
+        decisions = {cut.obligation.decision_reference for cut in proposal.qualified_cuts if cut.obligation is not None}
+        if len(decisions) > 1:
+            raise IntakeRefused("qualified cuts require conflicting owner decisions")
+        reader, dependencies = self.intake.reader, self.dependencies
+        if not isinstance(reader, EvidenceApplicability) or not isinstance(dependencies, SubjectApplicability):
+            raise IntakeRefused("local reader applicability is not available")
         for draft in proposal.drafts:
-            evidence = draft.evidence
-            OrdinaryIntake.validate_shared_policy(
-                self.owner,
-                draft.declaration,
-                self.policy,
-                evidence.baseline_producer,
-                evidence.baseline_reference,
-                evidence.baseline_result,
-                evidence.relevance_producer,
-            )
+            if (
+                reader.supports_evidence(draft) is not True
+                or dependencies.supports_subject(draft.evidence.subject) is not True
+            ):
+                raise IntakeRefused("configured readers do not cover this proposal")
+            self.intake.validate_authority(self.owner, draft, self.policy, draft.evidence)
 
     def approval_scope(self, proposal: OrdinaryProposal) -> dict[str, object]:
         """Canonical owner-visible inputs that determine the approval's meaning."""

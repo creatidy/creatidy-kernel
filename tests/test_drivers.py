@@ -288,6 +288,19 @@ def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, 
         with pytest.raises(IntakeRefused, match="cannot yet be mapped"):
             app.propose("qualified", "deliver", (("one", SUBJECT, declaration()),), qualified_cuts=(unresolved,))
         proposal = app.propose("qualified", "deliver", (("one", SUBJECT, declaration()),), qualified_cuts=(cut,))
+        second_work = project.work.work("ENG-41")
+        second_obligation = EdgeObligation(
+            second_work.fact.subject, driver_digest([asdict(edge) for edge in second_work.dependencies]), "other", 120
+        )
+        second_cut = QualifiedDependencyCut.capture(
+            second_work,
+            tuple(sorted((edge.identity, False) for edge in second_work.dependencies)),
+            100,
+            obligation=second_obligation,
+        )
+        conflicting = app.propose(
+            "conflicting", "deliver", (("two", SUBJECT, declaration()),), qualified_cuts=(cut, second_cut)
+        )
         assert proposal.payload["version"] == 2
         assert app.approval_scope(proposal)["proposal"] == proposal.payload
         assert app.approval_scope(proposal)["qualified_work_bindings"] == [asdict(project.work.binding)]
@@ -351,8 +364,19 @@ def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, 
         with pytest.raises(IntakeRefused, match="driver unavailable"):
             unavailable.check(recovered)
 
-        _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=True)
-        _assert_supervised_proposal_support(store, unavailable, proposal, sqlite_tmp_path, approval=False)
+        provider_requests = tuple(services.requests)
+        with (
+            patch.object(scenario.reader, "read", side_effect=AssertionError("launch observed intake")),
+            patch.object(dependencies, "read_dependencies", side_effect=AssertionError("launch observed dependencies")),
+        ):
+            _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=True)
+            _assert_supervised_proposal_support(store, unavailable, proposal, sqlite_tmp_path, approval=False)
+            _assert_supervised_proposal_support(store, app, conflicting, sqlite_tmp_path, approval=False)
+            with patch.object(scenario.reader, "binding", replace(scenario.reader.binding, repository="team/other")):
+                _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
+            with patch.object(dependencies, "binding", replace(dependencies.binding, repository="team/other")):
+                _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
+        assert tuple(services.requests) == provider_requests
         app.stop(recovered, "owner revoked")
         with pytest.raises(ValueError):
             app.check(recovered)

@@ -4,7 +4,7 @@
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Protocol, cast
+from typing import Protocol, cast, runtime_checkable
 
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.deadlines import DeadlineProjection
@@ -47,6 +47,23 @@ from creatidy_kernel.ports.resources import ResourceAllocator
 
 class EvidenceReader(Protocol):
     def read(self, subject: IssueSubject, declaration: Declaration) -> IntakeEvidence: ...
+
+
+@runtime_checkable
+class EvidenceApplicability(Protocol):
+    """Optional, local-only applicability check; never observe providers or grant authority."""
+
+    def supports_evidence(self, draft: Draft) -> bool: ...
+
+
+@runtime_checkable
+class SubjectApplicability(Protocol):
+    def supports_subject(self, subject: IssueSubject) -> bool: ...
+
+
+@runtime_checkable
+class BaselineApplicability(Protocol):
+    def supports_baseline(self, evidence: IntakeEvidence) -> bool: ...
 
 
 class IntakeForge(Protocol):
