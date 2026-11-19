@@ -2561,14 +2561,31 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                         for row in recovered.program.satisfactions
                         if row.source_attempt_id is not None
                     }
-                    original_work, corrected_work, dependent_work = (
-                        cast(dict[str, object], row["work"]) for row in subjects
-                    )
-                    assert original_work == corrected_work and corrected_work != dependent_work
-                    assert (
-                        cast(list[dict[str, object]], subjects[2]["dependencies"])[0]["identity"]
-                        == original_work["identity"]
-                    )
+
+                    def assert_exported_subject(value: object, expected: DriverSubject) -> None:
+                        assert isinstance(value, dict)
+                        subject = cast(dict[str, object], value)
+                        assert subject["family"] == expected.binding.family
+                        assert subject["subject"] == exported_ref("driver-subject", expected.reference)
+                        assert subject["identity"] == exported_ref(
+                            "driver-subject", replace(expected, revision=None).reference
+                        )
+                        assert subject["revision"] == (
+                            None if expected.revision is None else exported_ref("revision", expected.revision)
+                        )
+
+                    native_rows = {row["attempt"]: row for row in subjects}
+                    drafts = {draft.task_id: draft for draft in approved.proposal.qualified_drafts}
+                    assert set(native_rows) == {rejected_id, corrected_id, dependent_id}
+                    for attempt_id, unit in ((rejected_id, "first"), (corrected_id, "first"), (dependent_id, "second")):
+                        row, draft = native_rows[attempt_id], drafts[unit]
+                        assert row["work_unit"] == exported_ref("work-unit", unit)
+                        assert_exported_subject(row["work"], draft.cut.subject)
+                        assert draft.baseline.source == source
+                        assert_exported_subject(row["source"], source)
+                        dependencies = cast(list[object], row["dependencies"])
+                        for dependency, edge in zip(dependencies, draft.cut.edges, strict=True):
+                            assert_exported_subject(dependency, edge.target)
                     usage = cast(list[dict[str, object]], outcome["usage_history"])
                     assert {row["quantity"] for row in usage} == {None, "2", "4"}
                     assert all(

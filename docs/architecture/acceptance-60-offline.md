@@ -299,7 +299,7 @@ application. It does not implement alternate Program transitions or inject satis
 | 5 | GitHub Issues / GitHub SCM / GitHub Actions / independent local documents | `Q[github-github-actions-local]`: substitutes only knowledge relative to cell 3, using `LocalDocumentKnowledge`, authorized exact key and SHA-256 snapshot, not a repository/Confluence fallback. Same obligations, Attempts and authorized GitHub COMMENT. |
 | 6 | Missing, incompatible, unsupported or unverified required capabilities | The four new `Q` cells refuse a missing or changed CI profile, changed knowledge binding, incomplete dependency/inventory reads, wrong evidence and stale approval without replacing existing authority. They verify unsupported GitHub change mutation or absent Forgejo effect configuration separately. Historical matrix cells 8, 9, 13, 30-32 retain additional bounded version, optional/native capability and strict profile refusals. |
 
-Cells 1-3 and 5 passed together (4 passed, 50.04 seconds after fixture remediation). Distinct Forgejo
+Cells 1-3 and 5 passed together (4 passed, 66.10 seconds after final fixture remediation). Distinct Forgejo
 work, SCM and Actions read accounts and the GitHub Actions reader are enforced by their synthetic
 peers; missing and cross-role Actions credentials refuse without changing history, Operations or
 provider state. In the earlier focused run on the same
@@ -341,7 +341,9 @@ versions or a simultaneous slot list.
 The fresh Actions rows additionally track synthetic sourced `2 -> 4 USD` correction and unknown
 usage on the original verification Operation. Private export after reopen retains both distinct
 work identities, the dependency, accepted lineage and the presence or absence of a native effect;
-it verifies exact exported review, finding, remediation and satisfaction links. The correction is
+it verifies exact exported review, finding, remediation and satisfaction links, and binds each
+exported Attempt to its original WorkUnit, native work subject, SCM revision and dependency targets.
+The correction is
 bound to the original CI Operation, and the GitHub COMMENT result to its own Operation and B's
 satisfaction. The export exposes no raw source revision or any of the three candidate revisions, fixture origins, context
 text, paths or synthetic credentials used in the composition.
