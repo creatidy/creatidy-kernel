@@ -450,6 +450,7 @@ class QualifiedDraft:
     source_fresh_until: int
     relevance_reason: str
     ci_subjects: tuple[DriverSubject, ...] = ()
+    ci_profile: DriverSubject | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -485,13 +486,21 @@ class QualifiedDraft:
                 for item in self.ci_subjects
             )
             or len(set(self.ci_subjects)) != len(self.ci_subjects)
+            or self.ci_profile is not None
+            and (
+                type(self.ci_profile) is not DriverSubject
+                or self.ci_profile.binding.family != "ci"
+                or self.ci_profile.kind != "build"
+                or self.ci_profile.revision is not None
+                or bool(self.ci_subjects)
+            )
         ):
             raise ValueError("invalid qualified draft")
 
     def payload(self) -> dict[str, object]:
         return {
             "kind": "ordinary-qualified-draft",
-            "version": 1,
+            "version": 1 if self.ci_profile is None else 2,
             "task_id": self.task_id,
             "declaration": self.declaration.raw.decode("utf-8"),
             "cut": self.cut.payload,
@@ -504,13 +513,14 @@ class QualifiedDraft:
             "source_fresh_until": self.source_fresh_until,
             "relevance_reason": self.relevance_reason,
             "ci_subjects": [item.reference for item in self.ci_subjects],
+            **({"ci_profile": self.ci_profile.reference} if self.ci_profile is not None else {}),
         }
 
     @classmethod
     def parse(cls, raw: bytes) -> "QualifiedDraft":
         value = object_from(raw)
         if (
-            set(value)
+            set(value) - ({"ci_profile"} if value.get("version") == 2 else set())
             != {
                 "kind",
                 "version",
@@ -529,7 +539,9 @@ class QualifiedDraft:
             }
             or value["kind"] != "ordinary-qualified-draft"
             or type(value["version"]) is not int
-            or value["version"] != 1
+            or value["version"] not in {1, 2}
+            or value["version"] == 2
+            and type(value.get("ci_profile")) is not str
         ):
             raise ValueError("unsupported qualified draft")
         try:
@@ -587,6 +599,7 @@ class QualifiedDraft:
                 cast(int, value["source_fresh_until"]),
                 cast(str, value["relevance_reason"]),
                 tuple(DriverSubject.parse(item) for item in cast(list[str], value["ci_subjects"])),
+                DriverSubject.parse(cast(str, value["ci_profile"])) if value["version"] == 2 else None,
             )
             if encode(draft.payload()) != raw:
                 raise ValueError("noncanonical qualified draft")

@@ -3911,6 +3911,25 @@ class SQLiteProgramStore:
         with self._gate, self._transaction():
             return self._finalize_artifact(operation_id, name, data)
 
+    def attribute_ci_execution(self, operation_id: str, execution: str, receipt: bytes) -> bytes | None:
+        """Atomically retain one native execution attribution across all Attempts."""
+        self._assert_writer_thread()
+        with self._gate, self._transaction():
+            existing: bytes | None = None
+            for operation in self.operations("runtime:"):
+                prior = self.find_artifact(operation.operation_id, "qualified-ci-execution")
+                if prior is None:
+                    continue
+                value = json.loads(prior)
+                if operation.operation_id != operation_id and value["execution"] == execution:
+                    return None
+                if operation.operation_id == operation_id:
+                    existing = prior
+            if existing is not None:
+                return existing
+            self._finalize_artifact(operation_id, "qualified-ci-execution", receipt)
+            return receipt
+
     def _finalize_artifact(self, operation_id: str, name: str, data: bytes) -> str:
         self._assert_writer_thread()
         self.operation(operation_id)

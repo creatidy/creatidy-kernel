@@ -137,6 +137,31 @@ def test_concurrent_store_owner_cannot_oversubscribe(sqlite_tmp_path: Path) -> N
             prepare(store, store.load("program-2"), "racing-pull")
 
 
+def test_ci_execution_attribution_is_atomic_and_survives_reopen(sqlite_tmp_path: Path) -> None:
+    path = sqlite_tmp_path / "ci-attribution.sqlite3"
+    receipt = json.dumps({"execution": "same-native-run", "receipt": {"attempt": "a"}}).encode()
+    outcomes: list[str] = []
+    with SQLiteProgramStore(path, busy_timeout_ms=20) as store:
+        store.intent("runtime:a", "effect:a", {})
+        store.intent("runtime:b", "effect:b", {})
+        assert store.attribute_ci_execution("runtime:a", "same-native-run", receipt) == receipt
+
+        def contender() -> None:
+            try:
+                with SQLiteProgramStore(path, busy_timeout_ms=20) as other:
+                    other.attribute_ci_execution("runtime:b", "same-native-run", receipt)
+            except ConcurrentWriter:
+                outcomes.append("excluded")
+
+        worker = threading.Thread(target=contender)
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive() and outcomes == ["excluded"]
+    with SQLiteProgramStore(path) as store:
+        assert store.attribute_ci_execution("runtime:b", "same-native-run", receipt) is None
+        assert store.attribute_ci_execution("runtime:a", "same-native-run", b"different") == receipt
+
+
 def test_reservation_rolls_back_with_failed_program_commit(
     sqlite_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

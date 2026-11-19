@@ -26,6 +26,8 @@ class QualifiedCIProfile:
         interpret: Callable[[DriverFact, int], tuple[str, int] | None],
         *,
         timestamp_kind: Literal["native", "observation"] = "native",
+        reusable_selection: DriverSubject | None = None,
+        execution_identity: Callable[[DriverFact], bytes] | None = None,
     ) -> None:
         if binding != ci.binding or binding.family != "ci" or not producer.strip() or producer == "unknown":
             raise ValueError("exact configured CI interpretation profile required")
@@ -33,6 +35,17 @@ class QualifiedCIProfile:
         if timestamp_kind not in {"native", "observation"}:
             raise ValueError("explicit CI timestamp semantics required")
         self.timestamp_kind = timestamp_kind
+        if (
+            (reusable_selection is None) != (execution_identity is None)
+            or reusable_selection is not None
+            and (
+                reusable_selection.binding != binding
+                or reusable_selection.kind != "build"
+                or reusable_selection.revision is not None
+            )
+        ):
+            raise ValueError("reusable CI selection requires native execution identity")
+        self.reusable_selection, self.execution_identity = reusable_selection, execution_identity
 
     def matches_approval(self, proof: bytes) -> bool:
         value = object_from(proof)
@@ -64,9 +77,12 @@ class QualifiedCIProfile:
             or self.timestamp_kind not in {"native", "observation"}
         ):
             return None
-        fact = self.ci.build(selected.key, source)
-        at = now()
-        fact.require_current(at)
+        try:
+            fact = self.ci.build(selected.key, source)
+            at = now()
+            fact.require_current(at)
+        except (OSError, ValueError, TypeError, OverflowError):
+            return None
         if (
             self.ci.binding != self.binding
             or fact.subject != selected
