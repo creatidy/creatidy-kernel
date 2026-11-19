@@ -40,7 +40,8 @@ from creatidy_kernel.adapters.driver_http import DriverHTTP, object_value
 from creatidy_kernel.adapters.forge_refs import ForgeBinding
 from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.forgejo_discovery import ForgejoDiscovery
-from creatidy_kernel.adapters.forgejo_drivers import ForgejoCI
+from creatidy_kernel.adapters.forgejo_drivers import ForgejoCI, ForgejoSCM, ForgejoWorkManagement
+from creatidy_kernel.adapters.forgejo_transport import HTTPSForgejoTransport
 from creatidy_kernel.adapters.github_work import GitHubIssues
 from creatidy_kernel.adapters.intake import GitContentSource
 from creatidy_kernel.adapters.kilo_review import NativeKiloReview
@@ -871,12 +872,32 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         "confluence",
     )
     actions = reception is not None or mode.startswith("actions-")
+    forgejo_credentials: dict[str, HTTPSForgejoTransport] = {}
+
+    def forgejo_reader(peer: NativePeer, role: str) -> HTTPSForgejoTransport:
+        transport = peer.forge.http
+        assert isinstance(transport, HTTPSForgejoTransport)
+        token = "fixture-forgejo-" + role + "-read"
+        transport.token = lambda: token
+        forgejo_credentials[token] = transport
+        return transport
+
+    source_peer: NativePeer | None = None
     if actions:
         actions_peer = RolePeer(actions_provider)
         request.addfinalizer(actions_peer.services.close)
         if scm_provider == "forgejo":
-            actions_peer.native.scm.clock = clock.wall
-            project = replace(project, scm=actions_peer.native.scm)
+            source_peer = NativePeer()
+            request.addfinalizer(source_peer.services.close)
+            forgejo_reader(source_peer, "scm")
+            source_peer.scm = ForgejoSCM(
+                source_peer.forge,
+                replace(source_peer.binding("scm"), tenant="fixture-scm-reader"),
+                clock.wall,
+            )
+            project = replace(project, scm=source_peer.scm)
+            forgejo_reader(actions_peer.native, "actions")
+            actions_peer.binding = replace(actions_peer.binding, tenant="fixture-actions-reader")
     else:
         actions_peer = None
     tokens = {
@@ -1107,11 +1128,16 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     if work_provider == "forgejo":
         work_peer = NativePeer()
         request.addfinalizer(work_peer.services.close)
-        work_peer.clock.now = clock.now
-        work_peer.work.clock = clock.wall
-        work_peer.work.discovery.clock = clock.wall
+        forgejo_reader(work_peer, "work")
+        work_peer.work = ForgejoWorkManagement(
+            work_peer.forge,
+            replace(work_peer.binding("work"), tenant="fixture-work-reader"),
+            clock.wall,
+        )
 
         def forgejo_work(method: str, path: str, body: object) -> tuple[int, object] | None:
+            if work_peer.services.requests[-1][3] != "token fixture-forgejo-work-read":
+                return 403, {}
             resource = urlsplit(path).path.removeprefix("/api/v1/repos/" + work_peer.work.binding.namespace)
             if resource == "/issues/41":
                 return 200, work_peer.issue(41)
@@ -1167,24 +1193,25 @@ def test_qualified_work_dag_owner_approval_and_reopen(
 
         services.filter = github_work
         project = replace(project, work=GitHubIssues(issues_http, clock.wall))
-    if scm_provider == "forgejo":
-        assert actions_peer is not None
+    if source_peer is not None:
 
         def forgejo_source(method: str, path: str, body: object) -> tuple[int, object] | None:
-            resource = urlsplit(path).path.removeprefix("/api/v1" + actions_peer.prefix)
+            if source_peer.services.requests[-1][3] != "token fixture-forgejo-scm-read":
+                return 403, {}
+            resource = urlsplit(path).path.removeprefix("/api/v1/repos/" + source_peer.scm.binding.namespace)
             if resource == "/branches/feature":
                 return 200, {"name": "feature", "commit": {"id": source_revision}}
             if resource in {"/pulls", "/pulls/7"}:
                 if admission_fault[0] == "incomplete-inventory":
                     return 403, {}
-                change = actions_peer.native.change()
+                change = source_peer.change()
                 cast(dict[str, object], change["base"])["sha"] = source_revision
                 cast(dict[str, object], change["head"])["sha"] = source_revision
                 page = parse_qs(urlsplit(path).query).get("page")
                 return 200, change if resource.endswith("/7") else [change] if page == ["1"] else []
-            return actions_peer.native.route(method, path, body)
+            return source_peer.route(method, path, body)
 
-        actions_peer.services.filter = forgejo_source
+        source_peer.services.filter = forgejo_source
     keys = ("ENG-41", "ENG-42") if work_provider == "jira" else ("41", "42")
     selected = project.work.work(keys[1])
     predecessor = project.work.work(keys[0])
@@ -1211,7 +1238,6 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     native_times: dict[str, str] = {}
     published_objects = {source_revision: repository}
     if actions_peer is not None:
-        source_route = actions_peer.services.filter
         actions_peer.clock.now = clock.now
         actions_peer.recipe = replace(actions_peer.recipe, recipes=(recipe,))
         mapping = TrustedSCMRemote(repository_url, project.scm.binding, "owner:exact-Actions-SCM-mapping")
@@ -1238,12 +1264,9 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             parsed = urlsplit(path)
             if (
                 scm_provider == "forgejo"
-                and "/actions/" not in path
-                and "/contents" not in path
-                and parsed.path != "/api/v1" + actions_peer.prefix
+                and actions_peer.services.requests[-1][3] != "token fixture-forgejo-actions-read"
             ):
-                assert source_route is not None
-                return source_route(method, path, body)
+                return 403, {}
             if parsed.path.endswith("/actions/runs"):
                 head = parse_qs(parsed.query)["head_sha"][0]
                 if reception and head not in published_objects:
@@ -1333,9 +1356,8 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     )
 
     def inventory() -> DriverScan:
-        if scm_provider == "forgejo":
-            assert actions_peer is not None
-            return actions_peer.native.scm.open_changes()
+        if source_peer is not None:
+            return source_peer.scm.open_changes()
         facts = native_readiness._inventory()  # pyright: ignore[reportPrivateUsage] - Actual bounded fixture inventory, not fabricated absence.
         return DriverScan(
             facts or (),
@@ -1670,6 +1692,16 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 with pytest.raises(IntakeRefused):
                     app.check(approved)
             before_refusals = (store.history("qualified-dag"), store.operations())
+            if source_peer is not None:
+                assert len({project.work.binding.tenant, project.scm.binding.tenant, project.ci.binding.tenant}) == 3
+            for token, transport in forgejo_credentials.items():
+                foreign_token = next(
+                    (other for other in forgejo_credentials if other != token), "fixture-foreign-reader"
+                )
+                for invalid in ("", foreign_token):
+                    with patch.object(transport, "token", return_value=invalid), pytest.raises(ValueError):
+                        app.check(approved)
+                    assert (store.history("qualified-dag"), store.operations()) == before_refusals
             for unavailable in ("incomplete-dependency", "incomplete-inventory"):
                 admission_fault[0] = unavailable
                 with pytest.raises(ValueError):
@@ -2479,7 +2511,11 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                     selected.fact.subject.binding.origin,
                     context_driver.binding.origin,
                     "fixture-owned context",
-                    "Bearer issues-fixture-read",
+                    "issues-fixture-read",
+                    "synthetic-role-read",
+                    *forgejo_credentials,
+                    *[token for pair in tokens.values() for token in pair.values()],
+                    *published_objects,
                 ):
                     assert sensitive not in rendered
                 assert store.history("qualified-dag") == history and store.operations() == operations
