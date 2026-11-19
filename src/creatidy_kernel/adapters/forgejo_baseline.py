@@ -59,8 +59,10 @@ class ForgejoBaseline:
         )
 
     def supports_baseline(self, evidence: IntakeEvidence) -> bool:
-        return evidence.baseline_producer == "forgejo-status-baseline:v13.0.1" and self._supports(
-            evidence.subject, evidence.recipe_digest
+        return (
+            self.http.supports_reads
+            and evidence.baseline_producer == "forgejo-status-baseline:v13.0.1"
+            and self._supports(evidence.subject, evidence.recipe_digest)
         )
 
     def read_baseline(self, subject: IssueSubject, recipe_digest: str) -> BaselineSnapshot | None:

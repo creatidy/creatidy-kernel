@@ -20,7 +20,7 @@ import textwrap
 import threading
 import time
 from collections.abc import Callable, Generator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -1000,6 +1000,14 @@ print("Done")
                     app.policy = replace(app.policy, effects=frozenset())
                     app.check_proposal_record(proposal)
                     assert app.approval_scope(proposal)  # Valid binding, but this proposal is out of policy.
+                if case == "strict-work-budget":
+                    assert app.policy.work_budget is not None
+                    app.policy = replace(app.policy, work_budget=replace(app.policy.work_budget, strict_inference=True))
+                if case == "strict-project-budget":
+                    assert app.policy.project_budget is not None
+                    app.policy = replace(
+                        app.policy, project_budget=replace(app.policy.project_budget, strict_inference=True)
+                    )
                 if case == "artifact-loss":
                     app.check_proposal_record(proposal)
                     (root / "state.db.artifacts" / proposal.digest).unlink()
@@ -1078,15 +1086,22 @@ print("Done")
                                 receipt = read(s)
                                 assert receipt['status'] == 'approved' and receipt['authority'] == 'historical-only'
                 """)
-                launched = launch_owner(
-                    binding,
-                    [sys.executable, "-I", "-c", script, case, json.dumps(request)],
-                    environment={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
-                    scope=proposal.program_id,
-                    producer="fixture-producer",
-                    recipient="fixture-backend",
-                    version=1 if case == "legacy" else 2,
-                )
+                with (
+                    patch.object(store, "find_artifact", side_effect=PermissionError("synthetic approval read failure"))
+                    if case == "artifact-io"
+                    else nullcontext(),
+                    patch.object(reader, "read", side_effect=AssertionError("launch observed provider")),
+                    patch.object(store, "finalize_artifact", side_effect=AssertionError("launch wrote an artifact")),
+                ):
+                    launched = launch_owner(
+                        binding,
+                        [sys.executable, "-I", "-c", script, case, json.dumps(request)],
+                        environment={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                        scope=proposal.program_id,
+                        producer="fixture-producer",
+                        recipient="fixture-backend",
+                        version=1 if case == "legacy" else 2,
+                    )
                 try:
                     for _ in range(2 if case in {"enabled", "revoked"} else 1):
                         assert select.select([launched.channel.fileno()], [], [], 10)[0]

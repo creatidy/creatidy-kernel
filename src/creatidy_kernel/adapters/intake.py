@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qualified Forge reads and bounded literal-content relevance; no recipe execution."""
 
+import json
 import os
 import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
+from typing import cast
 
 from creatidy_kernel.adapters.forge_refs import ForgeBinding, oid
+from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.core.forge import Presence, Reference
 from creatidy_kernel.core.intake import (
     ContentCriterion,
@@ -272,13 +275,34 @@ class ForgeIntakeEvidence:
             and self.producer == draft.evidence.relevance_producer
             and tuple(item.criterion for item in self.criteria) == strings(draft.declaration.value["criteria"])
             and self.supports_snapshot(draft.evidence)
+            and self._matches_retained_criteria(draft.evidence)
+        )
+
+    def _criteria_binding(self) -> list[dict[str, str]]:
+        return [
+            {"criterion": item.criterion, "path": item.path, "expected_digest": digest(item.expected)}
+            for item in self.criteria
+        ]
+
+    def _matches_retained_criteria(self, evidence: IntakeEvidence) -> bool:
+        try:
+            proof: object = json.loads(evidence.relevance_proof)
+        except (ValueError, RecursionError):
+            return False
+        if not isinstance(proof, list) or not proof:
+            return False
+        initial = cast(list[object], proof)[0]
+        return (
+            isinstance(initial, dict) and cast(dict[str, object], initial).get("criteria") == self._criteria_binding()
         )
 
     def supports_snapshot(self, evidence: IntakeEvidence) -> bool:
         subject = evidence.subject
         return (
             self.binding == ForgeBinding(subject.origin, subject.repository)
-            and getattr(self.forge, "binding", None) == self.binding
+            and isinstance(self.forge, ForgejoForge)
+            and self.forge.binding == self.forge.http.binding == self.binding
+            and self.forge.http.supports_reads
             and getattr(self.source, "binding", None) == self.binding
             and isinstance(self.baseline, BaselineApplicability)
             and self.baseline.supports_baseline(evidence) is True
@@ -343,10 +367,7 @@ class ForgeIntakeEvidence:
                     "source": subject.base,
                     "content_result": implemented,
                     **({"owner_review_tree_available": source_readable is True} if self.inventory_only else {}),
-                    "criteria": [
-                        {"criterion": item.criterion, "path": item.path, "expected_digest": digest(item.expected)}
-                        for item in self.criteria
-                    ],
+                    "criteria": self._criteria_binding(),
                 }
             )
             refs, incomplete = self._scan(repository)

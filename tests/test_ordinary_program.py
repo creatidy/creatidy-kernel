@@ -649,6 +649,9 @@ def test_separate_owner_clients_share_host_bound_approval(sqlite_tmp_path: Path)
         "artifact-loss",
         "assessment-loss",
         "interrupted-amendment",
+        "strict-work-budget",
+        "strict-project-budget",
+        "artifact-io",
     ],
 )
 def test_supervisor_advertises_bound_operations_without_probing(sqlite_tmp_path: Path, case: str) -> None:

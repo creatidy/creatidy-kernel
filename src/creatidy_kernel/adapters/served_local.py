@@ -757,10 +757,8 @@ class LocalOwnerChannel(LocalReadChannel):
                 self._application.check_approval_provisioning(proposal)
             except IntakeRefused:
                 pass  # Proposal reads don't require approval evidence or policy.
-            except CorruptHistory:
-                logging.getLogger(__name__).warning(
-                    "Owner approval discovery could not verify stored evidence", exc_info=True
-                )
+            except (CorruptHistory, OSError):
+                logging.getLogger(__name__).warning("Owner approval discovery could not verify stored evidence")
             else:
                 operations.update(APPROVAL_OPERATIONS)
         return frozenset(operations)

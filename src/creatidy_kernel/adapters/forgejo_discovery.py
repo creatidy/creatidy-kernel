@@ -202,9 +202,14 @@ class ForgejoDiscovery:
         return self._observe(f"/repos/{self.binding.repository}/issues/{number}/dependencies", dependencies=True)
 
     def supports_subject(self, subject: IssueSubject) -> bool:
-        return self.http.binding == self.binding and (subject.origin, subject.repository) == (
-            self.binding.origin,
-            self.binding.repository,
+        return (
+            self.http.supports_reads
+            and self.http.binding == self.binding
+            and (subject.origin, subject.repository)
+            == (
+                self.binding.origin,
+                self.binding.repository,
+            )
         )
 
     def read_dependencies(self, subject: IssueSubject) -> DependencyEvidence:

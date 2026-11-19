@@ -656,6 +656,11 @@ class OrdinaryProgram:
             # These reader ports expose observations, not a local applicability declaration.
             raise IntakeRefused("qualified draft approval support cannot be verified at launch")
         self.approval_scope(proposal)
+        if any(
+            budget is not None and budget.strict_inference
+            for budget in (self.policy.work_budget, self.policy.project_budget)
+        ):
+            raise IntakeRefused("strict inference bounds unavailable for the installed profiles")
         work_bindings = {driver.binding for driver in self.qualified_work}
         if any(cut.subject.binding not in work_bindings for cut in proposal.qualified_cuts):
             raise IntakeRefused("qualified work driver unavailable or changed")

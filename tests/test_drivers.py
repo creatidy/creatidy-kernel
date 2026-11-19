@@ -383,6 +383,14 @@ def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, 
                 _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
             with patch.object(dependencies, "binding", replace(dependencies.binding, repository="team/other")):
                 _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
+            with patch.object(scenario.transport, "supports_reads", False):
+                _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
+            for criterion in (
+                replace(scenario.reader.criteria[0], path="other.txt"),
+                replace(scenario.reader.criteria[0], expected=b"different content"),
+            ):
+                with patch.object(scenario.reader, "criteria", (criterion,)):
+                    _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
         assert tuple(services.requests) == provider_requests
         app.stop(recovered, "owner revoked")
         with pytest.raises(ValueError):

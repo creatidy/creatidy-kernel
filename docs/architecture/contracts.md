@@ -193,7 +193,8 @@ Descriptor v2 advertises `snapshot`, `record` and `events`; it adds `proposal` a
 a bound proposal. `approval-scope`, `approval-scope-chunk` and `approve` appear together only with
 both proposal reads, the exact producer-recorded proposal, a valid material approval-scope binding,
 a proposal within the bound policy's static limits, and local evidence that the configured intake
-and dependency readers cover its subjects and baseline recipe. Any qualified dependency cuts must
+and dependency readers cover its subjects, baseline recipe, and any literal criteria. Unsupported
+strict-inference budget profiles do not advertise approval. Any qualified dependency cuts must
 have configured work bindings and agree on a wire-valid decision reference when one is required. This supports
 proposal payload versions 1 and 2. Proposal payload v3 (qualified drafts) remains readable, but its
 baseline and readiness reader ports cannot attest local applicability, so its approval is not
