@@ -36,14 +36,16 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    branch. Never stash/reset or overwrite others' work. Diagnose dirty/diverged state;
    use a clean authorized worktree when that resolves ordinary checkout contention.
    It is not an owner decision unless resolving it requires an owner-controlled action.
-   After verifying current refs and reconciling the ledger, a verified owner restart
-   that requires changes before the next review resumes at step 5 with the retained
-   findings, only if the applicable ceiling has room for a fresh review. Use those
-   findings for remediation, not as a current verdict. Record evidence that the
-   owner's pre-review condition is met before reserving or dispatching the next ordinal.
-   After remediation, return through step 2 for fresh exact-subject CI and review.
 2. Require the current PR branch to be clean and match MCP HEAD. Freeze exact
-   HEAD, base and merge base; verify canonical CI has successfully run required
+   HEAD, base and merge base before either remediation or review. A clean but
+   ahead local branch is not the canonical PR HEAD; do not patch or push from it.
+   After these checks and ledger reconciliation, if a verified owner restart under
+   the review ceiling rule requires changes not yet made before the next review,
+   resume at step 5 with the retained findings, only if the applicable ceiling has
+   room for a fresh review. Revalidate those findings against the current subject;
+   use them for remediation, not as a current verdict. After remediation, return
+   through step 2 for fresh exact-subject CI and review.
+   Before any review, verify canonical CI has successfully run required
    `make check` and `make package-check` and audit on the exact delivery subject,
    including actual checkout and required step evidence, per validation.md. Missing,
    pending, stale, failed or ambiguous CI is not success. Inspect reviewer permissions. The
@@ -56,7 +58,9 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    A missing native task/agent is a review-infrastructure failure: diagnose it and
    try an authorized independent read-only reviewer path with the same exact-HEAD
    contract. Never self-review, lower the contract, or use an unapproved service.
-3. Spawn a fresh foreground native `task` with `subagent_type: pr-reviewer`,
+3. If the owner set a pre-review condition, verify and record that it is met on the
+   frozen subject before reserving or dispatching the next ordinal. Spawn a fresh foreground
+   native `task` with `subagent_type: pr-reviewer`,
    `background: false`, no `task_id`. Supply only PR URL/number, exact expected
    HEAD/base and whole-PR review instructions with this checkout path.
    Do not supply past findings, implementation reasoning or a requested outcome.
