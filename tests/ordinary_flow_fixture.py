@@ -16,6 +16,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from collections.abc import Callable, Generator
@@ -975,6 +976,90 @@ print("Done")
                 assert store.find_artifact("ordinary-program:approval:legacy-decision", "record") is None
                 binding.revoke()
                 return {"status": "historical", "native_sends": 0}
+            if exercise.startswith("served-operations-"):
+                case = exercise.removeprefix("served-operations-")
+                if case in {"legacy", "unrecorded"}:
+                    proposal = replace(proposal, objective="Unrecorded proposal remains readable")
+                scope_digest = digest(encode(app.approval_scope(proposal)))
+                if case == "invalid-policy":
+                    app.verification = replace(app.verification, reviewer_required=False)
+                binding = LocalOwnerSession(OwnerProjection(store, proposal.program_id), app, None, proposal=proposal)
+                before = (store.history(proposal.program_id), store.operations())
+                request = {
+                    "version": 1,
+                    "action": "approve",
+                    "command_id": "advertised-approval",
+                    "expected_revision": -1,
+                    "decision_id": "advertised-decision",
+                    "expires_at": int(time.time()) + 900,
+                    "proposal_digest": proposal.digest,
+                    "scope_digest": scope_digest,
+                }
+                script = textwrap.dedent("""\
+                    import json, sys
+                    from creatidy_kernel.adapters.served_host import receive_owner_operations
+                    from creatidy_kernel.adapters.served_local import write_frame, read_frame
+
+                    case, approval = sys.argv[1], json.loads(sys.argv[2])
+                    def read(s):
+                        return json.loads(read_frame(s, bound=1048576, timeout=10))['result']
+                    def write(s, **request):
+                        write_frame(s, json.dumps(dict(version=1, **request)).encode(), bound=65536)
+
+                    s, ops = receive_owner_operations(int(sys.argv[-1]), expected_scope='everyday-program',
+                        expected_producer='fixture-producer', expected_recipient='fixture-backend')
+                    with s:
+                        expected = {'snapshot', 'events', 'record', 'proposal', 'proposal-chunk'}
+                        approve = {'approval-scope', 'approval-scope-chunk', 'approve'}
+                        if case in ('enabled', 'revoked'):
+                            expected |= approve
+                        assert ops == (None if case == 'legacy' else expected)
+                        write(s, action='proposal-chunk', offset=0, proposal_digest=None)
+                        assert read(s)['digest'] == approval['proposal_digest']
+                        if ops is not None and approve <= ops:
+                            write(s, action='approval-scope-chunk', offset=0, scope_digest=None)
+                            assert read(s)['digest'] == approval['scope_digest']
+                            write_frame(s, json.dumps(approval).encode(), bound=65536)
+                            if case == 'revoked':
+                                try:
+                                    assert s.recv(1) == b''
+                                except ConnectionResetError:
+                                    pass
+                            else:
+                                receipt = read(s)
+                                assert receipt['status'] == 'approved' and receipt['authority'] == 'historical-only'
+                """)
+                launched = launch_owner(
+                    binding,
+                    [sys.executable, "-I", "-c", script, case, json.dumps(request)],
+                    environment={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
+                    scope=proposal.program_id,
+                    producer="fixture-producer",
+                    recipient="fixture-backend",
+                    version=1 if case == "legacy" else 2,
+                )
+                try:
+                    for _ in range(2 if case in {"enabled", "revoked"} else 1):
+                        assert select.select([launched.channel.fileno()], [], [], 10)[0]
+                        launched.serve_once()
+                    if case in {"enabled", "revoked"}:
+                        assert select.select([launched.channel.fileno()], [], [], 10)[0]
+                        if case == "revoked":
+                            binding.revoke()
+                            assert launched.channel.fileno() == -1
+                        else:
+                            launched.serve_once()
+                    assert launched.process.wait(timeout=10) == 0
+                finally:
+                    launched.close()
+                    if launched.process.poll() is None:
+                        launched.process.kill()
+                        launched.process.wait(timeout=10)
+                if case == "enabled":
+                    assert app.recover("advertised-decision").proposal.digest == proposal.digest
+                    return {"status": "approved", "native_sends": 0}
+                assert (store.history(proposal.program_id), store.operations()) == before
+                return {"status": "read", "native_sends": 0}
             if exercise in {"served-host-receipts", "served-host-process-create"}:
                 binding = LocalOwnerSession(OwnerProjection(store, "everyday-program"), app, None, proposal=proposal)
                 script = (

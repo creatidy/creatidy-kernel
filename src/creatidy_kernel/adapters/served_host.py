@@ -11,6 +11,9 @@ from collections.abc import Mapping, Sequence
 from typing import cast
 
 from creatidy_kernel.adapters.served_local import (
+    APPROVAL_OPERATIONS,
+    OWNER_READS,
+    PROPOSAL_READS,
     LocalChannelRefused,
     LocalOwnerChannel,
     LocalOwnerSession,
@@ -20,6 +23,8 @@ from creatidy_kernel.adapters.served_local import (
 )
 
 PROVISIONING = "creatidy-kernel-owner-descriptor-v1"
+PROVISIONING_V2 = "creatidy-kernel-owner-descriptor-v2"
+_OWNER_OPERATIONS = OWNER_READS | PROPOSAL_READS | APPROVAL_OPERATIONS | {"stop", "reconcile", "start-managed"}
 
 
 def _valid_binding(value: object) -> bool:
@@ -68,7 +73,7 @@ def launch_owner(
     if (
         sys.platform != "linux"
         or type(version) is not int
-        or version != 1
+        or version not in (1, 2)
         or not argv
         or not os.path.isabs(argv[0])
         or not scope
@@ -81,14 +86,16 @@ def launch_owner(
     channel: LocalOwnerChannel | None = None
     try:
         channel = session.attach(server)
-        greeting = {
-            "contract": PROVISIONING,
-            "wire_version": 1,
+        greeting: dict[str, object] = {
+            "contract": PROVISIONING if version == 1 else PROVISIONING_V2,
+            "wire_version": 1,  # Only the provisioning greeting changes.
             "role": "owner",
             "scope": scope,
             "producer": producer,
             "recipient": recipient,
         }
+        if version == 2:
+            greeting["operations"] = sorted(channel.supported_operations())
         write_frame(server, json.dumps(greeting, sort_keys=True).encode(), bound=65536)
         process = subprocess.Popen(  # noqa: S603 - Trusted supervisor selects the exact executable and arguments.
             [*argv, str(peer.fileno())],
@@ -111,7 +118,21 @@ def launch_owner(
 def receive_owner(
     fd: int, *, expected_scope: str, expected_producer: str, expected_recipient: str, version: int = 1
 ) -> socket.socket:
-    """Take ownership of integer fd >= 3, including on refusal; never consume standard fds."""
+    """Receive the strict v1 greeting; own fd >= 3 even on refusal."""
+    channel, _ = _receive_owner(fd, expected_scope, expected_producer, expected_recipient, version, allow_v2=False)
+    return channel
+
+
+def receive_owner_operations(
+    fd: int, *, expected_scope: str, expected_producer: str, expected_recipient: str
+) -> tuple[socket.socket, frozenset[str] | None]:
+    """Receive v2 operations, or None on a verified legacy v1 descriptor, without a request."""
+    return _receive_owner(fd, expected_scope, expected_producer, expected_recipient, 1, allow_v2=True)
+
+
+def _receive_owner(
+    fd: int, expected_scope: str, expected_producer: str, expected_recipient: str, version: int, *, allow_v2: bool
+) -> tuple[socket.socket, frozenset[str] | None]:
     if type(fd) is not int or fd < 3:
         raise LocalChannelRefused("invalid inherited descriptor")
     try:
@@ -136,24 +157,56 @@ def receive_owner(
         if channel.family != socket.AF_UNIX or channel.type & socket.SOCK_STREAM != socket.SOCK_STREAM:
             raise LocalChannelRefused("inherited descriptor is not a local stream")
         channel.getpeername()
-        value: object = json.loads(read_frame(channel, bound=65536), object_pairs_hook=unique_object)
-        if (
-            type(value) is not dict
-            or type(cast(dict[str, object], value).get("wire_version")) is not int
-            or value
-            != {
-                "contract": PROVISIONING,
-                "wire_version": 1,
-                "role": "owner",
-                "scope": expected_scope,
-                "producer": expected_producer,
-                "recipient": expected_recipient,
-            }
-        ):
+        raw = read_frame(channel, bound=65536)
+        try:
+            value: object = json.loads(raw, object_pairs_hook=unique_object)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise LocalChannelRefused("malformed owner greeting") from error
+        if type(value) is not dict:
+            raise LocalChannelRefused("incompatible owner capability")
+        fields = cast(dict[str, object], value)
+        expected = {
+            "contract": PROVISIONING,
+            "wire_version": 1,
+            "role": "owner",
+            "scope": expected_scope,
+            "producer": expected_producer,
+            "recipient": expected_recipient,
+        }
+        operations = None
+        if allow_v2 and fields.get("contract") == PROVISIONING_V2:
+            try:
+                raw.decode("utf-8")
+            except UnicodeError as error:
+                raise LocalChannelRefused("malformed owner greeting") from error
+            expected["contract"] = PROVISIONING_V2
+            operations = _parse_operations(fields.pop("operations", None))
+        if type(fields.get("wire_version")) is not int or fields != expected:
             raise LocalChannelRefused("incompatible owner capability")
         channel.settimeout(None)
         channel.set_inheritable(False)
-        return channel
+        return channel, operations
     except BaseException:
         channel.close()
         raise
+
+
+def _parse_operations(value: object) -> frozenset[str]:
+    if type(value) is not list:
+        raise LocalChannelRefused("invalid owner operation declaration")
+    entries = cast(list[object], value)
+    if len(entries) > len(_OWNER_OPERATIONS) or any(
+        type(entry) is not str or entry not in _OWNER_OPERATIONS for entry in entries
+    ):
+        raise LocalChannelRefused("unknown owner operation")
+    operations = frozenset(cast(list[str], entries))
+    if (
+        len(operations) != len(entries)
+        or not OWNER_READS <= operations
+        or (operations & PROPOSAL_READS and not PROPOSAL_READS <= operations)
+        or (operations & APPROVAL_OPERATIONS and not (PROPOSAL_READS | APPROVAL_OPERATIONS) <= operations)
+        or ("reconcile" in operations and "stop" not in operations)
+        or ("start-managed" in operations and "reconcile" not in operations)
+    ):
+        raise LocalChannelRefused("inconsistent owner operation declaration")
+    return operations

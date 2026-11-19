@@ -14,7 +14,7 @@ from typing import cast
 from creatidy_kernel.adapters.ordinary_managed import OrdinaryManagedRun
 from creatidy_kernel.adapters.sqlite_store import IdempotencyConflict
 from creatidy_kernel.core.domain import AttemptStatus
-from creatidy_kernel.core.intake import digest, encode, object_from
+from creatidy_kernel.core.intake import IntakeRefused, digest, encode, object_from
 from creatidy_kernel.core.ownership import HandoffMode
 from creatidy_kernel.core.served import ProgressPosition, command_prefix
 from creatidy_kernel.ports.ordinary import (
@@ -29,6 +29,9 @@ from creatidy_kernel.ports.served import OwnerProjection, ServedSnapshot
 
 MAX_REQUEST = 65536
 MAX_RESPONSE = 1024 * 1024
+OWNER_READS = frozenset({"snapshot", "record", "events"})
+PROPOSAL_READS = frozenset({"proposal", "proposal-chunk"})
+APPROVAL_OPERATIONS = frozenset({"approval-scope", "approval-scope-chunk", "approve"})
 SNAPSHOT_COLLECTIONS = frozenset(
     {"work_units", "attempts", "reservations", "commands", "claims", "correlations", "decisions", "usage_subtotals"}
 )
@@ -730,6 +733,29 @@ class LocalOwnerChannel(LocalReadChannel):
     def approved(self) -> OrdinaryApproval | None:
         """Return the host-bound approval; it is never serialized to a client."""
         return self._approval_binding[0]
+
+    def supported_operations(self) -> frozenset[str]:
+        """Describe this live channel's launch-time bindings, not command admissibility."""
+        if self.fileno() < 0:
+            raise LocalChannelRefused("owner capability is closed")
+        operations = set(OWNER_READS)
+        proposal = self._proposal
+        if proposal is not None:
+            operations.update(PROPOSAL_READS)
+            try:
+                self._application.check_proposal_record(proposal)
+                self._application.approval_scope(proposal)
+            except IntakeRefused:
+                pass  # Proposal reads don't require approval evidence or policy.
+            else:
+                operations.update(APPROVAL_OPERATIONS)
+        if self._approved is not None:
+            operations.add("stop")
+        if self._control is not None and self._handoff is not None:
+            operations.add("reconcile")
+            if self._managed is not None and self._managed.client.approved == self._approved:
+                operations.add("start-managed")
+        return frozenset(operations)
 
     @property
     def _approved(self) -> OrdinaryApproval | None:
