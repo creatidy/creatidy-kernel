@@ -121,7 +121,7 @@ from creatidy_kernel.ports.ordinary import (
 from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.ownership import WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
-from creatidy_kernel.ports.verification import VerificationProfile
+from creatidy_kernel.ports.verification import VerificationProfile, decode_product_review_receipt
 from tools.check_drivers import (
     BASE,
     HEAD,
@@ -2682,22 +2682,47 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                     corrected_attempt = next(row for row in attempts if row["id"] == corrected_id)
                     assert corrected_attempt["remediation_of"] == rejected_id
                     findings = cast(list[dict[str, object]], outcome["findings"])
+                    review_operation = cast(str, remediation_context["review_operation_id"])
+                    rejected_receipt = decode_product_review_receipt(store.artifact(review_operation, "review-receipt"))
+                    assert rejected_receipt.verdict.value == "request_changes"
+                    assert {finding.fingerprint for finding in rejected_receipt.findings} == {"edge-case"}
+                    operation_ref = exported_ref("operation", review_operation)
+                    assert reviews[rejected_id]["operation"] == operation_ref
+                    assert reviews[rejected_id]["review"] == exported_ref("review", rejected_receipt.review_id)
                     expected_findings = {
-                        (row["id"], row["fingerprint"])
-                        for row in findings
-                        if row["attempt"] == rejected_id
-                        and row.get("review_operation") == reviews[rejected_id]["operation"]
+                        (
+                            exported_ref("finding", finding.finding_id),
+                            exported_ref("finding-fingerprint", finding.fingerprint),
+                        )
+                        for finding in rejected_receipt.findings
                     }
-                    assert expected_findings
+                    handed_findings = {
+                        (
+                            exported_ref("finding", row["finding_id"]),
+                            exported_ref("finding-fingerprint", row["fingerprint"]),
+                        )
+                        for row in cast(list[dict[str, str]], remediation_context["findings"])
+                    }
 
                     def finding_refs(links: object) -> set[tuple[object, object]]:
                         return {(row["id"], row["fingerprint"]) for row in cast(list[dict[str, object]], links)}
 
                     assert finding_refs(reviews[rejected_id]["findings"]) == expected_findings
-                    assert (
-                        expected_findings
-                        <= finding_refs(corrected_attempt["remediation_findings"])
-                        == {(row["id"], row["fingerprint"]) for row in findings if row["attempt"] == rejected_id}
+                    assert expected_findings == {
+                        (row["id"], row["fingerprint"])
+                        for row in findings
+                        if row["attempt"] == rejected_id and row.get("review_operation") == operation_ref
+                    }
+                    assert expected_findings == handed_findings
+                    verification_findings = {
+                        (
+                            exported_ref("finding", row["finding_id"]),
+                            exported_ref("finding-fingerprint", row["fingerprint"]),
+                        )
+                        for row in cast(list[dict[str, str]], remediation_context["rejection"]["findings"])
+                    }
+                    assert handed_findings | verification_findings == finding_refs(
+                        corrected_attempt["remediation_findings"]
                     )
                     assert {row["attempt"] for row in satisfactions} == {corrected_id, dependent_id}
                     assert {(row["id"], row["attempt"], row["work_unit"]) for row in satisfactions} == {
