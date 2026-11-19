@@ -232,7 +232,7 @@ class OrdinaryIntake:
         self.store.finalize_artifact(key, "record", raw)
         return raw
 
-    def _recover(self, operation: OperationRecord) -> bytes:
+    def _recover(self, operation: OperationRecord, *, repair: bool = True) -> bytes:
         value = object_from(operation.request_json.encode())
         request = object_from(encode(value.get("request")))
         if (
@@ -330,19 +330,24 @@ class OrdinaryIntake:
                 raise IntakeRefused("baseline age namespace differs from subject")
         artifact = self.store.find_artifact(operation.operation_id, "record")
         if artifact is None:
+            if not repair:
+                raise IntakeRefused("intake artifact has not been published")
             self.store.finalize_artifact(operation.operation_id, "record", raw)
         elif artifact != raw:
             raise IntakeRefused("intake artifact differs from journal")
         return raw
 
     def history(self, task_id: str) -> tuple[Draft, ...]:
+        return self._history(task_id, repair=True)
+
+    def _history(self, task_id: str, *, repair: bool) -> tuple[Draft, ...]:
         records = (
             *self.store.operations(self._prefix(task_id)),
             *self.store.operations(f"ordinary:record:ordinary-draft:{task_id}:"),
         )
         drafts: list[Draft] = []
         for record in records:
-            raw = self._recover(record)
+            raw = self._recover(record, repair=repair)
             if object_from(raw)["kind"] == "ordinary-draft":
                 drafts.append(draft_from(raw))
         drafts.sort(key=lambda item: item.revision)
@@ -553,6 +558,17 @@ class OrdinaryIntake:
             policy,
             current,
             self.history(draft.task_id),
+            self.store.find_program(f"ordinary:{draft.task_id}"),
+        )
+
+    def check_retained_authority(self, principal: Principal, draft: Draft, policy: OwnerPolicy) -> None:
+        """Check retained meaning without recovery or provider observation."""
+        self._check_authority(
+            principal,
+            draft,
+            policy,
+            draft.evidence,
+            self._history(draft.task_id, repair=False),
             self.store.find_program(f"ordinary:{draft.task_id}"),
         )
 

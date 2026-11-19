@@ -194,13 +194,13 @@ a bound proposal. `approval-scope`, `approval-scope-chunk` and `approve` appear 
 both proposal reads, the exact producer-recorded proposal, a valid material approval-scope binding,
 a proposal within the bound policy's static limits, and local evidence that the configured intake
 and dependency readers cover its subjects and baseline recipe. Any qualified dependency cuts must
-have configured work bindings and agree on the decision reference when one is required. This supports
+have configured work bindings and agree on a wire-valid decision reference when one is required. This supports
 proposal payload versions 1 and 2. Proposal payload v3 (qualified drafts) remains readable, but its
 baseline and readiness reader ports cannot attest local applicability, so its approval is not
 advertised. This does not disable the existing approval handlers.
 Read-only discovery is also the result for unrecorded or out-of-policy proposals, unreadable approval
 evidence, or missing required bindings. These checks use retained evidence and host configuration,
-not provider calls or freshness checks. Descriptor v2 declares only read and approval operations.
+not provider calls, recovery writes or freshness checks. Descriptor v2 declares only read and approval operations.
 Lifecycle commands (`stop`, `reconcile`, `start-managed`) are not in the declaration; their existing
 interfaces are unchanged.
 These are launch-time supported operations, not guarantees that a request, revision, target or effect

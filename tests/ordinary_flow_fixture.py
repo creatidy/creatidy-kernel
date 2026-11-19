@@ -1003,6 +1003,35 @@ print("Done")
                 if case == "artifact-loss":
                     app.check_proposal_record(proposal)
                     (root / "state.db.artifacts" / proposal.digest).unlink()
+                if case == "assessment-loss":
+                    app.check_proposal_record(proposal)
+                    assessment = store.operations("ordinary-source-review:")[0]
+                    raw = store.artifact(assessment.operation_id, "record")
+                    (root / "state.db.artifacts" / digest(raw)).unlink()
+                interrupted_key = None
+                if case == "interrupted-amendment":
+                    original = proposal.drafts[0]
+                    with patch.object(
+                        store, "finalize_artifact", side_effect=RuntimeError("draft publication interrupted")
+                    ):
+                        try:
+                            app.intake.prepare(
+                                original.task_id,
+                                original.evidence.subject,
+                                Declaration(encode({**original.declaration.value, "context": ["interrupted update"]})),
+                                expected_parent=original.digest,
+                            )
+                        except RuntimeError as error:
+                            assert str(error) == "draft publication interrupted"
+                        else:
+                            raise AssertionError("draft publication was not interrupted")
+                    pending = [
+                        op.operation_id
+                        for op in store.operations("ordinary:")
+                        if store.find_artifact(op.operation_id, "record") is None
+                    ]
+                    assert len(pending) == 1
+                    interrupted_key = pending[0]
                 binding = LocalOwnerSession(OwnerProjection(store, proposal.program_id), app, None, proposal=proposal)
                 before = (store.history(proposal.program_id), store.operations())
                 request = {
@@ -1079,6 +1108,8 @@ print("Done")
                     assert app.recover("advertised-decision").proposal.digest == proposal.digest
                     return {"status": "approved", "native_sends": 0}
                 assert (store.history(proposal.program_id), store.operations()) == before
+                if interrupted_key is not None:
+                    assert store.find_artifact(interrupted_key, "record") is None
                 return {"status": "read", "native_sends": 0}
             if exercise in {"served-host-receipts", "served-host-process-create"}:
                 binding = LocalOwnerSession(OwnerProjection(store, "everyday-program"), app, None, proposal=proposal)

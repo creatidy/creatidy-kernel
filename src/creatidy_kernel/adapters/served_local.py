@@ -10,7 +10,7 @@ import struct
 import time
 from collections.abc import Callable
 from dataclasses import asdict
-from typing import cast
+from typing import TypeGuard, cast
 
 from creatidy_kernel.adapters.ordinary_managed import OrdinaryManagedRun
 from creatidy_kernel.adapters.sqlite_store import CorruptHistory, IdempotencyConflict
@@ -40,6 +40,10 @@ SNAPSHOT_COLLECTIONS = frozenset(
 
 class LocalChannelRefused(ValueError):
     """The local capability received an invalid or incomplete frame."""
+
+
+def _valid_approval_decision_id(value: object) -> TypeGuard[str]:
+    return type(value) is str and bool(value.strip()) and len(value) <= 256
 
 
 class LocalDecisionNotifier:
@@ -744,6 +748,11 @@ class LocalOwnerChannel(LocalReadChannel):
         if proposal is not None:
             operations.update(PROPOSAL_READS)
             try:
+                if any(
+                    cut.obligation is not None and not _valid_approval_decision_id(cut.obligation.decision_reference)
+                    for cut in proposal.qualified_cuts
+                ):
+                    raise IntakeRefused("required owner decision is not representable on the served wire")
                 self._application.check_proposal_record(proposal)
                 self._application.check_approval_provisioning(proposal)
             except IntakeRefused:
@@ -1039,9 +1048,7 @@ class LocalOwnerChannel(LocalReadChannel):
             or len(command_id) > 256
             or type(revision) is not int
             or revision < -1
-            or type(decision_id) is not str
-            or not decision_id.strip()
-            or len(decision_id) > 256
+            or not _valid_approval_decision_id(decision_id)
             or type(expires_at) is not int
             or expires_at < 1
             or type(proposal_digest) is not str

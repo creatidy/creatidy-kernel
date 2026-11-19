@@ -64,14 +64,20 @@ class OwnerReviewedForgejoEvidence:
             return False
         proof = object_from(evidence.relevance_proof)
         assessment = proof.get("owner_assessment")
-        return isinstance(assessment, dict) and cast(dict[str, object], assessment).get("issuer") == self.owner.actor_id
+        snapshot = proof.get("received_native_snapshot")
+        if not isinstance(assessment, dict) or not isinstance(snapshot, dict):
+            return False
+        basis = self._snapshot_basis(digest(encode(cast(dict[str, object], snapshot))), draft.declaration.digest)
+        history = self._history(basis, optional_artifact=True)
+        return bool(history) and history[-1] == assessment
 
     def snapshot(self, subject: IssueSubject, declaration: Declaration) -> IntakeEvidence:
         return self.observer.read(subject, declaration)
 
-    def _history(self, snapshot_digest: str) -> tuple[dict[str, object], ...]:
+    def _history(self, snapshot_digest: str, *, optional_artifact: bool = False) -> tuple[dict[str, object], ...]:
         records: list[dict[str, object]] = []
         prefix = "ordinary-source-review:" + digest(self.owner.actor_id.encode()) + ":"
+        read_artifact = self.store.find_artifact if optional_artifact else self.store.artifact
         for operation in self.store.operations(prefix):
             request = object_from(operation.request_json.encode())
             outer = cast(dict[str, object], request.get("request"))
@@ -90,7 +96,7 @@ class OwnerReviewedForgejoEvidence:
                 or record["kind"] != "owner-source-assessment"
                 or record["issuer"] != self.owner.actor_id
                 or operation.operation_id != prefix + cast(str, record["decision"])
-                or self.store.artifact(operation.operation_id, "record") != raw
+                or read_artifact(operation.operation_id, "record") != raw
             ):
                 raise IntakeRefused("source assessment identity/version differs")
             if record["snapshot"] == snapshot_digest:
@@ -108,7 +114,11 @@ class OwnerReviewedForgejoEvidence:
 
     @staticmethod
     def snapshot_digest(evidence: IntakeEvidence, declaration: Declaration) -> str:
-        return digest(encode({"snapshot": evidence.digest, "declaration": declaration.digest}))
+        return OwnerReviewedForgejoEvidence._snapshot_basis(evidence.digest, declaration.digest)
+
+    @staticmethod
+    def _snapshot_basis(snapshot: str, declaration: str) -> str:
+        return digest(encode({"snapshot": snapshot, "declaration": declaration}))
 
     def review(
         self,

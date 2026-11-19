@@ -301,6 +301,12 @@ def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, 
         conflicting = app.propose(
             "conflicting", "deliver", (("two", SUBJECT, declaration()),), qualified_cuts=(cut, second_cut)
         )
+        oversized = app.propose(
+            "oversized-decision",
+            "deliver",
+            (("three", SUBJECT, declaration()),),
+            qualified_cuts=(replace(cut, obligation=replace(obligation, decision_reference="a" * 257)),),
+        )
         assert proposal.payload["version"] == 2
         assert app.approval_scope(proposal)["proposal"] == proposal.payload
         assert app.approval_scope(proposal)["qualified_work_bindings"] == [asdict(project.work.binding)]
@@ -372,6 +378,7 @@ def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, 
             _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=True)
             _assert_supervised_proposal_support(store, unavailable, proposal, sqlite_tmp_path, approval=False)
             _assert_supervised_proposal_support(store, app, conflicting, sqlite_tmp_path, approval=False)
+            _assert_supervised_proposal_support(store, app, oversized, sqlite_tmp_path, approval=False)
             with patch.object(scenario.reader, "binding", replace(scenario.reader.binding, repository="team/other")):
                 _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
             with patch.object(dependencies, "binding", replace(dependencies.binding, repository="team/other")):

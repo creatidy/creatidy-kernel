@@ -671,7 +671,7 @@ class OrdinaryProgram:
                 or dependencies.supports_subject(draft.evidence.subject) is not True
             ):
                 raise IntakeRefused("configured readers do not cover this proposal")
-            self.intake.validate_authority(self.owner, draft, self.policy, draft.evidence)
+            self.intake.check_retained_authority(self.owner, draft, self.policy)
 
     def approval_scope(self, proposal: OrdinaryProposal) -> dict[str, object]:
         """Canonical owner-visible inputs that determine the approval's meaning."""
