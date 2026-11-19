@@ -13,12 +13,14 @@ remediation commits/pushes; no additional issue, replacement PR or merge.
 An explicit owner `/loop` may reuse this procedure in its sole primary context;
 selection/merge/closure authority lives only in loop.md, never in `/finish-pr`.
 
-Delivery budget: at most 10 whole-PR review invocations per issue delivery,
+Delivery budget: by default at most 10 whole-PR review invocations per issue delivery,
 INCLUDING the initial review, COMMENT, invalidated reviews and corrected retries.
+Use a higher ceiling only under the [review ceiling rule](../rules/10-task-system.md#review-ceiling).
 Before the first review verify `.task_progress.md` is Git-locally excluded, then
 append a delivery ledger keyed by issue/PR (and `/loop` invocation ID if applicable).
-Before EVERY task dispatch reserve/persist the next review ordinal, frozen SHAs
-and pending result. Record returned verdict, remediation commits and checks.
+Before EVERY task dispatch verify the next ordinal is within the applicable ceiling,
+then reserve/persist it with frozen SHAs and pending result. Record returned verdict,
+remediation commits and checks.
 Reinvoking `/finish-pr`, changing phase, reviewer task, model or session MUST reuse
 the same delivery counter, not initialize zero. If prior dispatch/count recovery
 is ambiguous or unavailable, BLOCKED. Do not erase history or reset a stopped
@@ -72,7 +74,7 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    try the smallest authorized changed-strategy remediation before escalation.
    Otherwise reproduce
    each actionable finding. Before patching check the remaining delivery budget;
-   at 10 return STOP_REVISE without patches that cannot receive a fresh review.
+   at the applicable ceiling return STOP_REVISE without patches that cannot receive a fresh review.
    Remediate all in scope and add regression tests.
    Classify each as direct incomplete remediation or genuinely new semantic/
    architectural defect; record that distinction and the reviewed HEAD/verdict.
@@ -83,7 +85,7 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    Stage only intended files, commit normally and push the SAME PR branch through
    canonical Git. Never amend, squash, force-push or rewrite published history.
    Recheck remote/MCP head and return to step 2 with a NEW reviewer task.
-7. Never dispatch review 11. At the 10-review bound an exact valid APPROVE may
+7. Never dispatch beyond the applicable review ceiling. At that bound an exact valid APPROVE may
    yield READY_TO_MERGE; genuine decisions yield OWNER_DECISION_NEEDED. An external
    dependency or exhausted authorized infrastructure alternatives yields BLOCKED,
    and remaining actionable findings yield STOP_REVISE;
@@ -93,9 +95,10 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    not a target: stop as soon as an owner decision is clearly required.
 8. COMMENT: distinguish stale/incomplete/tool failure from evidence-backed judgment
    uncertainty and findings. Do not treat first-path failure as terminal. Attempt a
-   bounded remediation with a changed relevant condition and reserve the next ordinal
-   before dispatch. Do not repeat the same failed inputs/environment. If no authorized
-   route can establish the verdict, return BLOCKED with exact missing capability and
+   bounded remediation with a changed relevant condition only when a fresh review is
+   within the applicable ceiling, and reserve the next ordinal before dispatch.
+   Do not repeat the same failed inputs/environment. If no authorized route can
+   establish the verdict, return BLOCKED with exact missing capability and
    remediation paths already attempted; if evidence exists but material judgment
    cannot be resolved within accepted criteria, return OWNER_DECISION_NEEDED.
 

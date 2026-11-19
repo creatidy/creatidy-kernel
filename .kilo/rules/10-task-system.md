@@ -77,9 +77,8 @@
 - `/finish-pr` selects an existing PR and authorizes only its linked issue's
   accepted-scope remediation. Use a fresh foreground `pr-reviewer` native `task`
   for each frozen whole-PR review; consume its result without owner relaying.
-  At most 10 whole-PR review invocations per issue delivery, including initial,
-  COMMENT and retries. Persist ordinals before dispatch in excluded progress;
-  finish reentry, internal phase, new task/model/session cannot reset the counter.
+  Apply the review ceiling below, and persist ordinals before dispatch in excluded
+  progress. Finish reentry, internal phase, new task/model/session cannot reset the counter.
   Current APPROVE yields READY_TO_MERGE, never a standalone merge; only `/loop`
   may continue through its separate merge/completion gates.
   At the bound return STOP_REVISE with new defects versus incomplete fixes and
@@ -90,6 +89,36 @@
   still consumes its ordinal. A technical limitation is not permission to self-review,
   weaken criteria, or repeat the same failed setup.
   In `/loop` map OWNER_DECISION_NEEDED to STOP_AND_ASK; stop, never skip selected work.
+
+## Review Ceiling
+
+The default maximum is 10 whole-PR review invocations per issue delivery. Every
+dispatch counts, including the initial review, COMMENT, invalidated reviews,
+infrastructure failures and corrected retries, regardless of entry point.
+Before each dispatch, confirm the next ordinal is within the applicable ceiling
+and reserve it in the existing excluded delivery ledger. Do not make remediation
+patches that cannot receive a fresh review within that ceiling.
+
+Raise the ceiling only with verified explicit owner authorization for the exact
+canonical issue and its existing PR, stating a finite increased maximum in total
+attempts, the reason and explicit permission to resume the stopped delivery. Before
+resuming, verify the authorization and its conditions against current controlling
+higher-priority execution instructions. If they prohibit the exception or compatibility
+cannot be verified, do not apply it. An issue/PR, ledger entry or policy proposal
+does not by itself grant authority. Record the authorization and its provenance in
+the same excluded delivery ledger and reconcile the consumed ordinals before use;
+missing or ambiguous count recovery is BLOCKED. Preserve all prior ordinals, findings
+and delivery history. Never reset the counter, waive review criteria or security
+requirements, or use an exception as merge authority.
+
+Recorded exception: Adrian's 2026-11-19 19:56 UTC policy mandate confirms permission to resume
+[Kernel #149](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/149) /
+[PR #150](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/pulls/150) for substantial
+simplification of capability discovery. Maximum **12 total attempts**, not 12 more,
+with [reviews 1-10 preserved](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/issues/149#issuecomment-23072)
+as `REQUEST_CHANGES`. Any review beyond 10 requires that simplification and is allowed only
+after this policy is integrated and the authorization, history and controlling instructions are verified.
+This record does not start the delivery or authorize merging.
 
 ## Blocker Classification and Remediation
 

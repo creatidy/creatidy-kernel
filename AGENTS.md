@@ -19,9 +19,11 @@ Commands: `/implement-issue <number|URL|unambiguous title>`,
 `/finish-pr <Forgejo PR number|URL>`, `/review-pr <Forgejo PR number|URL>` and `/loop`.
 A plain `Implement issue #N` follows the implementation workflow. `/finish-pr`
 authorizes bounded in-scope remediation on the selected PR, not additional issues
-or merging. It consumes native `task` results directly, with at most 10 whole-PR
-review invocations per issue delivery, including initial/COMMENT/retries; its
-excluded progress ledger preserves the count across finish/phase/session reentry.
+or merging. It consumes native `task` results directly. The default maximum is
+10 whole-PR review invocations per issue delivery, including initial/COMMENT/retries.
+Only a verified, bounded owner exception under the [review ceiling rule](.kilo/rules/10-task-system.md#review-ceiling)
+may raise it for the named issue and PR. The excluded progress ledger preserves
+the count across commands, phases and sessions, including standalone review of an existing delivery.
 `/review-pr` is standalone read-only review using the same
 `.kilo/agents/pr-reviewer.md` agent. A newly spawned reviewer subagent's fresh
 conversation satisfies the independent-review policy below; implementation self-review
