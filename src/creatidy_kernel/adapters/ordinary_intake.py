@@ -67,9 +67,16 @@ class OwnerReviewedForgejoEvidence:
         snapshot = proof.get("received_native_snapshot")
         if not isinstance(assessment, dict) or not isinstance(snapshot, dict):
             return False
-        basis = self._snapshot_basis(digest(encode(cast(dict[str, object], snapshot))), draft.declaration.digest)
+        native_snapshot = cast(dict[str, object], snapshot)
+        native_proof = native_snapshot.get("relevance_proof")
+        if not isinstance(native_proof, str) or not self.observer.supports_pr_inventory(native_proof.encode()):
+            return False
+        basis = self._snapshot_basis(digest(encode(native_snapshot)), draft.declaration.digest)
         history = self._history(basis, optional_artifact=True)
         return bool(history) and history[-1] == assessment
+
+    def approval_observer(self) -> object:
+        return self.observer.approval_observer()
 
     def snapshot(self, subject: IssueSubject, declaration: Declaration) -> IntakeEvidence:
         return self.observer.read(subject, declaration)

@@ -432,14 +432,18 @@ def run_ordinary_flow(
         forge_service(
             base,
             lose_comment_reply=exercise == "lost-reply",
-            unrelated_branch=exercise in {"branch-pr", "ambiguous-pr"},
+            unrelated_branch=exercise in {"branch-pr", "ambiguous-pr", "served-operations-intake-scan-bound"},
             lose_pr_reply=exercise in {"branch-pr", "ambiguous-pr"},
             copied_marker=exercise == "ambiguous-pr",
             diamond=exercise in {"diamond", "diamond-conflict", "diamond-inherited"},
             initial_comments=31 if exercise == "many-comments" else 241 if exercise == "oversized-comments" else 0,
             duplicate_comment=exercise == "duplicate-comments",
             baseline_status=exercise.removeprefix("baseline-") if exercise.startswith("baseline-") else "success",
-            alternate_baseline=exercise == "served-operations-baseline-context-reread",
+            alternate_baseline=exercise
+            in {
+                "served-operations-baseline-context-reread",
+                "served-operations-baseline-replacement",
+            },
         ) as (endpoint, native_state),
         review_peer(
             root / "native",
@@ -1025,11 +1029,16 @@ print("Done")
                     )
                 if case == "baseline-context":
                     baseline.contexts = frozenset({"ci/other"})
-                if case == "baseline-context-reread":
-                    baseline.contexts = frozenset({"ci/other"})
+                if case in {"baseline-context-reread", "baseline-replacement"}:
+                    if case == "baseline-replacement":
+                        selected_baseline = ForgejoBaseline(read_http, recipes, frozenset({"ci/other"}))
+                        reader.observer.baseline = selected_baseline
+                    else:
+                        baseline.contexts = frozenset({"ci/other"})
+                        selected_baseline = baseline
                     for draft in proposal.drafts:
                         evidence = draft.evidence
-                        reread = baseline.read_baseline(evidence.subject, evidence.recipe_digest)
+                        reread = selected_baseline.read_baseline(evidence.subject, evidence.recipe_digest)
                         assert reread is not None
                         assert (reread.reference, reread.result) == (
                             evidence.baseline_reference,
@@ -1037,6 +1046,11 @@ print("Done")
                         )
                 if case == "baseline-scan-bound":
                     baseline.max_pages = 1
+                if case == "intake-scan-bound":
+                    assessed = object_from(proposal.drafts[0].evidence.relevance_proof)
+                    native = object_from(encode(assessed["received_native_snapshot"]))
+                    assert '"change_read":"initial"' in cast(str, native["relevance_proof"])
+                    reader.observer.max_pages = 1
                 if case == "dependency-scan-bound":
                     assert any(observation.required for observation in proposal.dependencies)
                     discovery.max_pages = 1
@@ -1053,6 +1067,12 @@ print("Done")
                     proposal = app.propose(proposal.program_id, "Changed objective after interruption", selections)
                 if case == "baseline-unobserved":
                     reader.observer.baseline = ForgejoBaseline(read_http, recipes, frozenset({"ci/baseline"}))
+                if case == "baseline-age-loss":
+                    evidence = proposal.drafts[0].evidence
+                    app.intake.baseline_age(replace(evidence, observed_at=evidence.observed_at - 1))
+                    age = store.operations("ordinary:baseline-age:")[0]
+                    raw = store.artifact(age.operation_id, "record")
+                    (root / "state.db.artifacts" / digest(raw)).unlink()
                 if case == "artifact-loss":
                     app.check_proposal_record(proposal)
                     (root / "state.db.artifacts" / proposal.digest).unlink()

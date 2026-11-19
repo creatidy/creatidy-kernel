@@ -55,6 +55,8 @@ class EvidenceApplicability(Protocol):
 
     def supports_evidence(self, draft: Draft) -> bool: ...
 
+    def approval_observer(self) -> object: ...
+
 
 @runtime_checkable
 class BaselineApplicability(Protocol):
@@ -215,6 +217,7 @@ class OrdinaryIntake:
         self.store = store
         self.reader = reader
         self.clock = clock
+        self._approval_observations: dict[str, tuple[EvidenceReader, object]] = {}
 
     @staticmethod
     def _prefix(task_id: str) -> str:
@@ -355,7 +358,7 @@ class OrdinaryIntake:
                 raise IntakeRefused("broken immutable draft chain")
         return tuple(drafts)
 
-    def _baseline_age(self, evidence: IntakeEvidence) -> int:
+    def _baseline_age(self, evidence: IntakeEvidence, *, repair: bool = True) -> int:
         """Earliest durable receipt age in this store, independent of task aliases/meaning."""
         identity = {
             "subject": evidence.subject.payload(),
@@ -368,7 +371,7 @@ class OrdinaryIntake:
         task_ids: set[str] = set()
         known_age: int | None = None
         for record in self.store.operations("ordinary:"):
-            inner = object_from(self._recover(record))
+            inner = object_from(self._recover(record, repair=repair))
             if inner["kind"] == "ordinary-draft":
                 task_ids.add(_text(inner["task_id"]))
             elif inner["kind"] == "ordinary-baseline-age" and inner["identity"] == identity:
@@ -410,7 +413,7 @@ class OrdinaryIntake:
             if (qualified.producer, qualified.reference) == (evidence.baseline_producer, evidence.baseline_reference):
                 known_age = qualified.observed_at if known_age is None else min(known_age, qualified.observed_at)
         for task_id in sorted(task_ids):
-            for draft in self.history(task_id):
+            for draft in self._history(task_id, repair=repair):
                 old = draft.evidence
                 if (
                     evidence.subject,
@@ -430,7 +433,8 @@ class OrdinaryIntake:
                     known_age = old.observed_at if known_age is None else min(known_age, old.observed_at)
         observed_at = _integer(evidence.observed_at)
         if (
-            known_age is not None
+            repair
+            and known_age is not None
             and observed_at < known_age
             and evidence.source == evidence.subject.base
             and evidence.baseline_result in {"passed", "failed"}
@@ -532,6 +536,11 @@ class OrdinaryIntake:
             # A legacy consumption for task 'draft' can occupy this exact draft key.
             key = f"ordinary:record:ordinary-draft:{task_id}:{draft.revision}"
         self._record(key, encode(draft.payload()))
+        if isinstance(self.reader, EvidenceApplicability):
+            # A reread cannot retroactively bind an existing draft to a new observer.
+            self._approval_observations[draft.digest] = (self.reader, self.reader.approval_observer())
+            if len(self._approval_observations) > 128:
+                del self._approval_observations[next(iter(self._approval_observations))]
         return draft
 
     def _validate(
@@ -558,6 +567,17 @@ class OrdinaryIntake:
 
     def check_retained_authority(self, principal: Principal, draft: Draft, policy: OwnerPolicy) -> None:
         """Check retained meaning without recovery or provider observation."""
+        reader = self.reader
+        retained = self._approval_observations.get(draft.digest)
+        if (
+            retained is None
+            or not isinstance(reader, EvidenceApplicability)
+            or retained[0] is not reader
+            or retained[1] is not reader.approval_observer()
+            or reader.supports_evidence(draft) is not True
+        ):
+            raise IntakeRefused("configured intake reader does not cover this retained draft")
+        self._baseline_age(draft.evidence, repair=False)
         self._check_authority(
             principal,
             draft,

@@ -356,27 +356,14 @@ def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, 
         assert len(native) == 1 and native[0]["driver"] == "ordinary-proposal-v1"
         assert cast(list[object], native[0]["qualified_dependencies"])
 
-    with SQLiteProgramStore(path, boot_clock=clock.boot) as store:
-        app = application(store)
-        recovered = app.recover("decision")
-        assert recovered.proposal == proposal
-        app.check(recovered)
-        services.filter = lambda _method, _path, _body: (403, {})
-        with pytest.raises(ValueError):
-            app.check(recovered)
-        services.filter = None
-        unavailable = application(store, configured_work=False)
-        assert unavailable.recover("decision").proposal == proposal
-        with pytest.raises(IntakeRefused, match="driver unavailable"):
-            unavailable.check(recovered)
-
         provider_requests = tuple(services.requests)
         with (
             patch.object(scenario.reader, "read", side_effect=AssertionError("launch observed intake")),
             patch.object(dependencies, "read_dependencies", side_effect=AssertionError("launch observed dependencies")),
         ):
             _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=True)
-            _assert_supervised_proposal_support(store, unavailable, proposal, sqlite_tmp_path, approval=False)
+            with patch.object(app, "qualified_work", ()):
+                _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
             _assert_supervised_proposal_support(store, app, conflicting, sqlite_tmp_path, approval=False)
             _assert_supervised_proposal_support(store, app, oversized, sqlite_tmp_path, approval=False)
             with patch.object(scenario.reader, "binding", replace(scenario.reader.binding, repository="team/other")):
@@ -392,6 +379,21 @@ def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, 
                 with patch.object(scenario.reader, "criteria", (criterion,)):
                     _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
         assert tuple(services.requests) == provider_requests
+
+    with SQLiteProgramStore(path, boot_clock=clock.boot) as store:
+        app = application(store)
+        recovered = app.recover("decision")
+        assert recovered.proposal == proposal
+        app.check(recovered)
+        services.filter = lambda _method, _path, _body: (403, {})
+        with pytest.raises(ValueError):
+            app.check(recovered)
+        services.filter = None
+        unavailable = application(store, configured_work=False)
+        assert unavailable.recover("decision").proposal == proposal
+        with pytest.raises(IntakeRefused, match="driver unavailable"):
+            unavailable.check(recovered)
+        _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
         app.stop(recovered, "owner revoked")
         with pytest.raises(ValueError):
             app.check(recovered)

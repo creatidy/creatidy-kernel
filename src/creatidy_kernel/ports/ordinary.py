@@ -50,7 +50,6 @@ from creatidy_kernel.core.work_budget import WorkBudgetPolicy
 from creatidy_kernel.ports.application import Collection, receive_candidate, remediation_context
 from creatidy_kernel.ports.drivers import SourceManagement, WorkManagement
 from creatidy_kernel.ports.intake import (
-    EvidenceApplicability,
     IntakeStore,
     OrdinaryIntake,
     draft_from,
@@ -684,14 +683,11 @@ class OrdinaryProgram:
         decisions = {cut.obligation.decision_reference for cut in proposal.qualified_cuts if cut.obligation is not None}
         if len(decisions) > 1:
             raise IntakeRefused("qualified cuts require conflicting owner decisions")
-        reader, dependencies = self.intake.reader, self.dependencies
-        if not isinstance(reader, EvidenceApplicability) or not isinstance(dependencies, DependencyApplicability):
+        dependencies = self.dependencies
+        if not isinstance(dependencies, DependencyApplicability):
             raise IntakeRefused("local reader applicability is not available")
         for draft, dependency in zip(proposal.drafts, proposal.dependencies, strict=True):
-            if (
-                reader.supports_evidence(draft) is not True
-                or dependencies.supports_dependencies(dependency) is not True
-            ):
+            if dependencies.supports_dependencies(dependency) is not True:
                 raise IntakeRefused("configured readers do not cover this proposal")
             self.intake.check_retained_authority(self.owner, draft, self.policy)
 
