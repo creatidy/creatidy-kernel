@@ -54,7 +54,7 @@ def test_launched_consumer_receives_and_uses_owner_descriptor(sqlite_tmp_path: P
             "expected_producer='producer-a',expected_recipient='backend-a'); "
             "\nif sys.argv[2]=='1': s=receive_owner(fd,**binding)"
             "\nelse:\n s,ops=receive_owner_operations(fd,**binding)"
-            "\n assert ops=={'snapshot','record','events','stop'}\n"
+            "\n assert ops=={'snapshot','record','events'}\n"
             'write_frame(s,b\'{"version":1,"action":"snapshot"}\',bound=65536); '
             "r=json.loads(read_frame(s,bound=1048576)); "
             "assert r['result']['scope']==sys.argv[1]; s.close()"
@@ -288,6 +288,7 @@ def test_consumer_refuses_incompatible_greetings(payload: bytes) -> None:
         {"operations": ["snapshot", "record", "events", "approve"]},
         {"operations": ["snapshot", "record", "events", "snapshot"]},
         {"operations": ["snapshot", "record", "events", "unknown"]},
+        {"operations": ["snapshot", "record", "events", "reconcile"]},
         {"operations": ["snapshot", "record", "events", ["approve"]]},
     ],
 )

@@ -648,6 +648,16 @@ class OrdinaryProgram:
         """Check the static approval binding without observing providers or granting authority."""
         self.check_proposal_record(proposal)
         self.approval_scope(proposal)
+        work_bindings = {driver.binding for driver in self.qualified_work}
+        cuts = (*proposal.qualified_cuts, *(item.cut for item in proposal.qualified_drafts))
+        if any(cut.subject.binding not in work_bindings for cut in cuts):
+            raise IntakeRefused("qualified work driver unavailable or changed")
+        if proposal.qualified_drafts and (
+            self.qualified_baselines is None
+            or self.qualified_readiness is None
+            or self.verification.checks[:2] != ("paths", "structural")
+        ):
+            raise IntakeRefused("qualified approval producer or verification configuration unavailable")
         for draft in proposal.drafts:
             evidence = draft.evidence
             OrdinaryIntake.validate_shared_policy(
@@ -659,7 +669,14 @@ class OrdinaryProgram:
                 evidence.baseline_result,
                 evidence.relevance_producer,
             )
+        scm_bindings = {driver.binding for driver in self.qualified_scm}
         for draft in proposal.qualified_drafts:
+            if (
+                draft.baseline.source.binding not in scm_bindings
+                or not draft.baseline.proof
+                or draft.readiness.owner_actor != self.owner.actor_id
+            ):
+                raise IntakeRefused("qualified approval source or evidence binding unavailable")
             OrdinaryIntake.validate_shared_policy(
                 self.owner,
                 draft.declaration,

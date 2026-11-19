@@ -24,7 +24,7 @@ from creatidy_kernel.adapters.served_local import (
 
 PROVISIONING = "creatidy-kernel-owner-descriptor-v1"
 PROVISIONING_V2 = "creatidy-kernel-owner-descriptor-v2"
-_OWNER_OPERATIONS = OWNER_READS | PROPOSAL_READS | APPROVAL_OPERATIONS | {"stop", "reconcile", "start-managed"}
+_OWNER_OPERATIONS = OWNER_READS | PROPOSAL_READS | APPROVAL_OPERATIONS
 
 
 def _valid_binding(value: object) -> bool:
@@ -207,8 +207,6 @@ def _parse_operations(value: object) -> frozenset[str]:
         or not OWNER_READS <= operations
         or (operations & PROPOSAL_READS and not PROPOSAL_READS <= operations)
         or (operations & APPROVAL_OPERATIONS and not (PROPOSAL_READS | APPROVAL_OPERATIONS) <= operations)
-        or ("reconcile" in operations and "stop" not in operations)
-        or ("start-managed" in operations and "reconcile" not in operations)
     ):
         raise LocalChannelRefused("inconsistent owner operation declaration")
     return operations

@@ -5,6 +5,7 @@ import copy
 import hmac
 import json
 import os
+import select
 import sys
 import tempfile
 import time
@@ -67,6 +68,8 @@ from creatidy_kernel.adapters.qualified_baseline import (
 )
 from creatidy_kernel.adapters.qualified_readiness import GitHubJiraLiteralReadiness, LiteralReadiness
 from creatidy_kernel.adapters.reference import reference_git
+from creatidy_kernel.adapters.served_host import launch_owner
+from creatidy_kernel.adapters.served_local import LocalOwnerSession
 from creatidy_kernel.adapters.source_cache import source_use
 from creatidy_kernel.adapters.sqlite_store import (
     IdempotencyConflict,
@@ -121,6 +124,7 @@ from creatidy_kernel.ports.ordinary import (
 from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.ownership import WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
+from creatidy_kernel.ports.served import OwnerProjection
 from creatidy_kernel.ports.verification import VerificationProfile, decode_product_review_receipt
 from tools.check_drivers import (
     BASE,
@@ -303,6 +307,44 @@ def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, 
         assert unavailable.recover("decision").proposal == proposal
         with pytest.raises(IntakeRefused, match="driver unavailable"):
             unavailable.check(recovered)
+
+        before = (store.history("qualified"), store.operations())
+        script = """
+import json, sys
+from creatidy_kernel.adapters.served_host import receive_owner_operations
+from creatidy_kernel.adapters.served_local import read_frame, write_frame
+
+channel, operations = receive_owner_operations(int(sys.argv[-1]), expected_scope='qualified',
+    expected_producer='qualified-producer', expected_recipient='test-backend')
+with channel:
+    expected = {'snapshot', 'record', 'events', 'proposal', 'proposal-chunk'}
+    if sys.argv[1] == 'configured':
+        expected |= {'approval-scope', 'approval-scope-chunk', 'approve'}
+    assert operations == expected
+    write_frame(channel, b'{"version":1,"action":"proposal-chunk","offset":0,"proposal_digest":null}', bound=65536)
+    assert json.loads(read_frame(channel, bound=1048576))['result']['digest'] == sys.argv[2]
+"""
+        for name, bound in (("configured", app), ("missing-driver", unavailable)):
+            session = LocalOwnerSession(OwnerProjection(store, "qualified"), bound, recovered, proposal=proposal)
+            launched = launch_owner(
+                session,
+                [sys.executable, "-I", "-c", script, name, proposal.digest],
+                environment={"HOME": str(sqlite_tmp_path), "PATH": os.defpath},
+                scope="qualified",
+                producer="qualified-producer",
+                recipient="test-backend",
+                version=2,
+            )
+            try:
+                assert select.select([launched.channel.fileno()], [], [], 10)[0]
+                launched.serve_once()
+                assert launched.process.wait(timeout=10) == 0
+            finally:
+                launched.close()
+                if launched.process.poll() is None:
+                    launched.process.kill()
+                    launched.process.wait(timeout=10)
+        assert (store.history("qualified"), store.operations()) == before
         app.stop(recovered, "owner revoked")
         with pytest.raises(ValueError):
             app.check(recovered)

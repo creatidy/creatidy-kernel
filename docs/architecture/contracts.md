@@ -191,14 +191,15 @@ for its already-known reads, including `proposal-chunk`.
 
 V2 advertises `snapshot`, `record` and `events`; it adds `proposal` and `proposal-chunk` together for
 a bound proposal. `approval-scope`, `approval-scope-chunk` and `approve` appear together only with
-both proposal reads, the exact producer-recorded proposal, a valid material approval-scope binding and
-a proposal within the bound policy's static limits. Readable unrecorded or out-of-policy proposals do
-not advertise approval. These checks use retained evidence, not provider calls or freshness checks.
-An original bound approval adds `stop`; an exact ownership/handoff binding adds `reconcile` (requires
-`stop`); a managed binding for that approval adds `start-managed` (requires `reconcile`). These are
-launch-time supported operations, not guarantees that a request, revision, target or effect is current
-or admissible. The declaration is not updated in-band. The producer writes operation names sorted;
-their order is not significant to the receiver.
+both proposal reads, the exact producer-recorded proposal, a valid material approval-scope binding,
+a proposal within the bound policy's static limits, and any required qualified work/source bindings
+and readers. Readable unrecorded or out-of-policy proposals, or proposals lacking required bindings,
+do not advertise approval. These checks use retained evidence and host configuration, not provider
+calls or freshness checks. V2 declares only read and approval operations. Lifecycle commands (`stop`,
+`reconcile`, `start-managed`) are not in the declaration; their existing interfaces are unchanged.
+These are launch-time supported operations, not guarantees that a request, revision, target or effect
+is current or admissible. The declaration is not updated in-band. The producer writes operation names
+sorted; their order is not significant to the receiver.
 
 Console must enable its approval flow only after validating v2 and finding both `approval-scope-chunk`
 and `approve`. Otherwise it remains read-only on verified read operations and does not probe scope,

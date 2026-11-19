@@ -735,7 +735,7 @@ class LocalOwnerChannel(LocalReadChannel):
         return self._approval_binding[0]
 
     def supported_operations(self) -> frozenset[str]:
-        """Describe this live channel's launch-time bindings, not command admissibility."""
+        """Advertise the read/approval surface, not lifecycle commands or command admissibility."""
         if self.fileno() < 0:
             raise LocalChannelRefused("owner capability is closed")
         operations = set(OWNER_READS)
@@ -748,12 +748,6 @@ class LocalOwnerChannel(LocalReadChannel):
                 pass  # Proposal reads don't require approval evidence or policy.
             else:
                 operations.update(APPROVAL_OPERATIONS)
-        if self._approved is not None:
-            operations.add("stop")
-        if self._control is not None and self._handoff is not None:
-            operations.add("reconcile")
-            if self._managed is not None and self._managed.client.approved == self._approved:
-                operations.add("start-managed")
         return frozenset(operations)
 
     @property
