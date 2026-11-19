@@ -25,7 +25,8 @@ import pytest
 from composable_fixture import SyntheticCI, SyntheticDocument, SyntheticWork, synthetic_ci_result
 from native_kilo_fixture import review_peer
 from ordinary_flow_fixture import CODEX_PEER
-from test_actions_work_roles import RolePeer
+from test_actions_work_roles import WORKFLOW, RolePeer
+from test_forgejo_roles import NativePeer
 from test_intake import SUBJECT, Scenario, Transport, declaration
 from test_intake import policy as intake_policy
 from test_sqlite_store import sqlite_tmp_path as sqlite_tmp_path
@@ -35,13 +36,15 @@ import creatidy_kernel.adapters.task_execution as task_execution_module
 from creatidy_kernel.adapters.actions_roles import ForgejoActionsCI, GitHubActionsCI
 from creatidy_kernel.adapters.codex_runtime import CodexOwnedSessionWitness
 from creatidy_kernel.adapters.codex_stdio import CodexStdio
-from creatidy_kernel.adapters.driver_http import object_value
+from creatidy_kernel.adapters.driver_http import DriverHTTP, object_value
 from creatidy_kernel.adapters.forge_refs import ForgeBinding
 from creatidy_kernel.adapters.forgejo import ForgejoForge
 from creatidy_kernel.adapters.forgejo_discovery import ForgejoDiscovery
 from creatidy_kernel.adapters.forgejo_drivers import ForgejoCI
+from creatidy_kernel.adapters.github_work import GitHubIssues
 from creatidy_kernel.adapters.intake import GitContentSource
 from creatidy_kernel.adapters.kilo_review import NativeKiloReview
+from creatidy_kernel.adapters.local_context import LocalDocumentKnowledge
 from creatidy_kernel.adapters.local_verification import TrustedLocalVerification
 from creatidy_kernel.adapters.ordinary_managed import OrdinaryManagedRun
 from creatidy_kernel.adapters.ordinary_workspace import OrdinaryGitWorkspace
@@ -50,6 +53,7 @@ from creatidy_kernel.adapters.project_drivers import (
     GitHubSCM,
     JenkinsCI,
     JiraWorkManagement,
+    RepositoryDocumentation,
     TrustedSCMRemote,
     binding_from_mapping,
 )
@@ -103,7 +107,7 @@ from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, WorkClaim
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
 from creatidy_kernel.core.work_budget import BudgetRefused, WorkBudgetPolicy, WorkKind
-from creatidy_kernel.ports.drivers import DriverApplication, DriverDraftGrant, DriverEffectGrant
+from creatidy_kernel.ports.drivers import DriverApplication, DriverDraftGrant, DriverEffectGrant, Knowledge
 from creatidy_kernel.ports.intake import OrdinaryIntake
 from creatidy_kernel.ports.ordinary import (
     DependencyReader,
@@ -786,6 +790,15 @@ def test_qualified_readiness_uses_current_time_without_renewing_evidence(
             assert context_reads[0].fresh_until == 102 and context_reads[2].observed_at == 103
 
 
+_INSTALLED_ACTIONS_COMPOSITIONS = {
+    # Work, SCM, CI and context are independent host selections, not application modes.
+    "forgejo-forgejo-actions-git": ("forgejo", "forgejo", "forgejo", "git"),
+    "forgejo-github-actions-git": ("forgejo", "github", "github", "git"),
+    "github-github-actions-git": ("github", "github", "github", "git"),
+    "github-github-actions-local": ("github", "github", "github", "local"),
+}
+
+
 @pytest.mark.parametrize(
     "mode",
     [
@@ -813,10 +826,16 @@ def test_qualified_readiness_uses_current_time_without_renewing_evidence(
         "export-unknown",
         "actions-github",
         "actions-forgejo",
+        *_INSTALLED_ACTIONS_COMPOSITIONS,
     ],
 )
 def test_qualified_work_dag_owner_approval_and_reopen(
-    services: SyntheticServices, sqlite_tmp_path: Path, tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch
+    services: SyntheticServices,
+    sqlite_tmp_path: Path,
+    tmp_path: Path,
+    mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     clock = Clock()
     now = clock.wall()
@@ -844,6 +863,22 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         monkeypatch.setattr(ordinary_workspace_module, "run_verification_command", command_then_advance)
     project, scm, knowledge, transports = configured(services, clock)
     native_work = project.work
+    reception = _INSTALLED_ACTIONS_COMPOSITIONS.get(mode)
+    work_provider, scm_provider, actions_provider, knowledge_provider = reception or (
+        "jira",
+        "github",
+        mode.removeprefix("actions-"),
+        "confluence",
+    )
+    actions = reception is not None or mode.startswith("actions-")
+    if actions:
+        actions_peer = RolePeer(actions_provider)
+        request.addfinalizer(actions_peer.services.close)
+        if scm_provider == "forgejo":
+            actions_peer.native.scm.clock = clock.wall
+            project = replace(project, scm=actions_peer.native.scm)
+    else:
+        actions_peer = None
     tokens = {
         name: {"read": f"Bearer {name}-fixture-read", "write": f"Bearer {name}-fixture-write"}
         for name in ("jira", "github", "jenkins", "confluence")
@@ -878,7 +913,13 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     validate_local_storage(repository)
     reference_git(repository, "init", "--initial-branch=feature")
     (repository / "result.txt").write_text("broken\n" if mode == "baseline-failed" else "original\n")
-    reference_git(repository, "add", "result.txt")
+    if reception:
+        assert actions_peer is not None
+        workflow = repository / actions_peer.recipe.workflow_path
+        workflow.parent.mkdir(parents=True)
+        workflow.write_bytes(WORKFLOW)
+        (repository / "context.txt").write_text("fixture-owned context\n")
+    reference_git(repository, "add", ".")
     reference_git(repository, "commit", "-m", "Synthetic baseline")
     source_revision = reference_git(repository, "rev-parse", "HEAD").strip()
     repository_url = project.scm.binding.origin + "/" + project.scm.binding.namespace + ".git"
@@ -886,6 +927,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     services.head = source_revision
     active_workspace: list[OrdinaryGitWorkspace] = []
     context_drift = [False]
+    sync_head: list[str | None] = [None]
     admission_fault: list[str | None] = [None]
     output_pages = {19: deepcopy(services.page(19, "Output", "<p>unmodified</p>", "fixture original"))}
     output_pages[19]["id"] = "901"
@@ -954,6 +996,8 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             if status == 200:
                 data = cast(dict[str, object], value)
                 cast(dict[str, object], data["base"])["sha"] = source_revision
+                if sync_head[0] is not None:
+                    cast(dict[str, object], data["head"])["sha"] = sync_head[0]
             return status, value
         if path.startswith(tuple(f"/job/service/job/feature/{item}/api/json" for item in (11, 12, 13, 14))):
             if "/11/" in path and mode == "baseline-unavailable":
@@ -1021,9 +1065,129 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         project = replace(project, work=SyntheticWork(native_work, "https://work.separate.invalid:8443"))
     if mode == "composition-ci-context":
         project = replace(project, ci=SyntheticCI(project.ci))
-    context_driver = SyntheticDocument(knowledge) if mode == "composition-ci-context" else knowledge
-    selected = project.work.work("ENG-42")
-    predecessor = project.work.work("ENG-41")
+    context_driver: Knowledge = SyntheticDocument(knowledge) if mode == "composition-ci-context" else knowledge
+    context_key, context_revision = "900", "19"
+    context_kind = "document" if mode == "composition-ci-context" else "page"
+    if reception:
+        context_key, context_kind = "context.txt", "document"
+        source_binding = ForgeBinding(project.scm.binding.origin, project.scm.binding.namespace)
+        if knowledge_provider == "git":
+            doc_binding = replace(
+                project.scm.binding,
+                family="knowledge",
+                implementation="repository-docs",
+                api_version="git-object-v1",
+                rights="owner:exact-repository-context",
+            )
+            context_driver = RepositoryDocumentation(
+                doc_binding, GitContentSource(repository, source_binding), clock.wall
+            )
+            context_revision = source_revision
+        else:
+            root = sqlite_tmp_path / "documents"
+            root.mkdir()
+            (root / context_key).write_bytes(b"fixture-owned context\n")
+            context_revision = "sha256:" + digest(b"fixture-owned context\n")
+            doc_binding = DriverBinding(
+                "knowledge",
+                "local-documents",
+                "1",
+                "https://local-fixture.invalid",
+                "owner",
+                "documents",
+                "file-snapshot-v1",
+                "owner:exact-local-context",
+            )
+            context_driver = LocalDocumentKnowledge(
+                doc_binding,
+                root,
+                clock.wall,
+                lambda subject, _: subject == DriverSubject(doc_binding, "document", context_key, context_revision),
+            )
+    if work_provider == "forgejo":
+        work_peer = NativePeer()
+        request.addfinalizer(work_peer.services.close)
+        work_peer.clock.now = clock.now
+        work_peer.work.clock = clock.wall
+        work_peer.work.discovery.clock = clock.wall
+
+        def forgejo_work(method: str, path: str, body: object) -> tuple[int, object] | None:
+            resource = urlsplit(path).path.removeprefix("/api/v1/repos/" + work_peer.work.binding.namespace)
+            if resource == "/issues/41":
+                return 200, work_peer.issue(41)
+            if resource in {"/issues/41/dependencies", "/issues/42/dependencies"}:
+                if admission_fault[0] == "incomplete-dependency":
+                    return 403, {}
+                page = parse_qs(urlsplit(path).query)["page"]
+                return 200, [work_peer.issue(41)] if resource.startswith("/issues/42") and page == ["1"] else []
+            return work_peer.route(method, path, body)
+
+        work_peer.services.filter = forgejo_work
+        project = replace(project, work=work_peer.work)
+    elif work_provider == "github":
+        assert actions_peer is not None
+        issues_binding = replace(
+            project.scm.binding,
+            family="work",
+            implementation="github-issues",
+            namespace="fixture/planning",
+            tenant="issue-reader",
+            rights="owner:visible-blocked-by-only",
+        )
+        issues_http = DriverHTTP(
+            issues_binding,
+            "/repos/fixture/planning",
+            read_authorization=lambda: "Bearer issues-fixture-read",
+            headers={"X-GitHub-Api-Version": "2026-03-10", "Accept": "application/vnd.github+json"},
+        )
+        issues_http.opener = services.opener(issues_binding.origin)
+
+        def github_work(method: str, path: str, body: object) -> tuple[int, object] | None:
+            parsed = urlsplit(path)
+            if not parsed.path.startswith(issues_http.prefix + "/issues/"):
+                return open_predecessor(method, path, body)
+            assert method == "GET" and services.requests[-1][3] == "Bearer issues-fixture-read"
+            suffix = parsed.path.removeprefix(issues_http.prefix + "/issues/")
+
+            def issue(number: int) -> dict[str, object]:
+                root = issues_binding.origin + issues_http.prefix
+                return {
+                    **actions_peer.issue(number, issues_binding.namespace),
+                    "repository_url": root,
+                    "url": root + "/issues/" + str(number),
+                }
+
+            if suffix in {"41", "42"}:
+                return 200, issue(int(suffix))
+            if suffix in {"41/dependencies/blocked_by", "42/dependencies/blocked_by"}:
+                if admission_fault[0] == "incomplete-dependency":
+                    return 403, {}
+                return 200, [issue(41)] if suffix.startswith("42/") and parse_qs(parsed.query)["page"] == ["1"] else []
+            return 404, {}
+
+        services.filter = github_work
+        project = replace(project, work=GitHubIssues(issues_http, clock.wall))
+    if scm_provider == "forgejo":
+        assert actions_peer is not None
+
+        def forgejo_source(method: str, path: str, body: object) -> tuple[int, object] | None:
+            resource = urlsplit(path).path.removeprefix("/api/v1" + actions_peer.prefix)
+            if resource == "/branches/feature":
+                return 200, {"name": "feature", "commit": {"id": source_revision}}
+            if resource in {"/pulls", "/pulls/7"}:
+                if admission_fault[0] == "incomplete-inventory":
+                    return 403, {}
+                change = actions_peer.native.change()
+                cast(dict[str, object], change["base"])["sha"] = source_revision
+                cast(dict[str, object], change["head"])["sha"] = source_revision
+                page = parse_qs(urlsplit(path).query).get("page")
+                return 200, change if resource.endswith("/7") else [change] if page == ["1"] else []
+            return actions_peer.native.route(method, path, body)
+
+        actions_peer.services.filter = forgejo_source
+    keys = ("ENG-41", "ENG-42") if work_provider == "jira" else ("41", "42")
+    selected = project.work.work(keys[1])
+    predecessor = project.work.work(keys[0])
     source = project.scm.ref("feature").subject
     decision = "qualified-decision"
 
@@ -1035,19 +1199,19 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             work,
             tuple(sorted((edge.identity, required) for edge in work.dependencies)),
             work.fact.observed_at,
-            obligation=obligation,
+            obligation=None if work.dependencies_complete else obligation,
         )
 
     recipe = "fixture:baseline-has-readable-original:v1"
 
-    actions = mode.startswith("actions-")
-    actions_peer: RolePeer | None = None
     actions_ci: GitHubActionsCI | ForgejoActionsCI | None = None
     actions_key = ""
     actions_fault: list[str | None] = [None]
     executions: dict[str, int] = {}
-    if actions:
-        actions_peer = RolePeer(mode.removeprefix("actions-"))
+    native_times: dict[str, str] = {}
+    published_objects = {source_revision: repository}
+    if actions_peer is not None:
+        source_route = actions_peer.services.filter
         actions_peer.clock.now = clock.now
         actions_peer.recipe = replace(actions_peer.recipe, recipes=(recipe,))
         mapping = TrustedSCMRemote(repository_url, project.scm.binding, "owner:exact-Actions-SCM-mapping")
@@ -1072,13 +1236,27 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         def actions_route(method: str, path: str, body: object) -> tuple[int, object] | None:
             assert actions_peer is not None
             parsed = urlsplit(path)
+            if (
+                scm_provider == "forgejo"
+                and "/actions/" not in path
+                and "/contents" not in path
+                and parsed.path != "/api/v1" + actions_peer.prefix
+            ):
+                assert source_route is not None
+                return source_route(method, path, body)
             if parsed.path.endswith("/actions/runs"):
                 head = parse_qs(parsed.query)["head_sha"][0]
+                if reception and head not in published_objects:
+                    assert active_workspace and active_workspace[0].collected is not None
+                    assert head == active_workspace[0].collected[1].head
+                    published_objects[head] = active_workspace[0].objects
                 actions_peer.head = head
                 actions_peer.run_id = executions.setdefault(head, len(executions) + 11)
                 if actions_fault[0] != "stale":
                     actions_peer.result_stamp = (
-                        "1970-01-01T00:01:35Z" if head == source_revision else "1970-01-01T00:01:40Z"
+                        "1970-01-01T00:01:35Z"
+                        if head == source_revision
+                        else native_times.setdefault(head, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock.now)))
                     )
                 if actions_fault[0] in {"old-receipt", "reused-native-identity"}:
                     assert active_workspace and workspace.collected is not None
@@ -1088,6 +1266,17 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             if actions_fault[0] == "interrupted-read" and "/jobs" in parsed.path:
                 return 503, {"error": "synthetic interrupted native read"}
             result = original_route(method, path, body)
+            if (
+                reception
+                and actions_fault[0] is None
+                and parsed.path.endswith("/contents/" + actions_peer.recipe.workflow_path)
+            ):
+                head = actions_peer.head
+                objects = published_objects[head]
+                exact_source = GitContentSource(
+                    objects, ForgeBinding(project.scm.binding.origin, project.scm.binding.namespace)
+                )
+                assert exact_source.read(head, actions_peer.recipe.workflow_path) == WORKFLOW
             if parsed.path.endswith(actions_peer.prefix) and result is not None:
                 value = cast(dict[str, object], result[1])
                 value["clone_url"] = repository_url
@@ -1144,6 +1333,9 @@ def test_qualified_work_dag_owner_approval_and_reopen(
     )
 
     def inventory() -> DriverScan:
+        if scm_provider == "forgejo":
+            assert actions_peer is not None
+            return actions_peer.native.scm.open_changes()
         facts = native_readiness._inventory()  # pyright: ignore[reportPrivateUsage] - Actual bounded fixture inventory, not fabricated absence.
         return DriverScan(
             facts or (),
@@ -1155,35 +1347,41 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             "synthetic-two-bounded-reads-not-snapshot",
         )
 
+    def work_is_open(work: WorkObservation) -> bool:
+        native = json.loads(work.fact.native)
+        if work_provider == "github":
+            return native["issue"]["state"] == "open"
+        if work_provider == "forgejo":
+            return native["state"] == "open"
+        return native.get("stage") == "active"
+
+    context_subject = DriverSubject(context_driver.binding, context_kind, context_key, context_revision)
     readiness = (
         LiteralReadiness(
             project.work,
-            scm,
+            project.scm,
             repository,
             ((predecessor.fact.subject, (first_criterion,)), (selected.fact.subject, (second_criterion,))),
-            frozenset({"active"}),
-            ((context_driver, "900", "19"),),
+            frozenset({"open" if reception else "active"}),
+            ((context_driver, context_key, context_revision),),
             Principal("owner", "owner"),
             "owner:fixture-complete-repository-visibility",
             clock.wall,
             max_pages=3,
             inventory=inventory,
-            work_is_open=lambda work: json.loads(work.fact.native).get("stage") == "active",
+            work_is_open=work_is_open,
             producer="configured-literal-readiness:fixture-v1",
-            context_subjects=(
-                DriverSubject(
-                    context_driver.binding, "document" if mode == "composition-ci-context" else "page", "900", "19"
-                ),
-            ),
+            context_subjects=(context_subject,),
         )
-        if composable
+        if composable or reception
         else native_readiness
     )
 
     budget = WorkBudgetPolicy(tuple((kind, 20) for kind in WorkKind), 3, 4_000_000)
+    attempt_limit = 3 if reception else 2 if actions else 4
     policy = replace(
         intake_policy(),
-        budget=BudgetPolicy(2 if actions else 4, 1),
+        budget=BudgetPolicy(attempt_limit, 1),
         work_budget=budget,
         project_budget=budget,
         project_id="qualified-project",
@@ -1197,14 +1395,12 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         },
         authority=AuthorityEnvelope(
             "owner",
-            max_attempts=2 if actions else 4,
+            max_attempts=attempt_limit,
             trusted_satisfaction_issuers=frozenset({"verifier"}),
             delegated_actor_ids=frozenset({"worker"}),
         ),
     )
     with ExitStack() as stores:
-        if actions_peer is not None:
-            stores.callback(actions_peer.services.close)
         store = stores.enter_context(SQLiteProgramStore(sqlite_tmp_path / "qualified-dag.db", boot_clock=clock.boot))
         legacy = Scenario()
         if baseline is not None:
@@ -1315,10 +1511,15 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             ):
                 with pytest.raises(ValueError, match="unsupported qualified draft"):
                     QualifiedDraft.parse(encode(invalid))
-        context_subject = DriverSubject.parse(json.loads(first.readiness.proof)["contexts"][0]["subject"])
-        assert context_subject == DriverSubject(
-            context_driver.binding, "document" if mode == "composition-ci-context" else "page", "900", "19"
-        )
+        assert DriverSubject.parse(json.loads(first.readiness.proof)["contexts"][0]["subject"]) == context_subject
+        if reception:
+            assert source.revision == source_revision and source.binding != selected.fact.subject.binding
+            assert second.cut.required == (predecessor.fact.subject,)
+            assert second.cut.assurance == (
+                "native-complete" if work_provider == "forgejo" else "visible-scope-obligation"
+            )
+            assert second.cut.fresh_until <= now + 30
+            assert len(json.loads(second.readiness.proof)["scan_evidence"]) == 2
         if composable:
             before_missing = store.operations()
             current_context = context_driver.content("900", "19")
@@ -1462,10 +1663,25 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 app.check(approved)
             readiness.inventory = original_inventory
             app.check(approved)
-        context_drift[0] = True
-        with pytest.raises(ValueError):
+        if reception:
+            with patch.object(
+                context_driver, "binding", replace(context_driver.binding, rights="owner:changed-context")
+            ):
+                with pytest.raises(IntakeRefused):
+                    app.check(approved)
+            before_refusals = (store.history("qualified-dag"), store.operations())
+            for unavailable in ("incomplete-dependency", "incomplete-inventory"):
+                admission_fault[0] = unavailable
+                with pytest.raises(ValueError):
+                    app.check(approved)
+                assert (store.history("qualified-dag"), store.operations()) == before_refusals
+            admission_fault[0] = None
             app.check(approved)
-        context_drift[0] = False
+        else:
+            context_drift[0] = True
+            with pytest.raises(ValueError):
+                app.check(approved)
+            context_drift[0] = False
         protected = sqlite_tmp_path / "owned"
         protected.mkdir(mode=0o700)
         tree = LocalOwnedWorkspace(protected, "first", create=True)
@@ -1670,10 +1886,17 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         assert handoff_context["approved"]["version"] == 3
         approved_draft = handoff_context["approved"]["qualified_drafts"][0]
         handed_proof = json.loads(bytes.fromhex(approved_draft["readiness"]["proof"]))
-        assert (
-            json.loads(bytes.fromhex(handed_proof["contexts"][0]["native"]))["body"]["storage"]["value"]
-            == "<p>synthetic context</p>"
-        )
+
+        def assert_context(proof: dict[str, object]) -> None:
+            record = cast(list[dict[str, str]], proof["contexts"])[0]
+            native = json.loads(bytes.fromhex(record["native"]))
+            assert DriverSubject.parse(record["subject"]) == context_subject
+            if reception:
+                assert native["sha256"] == digest(b"fixture-owned context\n")
+            else:
+                assert native["body"]["storage"]["value"] == "<p>synthetic context</p>"
+
+        assert_context(handed_proof)
         if mode == "stop":
             app.stop(approved, "owner revoked the qualified Program")
             assert tree.path.exists() and not store.load("qualified-dag").satisfactions
@@ -1741,10 +1964,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             reviewed_proof = json.loads(
                 bytes.fromhex(json.loads(workspace.review_input())["approved"]["readiness"]["proof"])
             )
-            assert (
-                json.loads(bytes.fromhex(reviewed_proof["contexts"][0]["native"]))["body"]["storage"]["value"]
-                == "<p>synthetic context</p>"
-            )
+            assert_context(reviewed_proof)
             control.release(handoff.claim, evidence="owner retains rejected workspace and admits remediation")
             remediation_tree = LocalOwnedWorkspace(protected, "remediation", create=True)
             remediation_workspace = OrdinaryGitWorkspace(
@@ -1790,6 +2010,8 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 remediation_control,
                 remediation_reviewer,
             )
+            if reception:
+                clock.now += 1  # New observation and review, not a reinterpretation of the first success.
             remediation = remediation_client.request(
                 "first-remediation", lease_seconds=10, remediation_of=handoff.attempt.attempt_id
             )
@@ -1813,6 +2035,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                     subject: EvidenceSubject,  # pyright: ignore[reportPrivateUsage]
                 ) -> Evidence | None:
                     assert actions_peer is not None
+                    first_observed_at = clock.now
                     before = (store.history("qualified-dag"), store.operations(), len(calls))
                     for changed_subject in (
                         replace(subject, attempt_digest="foreign-attempt"),
@@ -1866,7 +2089,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                     clock.now += 1
                     result = real_ci_check(checker, name, subject)
                     assert result is not None
-                    assert result.observed_at == now
+                    assert result.observed_at == first_observed_at
                     clock.now += 1
                     assert real_ci_check(checker, name, subject) == result
                     return result
@@ -2035,13 +2258,168 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 store.artifact("runtime:" + remediation.attempt.attempt_id, "qualified-ci:" + ci_reference)
             )
             assert DriverSubject.parse(ci_payload["source"]).revision == candidate_head
+
+            def finish_second() -> None:
+                second_tree = LocalOwnedWorkspace(protected, "second", create=True)
+                second_workspace = OrdinaryGitWorkspace(
+                    store,
+                    second_tree,
+                    repository,
+                    repository_url,
+                    proposal,
+                    (
+                        VerificationCommand(
+                            (
+                                sys.executable,
+                                "-I",
+                                "-c",
+                                "from pathlib import Path; assert Path('result.txt').read_text() == 'second result\\n'",
+                            ),
+                            10,
+                            1,
+                        ),
+                    ),
+                    ("Fixture", "fixture@example.invalid"),
+                    authority_deadline=approved.expires_at,
+                    qualified_ci=project.ci,
+                    qualified_ci_profile=ci_profile if composable or reception else None,
+                )
+                second_worker = WorkOwnership(
+                    store,
+                    Principal("worker", "worker"),
+                    second_tree,
+                    mode=HandoffMode.PULL,
+                    profile=COOPERATIVE_PROFILE,
+                )
+                second_control = WorkOwnership(
+                    store, Principal("owner", "owner"), second_tree, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
+                )
+                second_workspace.control = second_control
+                active_workspace[0] = second_workspace
+                second_reviewer = NativeKiloReview(
+                    store,
+                    origin,
+                    tmp_path,
+                    "product-review",
+                    lambda _: second_workspace.review_input(),
+                    clock.wall,
+                    freshness_seconds=20,
+                    timeout_seconds=10,
+                    authority_deadline=approved.expires_at,
+                )
+                second_client = app.client(
+                    approved,
+                    Principal("worker", "worker"),
+                    second_workspace,
+                    second_worker,
+                    second_control,
+                    second_reviewer,
+                )
+                second_handoff = second_client.request("second-request", lease_seconds=10)
+                assert second_handoff.attempt.work_unit_id == "second"
+                assert (second_tree.path / "result.txt").read_text() == "approved exact result\nedge-case addressed\n"
+                second_client.start(second_handoff)
+                (second_tree.path / "result.txt").write_text("second result\n")
+                second_client.quiesce(second_handoff, "fixture-worker-finished-2")
+                second_control.reconcile(
+                    second_handoff.claim,
+                    second_control.observe(second_handoff.claim),
+                    evidence="owner receives exact fixture bytes",
+                )
+                assert second_client.report(second_handoff) == "accepted"
+                assert len(calls) == 3
+
             if actions:
                 assert workspace.collected is not None
                 assert actions_peer is not None
                 assert executions[workspace.collected[1].head] != executions[candidate_head]
+                if reception:
+                    assert native_times[workspace.collected[1].head] < native_times[candidate_head]
                 assert DriverSubject.parse(ci_payload["subject"]).key == actions_key
-                with pytest.raises(BudgetExceeded, match="attempt admission limit"):
-                    remediation_client.request("beyond-finite-authority", lease_seconds=10)
+                if reception:
+                    original_usage = UsageObservation(
+                        "known-actions",
+                        remediation.attempt.attempt_id,
+                        "fixture-ci-meter",
+                        "money",
+                        "USD",
+                        Decimal("2"),
+                        Provenance.PROVIDER_REPORT,
+                        "fixture-ci-usage",
+                        clock.now,
+                    )
+                    usage_operation = ci_operations[0].operation_id
+                    store.record_usage(usage_operation, original_usage)
+                    store.record_usage(
+                        usage_operation,
+                        replace(
+                            original_usage,
+                            observation_id="corrected-actions",
+                            quantity=Decimal("4"),
+                            supersedes_id="known-actions",
+                        ),
+                    )
+                    store.record_usage(
+                        usage_operation,
+                        replace(
+                            original_usage,
+                            receipt_id="fixture-missing",
+                            observation_id="unknown-actions",
+                            quantity=None,
+                        ),
+                    )
+                    if scm_provider == "github":
+                        mutation = replace(
+                            review_mutation(scm), target=DriverSubject(scm.binding, "change", "7", candidate_head)
+                        )
+
+                        def grant(claim: WorkClaim, requested: DriverMutation) -> DriverEffectGrant:
+                            assert claim == remediation.claim and requested == mutation
+                            return DriverEffectGrant(claim, requested, 1, approved.expires_at, Event())
+
+                        sync = DriverApplication(store, remediation_control, project, (scm,), clock.wall, grant)
+                        with pytest.raises(UnsupportedForge):
+                            sync.synchronize(
+                                remediation.claim, "forbidden", "forbidden", replace(mutation, action="update_change")
+                            )
+                        sync_head[0] = candidate_head  # The synthetic native change already points at accepted B.
+                        try:
+                            receipt = sync.synchronize(remediation.claim, "actions-sync", "actions-sync", mutation)
+                            assert receipt.status is EffectStatus.ACCEPTED
+                            assert (
+                                sync.synchronize(remediation.claim, "actions-sync", "actions-sync", mutation) == receipt
+                            )
+                        finally:
+                            sync_head[0] = None
+                        assert services.reviews[:-1] == before_reviews
+                        assert len(services.reviews) == len(before_reviews) + 1
+                        assert (services.reviews[-1]["commit_id"], services.reviews[-1]["state"]) == (
+                            candidate_head,
+                            "COMMENTED",
+                        )
+                    else:
+                        mutation = DriverMutation(
+                            DriverSubject(project.scm.binding, "change", "7", candidate_head),
+                            "append_review",
+                            (("actor", "fixture-writer"), ("body", "no configured write capability")),
+                            "owner:effect-policy",
+                        )
+                        sync = DriverApplication(
+                            store,
+                            remediation_control,
+                            project,
+                            (),
+                            clock.wall,
+                            lambda claim, requested: pytest.fail("unconfigured role requested write authority"),
+                        )
+                        with pytest.raises(ValueError, match="effect driver not configured"):
+                            sync.synchronize(remediation.claim, "actions-sync", "actions-sync", mutation)
+                    finish_second()
+                    assert store.load("qualified-dag").status.value == "completed"
+                    assert len(executions) == 4  # one baseline plus three independently collected candidates
+                else:
+                    with pytest.raises(BudgetExceeded, match="attempt admission limit"):
+                        remediation_client.request("beyond-finite-authority", lease_seconds=10)
                 history = store.history("qualified-dag")
                 operations = store.operations()
                 store.close()
@@ -2053,10 +2431,15 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 recovered = app.recover(decision)
                 assert recovered.proposal == proposal and recovered.expires_at == approved.expires_at
                 assert store.history("qualified-dag") == history and store.operations() == operations
-                assert len(recovered.program.satisfactions) == 1
-                assert len(recovered.program.attempts) == 2
-                assert recovered.program.attempts[-1].spec.remediation_of == handoff.attempt.attempt_id
-                assert len(calls) == 2
+                assert len(recovered.program.satisfactions) == (2 if reception else 1)
+                assert len(recovered.program.attempts) == (3 if reception else 2)
+                recovered_remediation = next(
+                    item.spec
+                    for item in recovered.program.attempts
+                    if item.spec.attempt_id == remediation.attempt.attempt_id
+                )
+                assert recovered_remediation.remediation_of == handoff.attempt.attempt_id
+                assert len(calls) == (3 if reception else 2)
                 assert ci_payload["attempt"]["attempt_id"] == remediation.attempt.attempt_id
                 assert ci_payload["attempt"]["work_unit_id"] == "first"
                 assert ci_payload["candidate"] == evidence["subject"]
@@ -2067,8 +2450,37 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                     ]
                 )
                 outcome = export_private_outcome(store, "qualified-dag", owner_policy=PRIVATE_METADATA)
+                if reception:
+                    subjects = cast(list[dict[str, object]], outcome["native_subjects"])
+                    assert len(subjects) == 3
+                    assert len(cast(list[object], outcome["satisfactions"])) == 2
+                    original_work, corrected_work, dependent_work = (
+                        cast(dict[str, object], row["work"]) for row in subjects
+                    )
+                    assert original_work == corrected_work and corrected_work != dependent_work
+                    assert (
+                        cast(list[dict[str, object]], subjects[2]["dependencies"])[0]["identity"]
+                        == original_work["identity"]
+                    )
+                    usage = cast(list[dict[str, object]], outcome["usage_history"])
+                    assert {row["quantity"] for row in usage} == {None, "2", "4"}
+                    assert not next(row for row in usage if row["quantity"] == "2")["effective"]
+                    assert next(row for row in usage if row["quantity"] == "4")["effective"]
+                    assert cast(dict[str, object], outcome["coverage"])["complete_cost"] is None
+                    assert len(cast(list[object], outcome["native_effects"])) == (1 if scm_provider == "github" else 0)
                 rendered = json.dumps(outcome)
-                for sensitive in (candidate_head, actions_key, actions_peer.binding.origin, str(repository)):
+                for sensitive in (
+                    candidate_head,
+                    actions_key,
+                    actions_peer.binding.origin,
+                    str(repository),
+                    source_revision,
+                    source.binding.origin,
+                    selected.fact.subject.binding.origin,
+                    context_driver.binding.origin,
+                    "fixture-owned context",
+                    "Bearer issues-fixture-read",
+                ):
                     assert sensitive not in rendered
                 assert store.history("qualified-dag") == history and store.operations() == operations
                 cold = OrdinaryGitWorkspace(
@@ -2229,70 +2641,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             services.head = source_revision
             app.check(approved)
 
-            second_tree = LocalOwnedWorkspace(protected, "second", create=True)
-            second_workspace = OrdinaryGitWorkspace(
-                store,
-                second_tree,
-                repository,
-                repository_url,
-                proposal,
-                (
-                    VerificationCommand(
-                        (
-                            sys.executable,
-                            "-I",
-                            "-c",
-                            "from pathlib import Path; assert Path('result.txt').read_text() == 'second result\\n'",
-                        ),
-                        10,
-                        1,
-                    ),
-                ),
-                ("Fixture", "fixture@example.invalid"),
-                authority_deadline=approved.expires_at,
-                qualified_ci=project.ci,
-                qualified_ci_profile=ci_profile if composable else None,
-            )
-            second_worker = WorkOwnership(
-                store, Principal("worker", "worker"), second_tree, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
-            )
-            second_control = WorkOwnership(
-                store, Principal("owner", "owner"), second_tree, mode=HandoffMode.PULL, profile=COOPERATIVE_PROFILE
-            )
-            second_workspace.control = second_control
-            active_workspace[0] = second_workspace
-            second_reviewer = NativeKiloReview(
-                store,
-                origin,
-                tmp_path,
-                "product-review",
-                lambda _: second_workspace.review_input(),
-                clock.wall,
-                freshness_seconds=20,
-                timeout_seconds=10,
-                authority_deadline=approved.expires_at,
-            )
-            second_client = app.client(
-                approved,
-                Principal("worker", "worker"),
-                second_workspace,
-                second_worker,
-                second_control,
-                second_reviewer,
-            )
-            second_handoff = second_client.request("second-request", lease_seconds=10)
-            assert second_handoff.attempt.work_unit_id == "second"
-            assert (second_tree.path / "result.txt").read_text() == "approved exact result\nedge-case addressed\n"
-            second_client.start(second_handoff)
-            (second_tree.path / "result.txt").write_text("second result\n")
-            second_client.quiesce(second_handoff, "fixture-worker-finished-2")
-            second_control.reconcile(
-                second_handoff.claim,
-                second_control.observe(second_handoff.claim),
-                evidence="owner receives exact fixture bytes",
-            )
-            assert second_client.report(second_handoff) == "accepted"
-            assert len(calls) >= 3
+            finish_second()
         assert store.load("qualified-dag").status.value == "completed"
         assert len(store.load("qualified-dag").satisfactions) == 2
         original_usage = UsageObservation(
