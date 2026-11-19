@@ -813,28 +813,9 @@ class _QualifiedCICheck:
                 }
             )
             runtime = f"runtime:{attempt.attempt_id}"
-            for operation in owner.store.operations("runtime:"):
-                previous = owner.store.find_artifact(operation.operation_id, "qualified-ci-execution")
-                if previous is None:
-                    continue
-                saved = object_from(previous)
-                if operation.operation_id != runtime:
-                    if saved["execution"] == execution:
-                        return None
-                    continue
-                if encode(saved["receipt"]) != encode(value):
-                    return None
-                observed_at, fresh_until = saved["observed_at"], saved["fresh_until"]
-                if (
-                    type(observed_at) is not int
-                    or type(fresh_until) is not int
-                    or not observed_at <= int(time.time()) <= fresh_until
-                ):
-                    return None
-                fact = replace(fact, observed_at=observed_at, fresh_until=fresh_until)
-            owner.store.finalize_artifact(
+            previous = owner.store.attribute_ci_execution(
                 runtime,
-                "qualified-ci-execution",
+                execution,
                 encode(
                     {
                         "execution": execution,
@@ -844,6 +825,19 @@ class _QualifiedCICheck:
                     }
                 ),
             )
+            if previous is None:
+                return None
+            saved = object_from(previous)
+            if encode(saved["receipt"]) != encode(value):
+                return None
+            observed_at, fresh_until = saved["observed_at"], saved["fresh_until"]
+            if (
+                type(observed_at) is not int
+                or type(fresh_until) is not int
+                or not observed_at <= int(time.time()) <= fresh_until
+            ):
+                return None
+            fact = replace(fact, observed_at=observed_at, fresh_until=fresh_until)
         payload = encode(value)
         reference = owner.store.finalize_artifact(
             f"runtime:{attempt.attempt_id}", "qualified-ci:" + digest(payload), payload
