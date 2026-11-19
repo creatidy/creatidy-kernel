@@ -2819,6 +2819,21 @@ class SQLiteProgramStore:
         self._assert_writer_thread()
         return self._work_binding(program_id) is not None
 
+    def supports_work_budget(
+        self, program_id: str, project_id: str, project: WorkBudgetPolicy, task: WorkBudgetPolicy
+    ) -> bool:
+        """Check immutable budget bindings without preparing clocks or accepting work."""
+        self._assert_writer_thread()
+        existing = self._work_binding(program_id)
+        project_record = self._work_record("project", project_id)
+        current = self.find_program(program_id)
+        return (
+            not (project.strict_inference or task.strict_inference)
+            and (existing is None or (existing["project"] == project_id and existing["policy"] == task.payload()))
+            and (project_record is None or project_record["policy"] == project.payload())
+            and (existing is not None or current is None or not current.attempts)
+        )
+
     def pending_work_projection(self, spec: ProgramSpec) -> DeadlineProjection | None:
         """Recover a prepared clock origin, never accepted work/dispatch authority."""
         self._assert_writer_thread()

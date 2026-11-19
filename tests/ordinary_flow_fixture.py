@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from sqlite3 import OperationalError
 from typing import cast
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
@@ -1008,6 +1009,25 @@ print("Done")
                     app.policy = replace(
                         app.policy, project_budget=replace(app.policy.project_budget, strict_inference=True)
                     )
+                if case == "existing-project-budget":
+                    app.approve(proposal, decision_id="existing-project", expires_at=int(time.time()) + 900)
+                    proposal = app.propose(
+                        "new-program",
+                        proposal.objective,
+                        tuple((f"new-{unit}", subject, declaration) for unit, subject, declaration in selections),
+                    )
+                    assert app.policy.project_budget is not None
+                    original_budget = app.policy.project_budget
+                    app.policy = replace(
+                        app.policy,
+                        project_budget=replace(original_budget, retained_bytes=original_budget.retained_bytes + 1),
+                    )
+                if case == "baseline-context":
+                    baseline.contexts = frozenset({"ci/other"})
+                if case == "baseline-scan-bound":
+                    baseline.max_pages = 1
+                if case == "baseline-unobserved":
+                    reader.observer.baseline = ForgejoBaseline(read_http, recipes, frozenset({"ci/baseline"}))
                 if case == "artifact-loss":
                     app.check_proposal_record(proposal)
                     (root / "state.db.artifacts" / proposal.digest).unlink()
@@ -1063,7 +1083,7 @@ print("Done")
                     def write(s, **request):
                         write_frame(s, json.dumps(dict(version=1, **request)).encode(), bound=65536)
 
-                    s, ops = receive_owner_operations(int(sys.argv[-1]), expected_scope='everyday-program',
+                    s, ops = receive_owner_operations(int(sys.argv[-1]), expected_scope=sys.argv[3],
                         expected_producer='fixture-producer', expected_recipient='fixture-backend')
                     with s:
                         expected = {'snapshot', 'events', 'record', 'proposal', 'proposal-chunk'}
@@ -1086,16 +1106,20 @@ print("Done")
                                 receipt = read(s)
                                 assert receipt['status'] == 'approved' and receipt['authority'] == 'historical-only'
                 """)
+                read_failure = {
+                    "artifact-io": PermissionError("synthetic approval read failure"),
+                    "artifact-sqlite": OperationalError("synthetic approval database read failure"),
+                }.get(case)
                 with (
-                    patch.object(store, "find_artifact", side_effect=PermissionError("synthetic approval read failure"))
-                    if case == "artifact-io"
+                    patch.object(store, "find_artifact", side_effect=read_failure)
+                    if read_failure is not None
                     else nullcontext(),
-                    patch.object(reader, "read", side_effect=AssertionError("launch observed provider")),
+                    patch.object(read_http, "request", side_effect=AssertionError("launch observed provider")),
                     patch.object(store, "finalize_artifact", side_effect=AssertionError("launch wrote an artifact")),
                 ):
                     launched = launch_owner(
                         binding,
-                        [sys.executable, "-I", "-c", script, case, json.dumps(request)],
+                        [sys.executable, "-I", "-c", script, case, json.dumps(request), proposal.program_id],
                         environment={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
                         scope=proposal.program_id,
                         producer="fixture-producer",

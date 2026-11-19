@@ -194,7 +194,10 @@ a bound proposal. `approval-scope`, `approval-scope-chunk` and `approve` appear 
 both proposal reads, the exact producer-recorded proposal, a valid material approval-scope binding,
 a proposal within the bound policy's static limits, and local evidence that the configured intake
 and dependency readers cover its subjects, baseline recipe, and any literal criteria. Unsupported
-strict-inference budget profiles do not advertise approval. Any qualified dependency cuts must
+or conflicting stored project/work budgets do not advertise approval. The Forgejo status baseline
+reader verifies scan bounds and context selection against its bounded in-memory observations from
+normal baseline reads; a new reader or an evicted observation cannot prove that an old status
+digest applies and therefore leaves discovery read-only. Any qualified dependency cuts must
 have configured work bindings and agree on a wire-valid decision reference when one is required. This supports
 proposal payload versions 1 and 2. Proposal payload v3 (qualified drafts) remains readable, but its
 baseline and readiness reader ports cannot attest local applicability, so its approval is not

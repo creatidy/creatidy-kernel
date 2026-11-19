@@ -652,6 +652,11 @@ def test_separate_owner_clients_share_host_bound_approval(sqlite_tmp_path: Path)
         "strict-work-budget",
         "strict-project-budget",
         "artifact-io",
+        "artifact-sqlite",
+        "existing-project-budget",
+        "baseline-context",
+        "baseline-scan-bound",
+        "baseline-unobserved",
     ],
 )
 def test_supervisor_advertises_bound_operations_without_probing(sqlite_tmp_path: Path, case: str) -> None:

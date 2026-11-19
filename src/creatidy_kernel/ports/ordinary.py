@@ -46,6 +46,7 @@ from creatidy_kernel.core.ordinary_qualified import (
 )
 from creatidy_kernel.core.ownership import HandoffMode, WorkClaim
 from creatidy_kernel.core.verification import CandidateResult, EvidenceSubject, ProductReviewRequest, VerificationPolicy
+from creatidy_kernel.core.work_budget import WorkBudgetPolicy
 from creatidy_kernel.ports.application import Collection, receive_candidate, remediation_context
 from creatidy_kernel.ports.drivers import SourceManagement, WorkManagement
 from creatidy_kernel.ports.intake import (
@@ -66,6 +67,10 @@ from creatidy_kernel.ports.verification import (
 
 
 class OrdinaryStore(IntakeStore, OwnershipStore, Protocol):
+    def supports_work_budget(
+        self, program_id: str, project_id: str, project: WorkBudgetPolicy, task: WorkBudgetPolicy
+    ) -> bool: ...
+
     def work_budget_status(self, program_id: str) -> dict[str, object]: ...
     def report_revision_guard(self, program_id: str, revision: int) -> AbstractContextManager[None]: ...
     def work_decision_time(self, program_id: str) -> int: ...
@@ -656,11 +661,16 @@ class OrdinaryProgram:
             # These reader ports expose observations, not a local applicability declaration.
             raise IntakeRefused("qualified draft approval support cannot be verified at launch")
         self.approval_scope(proposal)
-        if any(
-            budget is not None and budget.strict_inference
-            for budget in (self.policy.work_budget, self.policy.project_budget)
+        policy = self.policy
+        if (
+            policy.project_id is None
+            or policy.project_budget is None
+            or policy.work_budget is None
+            or not self.store.supports_work_budget(
+                proposal.program_id, policy.project_id, policy.project_budget, policy.work_budget
+            )
         ):
-            raise IntakeRefused("strict inference bounds unavailable for the installed profiles")
+            raise IntakeRefused("work budget cannot bind to the configured Program and project")
         work_bindings = {driver.binding for driver in self.qualified_work}
         if any(cut.subject.binding not in work_bindings for cut in proposal.qualified_cuts):
             raise IntakeRefused("qualified work driver unavailable or changed")
