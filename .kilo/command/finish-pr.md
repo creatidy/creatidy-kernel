@@ -13,12 +13,14 @@ remediation commits/pushes; no additional issue, replacement PR or merge.
 An explicit owner `/loop` may reuse this procedure in its sole primary context;
 selection/merge/closure authority lives only in loop.md, never in `/finish-pr`.
 
-Delivery budget: at most 10 whole-PR review invocations per issue delivery,
+Delivery budget: by default at most 10 whole-PR review invocations per issue delivery,
 INCLUDING the initial review, COMMENT, invalidated reviews and corrected retries.
+Use a higher ceiling only under the [review ceiling rule](../rules/10-task-system.md#review-ceiling).
 Before the first review verify `.task_progress.md` is Git-locally excluded, then
 append a delivery ledger keyed by issue/PR (and `/loop` invocation ID if applicable).
-Before EVERY task dispatch reserve/persist the next review ordinal, frozen SHAs
-and pending result. Record returned verdict, remediation commits and checks.
+Before EVERY reviewer dispatch verify the next ordinal is within the applicable ceiling,
+then reserve/persist it with frozen SHAs and pending result. Record returned verdict,
+remediation commits and checks.
 Reinvoking `/finish-pr`, changing phase, reviewer task, model or session MUST reuse
 the same delivery counter, not initialize zero. If prior dispatch/count recovery
 is ambiguous or unavailable, BLOCKED. Do not erase history or reset a stopped
@@ -35,7 +37,15 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    use a clean authorized worktree when that resolves ordinary checkout contention.
    It is not an owner decision unless resolving it requires an owner-controlled action.
 2. Require the current PR branch to be clean and match MCP HEAD. Freeze exact
-   HEAD, base and merge base; verify canonical CI has successfully run required
+   HEAD, base and merge base before either remediation or review. A clean but
+   ahead local branch is not the canonical PR HEAD; do not patch or push from it.
+   After these checks and ledger reconciliation, if a verified owner restart under
+   the review ceiling rule requires changes not yet made before the next review,
+   resume at step 5 with the retained findings, only if the applicable ceiling has
+   room for a fresh review. Revalidate those findings against the current subject;
+   use them for remediation, not as a current verdict. After remediation, return
+   through step 2 for fresh exact-subject CI and review.
+   Before any review, verify canonical CI has successfully run required
    `make check` and `make package-check` and audit on the exact delivery subject,
    including actual checkout and required step evidence, per validation.md. Missing,
    pending, stale, failed or ambiguous CI is not success. Inspect reviewer permissions. The
@@ -45,16 +55,21 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    current clean branch in this same checkout by default; a separate environment
    requires concrete technical necessity under AGENTS.md. The parent must not edit/switch
    branches while the reviewer is active.
-   A missing native task/agent is a review-infrastructure failure: diagnose it and
-   try an authorized independent read-only reviewer path with the same exact-HEAD
-   contract. Never self-review, lower the contract, or use an unapproved service.
-3. Spawn a fresh foreground native `task` with `subagent_type: pr-reviewer`,
+3. Before either native or alternate reviewer dispatch, verify and record that
+   any owner-imposed pre-review condition is met on the frozen subject. Do not
+   dispatch if this cannot be verified. Check the applicable ceiling and persist
+   the next ordinal before dispatching either path, including retries.
+   Spawn a fresh foreground native `task` with `subagent_type: pr-reviewer`,
    `background: false`, no `task_id`. Supply only PR URL/number, exact expected
    HEAD/base and whole-PR review instructions with this checkout path.
    Do not supply past findings, implementation reasoning or a requested outcome.
    The agent owns the result contract/model. Parse its JSON and require the exact
    frozen SHAs and valid field types/verdict. Consume returned findings directly.
    Recheck local HEAD/clean status; a changed or dirty checkout invalidates review.
+   A missing native task/agent is a review-infrastructure failure: diagnose it and
+   try an authorized independent read-only reviewer path with the same exact-HEAD
+   contract, only through the same pre-dispatch checks and reservation above.
+   Never self-review, lower the contract, or use an unapproved service.
 4. Re-fetch PR metadata and canonical develop. APPROVE with empty findings,
    matching current HEAD/base SHAs, clean checkout, successful required validation
    and still open/unmerged develop target yields READY_TO_MERGE / APPROVE. Never merge.
@@ -72,7 +87,7 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    try the smallest authorized changed-strategy remediation before escalation.
    Otherwise reproduce
    each actionable finding. Before patching check the remaining delivery budget;
-   at 10 return STOP_REVISE without patches that cannot receive a fresh review.
+   at the applicable ceiling return STOP_REVISE without patches that cannot receive a fresh review.
    Remediate all in scope and add regression tests.
    Classify each as direct incomplete remediation or genuinely new semantic/
    architectural defect; record that distinction and the reviewed HEAD/verdict.
@@ -83,7 +98,7 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    Stage only intended files, commit normally and push the SAME PR branch through
    canonical Git. Never amend, squash, force-push or rewrite published history.
    Recheck remote/MCP head and return to step 2 with a NEW reviewer task.
-7. Never dispatch review 11. At the 10-review bound an exact valid APPROVE may
+7. Never dispatch beyond the applicable review ceiling. At that bound an exact valid APPROVE may
    yield READY_TO_MERGE; genuine decisions yield OWNER_DECISION_NEEDED. An external
    dependency or exhausted authorized infrastructure alternatives yields BLOCKED,
    and remaining actionable findings yield STOP_REVISE;
@@ -93,9 +108,10 @@ delivery; STOP_REVISE still requires an explicit owner decision, not a new PR/na
    not a target: stop as soon as an owner decision is clearly required.
 8. COMMENT: distinguish stale/incomplete/tool failure from evidence-backed judgment
    uncertainty and findings. Do not treat first-path failure as terminal. Attempt a
-   bounded remediation with a changed relevant condition and reserve the next ordinal
-   before dispatch. Do not repeat the same failed inputs/environment. If no authorized
-   route can establish the verdict, return BLOCKED with exact missing capability and
+   bounded remediation with a changed relevant condition only when a fresh review is
+   within the applicable ceiling, and reserve the next ordinal before dispatch.
+   Do not repeat the same failed inputs/environment. If no authorized route can
+   establish the verdict, return BLOCKED with exact missing capability and
    remediation paths already attempted; if evidence exists but material judgment
    cannot be resolved within accepted criteria, return OWNER_DECISION_NEEDED.
 

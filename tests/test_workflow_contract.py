@@ -500,13 +500,14 @@ class WorkflowContractTests(unittest.TestCase):
     def test_delivery_counter_survives_reentry(self) -> None:
         finish = text(".kilo/command/finish-pr.md")
         for requirement in (
-            "at most 10 whole-PR review invocations per issue delivery",
+            "by default at most 10 whole-PR review invocations per issue delivery",
             "INCLUDING the initial review, COMMENT, invalidated reviews and corrected retries",
-            "Before EVERY task dispatch reserve/persist the next review ordinal",
+            "Before EVERY reviewer dispatch verify the next ordinal is within the applicable ceiling, "
+            "then reserve/persist it",
             "Reinvoking `/finish-pr`, changing phase, reviewer task, model or session "
             "MUST reuse the same delivery counter",
             "prior dispatch/count recovery is ambiguous or unavailable, BLOCKED",
-            "Never dispatch review 11",
+            "Never dispatch beyond the applicable review ceiling",
             "without patches that cannot receive a fresh review",
             "not a target: stop as soon as an owner decision is clearly required",
         ):
@@ -520,6 +521,54 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("canonical evidence, never from the ledger", progress)
         self.assertIn("consumed review ordinal", progress)
         self.assertIn("why it is not engineering", progress)
+
+    def test_review_ceiling_exception_is_bounded_and_issue_specific(self) -> None:
+        rule = text(".kilo/rules/10-task-system.md").split("## Review Ceiling", 1)[1]
+        for requirement in (
+            "default maximum is 10 whole-PR review invocations per issue delivery",
+            "verified explicit owner authorization for the exact canonical issue and its existing PR",
+            "finite increased maximum in total attempts, the reason and explicit permission to resume",
+            "current controlling higher-priority execution instructions",
+            "same excluded delivery ledger and reconcile the consumed ordinals before use",
+            "Preserve all prior ordinals, findings and delivery history",
+            "Never reset the counter, waive review criteria or security requirements, "
+            "or use an exception as merge authority",
+            "[Kernel #149]",
+            "[PR #150]",
+            "Maximum **12 total attempts**, not 12 more",
+            "with [reviews 1-10 preserved]",
+        ):
+            self.assertIn(requirement, rule)
+        for path in ("AGENTS.md", ".kilo/command/finish-pr.md", ".kilo/command/loop.md"):
+            self.assertIn("10-task-system.md#review-ceiling)", text(path))
+        finish = text(".kilo/command/finish-pr.md")
+        reentry = finish.split("2. Require the current PR branch to be clean and match MCP HEAD.", 1)[1]
+        prior_to_remediation, after = reentry.split("resume at step 5 with the retained findings", 1)
+        self.assertIn(
+            "ahead local branch is not the canonical PR HEAD; do not patch or push from it", prior_to_remediation
+        )
+        self.assertIn("After these checks and ledger reconciliation", prior_to_remediation)
+        self.assertIn("only if the applicable ceiling has room for a fresh review", after)
+        self.assertIn("return through step 2 for fresh exact-subject CI and review", after)
+        dispatch_gate = after.split("Spawn a fresh foreground", 1)[0]
+        self.assertIn("Before either native or alternate reviewer dispatch", dispatch_gate)
+        self.assertIn("any owner-imposed pre-review condition is met on the frozen subject", dispatch_gate)
+        self.assertIn("persist the next ordinal before dispatching either path", dispatch_gate)
+        self.assertNotIn("try an authorized independent read-only reviewer path", dispatch_gate)
+        self.assertIn("only through the same pre-dispatch checks and reservation above", after)
+        loop = text(".kilo/command/loop.md")
+        self.assertIn("verify a matching owner exception with remaining attempts", loop)
+        self.assertIn("No dispatch beyond the applicable ceiling or unreviewable further patches", loop)
+        standalone = text(".kilo/command/review-pr.md").split("Invoke `task`", 1)[0]
+        for requirement in (
+            "10-task-system.md#review-ceiling)",
+            "All reviewer dispatches, including alternate paths and retries, use the gate below",
+            "Reconcile the existing issue/PR review history",
+            "next ordinal is within the applicable ceiling",
+            "pre-review condition on the frozen subject",
+            "reserve the next ordinal there with frozen SHAs and a pending result before dispatch",
+        ):
+            self.assertIn(requirement, standalone)
 
     def test_exact_approval_and_loop_only_pr_merge(self) -> None:
         finish = text(".kilo/command/finish-pr.md")

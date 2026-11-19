@@ -79,8 +79,10 @@ records (not PRs). Apply these steps in order:
    PR/source/test or producer-contract evidence. Do not invent dependencies from
    similar prose.
    Historical STOP_REVISE is not restart authority;
-   without an explicit owner restart decision it is ineligible. An open unrelated PR
-   never supplies such a decision.
+   without an explicit owner restart decision it is ineligible. If the ceiling was
+   exhausted, also verify a matching owner exception with remaining attempts under
+   the [review ceiling rule](../rules/10-task-system.md#review-ceiling). An open unrelated
+   PR never supplies such a decision.
 3. Walk each explicit dependency chain backward from the candidate, recursively
    restricting partial deliveries to prerequisites verified as applicable to their scope,
    refreshing every edge and producer/contract observation, until reaching the
@@ -233,8 +235,9 @@ uses a fresh foreground `task`, `subagent_type: pr-reviewer`, no `task_id`; neve
 self-approve or resume a reviewer. Parent makes no edits/branch switches while it
 runs. Do not feed past findings, reasoning or desired verdict to the reviewer.
 
-Maximum 10 whole-PR review invocations per issue delivery, INCLUDING the initial
-review, COMMENT, invalidated reviews and corrected retries. Reserve/persist each
+Default maximum: 10 whole-PR review invocations per issue delivery, INCLUDING the initial
+review, COMMENT, invalidated reviews and corrected retries. Use a higher ceiling only under
+the [review ceiling rule](../rules/10-task-system.md#review-ceiling). Reserve/persist each
 ordinal BEFORE dispatch in the shared delivery ledger; `/finish-pr` reentry,
 internal phases, new tasks and model/session changes cannot reset it. This is a
 safety ceiling, not a target; stop immediately for a genuine material decision.
@@ -255,11 +258,12 @@ before another attempt. Do not repeat an identical failed review. Reviewer failu
 not an implementation finding; do not substitute implementer research for independent
 review of public pinned sources. Reviewer disagreement with evidence is not an
 infrastructure failure. READY_TO_MERGE is internal, not loop termination.
-At review 10, exact valid APPROVE may advance to MERGE; a genuine owner decision
-terminates STOP_AND_ASK, an exhausted technical path or external dependency without
-workaround terminates BLOCKED, and remaining actionable defects terminate STOP_REVISE.
-No review 11 or unreviewable further patches. Never stop just because the first
-review environment is inconvenient.
+At the applicable ceiling, exact valid APPROVE may advance to MERGE under the unchanged
+merge gates. A genuine owner decision terminates STOP_AND_ASK, an exhausted technical path
+or external dependency without a workaround terminates BLOCKED, and remaining actionable
+defects terminate STOP_REVISE.
+No dispatch beyond the applicable ceiling or unreviewable further patches. Never stop
+just because the first review environment is inconvenient.
 
 ## MERGE
 
