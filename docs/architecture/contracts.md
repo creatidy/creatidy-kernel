@@ -189,13 +189,16 @@ An invalid greeting closes the descriptor; it is not treated as legacy. A valid 
 discovery request or try another frame. An otherwise valid legacy proposal connection remains usable
 for its already-known reads, including `proposal-chunk`.
 
-V2 advertises `snapshot`, `record` and `events`; it adds `proposal` and `proposal-chunk` together for
+Descriptor v2 advertises `snapshot`, `record` and `events`; it adds `proposal` and `proposal-chunk` together for
 a bound proposal. `approval-scope`, `approval-scope-chunk` and `approve` appear together only with
 both proposal reads, the exact producer-recorded proposal, a valid material approval-scope binding,
-a proposal within the bound policy's static limits, and any required qualified work/source bindings
-and readers. Readable unrecorded or out-of-policy proposals, or proposals lacking required bindings,
-do not advertise approval. These checks use retained evidence and host configuration, not provider
-calls or freshness checks. V2 declares only read and approval operations. Lifecycle commands (`stop`,
+a proposal within the bound policy's static limits, and the configured work bindings for any
+qualified dependency cuts. This supports proposal payload versions 1 and 2. Proposal payload v3
+(qualified drafts) remains readable, but its baseline and readiness reader ports cannot attest local
+applicability, so its approval is not advertised. This does not disable the existing approval handlers.
+Read-only discovery is also the result for unrecorded or out-of-policy proposals or missing required
+bindings. These checks use retained evidence and host configuration, not provider calls or freshness
+checks. Descriptor v2 declares only read and approval operations. Lifecycle commands (`stop`,
 `reconcile`, `start-managed`) are not in the declaration; their existing interfaces are unchanged.
 These are launch-time supported operations, not guarantees that a request, revision, target or effect
 is current or admissible. The declaration is not updated in-band. The producer writes operation names

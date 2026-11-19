@@ -104,6 +104,7 @@ from creatidy_kernel.core.drivers import (
 from creatidy_kernel.core.execution import OperationKey
 from creatidy_kernel.core.forge import EffectStatus, Presence, UnsupportedForge
 from creatidy_kernel.core.intake import ContentCriterion, Declaration, IntakeRefused, digest, encode
+from creatidy_kernel.core.ordinary import OrdinaryProposal
 from creatidy_kernel.core.ordinary_qualified import (
     QualifiedDependencyCut,
     QualifiedDraft,
@@ -193,6 +194,48 @@ def test_requested_unsupported_strict_profile_refuses_before_recording(sqlite_tm
                     execution_profile=encode(profile),
                 )
         assert not store.operations() and store.find_program("strict-refusal") is None
+
+
+def _assert_supervised_proposal_support(
+    store: SQLiteProgramStore, app: OrdinaryProgram, proposal: OrdinaryProposal, root: Path, *, approval: bool
+) -> None:
+    scope = proposal.program_id
+    before = (store.history(scope), store.operations())
+    script = """
+import json, sys
+from creatidy_kernel.adapters.served_host import receive_owner_operations
+from creatidy_kernel.adapters.served_local import read_frame, write_frame
+
+channel, operations = receive_owner_operations(int(sys.argv[-1]), expected_scope=sys.argv[1],
+    expected_producer='qualified-producer', expected_recipient='test-backend')
+with channel:
+    expected = {'snapshot', 'record', 'events', 'proposal', 'proposal-chunk'}
+    if sys.argv[2] == 'True':
+        expected |= {'approval-scope', 'approval-scope-chunk', 'approve'}
+    assert operations == expected
+    write_frame(channel, b'{"version":1,"action":"proposal-chunk","offset":0,"proposal_digest":null}', bound=65536)
+    assert json.loads(read_frame(channel, bound=1048576))['result']['digest'] == sys.argv[3]
+"""
+    session = LocalOwnerSession(OwnerProjection(store, scope), app, None, proposal=proposal)
+    launched = launch_owner(
+        session,
+        [sys.executable, "-I", "-c", script, scope, str(approval), proposal.digest],
+        environment={"HOME": str(root), "PATH": os.defpath},
+        scope=scope,
+        producer="qualified-producer",
+        recipient="test-backend",
+        version=2,
+    )
+    try:
+        assert select.select([launched.channel.fileno()], [], [], 10)[0]
+        launched.serve_once()
+        assert launched.process.wait(timeout=10) == 0
+    finally:
+        launched.close()
+        if launched.process.poll() is None:
+            launched.process.kill()
+            launched.process.wait(timeout=10)
+    assert (store.history(scope), store.operations()) == before
 
 
 def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, sqlite_tmp_path: Path) -> None:
@@ -308,43 +351,8 @@ def test_qualified_cut_owner_approval_and_recovery(services: SyntheticServices, 
         with pytest.raises(IntakeRefused, match="driver unavailable"):
             unavailable.check(recovered)
 
-        before = (store.history("qualified"), store.operations())
-        script = """
-import json, sys
-from creatidy_kernel.adapters.served_host import receive_owner_operations
-from creatidy_kernel.adapters.served_local import read_frame, write_frame
-
-channel, operations = receive_owner_operations(int(sys.argv[-1]), expected_scope='qualified',
-    expected_producer='qualified-producer', expected_recipient='test-backend')
-with channel:
-    expected = {'snapshot', 'record', 'events', 'proposal', 'proposal-chunk'}
-    if sys.argv[1] == 'configured':
-        expected |= {'approval-scope', 'approval-scope-chunk', 'approve'}
-    assert operations == expected
-    write_frame(channel, b'{"version":1,"action":"proposal-chunk","offset":0,"proposal_digest":null}', bound=65536)
-    assert json.loads(read_frame(channel, bound=1048576))['result']['digest'] == sys.argv[2]
-"""
-        for name, bound in (("configured", app), ("missing-driver", unavailable)):
-            session = LocalOwnerSession(OwnerProjection(store, "qualified"), bound, recovered, proposal=proposal)
-            launched = launch_owner(
-                session,
-                [sys.executable, "-I", "-c", script, name, proposal.digest],
-                environment={"HOME": str(sqlite_tmp_path), "PATH": os.defpath},
-                scope="qualified",
-                producer="qualified-producer",
-                recipient="test-backend",
-                version=2,
-            )
-            try:
-                assert select.select([launched.channel.fileno()], [], [], 10)[0]
-                launched.serve_once()
-                assert launched.process.wait(timeout=10) == 0
-            finally:
-                launched.close()
-                if launched.process.poll() is None:
-                    launched.process.kill()
-                    launched.process.wait(timeout=10)
-        assert (store.history("qualified"), store.operations()) == before
+        _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=True)
+        _assert_supervised_proposal_support(store, unavailable, proposal, sqlite_tmp_path, approval=False)
         app.stop(recovered, "owner revoked")
         with pytest.raises(ValueError):
             app.check(recovered)
@@ -868,6 +876,7 @@ _INSTALLED_ACTIONS_COMPOSITIONS = {
         "sync-reopen",
         "sync-ambiguous-reopen",
         "export-unknown",
+        "served-operations-v3",
         "actions-github",
         "actions-forgejo",
         *_INSTALLED_ACTIONS_COMPOSITIONS,
@@ -1718,6 +1727,15 @@ def test_qualified_work_dag_owner_approval_and_reopen(
         )
         approved = app.recover(decision)
         assert approved.proposal == proposal
+        if mode == "served-operations-v3":
+            before_requests = tuple(services.requests)
+            _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
+            app.verification = VerificationPolicy(policy.reference, ("paths", "structural", "commands"))
+            with pytest.raises(IntakeRefused, match="qualified CI check and exact build selection"):
+                app._spec(proposal, None)  # pyright: ignore[reportPrivateUsage]
+            _assert_supervised_proposal_support(store, app, proposal, sqlite_tmp_path, approval=False)
+            assert tuple(services.requests) == before_requests
+            return
         assert app._qualified_baseline_age(replace(first.baseline, observed_at=100)) == 90  # pyright: ignore[reportPrivateUsage]
         assert (
             OrdinaryIntake(store, later_legacy.reader, clock.wall).baseline_age(
