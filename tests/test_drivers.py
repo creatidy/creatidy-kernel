@@ -2,6 +2,7 @@
 """Provider-shaped transport and shared application conformance, no live accounts."""
 
 import copy
+import hmac
 import json
 import os
 import sys
@@ -898,6 +899,10 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             project = replace(project, scm=source_peer.scm)
             forgejo_reader(actions_peer.native, "actions")
             actions_peer.binding = replace(actions_peer.binding, tenant="fixture-actions-reader")
+        elif reception:
+            actions_peer.binding = replace(actions_peer.binding, tenant="fixture-actions-reader")
+            actions_peer.http.binding = actions_peer.binding
+            actions_peer.http.read_authorization = lambda: "Bearer fixture-github-actions-read"
     else:
         actions_peer = None
     tokens = {
@@ -1265,6 +1270,12 @@ def test_qualified_work_dag_owner_approval_and_reopen(
             if (
                 scm_provider == "forgejo"
                 and actions_peer.services.requests[-1][3] != "token fixture-forgejo-actions-read"
+            ):
+                return 403, {}
+            if (
+                reception
+                and actions_provider == "github"
+                and actions_peer.services.requests[-1][3] != "Bearer fixture-github-actions-read"
             ):
                 return 403, {}
             if parsed.path.endswith("/actions/runs"):
@@ -1692,6 +1703,19 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 with pytest.raises(IntakeRefused):
                     app.check(approved)
             before_refusals = (store.history("qualified-dag"), store.operations())
+            if actions_provider == "github":
+                assert actions_peer is not None
+                assert len({project.work.binding.tenant, project.scm.binding.tenant, project.ci.binding.tenant}) == 3
+                for reader in (None, lambda: tokens["github"]["read"]):
+                    with patch.object(actions_peer.http, "read_authorization", reader), pytest.raises(ValueError):
+                        app.check(approved)
+                    assert (store.history("qualified-dag"), store.operations()) == before_refusals
+                    assert (services.reviews, services.pages, services.draft) == (
+                        before_reviews,
+                        before_pages,
+                        before_draft,
+                    )
+                    assert all(item[0] == "GET" for item in actions_peer.services.requests)
             if source_peer is not None:
                 assert len({project.work.binding.tenant, project.scm.binding.tenant, project.ci.binding.tenant}) == 3
             for token, transport in forgejo_credentials.items():
@@ -2368,6 +2392,8 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                 if reception:
                     assert native_times[workspace.collected[1].head] < native_times[candidate_head]
                 assert DriverSubject.parse(ci_payload["subject"]).key == actions_key
+                synced_effect = None
+                usage_operation = ci_operations[0].operation_id
                 if reception:
                     original_usage = UsageObservation(
                         "known-actions",
@@ -2380,7 +2406,6 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                         "fixture-ci-usage",
                         clock.now,
                     )
-                    usage_operation = ci_operations[0].operation_id
                     store.record_usage(usage_operation, original_usage)
                     store.record_usage(
                         usage_operation,
@@ -2417,6 +2442,9 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                         sync_head[0] = candidate_head  # The synthetic native change already points at accepted B.
                         try:
                             receipt = sync.synchronize(remediation.claim, "actions-sync", "actions-sync", mutation)
+                            synced_effect = next(
+                                item for item in store.operations() if item.accepted_reference == receipt.reference
+                            )
                             assert receipt.status is EffectStatus.ACCEPTED
                             assert (
                                 sync.synchronize(remediation.claim, "actions-sync", "actions-sync", mutation) == receipt
@@ -2481,11 +2509,58 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                         "execution"
                     ]
                 )
-                outcome = export_private_outcome(store, "qualified-dag", owner_policy=PRIVATE_METADATA)
+                export_key = b"k" * 32
+                outcome = export_private_outcome(
+                    store, "qualified-dag", owner_policy=PRIVATE_METADATA, pseudonym_key=export_key
+                )
                 if reception:
+
+                    def exported_ref(kind: str, identifier: str) -> str:
+                        encoded = json.dumps([kind, identifier], separators=(",", ":")).encode()
+                        return "hmac-sha256:" + hmac.digest(export_key, encoded, "sha256").hex()
+
                     subjects = cast(list[dict[str, object]], outcome["native_subjects"])
-                    assert len(subjects) == 3
-                    assert len(cast(list[object], outcome["satisfactions"])) == 2
+                    attempts = cast(list[dict[str, object]], outcome["attempts"])
+                    satisfactions = cast(list[dict[str, object]], outcome["satisfactions"])
+                    assert len(subjects) == len(attempts) == 3 and len(satisfactions) == 2
+                    assert {row["attempt"] for row in subjects} == {row["id"] for row in attempts}
+                    rejected_id = exported_ref("attempt", handoff.attempt.attempt_id)
+                    corrected_id = exported_ref("attempt", remediation.attempt.attempt_id)
+                    dependent_id = exported_ref("attempt", recovered.program.attempts[-1].spec.attempt_id)
+                    reviews = {row["attempt"]: row for row in cast(list[dict[str, object]], outcome["reviews"])}
+                    assert set(reviews) == {rejected_id, corrected_id, dependent_id}
+                    assert reviews[rejected_id]["verdict"] == "request_changes"
+                    assert all(reviews[item]["verdict"] == "approve" for item in (corrected_id, dependent_id))
+                    corrected_attempt = next(row for row in attempts if row["id"] == corrected_id)
+                    assert corrected_attempt["remediation_of"] == rejected_id
+                    findings = cast(list[dict[str, object]], outcome["findings"])
+                    expected_findings = {
+                        (row["id"], row["fingerprint"])
+                        for row in findings
+                        if row["attempt"] == rejected_id
+                        and row.get("review_operation") == reviews[rejected_id]["operation"]
+                    }
+                    assert expected_findings
+
+                    def finding_refs(links: object) -> set[tuple[object, object]]:
+                        return {(row["id"], row["fingerprint"]) for row in cast(list[dict[str, object]], links)}
+
+                    assert finding_refs(reviews[rejected_id]["findings"]) == expected_findings
+                    assert (
+                        expected_findings
+                        <= finding_refs(corrected_attempt["remediation_findings"])
+                        == {(row["id"], row["fingerprint"]) for row in findings if row["attempt"] == rejected_id}
+                    )
+                    assert {row["attempt"] for row in satisfactions} == {corrected_id, dependent_id}
+                    assert {(row["id"], row["attempt"], row["work_unit"]) for row in satisfactions} == {
+                        (
+                            exported_ref("satisfaction", row.reference_id),
+                            exported_ref("attempt", row.source_attempt_id),
+                            exported_ref("work-unit", row.work_unit_id),
+                        )
+                        for row in recovered.program.satisfactions
+                        if row.source_attempt_id is not None
+                    }
                     original_work, corrected_work, dependent_work = (
                         cast(dict[str, object], row["work"]) for row in subjects
                     )
@@ -2496,10 +2571,42 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                     )
                     usage = cast(list[dict[str, object]], outcome["usage_history"])
                     assert {row["quantity"] for row in usage} == {None, "2", "4"}
-                    assert not next(row for row in usage if row["quantity"] == "2")["effective"]
-                    assert next(row for row in usage if row["quantity"] == "4")["effective"]
+                    assert all(
+                        row["attempt"] == corrected_id
+                        and row["operation"] == exported_ref("operation", usage_operation)
+                        for row in usage
+                    )
+                    old = next(row for row in usage if row["quantity"] == "2")
+                    correction = next(row for row in usage if row["quantity"] == "4")
+                    assert (
+                        correction["supersedes"] == old["observation"]
+                        and not old["effective"]
+                        and correction["effective"]
+                    )
                     assert cast(dict[str, object], outcome["coverage"])["complete_cost"] is None
-                    assert len(cast(list[object], outcome["native_effects"])) == (1 if scm_provider == "github" else 0)
+                    effects = cast(list[dict[str, object]], outcome["native_effects"])
+                    if scm_provider == "github":
+                        assert synced_effect is not None
+                        (effect,) = effects
+                        assert effect["operation"] == exported_ref("operation", synced_effect.operation_id)
+                        assert effect["attempt"] == corrected_id
+                        assert effect["satisfaction"] == next(
+                            row["id"] for row in satisfactions if row["attempt"] == corrected_id
+                        )
+                        assert effect["status"] == "accepted" and effect["receipt_recorded"]
+                        linked = next(
+                            row
+                            for row in cast(list[dict[str, object]], outcome["effects"])
+                            if row["operation"] == effect["operation"]
+                        )
+                        assert linked["dispatch_count"] == 1 and not linked["reconciliations"]
+                        assert synced_effect.accepted_reference is not None
+                        receipt_ref = exported_ref("effect-receipt", synced_effect.accepted_reference)
+                        assert linked["receipt"] == receipt_ref
+                        (observation,) = cast(list[dict[str, object]], linked["observations"])
+                        assert (observation["kind"], observation["reference"]) == ("accepted", receipt_ref)
+                    else:
+                        assert not effects
                 rendered = json.dumps(outcome)
                 for sensitive in (
                     candidate_head,
@@ -2513,6 +2620,7 @@ def test_qualified_work_dag_owner_approval_and_reopen(
                     "fixture-owned context",
                     "issues-fixture-read",
                     "synthetic-role-read",
+                    "fixture-github-actions-read",
                     *forgejo_credentials,
                     *[token for pair in tokens.values() for token in pair.values()],
                     *published_objects,
