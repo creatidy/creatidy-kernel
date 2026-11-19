@@ -288,6 +288,22 @@ def role_peer(request: pytest.FixtureRequest) -> Iterator[RolePeer]:
 
 
 @pytest.mark.parametrize("role_peer", ["github", "forgejo"], indirect=True)
+def test_native_execution_identity_excludes_access_metadata(role_peer: RolePeer) -> None:
+    ci = role_peer.ci()
+    source = DriverSubject(role_peer.source, "commit", HEAD, HEAD)
+    fact = ci.build(ci.key, source)
+    profile = ci.profile()
+    assert profile.execution_identity is not None
+    identity = profile.execution_identity(fact)
+    subject = fact.subject
+    alternate = replace(subject, binding=replace(subject.binding, tenant="other-tenant", rights="other-rights"))
+    assert profile.execution_identity(replace(fact, subject=alternate)) == identity
+    role_peer.run_id = 12
+    distinct = ci.build(ci.key, source)
+    assert profile.execution_identity(distinct) != identity
+
+
+@pytest.mark.parametrize("role_peer", ["github", "forgejo"], indirect=True)
 @pytest.mark.parametrize(
     "mode",
     [

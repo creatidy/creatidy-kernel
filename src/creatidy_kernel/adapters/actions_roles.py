@@ -268,7 +268,15 @@ def _execution_identity(fact: DriverFact) -> bytes:
                 key=lambda item: int(str(item[0])),
             ),
         }
-    return encode({"binding": asdict(fact.subject.binding), "execution": identity})
+    binding = fact.subject.binding
+    return encode(
+        {
+            "provider": binding.implementation,
+            "origin": binding.origin,
+            "repository": binding.namespace,
+            "execution": identity,
+        }
+    )
 
 
 class GitHubActionsCI:
