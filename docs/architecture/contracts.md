@@ -294,8 +294,8 @@ configuration for that same pairing. Then send this wire-version-1 object (examp
   "action": "approval-disposition",
   "producer": "fixture-producer",
   "recipient": "fixture-backend",
-  "scope": "everyday-program",
-  "actor": "owner",
+  "program_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+  "actor_digest": "4444444444444444444444444444444444444444444444444444444444444444",
   "original": {
     "version": 1,
     "action": "approve",
@@ -312,7 +312,12 @@ configuration for that same pairing. Then send this wire-version-1 object (examp
 Field sets are exact. The original request is the digest-bound version-1 `approve`; no other command
 or pre-scope legacy approval is supported by this lookup. IDs are nonblank strings of at most 256
 characters; digests are 64 lowercase hex characters. Revision is an integer at least `-1`; expiry is
-a positive integer epoch-second upper bound. The binding fields assert equality, not authority selection.
+a positive integer epoch-second upper bound. `program_digest` and `actor_digest` are SHA-256 of the
+respective exact Program ID and owner actor ID, each encoded as a canonical JSON string (quoted,
+ASCII-escaped, and with no surrounding whitespace, as in Kernel's `core.intake.encode`). They keep
+the binding assertions fixed-size even for long IDs. The example uses placeholder digests. The
+producer uses its full host-bound IDs for the journal lookup; these fields assert equality, not
+authority selection.
 Within the existing 64 KiB request and 1 MiB response frames the producer reads one exact operation
 key, then at most its receipt and corresponding durable approval record. It does not sample a snapshot,
 invoke approval, load current policy, or reconstruct a missing historical receipt.

@@ -1047,11 +1047,12 @@ class LocalOwnerChannel(LocalReadChannel):
         application = self._command_application
         if (
             binding is None
-            or set(request) != {"version", "action", "producer", "recipient", "scope", "actor", "original"}
+            or set(request)
+            != {"version", "action", "producer", "recipient", "program_digest", "actor_digest", "original"}
             or (request["producer"], request["recipient"]) != binding
-            or request["scope"] != self._owner.scope
+            or request["program_digest"] != digest(encode(self._owner.scope))
             or actor is None
-            or request["actor"] != actor.actor_id
+            or request["actor_digest"] != digest(encode(actor.actor_id))
             or (
                 application is not None
                 and (application.owner != actor or not self._owner.uses_store(application.store))

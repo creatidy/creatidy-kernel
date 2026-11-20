@@ -307,8 +307,8 @@ def _approval_disposition_request(original: object) -> dict[str, object]:
         "action": "approval-disposition",
         "producer": "fixture-producer",
         "recipient": "fixture-backend",
-        "scope": "everyday-program",
-        "actor": "owner",
+        "program_digest": digest(encode("everyday-program")),
+        "actor_digest": digest(encode("owner")),
         "original": original,
     }
 
@@ -1298,8 +1298,8 @@ print("Done")
                         assert finish(recovered, path) == {"version": 1, "status": "unknown", "receipt": None}
                     for invalid in (
                         {**lookup_request, "version": 2},
-                        {**lookup_request, "actor": "another-owner"},
-                        {**lookup_request, "scope": "other-program"},
+                        {**lookup_request, "actor_digest": digest(encode("another-owner"))},
+                        {**lookup_request, "program_digest": digest(encode("other-program"))},
                         {**lookup_request, "producer": "other-producer"},
                         {**lookup_request, "recipient": "other-backend"},
                         _approval_disposition_request({**approval_request, "version": True}),

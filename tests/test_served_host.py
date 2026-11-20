@@ -26,6 +26,7 @@ from creatidy_kernel.adapters.served_host import (
     receive_owner_operations,
 )
 from creatidy_kernel.adapters.served_local import (
+    MAX_REQUEST,
     LocalChannelRefused,
     LocalOwnerChannel,
     LocalOwnerSession,
@@ -34,7 +35,9 @@ from creatidy_kernel.adapters.served_local import (
 )
 from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
 from creatidy_kernel.core.authority import Principal
+from creatidy_kernel.core.intake import digest, encode
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode
+from creatidy_kernel.core.served import command_prefix
 from creatidy_kernel.ports.ordinary import OrdinaryApproval, OrdinaryHandoff, OrdinaryProgram
 from creatidy_kernel.ports.ownership import OwnedWorkspace, WorkOwnership
 from creatidy_kernel.ports.served import OwnerProjection
@@ -79,6 +82,75 @@ def test_launched_consumer_receives_and_uses_owner_descriptor(sqlite_tmp_path: P
                 launched.process.kill()
                 launched.process.wait(timeout=10)
         assert (store.history(program.program_id), store.operations()) == before
+
+
+def test_disposition_fits_frame_for_long_host_bound_ids(sqlite_tmp_path: Path) -> None:
+    scope = "p" * 65_000
+    actor = Principal("a" * 2048, "owner")
+    original = {
+        "version": 1,
+        "action": "approve",
+        "command_id": "c" * 256,
+        "decision_id": "d" * 256,
+        "expected_revision": -1,
+        "expires_at": 1,
+        "proposal_digest": "1" * 64,
+        "scope_digest": "2" * 64,
+    }
+    request = {
+        "version": 1,
+        "action": "approval-disposition",
+        "producer": "producer-a",
+        "recipient": "backend-a",
+        "program_digest": digest(encode(scope)),
+        "actor_digest": digest(encode(actor.actor_id)),
+        "original": original,
+    }
+    assert len(encode(request)) <= MAX_REQUEST < len(encode({"scope": scope, "original": original}))
+    script = (
+        "import json,sys; from creatidy_kernel.adapters.served_host import receive_owner_operations; "
+        "from creatidy_kernel.adapters.served_local import write_frame,read_frame; "
+        "s,ops=receive_owner_operations(int(sys.argv[-1]),expected_scope=sys.argv[1],"
+        "expected_producer='producer-a',expected_recipient='backend-a'); "
+        "assert 'approval-disposition' in ops; write_frame(s,sys.argv[2].encode(),bound=65536); "
+        "assert json.loads(read_frame(s,bound=1048576))['result']=="
+        "{'version':1,'status':'intent-recorded','receipt':None}; s.close()"
+    )
+    with SQLiteProgramStore(sqlite_tmp_path / "long-identity.db") as store:
+        operation_id = command_prefix(scope) + digest(encode([actor.actor_id, original["command_id"]]))
+        store.intent(
+            operation_id,
+            operation_id,
+            {
+                **original,
+                "scope": scope,
+                "actor": actor.actor_id,
+                "proposal": original["proposal_digest"],
+                "approval_history_pairing": ["producer-a", "backend-a"],
+            },
+        )
+        before = store.served_change_token()
+        session = LocalOwnerSession(OwnerProjection(store, scope), None, None, history_owner=actor)
+        launched = launch_owner(
+            session,
+            [sys.executable, "-I", "-c", script, scope, encode(request).decode()],
+            environment={"HOME": str(sqlite_tmp_path), "PATH": os.defpath, "LANG": "C.UTF-8"},
+            scope=scope,
+            producer="producer-a",
+            recipient="backend-a",
+            version=2,
+            verified_approval_history=True,
+        )
+        try:
+            assert select.select([launched.channel.fileno()], [], [], 10)[0]
+            launched.serve_once()
+            assert launched.process.wait(timeout=10) == 0
+        finally:
+            launched.close()
+            if launched.process.poll() is None:
+                launched.process.kill()
+                launched.process.wait(timeout=10)
+        assert store.served_change_token() == before
 
 
 def test_duplicated_bearer_works_until_session_revocation(sqlite_tmp_path: Path) -> None:
