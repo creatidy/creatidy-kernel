@@ -260,11 +260,12 @@ Do not opt in for old v2 receivers (which reject unknown names). Default v1 and 
 direct descriptors, and existing admission and replay semantics on the upgraded producer are unchanged.
 No network or second DB connection is used.
 
-For a replacement that must not retain mutation authority, construct `LocalOwnerSession` with
-`approved=None, history_only=True` and no proposal, claim or managed target. It serves the base
-owner reads plus the explicitly provisioned disposition read; all mutation requests are refused
-before invoking their handlers. It does not require rehydrating an approval or work policy, even
-after a crash at the very first intent, when no Program has been committed.
+For a replacement that must not retain mutation authority, use
+`LocalOwnerSession(projection, None, None, history_owner=principal)` with the trusted owner principal
+and no command application, approval, proposal, claim or managed target. It serves the base owner
+reads plus the explicitly provisioned disposition read; mutation requests are refused before invoking
+their handlers. It needs no work policy or execution profile, even after a crash at the first intent
+when no Program has been committed. Provisioning this history-only session does not record anything.
 
 Opt in only when the supervisor knows that the bound owner actor and Program are authorized for
 historical reads and that the exclusive store and its artifacts are the authoritative journal of the

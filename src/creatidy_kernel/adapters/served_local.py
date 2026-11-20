@@ -15,6 +15,7 @@ from typing import cast
 
 from creatidy_kernel.adapters.ordinary_managed import OrdinaryManagedRun
 from creatidy_kernel.adapters.sqlite_store import CorruptHistory, IdempotencyConflict
+from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.domain import AttemptStatus
 from creatidy_kernel.core.intake import IntakeRefused, digest, encode, object_from
 from creatidy_kernel.core.ownership import HandoffMode
@@ -674,20 +675,28 @@ class LocalWorkerSession:
 
 def _validate_owner_binding(
     owner: OwnerProjection,
-    application: OrdinaryProgram,
+    application: OrdinaryProgram | None,
     approved: OrdinaryApproval | None,
     proposal: OrdinaryProposal | None,
     control: WorkOwnership | None,
     handoff: OrdinaryHandoff | None,
     managed: OrdinaryManagedRun | None,
-    history_only: bool,
+    history_owner: Principal | None,
 ) -> None:
+    if application is None:
+        if (
+            history_owner is None
+            or history_owner.role != "owner"
+            or any(value is not None for value in (approved, proposal, control, handoff, managed))
+        ):
+            raise LocalChannelRefused("invalid history-only owner binding")
+        return
     store = application.store
     if (
         not owner.uses_store(store)
         or application.owner.role != "owner"
-        or type(history_only) is not bool
-        or (approved is None and proposal is None) != history_only
+        or history_owner is not None
+        or (approved is None and proposal is None)
         or (approved is not None and approved.program.program_id != owner.scope)
         or (proposal is not None and proposal.program_id != owner.scope)
         or ((control is None) != (handoff is None))
@@ -715,7 +724,7 @@ class LocalOwnerChannel(LocalReadChannel):
         self,
         owner: OwnerProjection,
         channel: socket.socket,
-        application: OrdinaryProgram,
+        application: OrdinaryProgram | None,
         approved: OrdinaryApproval | None,
         *,
         proposal: OrdinaryProposal | None = None,
@@ -725,19 +734,25 @@ class LocalOwnerChannel(LocalReadChannel):
         approval_binding: list[OrdinaryApproval | None] | None = None,
         proposal_cache: list[tuple[OrdinaryProposal, bytes, str]] | None = None,
         approval_history_binding: tuple[str, str] | None = None,
-        history_only: bool = False,
+        history_owner: Principal | None = None,
     ) -> None:
-        _validate_owner_binding(owner, application, approved, proposal, control, handoff, managed, history_only)
+        _validate_owner_binding(owner, application, approved, proposal, control, handoff, managed, history_owner)
         super().__init__(owner, channel)
-        self._application = application
+        self._command_application = application
         self._approval_binding = [approved] if approval_binding is None else approval_binding
         self._proposal = proposal
         self._proposal_cache = [] if proposal_cache is None else proposal_cache
         self._control, self._handoff = control, handoff
         self._managed = managed
         self._approval_history_binding = approval_history_binding
-        self._bound_owner = application.owner
-        self._history_only = history_only
+        self._bound_owner = history_owner if application is None else application.owner
+
+    @property
+    def _application(self) -> OrdinaryProgram:
+        application = self._command_application
+        if application is None:
+            raise LocalChannelRefused("command application is unavailable on a history-only channel")
+        return application
 
     @property
     def approved(self) -> OrdinaryApproval | None:
@@ -775,7 +790,7 @@ class LocalOwnerChannel(LocalReadChannel):
     def _dispatch(self, request: dict[str, object]) -> object:
         if request.get("action") == APPROVAL_DISPOSITION:
             return self._approval_disposition(request)
-        if self._history_only:
+        if self._command_application is None:
             return super()._dispatch(request)
         if request.get("action") in {"approval-scope", "approval-scope-chunk"}:
             proposal = self._proposal
@@ -1028,15 +1043,19 @@ class LocalOwnerChannel(LocalReadChannel):
 
     def _approval_disposition(self, request: dict[str, object]) -> object:
         binding = self._approval_history_binding
-        actor = self._application.owner
+        actor = self._bound_owner
+        application = self._command_application
         if (
             binding is None
             or set(request) != {"version", "action", "producer", "recipient", "scope", "actor", "original"}
             or (request["producer"], request["recipient"]) != binding
             or request["scope"] != self._owner.scope
-            or actor != self._bound_owner
+            or actor is None
             or request["actor"] != actor.actor_id
-            or not self._owner.uses_store(self._application.store)
+            or (
+                application is not None
+                and (application.owner != actor or not self._owner.uses_store(application.store))
+            )
             or type(request["original"]) is not dict
         ):
             raise LocalChannelRefused("approval disposition binding differs or is unsupported")
@@ -1202,23 +1221,23 @@ class LocalOwnerSession:
     def __init__(
         self,
         owner: OwnerProjection,
-        application: OrdinaryProgram,
+        application: OrdinaryProgram | None,
         approved: OrdinaryApproval | None,
         *,
         proposal: OrdinaryProposal | None = None,
         control: WorkOwnership | None = None,
         handoff: OrdinaryHandoff | None = None,
         managed: OrdinaryManagedRun | None = None,
-        history_only: bool = False,
+        history_owner: Principal | None = None,
     ) -> None:
-        _validate_owner_binding(owner, application, approved, proposal, control, handoff, managed, history_only)
+        _validate_owner_binding(owner, application, approved, proposal, control, handoff, managed, history_owner)
         self._owner, self._application = owner, application
         self._approval_binding: list[OrdinaryApproval | None] = [approved]
         self._proposal, self._control, self._handoff, self._managed = proposal, control, handoff, managed
         self._proposal_cache: list[tuple[OrdinaryProposal, bytes, str]] = []
         self._channels: list[LocalOwnerChannel] = []
         self._revoked = False
-        self._history_only = history_only
+        self._history_owner = history_owner
 
     @property
     def scope(self) -> str:
@@ -1241,7 +1260,7 @@ class LocalOwnerSession:
             approval_binding=self._approval_binding,
             proposal_cache=self._proposal_cache,
             approval_history_binding=approval_history_binding,
-            history_only=self._history_only,
+            history_owner=self._history_owner,
         )
         self._channels.append(result)
         return result

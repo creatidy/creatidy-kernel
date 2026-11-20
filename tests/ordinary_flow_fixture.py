@@ -345,7 +345,7 @@ def replay_host_after_process_restart(root: Path) -> None:
         "\nexcept (ValueError,OSError):\n raw=b''"
         "\npathlib.Path(sys.argv[2]).write_bytes(raw); s.close()"
     )
-    with SQLiteProgramStore(root / "state.db") as store:
+    with SQLiteProgramStore(root / "state.db") as store, ExitStack() as read_guard:
         assert repr(store.history("everyday-program")) == saved["history"]
         assert repr(store.operations()) == saved["operations"]
         approval_id = command_prefix("everyday-program") + digest(encode(["owner", "host-approval"]))
@@ -366,32 +366,41 @@ def replay_host_after_process_restart(root: Path) -> None:
             "proposal": original["proposal_digest"],
             "approval_history_pairing": ["fixture-producer", "fixture-backend"],
         }
-        app = OrdinaryProgram(
-            store,
-            cast(OrdinaryIntake, None),
-            cast(DependencyReader, None),
-            Principal("owner", "owner"),
-            policy,
-            VerificationPolicy(policy_ref, ("paths", "structural", "commands")),
-            lambda: int(time.time()),
-            execution_profile=encode(
-                {
-                    "harness": "kilo-pull+codex",
-                    "provider": "fixture-provider",
-                    "model": "fixture-model",
-                    "effort": None,
-                    "trust": "trusted_development",
-                }
-            ),
+        before = (store.history("everyday-program"), store.operations(), store.work_budget_status("everyday-program"))
+        token = store.served_change_token()
+        for method in ("intent", "finalize_artifact"):
+            read_guard.enter_context(patch.object(SQLiteProgramStore, method, side_effect=AssertionError(method)))
+        read_guard.enter_context(
+            patch.object(OrdinaryProgram, "__init__", side_effect=AssertionError("cold recovery needs no application"))
         )
         projection = OwnerProjection(store, "everyday-program")
-        session = LocalOwnerSession(projection, app, None, history_only=True)
-        before = (store.history("everyday-program"), store.operations(), store.work_budget_status("everyday-program"))
+        actor = Principal("owner", "owner")
+        session = LocalOwnerSession(projection, None, None, history_owner=actor)
         for index, mode in enumerate(("verified", "unverified", "mutation", "replay")):
             path = root / f"restart-result-{index}.json"
             request = original if mode in {"replay", "mutation"} else _approval_disposition_request(original)
             target = session
             if mode == "replay":
+                assert store.served_change_token() == token
+                read_guard.close()
+                app = OrdinaryProgram(
+                    store,
+                    cast(OrdinaryIntake, None),
+                    cast(DependencyReader, None),
+                    actor,
+                    policy,
+                    VerificationPolicy(policy_ref, ("paths", "structural", "commands")),
+                    lambda: int(time.time()),
+                    execution_profile=encode(
+                        {
+                            "harness": "kilo-pull+codex",
+                            "provider": "fixture-provider",
+                            "model": "fixture-model",
+                            "effort": None,
+                            "trust": "trusted_development",
+                        }
+                    ),
+                )
                 proposal = proposal_from(
                     store.artifact(f"ordinary-program:proposal:{original['proposal_digest']}", "record")
                 )
