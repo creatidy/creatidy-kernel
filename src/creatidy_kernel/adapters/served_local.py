@@ -1071,7 +1071,7 @@ class LocalOwnerChannel(LocalReadChannel):
             )
         ):
             raise LocalChannelRefused("invalid original approval values")
-        return self._owner.approval_disposition(actor.actor_id, original)
+        return self._owner.approval_disposition(actor.actor_id, original, binding)
 
     def _approve(self, request: dict[str, object]) -> object:
         fields = {
@@ -1124,6 +1124,7 @@ class LocalOwnerChannel(LocalReadChannel):
             if type(recorded) is dict:
                 legacy_fields = dict(cast(dict[str, object], recorded))
                 legacy_fields.pop("policy", None)  # Legacy receipts retain their original historical meaning.
+                legacy_fields.pop("approval_history_pairing", None)  # Not an input to legacy replay.
                 recorded = legacy_fields
             if prior.effect_key != operation_id or recorded != exact:
                 raise LocalChannelRefused("command identity already has different input")
@@ -1168,6 +1169,10 @@ class LocalOwnerChannel(LocalReadChannel):
         self._application.check_proposal_record(proposal)
         if store.find_artifact(f"ordinary-program:approval:{decision_id}", "record") is not None:
             raise LocalChannelRefused("approval decision is already recorded; replay its original command")
+        if self._approval_history_binding is not None:
+            if self._application.owner != self._bound_owner or not self._owner.uses_store(store):
+                raise LocalChannelRefused("original approval binding changed")
+            exact["approval_history_pairing"] = list(self._approval_history_binding)
         store.intent(operation_id, operation_id, exact)
         approved = self._application.approve(
             proposal, decision_id=decision_id, expires_at=expires_at, expected_revision=revision, final_guard=guard

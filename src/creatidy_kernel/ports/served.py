@@ -75,7 +75,9 @@ class OwnerProjection:
         """Check the live host composition, not durable producer identity."""
         return self._store is store
 
-    def approval_disposition(self, actor: str, original: dict[str, object]) -> dict[str, object]:
+    def approval_disposition(
+        self, actor: str, original: dict[str, object], pairing: tuple[str, str]
+    ) -> dict[str, object]:
         """Read evidence for one validated approval on a supervisor-verified journal."""
         command_id = original["command_id"]
         decision_id = original["decision_id"]
@@ -83,19 +85,19 @@ class OwnerProjection:
         operation = self._store.find_operation(operation_id)
         if operation is None:
             return {"version": 1, "status": "unknown", "receipt": None}
-        expected = encode(
-            {
-                "version": 1,
-                "request": {**original, "scope": self._scope, "actor": actor, "proposal": original["proposal_digest"]},
-            }
-        )
+        exact = {**original, "scope": self._scope, "actor": actor, "proposal": original["proposal_digest"]}
+        recorded = operation.request_json.encode()
         if (
             operation.operation_id != operation_id
             or operation.effect_key != operation_id
-            or operation.request_digest != digest(expected)
-            or operation.request_json.encode() != expected
+            or operation.request_digest != digest(recorded)
         ):
-            raise ValueError("recorded command identity or input differs")
+            raise ValueError("recorded command identity is invalid")
+        if recorded == encode({"version": 1, "request": exact}):
+            return {"version": 1, "status": "unknown", "receipt": None}
+        exact["approval_history_pairing"] = list(pairing)
+        if recorded != encode({"version": 1, "request": exact}):
+            raise ValueError("recorded command pairing or input differs")
         raw = self._store.find_artifact(operation_id, "receipt")
         if raw is None:
             return {"version": 1, "status": "intent-recorded", "receipt": None}
@@ -119,8 +121,15 @@ class OwnerProjection:
         if record is None:
             raise ValueError("receipt lacks its recorded approval")
         approval = object_from(record)
+        policy, execution = approval.get("policy"), approval.get("execution")
         if (
-            approval.get("proposal") != original["proposal_digest"]
+            set(approval) != {"proposal", "policy", "issuer", "expires_at", "spec", "execution"}
+            or type(policy) is not str
+            or fullmatch(r"[0-9a-f]{64}", policy) is None
+            or type(execution) is not str
+            or fullmatch(r"basic-harness-policy:[0-9a-f]{64}", execution) is None
+            or encode(approval) != record
+            or approval.get("proposal") != original["proposal_digest"]
             or approval.get("issuer") != actor
             or approval.get("spec") != spec
             or type(approval.get("expires_at")) is not int

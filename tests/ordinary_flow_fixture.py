@@ -351,6 +351,7 @@ def replay_host_after_process_restart(root: Path) -> None:
             "scope": "everyday-program",
             "actor": "owner",
             "proposal": object_from(store.artifact("ordinary-program:approval:host-decision", "record"))["proposal"],
+            "approval_history_pairing": ["fixture-producer", "fixture-backend"],
         }
         if saved["boundary"] == "intent":
             unknown = store.operation(unknown_id)
@@ -358,6 +359,7 @@ def replay_host_after_process_restart(root: Path) -> None:
                 **cast(dict[str, object], saved["unknown"]),
                 "scope": "everyday-program",
                 "actor": "owner",
+                "approval_history_pairing": ["fixture-producer", "fixture-backend"],
                 "proposal": object_from(store.artifact("ordinary-program:approval:host-decision", "record"))[
                     "proposal"
                 ],
@@ -1108,7 +1110,7 @@ print("Done")
                     "from creatidy_kernel.adapters.served_host import receive_owner_operations; "
                     "from creatidy_kernel.adapters.served_local import write_frame,read_frame; "
                     "s,ops=receive_owner_operations(int(sys.argv[-1]),expected_scope='everyday-program',"
-                    "expected_producer='fixture-producer',expected_recipient='fixture-backend'); "
+                    "expected_producer=sys.argv[5],expected_recipient=sys.argv[6]); "
                     "assert (ops is not None and 'approval-disposition' in ops)==(sys.argv[4]=='lookup'); "
                     "write_frame(s,sys.argv[1].encode(),bound=65536); "
                     "\nif sys.argv[3]=='drop':\n s.close(); sys.exit(0)"
@@ -1127,7 +1129,12 @@ print("Done")
                         launched.process.wait(timeout=10)
 
                 def spawn(
-                    request: dict[str, object], *, drop: bool = False, lookup: bool = False
+                    request: dict[str, object],
+                    *,
+                    drop: bool = False,
+                    lookup: bool = False,
+                    producer: str = "fixture-producer",
+                    recipient: str = "fixture-backend",
                 ) -> tuple[LaunchedOwner, Path]:
                     nonlocal serial
                     serial += 1
@@ -1143,11 +1150,13 @@ print("Done")
                             str(result_path),
                             "drop" if drop else "read",
                             "lookup" if lookup else "legacy",
+                            producer,
+                            recipient,
                         ],
                         environment={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
                         scope="everyday-program",
-                        producer="fixture-producer",
-                        recipient="fixture-backend",
+                        producer=producer,
+                        recipient=recipient,
                         version=2 if lookup else 1,
                         verified_approval_history=lookup,
                     )
@@ -1191,7 +1200,7 @@ print("Done")
                     unknown_id = command_prefix("everyday-program") + digest(encode(["owner", "uncertain-approval"]))
                     boundary_request: dict[str, object] | None = None
                     if crash_host_boundary == "intent":
-                        first, path = spawn(approval_request)
+                        first, path = spawn(approval_request, lookup=True)
                         assert finish(first, path)["status"] == "approved"
                         boundary_request = {
                             "version": 1,
@@ -1225,7 +1234,7 @@ print("Done")
                         os._exit(0)
 
                     interrupted, _ = spawn(
-                        approval_request if boundary_request is None else boundary_request, drop=True
+                        approval_request if boundary_request is None else boundary_request, drop=True, lookup=True
                     )
                     assert interrupted.process.wait(timeout=10) == 0
                     assert select.select([interrupted.channel.fileno()], [], [], 10)[0]
@@ -1257,13 +1266,13 @@ print("Done")
                             interrupted.channel.serve_once()
                     raise AssertionError("producer did not exit at the requested durable boundary")
                 refused_request = {**approval_request, "command_id": "pre-intent", "expected_revision": 0}
-                refused, path = spawn(refused_request)
+                refused, path = spawn(refused_request, lookup=True)
                 assert finish(refused, path, refused=True) == {"error": True}
                 assert (
                     store.find_operation(command_prefix("everyday-program") + digest(encode(["owner", "pre-intent"])))
                     is None
                 )
-                lost, _ = spawn(approval_request, drop=True)
+                lost, _ = spawn(approval_request, drop=True, lookup=True)
                 try:
                     assert lost.process.wait(timeout=10) == 0
                     assert select.select([lost.channel.fileno()], [], [], 10)[0]
@@ -1310,6 +1319,14 @@ print("Done")
                     ):
                         rejected, path = spawn(invalid, lookup=True)
                         assert finish(rejected, path, refused=True) == {"error": True}
+                    rejected, path = spawn(
+                        {**lookup_request, "recipient": "other-backend"}, lookup=True, recipient="other-backend"
+                    )
+                    assert finish(rejected, path, refused=True) == {"error": True}
+                    rejected, path = spawn(
+                        {**lookup_request, "producer": "other-producer"}, lookup=True, producer="other-producer"
+                    )
+                    assert finish(rejected, path, refused=True) == {"error": True}
                     find_artifact = SQLiteProgramStore.find_artifact
 
                     def inconsistent_receipt(target: SQLiteProgramStore, operation_id: str, name: str) -> bytes | None:
@@ -1319,6 +1336,17 @@ print("Done")
 
                     rejected, path = spawn(lookup_request, lookup=True)
                     with patch.object(SQLiteProgramStore, "find_artifact", inconsistent_receipt):
+                        assert finish(rejected, path, refused=True) == {"error": True}
+
+                    def malformed_approval(target: SQLiteProgramStore, operation_id: str, name: str) -> bytes | None:
+                        if (operation_id, name) == ("ordinary-program:approval:host-decision", "record"):
+                            record = object_from(recorded_approval)
+                            del record["execution"]
+                            return encode(record)
+                        return find_artifact(target, operation_id, name)
+
+                    rejected, path = spawn(lookup_request, lookup=True)
+                    with patch.object(SQLiteProgramStore, "find_artifact", malformed_approval):
                         assert finish(rejected, path, refused=True) == {"error": True}
                     revoked, path = spawn(lookup_request, lookup=True)
                     assert select.select([revoked.channel.fileno()], [], [], 10)[0]
@@ -1355,6 +1383,8 @@ print("Done")
                 interrupted, path = spawn(unknown_request)
                 with patch.object(OrdinaryProgram, "approve", side_effect=OSError("synthetic interruption")):
                     assert finish(interrupted, path, refused=True) == {"error": True}
+                legacy_lookup, path = spawn(_approval_disposition_request(unknown_request), lookup=True)
+                assert finish(legacy_lookup, path) == {"version": 1, "status": "unknown", "receipt": None}
                 replay, path = spawn(unknown_request)
                 assert finish(replay, path) == {"status": "unknown", "settlement": "unknown"}
                 assert store.load("everyday-program").revision == revision
