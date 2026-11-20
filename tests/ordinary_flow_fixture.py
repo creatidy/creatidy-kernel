@@ -95,7 +95,13 @@ from creatidy_kernel.core.verification import Evidence, EvidenceSubject, Verific
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.application import Collection
 from creatidy_kernel.ports.intake import OrdinaryIntake
-from creatidy_kernel.ports.ordinary import DependencyReader, OrdinaryApproval, OrdinaryHandoff, OrdinaryProgram
+from creatidy_kernel.ports.ordinary import (
+    DependencyReader,
+    OrdinaryApproval,
+    OrdinaryHandoff,
+    OrdinaryProgram,
+    proposal_from,
+)
 from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.ownership import WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
@@ -331,7 +337,9 @@ def replay_host_after_process_restart(root: Path) -> None:
         "from creatidy_kernel.adapters.served_local import write_frame,read_frame; "
         "s,ops=receive_owner_operations(int(sys.argv[-1]),expected_scope='everyday-program',"
         "expected_producer='fixture-producer',expected_recipient='fixture-backend'); "
-        "assert ops is not None and ('approval-disposition' in ops)==(sys.argv[3]=='verified'); "
+        "assert (ops is None) == (sys.argv[3]=='replay'); "
+        "assert ops is None or ('approval-disposition' in ops)==(sys.argv[3] in ('verified','mutation')); "
+        "assert ops is None or ops <= {'snapshot','record','events','approval-disposition'}; "
         "write_frame(s,sys.argv[1].encode(),bound=65536); "
         "\ntry:\n raw=read_frame(s,bound=1048576)"
         "\nexcept (ValueError,OSError):\n raw=b''"
@@ -341,33 +349,23 @@ def replay_host_after_process_restart(root: Path) -> None:
         assert repr(store.history("everyday-program")) == saved["history"]
         assert repr(store.operations()) == saved["operations"]
         approval_id = command_prefix("everyday-program") + digest(encode(["owner", "host-approval"]))
-        unknown_id = command_prefix("everyday-program") + digest(encode(["owner", "uncertain-approval"]))
-        receipt_bytes = store.artifact(approval_id, "receipt")
-        assert receipt_bytes.hex() == saved["receipt_hex"]
-        receipt = object_from(receipt_bytes)
-        assert receipt["status"] == "approved" and receipt["decision_id"] == "host-decision"
+        original = cast(dict[str, object], saved["request"])
+        receipt_bytes = store.find_artifact(approval_id, "receipt")
+        assert (None if receipt_bytes is None else receipt_bytes.hex()) == saved["receipt_hex"]
+        receipt = None if receipt_bytes is None else object_from(receipt_bytes)
+        committed = saved["boundary"] == "receipt"
+        if committed:
+            assert receipt is not None and receipt["status"] == "approved" and receipt["decision_id"] == "host-decision"
+        else:
+            assert receipt is None and store.find_program("everyday-program") is None
+            assert store.find_artifact("ordinary-program:approval:host-decision", "record") is None
         assert object_from(store.operation(approval_id).request_json.encode())["request"] == {
-            **cast(dict[str, object], saved["request"]),
+            **original,
             "scope": "everyday-program",
             "actor": "owner",
-            "proposal": object_from(store.artifact("ordinary-program:approval:host-decision", "record"))["proposal"],
+            "proposal": original["proposal_digest"],
             "approval_history_pairing": ["fixture-producer", "fixture-backend"],
         }
-        if saved["boundary"] == "intent":
-            unknown = store.operation(unknown_id)
-            assert object_from(unknown.request_json.encode())["request"] == {
-                **cast(dict[str, object], saved["unknown"]),
-                "scope": "everyday-program",
-                "actor": "owner",
-                "approval_history_pairing": ["fixture-producer", "fixture-backend"],
-                "proposal": object_from(store.artifact("ordinary-program:approval:host-decision", "record"))[
-                    "proposal"
-                ],
-            }
-            assert store.find_artifact(unknown_id, "receipt") is None
-            assert store.find_artifact("ordinary-program:approval:interrupted-decision", "record") is None
-        else:
-            assert store.find_operation(unknown_id) is None
         app = OrdinaryProgram(
             store,
             cast(OrdinaryIntake, None),
@@ -386,18 +384,20 @@ def replay_host_after_process_restart(root: Path) -> None:
                 }
             ),
         )
-        approved = app.recover("host-decision")
-        # Recovery must work without the original proposal or approval execution configuration.
-        session = LocalOwnerSession(OwnerProjection(store, "everyday-program"), app, approved)
+        projection = OwnerProjection(store, "everyday-program")
+        session = LocalOwnerSession(projection, app, None, history_only=True)
         before = (store.history("everyday-program"), store.operations(), store.work_budget_status("everyday-program"))
-        cases = [("request", "verified"), ("request", "unverified"), ("request", "replay")]
-        if saved["boundary"] == "intent":
-            cases.extend([("unknown", "verified"), ("unknown", "replay")])
-        for index, (key, mode) in enumerate(cases):
+        for index, mode in enumerate(("verified", "unverified", "mutation", "replay")):
             path = root / f"restart-result-{index}.json"
-            request = saved[key] if mode == "replay" else _approval_disposition_request(saved[key])
+            request = original if mode in {"replay", "mutation"} else _approval_disposition_request(original)
+            target = session
+            if mode == "replay":
+                proposal = proposal_from(
+                    store.artifact(f"ordinary-program:proposal:{original['proposal_digest']}", "record")
+                )
+                target = LocalOwnerSession(projection, app, None, proposal=proposal)
             launched = launch_owner(
-                session,
+                target,
                 [
                     sys.executable,
                     "-I",
@@ -411,8 +411,8 @@ def replay_host_after_process_restart(root: Path) -> None:
                 scope="everyday-program",
                 producer="fixture-producer",
                 recipient="fixture-backend",
-                version=2,
-                verified_approval_history=mode == "verified",
+                version=1 if mode == "replay" else 2,
+                verified_approval_history=mode in {"verified", "mutation"},
             )
             try:
                 assert select.select([launched.channel.fileno()], [], [], 10)[0]
@@ -430,17 +430,17 @@ def replay_host_after_process_restart(root: Path) -> None:
                             except LocalChannelRefused:
                                 pass
                             else:
-                                raise AssertionError("unverified producer binding accepted")
+                                raise AssertionError("unverified history or mutation accepted")
                 assert launched.process.wait(timeout=10) == 0
                 if mode == "replay":
                     assert json.loads(path.read_text())["result"] == (
-                        receipt if key == "request" else {"status": "unknown", "settlement": "unknown"}
+                        receipt if committed else {"status": "unknown", "settlement": "unknown"}
                     )
                 elif mode == "verified":
                     result = json.loads(path.read_text())["result"]
                     assert result == (
                         {"version": 1, "status": "historical-receipt", "receipt": receipt}
-                        if key == "request"
+                        if committed
                         else {"version": 1, "status": "intent-recorded", "receipt": None}
                     )
                 else:
@@ -455,8 +455,7 @@ def replay_host_after_process_restart(root: Path) -> None:
             store.operations(),
             store.work_budget_status("everyday-program"),
         ) == before
-        assert store.artifact(approval_id, "receipt") == receipt_bytes
-        assert store.find_artifact(unknown_id, "receipt") is None
+        assert store.find_artifact(approval_id, "receipt") == receipt_bytes
 
 
 def run_ordinary_flow(
@@ -1197,33 +1196,16 @@ print("Done")
                     assert crash_host_boundary in {"receipt", "intent"}
                 if exercise == "served-host-process-create" and crash_host_boundary in {"receipt", "intent"}:
                     approval_id = command_prefix("everyday-program") + digest(encode(["owner", "host-approval"]))
-                    unknown_id = command_prefix("everyday-program") + digest(encode(["owner", "uncertain-approval"]))
-                    boundary_request: dict[str, object] | None = None
-                    if crash_host_boundary == "intent":
-                        first, path = spawn(approval_request, lookup=True)
-                        assert finish(first, path)["status"] == "approved"
-                        boundary_request = {
-                            "version": 1,
-                            "action": "approve",
-                            "command_id": "uncertain-approval",
-                            "expected_revision": store.load("everyday-program").revision,
-                            "decision_id": "interrupted-decision",
-                            "expires_at": approval_request["expires_at"],
-                            "proposal_digest": proposal.digest,
-                            "scope_digest": digest(encode(app.approval_scope(proposal))),
-                        }
 
                     def crash_at_boundary() -> None:
-                        receipt_bytes = store.artifact(approval_id, "receipt")
-                        missing = store.find_artifact(unknown_id, "receipt")
-                        assert missing is None
+                        receipt_bytes = store.find_artifact(approval_id, "receipt")
+                        assert (receipt_bytes is None) == (crash_host_boundary == "intent")
                         (root / "host-replay.json").write_text(
                             json.dumps(
                                 {
                                     "request": approval_request,
-                                    "unknown": boundary_request,
                                     "reader_producer": reader.producer,
-                                    "receipt_hex": receipt_bytes.hex(),
+                                    "receipt_hex": None if receipt_bytes is None else receipt_bytes.hex(),
                                     "history": repr(store.history("everyday-program")),
                                     "operations": repr(store.operations()),
                                     "boundary": crash_host_boundary,
@@ -1233,9 +1215,7 @@ print("Done")
                         (root / "first-producer.pid").write_text(str(os.getpid()))
                         os._exit(0)
 
-                    interrupted, _ = spawn(
-                        approval_request if boundary_request is None else boundary_request, drop=True, lookup=True
-                    )
+                    interrupted, _ = spawn(approval_request, drop=True, lookup=True)
                     assert interrupted.process.wait(timeout=10) == 0
                     assert select.select([interrupted.channel.fileno()], [], [], 10)[0]
                     if crash_host_boundary == "receipt":
@@ -1258,7 +1238,7 @@ print("Done")
                             target: SQLiteProgramStore, operation_id: str, effect_key: str, request: dict[str, object]
                         ) -> OperationRecord:
                             result = intent(target, operation_id, effect_key, request)
-                            if operation_id == unknown_id:
+                            if operation_id == approval_id:
                                 crash_at_boundary()
                             return result
 
