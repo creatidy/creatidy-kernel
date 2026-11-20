@@ -361,6 +361,7 @@ def test_consumer_refuses_incompatible_greetings(payload: bytes) -> None:
         {"operations": ["snapshot", "record", "events", "approve"]},
         {"operations": ["snapshot", "record", "events", "snapshot"]},
         {"operations": ["snapshot", "record", "events", "unknown"]},
+        {"operations": ["snapshot", "record", "events", "approval-disposition-v2"]},
         {"operations": ["snapshot", "record", "events", "reconcile"]},
         {"operations": ["snapshot", "record", "events", ["approve"]]},
     ],

@@ -338,20 +338,64 @@ Past work deadlines and task revocation neither grant fresh permission nor erase
 on a currently authorized descriptor. After channel loss, verified reads (including repeating this
 lookup) are safe; do not use `approve` as a read or advance a command based on `unknown` or intent alone.
 
-The journal does not retain a pre-intent refusal or prove the original execution boundary permanently
-closed. A definitive negative requires a separate owner decision about what durable refusal/finality
-evidence may be recorded at that boundary and how its continuity is verified. It cannot be derived from
-the current journal by a consumer or enabled by this read contract.
+##### Terminal Refusal (Disposition V2)
+
+For a receiver that understands terminal refusals, the trusted supervisor can additionally set
+`approval_disposition_v2=True` with `version=2, verified_approval_history=True`. This adds
+`approval-disposition-v2` alongside `approval-disposition` in the same v2 greeting. It works on
+both the original command descriptor and a history-only replacement. Do not set it for strict
+older receivers; they reject the new operation name. The original `approve` wire request,
+approval reply, and channel-close behavior for refusals do not change. Defaults and legacy
+operation declarations are unchanged.
+
+Console must check the replacement's verified greeting for `approval-disposition-v2` and confirm
+the same pairing, actor, Program and journal continuity as above. Use the exact same wire-version-1
+lookup object shown above, replacing only `action` with `approval-disposition-v2`. The outer
+response envelope remains version 1. The inner result has `version: 2`. The three existing statuses
+have the exact same fields and meaning (including the unchanged version-1 historical receipt).
+The new exact inner result is:
+
+```json
+{"version":2,"status":"terminal-refusal","receipt":null,"reason":"stale-revision"}
+```
+
+This is durable evidence that Kernel received and refused **this exact command before calling
+approval execution**. It is not a receipt, proof of current authority, evidence about another
+command/decision, or proof of physical settlement. Console can resolve the original pending command
+as refused and release its uncertainty block for that command; never retry that command. Any later
+approval is a new owner decision using the normal reviewed scope, revision, authority and command ID.
+
+Only a revision mismatch at the first admission check is recorded, and only when the original
+descriptor opted into v2 and the exact owner/store binding, Program, reviewed proposal, durable
+proposal record and reviewed scope were verified. Kernel atomically claims the original command
+journal key with an immutable refusal marker in the canonical request record, with no dispatch,
+approval record or receipt for that command. The existing journal transaction protects both the
+key and marker, and the marker blocks later approval execution or dispatch even if the expected
+revision becomes current. No new table, artifact, durable identity source or authority is needed.
+The v1 lookup reports `unknown` for this marker, not a receipt or `intent-recorded`. Older producers
+cannot report the new result; their approval handlers reject reuse of the marked key as mismatched
+input rather than executing it. Legacy snapshots are not a substitute for an exact disposition read.
+
+There is no backfill. Malformed and unauthorized requests, other pre-intent refusals (including
+proposal/scope or existing-decision checks), a crash before the refusal transaction commits, and
+commands that never arrived provide no negative evidence. Refusals or failures after an intent,
+including later authority, deadline or revision checks, remain `intent-recorded` when that exact
+intent is present but no receipt is retained. Inconsistent evidence fails closed. With an unverified
+journal, missing capability or invalid response, preserve the unresolved outcome; do not infer a
+refusal from timeout, disconnection, missing rows or the current Program revision.
 
 The repository's installed-wheel pytest phase includes `test_served_host.py` and the ordinary-program
 supervisor receipt test. These exercise synthetic separate child processes and the installed producer,
 including active channel closure, more than 64 refused replacements, producer-process death and event-gap
 resync, wrong scope/version/configured binding, concurrent duplicate approvals, dropped reply and a missing
-approval receipt. A separate synthetic ordinary-producer process test uses the read-only lookup after
+approval receipt, and a competing-revision refusal with a lost reply. A separate synthetic
+ordinary-producer process test uses the read-only lookup after
 the original producer exits and the verified replacement reopens the original store; an unverified
 binding with the same labels is refused. Separate forced exits occur after the approval receipt commit and after another
 approval's intent commit, before their replies and first replay; the restarted test compares exact
-recorded command/receipt evidence and history/operations. It does not cover every command or crash point. This is
+recorded command/receipt evidence and history/operations. Forced exits before the refusal write,
+after the journal insert but before commit, and after commit distinguish `unknown` from a durable
+negative. These tests do not cover every command or crash point. This is
 not a consumer-owned Console conformance receipt or a live/hostile-local security proof. In particular,
 the test evidence does not cover every owner command across process or Kernel crash boundaries.
 

@@ -655,8 +655,10 @@ def test_supervisor_launch_receipts_and_current_authority(sqlite_tmp_path: Path)
     ) == {"status": "stopped", "native_sends": 0}
 
 
-@pytest.mark.parametrize("boundary", ["receipt", "intent"])
-def test_original_host_command_receipt_survives_producer_process_death(sqlite_tmp_path: Path, boundary: str) -> None:
+@pytest.mark.parametrize(
+    "boundary", ["receipt", "intent", "refusal-before-write", "refusal-uncommitted", "refusal-committed"]
+)
+def test_original_host_command_disposition_after_producer_process_death(sqlite_tmp_path: Path, boundary: str) -> None:
     root = sqlite_tmp_path / ("process-replay-" + boundary)
     fixture_dir = str(Path(__file__).parent)
     env = {"HOME": str(sqlite_tmp_path), "PATH": os.defpath, "LANG": "C.UTF-8"}

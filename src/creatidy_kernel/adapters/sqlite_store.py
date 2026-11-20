@@ -60,7 +60,7 @@ from creatidy_kernel.core.ownership import (
     ResourceScope,
     WorkClaim,
 )
-from creatidy_kernel.core.served import command_prefix
+from creatidy_kernel.core.served import APPROVAL_REVISION_REFUSAL, command_prefix
 from creatidy_kernel.core.work_budget import COUNT_ONLY_WORK, BudgetRefused, WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.program_store import OperationRecord, ProgramReadChanged
 
@@ -629,8 +629,10 @@ class SQLiteProgramStore:
             self._validate_command_key(value)
         if type(request) is not dict:
             raise TypeError("request must be a JSON object")
-        with self._gate, self._transaction():
-            self._insert_intent(operation_id, effect_key, request)
+        refusal = request.get("kind") == APPROVAL_REVISION_REFUSAL
+        # A refusal performs no admission and must not sample or update work authority clocks.
+        with self._gate, self._transaction({} if refusal else None):
+            self._insert_intent(operation_id, effect_key, request, allow_existing=not refusal)
         return self.operation(operation_id)
 
     def _insert_intent(
@@ -1021,6 +1023,10 @@ class SQLiteProgramStore:
         self._assert_writer_thread()
         if type(now) is not int or type(lease_seconds) is not int or lease_seconds <= 0:
             raise ValueError("now must be an integer and lease_seconds positive")
+        if operation_id.startswith("served-command:"):
+            request = json.loads(self.operation(operation_id).request_json)["request"]
+            if request.get("kind") == APPROVAL_REVISION_REFUSAL:
+                raise OperationConflict("terminal approval refusal cannot be dispatched")
         with (
             self._gate,
             self._workspace_cut(
