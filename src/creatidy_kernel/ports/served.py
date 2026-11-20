@@ -8,7 +8,13 @@ from uuid import uuid4
 
 from creatidy_kernel.core.domain import Program
 from creatidy_kernel.core.intake import digest, encode, object_from
-from creatidy_kernel.core.served import ProgressBatch, ProgressBuffer, ProgressPosition, command_prefix
+from creatidy_kernel.core.served import (
+    APPROVAL_REVISION_REFUSAL,
+    ProgressBatch,
+    ProgressBuffer,
+    ProgressPosition,
+    command_prefix,
+)
 from creatidy_kernel.ports.program_store import OperationRecord
 
 
@@ -76,15 +82,17 @@ class OwnerProjection:
         return self._store is store
 
     def approval_disposition(
-        self, actor: str, original: dict[str, object], pairing: tuple[str, str]
+        self, actor: str, original: dict[str, object], pairing: tuple[str, str], *, include_refusals: bool = False
     ) -> dict[str, object]:
         """Read evidence for one validated approval on a supervisor-verified journal."""
+        version = 2 if include_refusals else 1
+        unknown: dict[str, object] = {"version": version, "status": "unknown", "receipt": None}
         command_id = original["command_id"]
         decision_id = original["decision_id"]
         operation_id = command_prefix(self._scope) + digest(encode([actor, command_id]))
         operation = self._store.find_operation(operation_id)
         if operation is None:
-            return {"version": 1, "status": "unknown", "receipt": None}
+            return unknown
         exact = {**original, "scope": self._scope, "actor": actor, "proposal": original["proposal_digest"]}
         recorded = operation.request_json.encode()
         if (
@@ -94,13 +102,27 @@ class OwnerProjection:
         ):
             raise ValueError("recorded command identity is invalid")
         if recorded == encode({"version": 1, "request": exact}):
-            return {"version": 1, "status": "unknown", "receipt": None}
+            return unknown
         exact["approval_history_pairing"] = list(pairing)
+        if recorded == encode({"version": 1, "request": {**exact, "kind": APPROVAL_REVISION_REFUSAL}}):
+            if (
+                operation.status != "intent"
+                or operation.fence != 0
+                or operation.attempts != 0
+                or operation.lease_until is not None
+                or operation.accepted_reference is not None
+                or operation.retry_proof is not None
+                or self._store.find_artifact(operation_id, "receipt") is not None
+            ):
+                raise ValueError("terminal refusal has inconsistent journal evidence")
+            if not include_refusals:
+                return unknown
+            return {"version": version, "status": "terminal-refusal", "receipt": None, "reason": "stale-revision"}
         if recorded != encode({"version": 1, "request": exact}):
             raise ValueError("recorded command pairing or input differs")
         raw = self._store.find_artifact(operation_id, "receipt")
         if raw is None:
-            return {"version": 1, "status": "intent-recorded", "receipt": None}
+            return {"version": version, "status": "intent-recorded", "receipt": None}
         receipt = object_from(raw)
         spec, expiry = receipt.get("spec_digest"), receipt.get("expires_at")
         if (
@@ -136,7 +158,7 @@ class OwnerProjection:
             or approval["expires_at"] != expiry
         ):
             raise ValueError("receipt differs from the recorded approval")
-        return {"version": 1, "status": "historical-receipt", "receipt": receipt}
+        return {"version": version, "status": "historical-receipt", "receipt": receipt}
 
     def snapshot(self, *, page: int = 0) -> ServedSnapshot:
         if type(page) is not int or page < 0 or page > 1_000_000:

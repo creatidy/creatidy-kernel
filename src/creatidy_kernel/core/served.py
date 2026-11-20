@@ -6,6 +6,8 @@ import re
 from collections import deque
 from dataclasses import dataclass
 
+APPROVAL_REVISION_REFUSAL = "served-approval-stale-revision"
+
 
 class ProgressRefused(ValueError):
     """A progress position or bounded event is malformed."""

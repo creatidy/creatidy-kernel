@@ -58,7 +58,7 @@ from creatidy_kernel.adapters.served_local import (
     read_frame,
     write_frame,
 )
-from creatidy_kernel.adapters.sqlite_store import SQLiteProgramStore
+from creatidy_kernel.adapters.sqlite_store import OperationConflict, SQLiteProgramStore
 from creatidy_kernel.adapters.task_execution import VerificationCommand
 from creatidy_kernel.core.authority import Principal
 from creatidy_kernel.core.deadlines import BootClockReading
@@ -90,7 +90,7 @@ from creatidy_kernel.core.intake import (
 from creatidy_kernel.core.ordinary import OrdinaryProposal
 from creatidy_kernel.core.outcomes import Provenance, UsageObservation
 from creatidy_kernel.core.ownership import COOPERATIVE_PROFILE, HandoffMode, WorkClaim
-from creatidy_kernel.core.served import command_prefix
+from creatidy_kernel.core.served import APPROVAL_REVISION_REFUSAL, command_prefix
 from creatidy_kernel.core.verification import Evidence, EvidenceSubject, VerificationPolicy
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.application import Collection
@@ -301,10 +301,10 @@ def forge_service(
         thread.join()
 
 
-def _approval_disposition_request(original: object) -> dict[str, object]:
+def _approval_disposition_request(original: object, *, v2: bool = False) -> dict[str, object]:
     return {
         "version": 1,
-        "action": "approval-disposition",
+        "action": "approval-disposition-v2" if v2 else "approval-disposition",
         "producer": "fixture-producer",
         "recipient": "fixture-backend",
         "program_digest": digest(encode("everyday-program")),
@@ -339,13 +339,17 @@ def replay_host_after_process_restart(root: Path) -> None:
         "expected_producer='fixture-producer',expected_recipient='fixture-backend'); "
         "assert (ops is None) == (sys.argv[3]=='replay'); "
         "assert ops is None or ('approval-disposition' in ops)==(sys.argv[3] in ('verified','mutation')); "
-        "assert ops is None or ops <= {'snapshot','record','events','approval-disposition'}; "
+        "assert ops is None or ('approval-disposition-v2' in ops)==(sys.argv[3] in ('verified','mutation')); "
+        "assert ops is None or ops <= {'snapshot','record','events','approval-disposition','approval-disposition-v2'}; "
         "write_frame(s,sys.argv[1].encode(),bound=65536); "
         "\ntry:\n raw=read_frame(s,bound=1048576)"
         "\nexcept (ValueError,OSError):\n raw=b''"
         "\npathlib.Path(sys.argv[2]).write_bytes(raw); s.close()"
     )
-    with SQLiteProgramStore(root / "state.db") as store, ExitStack() as read_guard:
+    db = root / "state.db"
+    identity = db.stat()
+    assert [identity.st_dev, identity.st_ino] == saved["db_identity"]
+    with SQLiteProgramStore(db) as store, ExitStack() as read_guard:
         assert repr(store.history("everyday-program")) == saved["history"]
         assert repr(store.operations()) == saved["operations"]
         approval_id = command_prefix("everyday-program") + digest(encode(["owner", "host-approval"]))
@@ -353,19 +357,32 @@ def replay_host_after_process_restart(root: Path) -> None:
         receipt_bytes = store.find_artifact(approval_id, "receipt")
         assert (None if receipt_bytes is None else receipt_bytes.hex()) == saved["receipt_hex"]
         receipt = None if receipt_bytes is None else object_from(receipt_bytes)
-        committed = saved["boundary"] == "receipt"
+        boundary = saved["boundary"]
+        committed = boundary == "receipt"
+        terminal = boundary == "refusal-committed"
+        missing = boundary in ("refusal-before-write", "refusal-uncommitted")
         if committed:
             assert receipt is not None and receipt["status"] == "approved" and receipt["decision_id"] == "host-decision"
-        else:
+        elif boundary == "intent":
             assert receipt is None and store.find_program("everyday-program") is None
             assert store.find_artifact("ordinary-program:approval:host-decision", "record") is None
-        assert object_from(store.operation(approval_id).request_json.encode())["request"] == {
+        else:
+            assert receipt is None and store.load("everyday-program").revision != original["expected_revision"]
+            assert store.find_artifact("ordinary-program:approval:host-decision", "record") is None
+        expected = {
             **original,
             "scope": "everyday-program",
             "actor": "owner",
             "proposal": original["proposal_digest"],
             "approval_history_pairing": ["fixture-producer", "fixture-backend"],
         }
+        if terminal:
+            expected["kind"] = APPROVAL_REVISION_REFUSAL
+        operation = store.find_operation(approval_id)
+        if missing:
+            assert operation is None
+        else:
+            assert operation is not None and object_from(operation.request_json.encode())["request"] == expected
         before = (store.history("everyday-program"), store.operations(), store.work_budget_status("everyday-program"))
         token = store.served_change_token()
         for method in ("intent", "finalize_artifact"):
@@ -376,9 +393,10 @@ def replay_host_after_process_restart(root: Path) -> None:
         projection = OwnerProjection(store, "everyday-program")
         actor = Principal("owner", "owner")
         session = LocalOwnerSession(projection, None, None, history_owner=actor)
-        for index, mode in enumerate(("verified", "unverified", "mutation", "replay")):
+        modes = ("verified", "verified", "unverified", "mutation") + (() if missing else ("replay",))
+        for index, mode in enumerate(modes):
             path = root / f"restart-result-{index}.json"
-            request = original if mode in {"replay", "mutation"} else _approval_disposition_request(original)
+            request = original if mode in {"replay", "mutation"} else _approval_disposition_request(original, v2=True)
             target = session
             if mode == "replay":
                 assert store.served_change_token() == token
@@ -422,11 +440,23 @@ def replay_host_after_process_restart(root: Path) -> None:
                 recipient="fixture-backend",
                 version=1 if mode == "replay" else 2,
                 verified_approval_history=mode in {"verified", "mutation"},
+                approval_disposition_v2=mode in {"verified", "mutation"},
             )
             try:
                 assert select.select([launched.channel.fileno()], [], [], 10)[0]
                 if mode == "replay":
-                    launched.serve_once()
+                    with patch.object(
+                        OrdinaryProgram, "approve", side_effect=AssertionError("replay invoked approval")
+                    ):
+                        if terminal:
+                            try:
+                                launched.serve_once()
+                            except LocalChannelRefused as error:
+                                assert "terminally refused" in str(error.__cause__)
+                            else:
+                                raise AssertionError("terminal refusal was replayed")
+                        else:
+                            launched.serve_once()
                 else:
                     with patch.object(
                         LocalOwnerChannel, "_approve", side_effect=AssertionError("lookup invoked approve")
@@ -441,17 +471,22 @@ def replay_host_after_process_restart(root: Path) -> None:
                             else:
                                 raise AssertionError("unverified history or mutation accepted")
                 assert launched.process.wait(timeout=10) == 0
-                if mode == "replay":
+                if mode == "replay" and not terminal:
                     assert json.loads(path.read_text())["result"] == (
                         receipt if committed else {"status": "unknown", "settlement": "unknown"}
                     )
                 elif mode == "verified":
                     result = json.loads(path.read_text())["result"]
-                    assert result == (
-                        {"version": 1, "status": "historical-receipt", "receipt": receipt}
-                        if committed
-                        else {"version": 1, "status": "intent-recorded", "receipt": None}
-                    )
+                    status = "historical-receipt" if committed else "intent-recorded"
+                    if terminal:
+                        assert result == {
+                            "version": 2,
+                            "status": "terminal-refusal",
+                            "receipt": None,
+                            "reason": "stale-revision",
+                        }
+                    else:
+                        assert result == {"version": 2, "status": "unknown" if missing else status, "receipt": receipt}
                 else:
                     assert path.read_bytes() == b""
             finally:
@@ -464,6 +499,8 @@ def replay_host_after_process_restart(root: Path) -> None:
             store.operations(),
             store.work_budget_status("everyday-program"),
         ) == before
+        if missing:
+            assert store.served_change_token() == token
         assert store.find_artifact(approval_id, "receipt") == receipt_bytes
 
 
@@ -1119,7 +1156,8 @@ print("Done")
                     "from creatidy_kernel.adapters.served_local import write_frame,read_frame; "
                     "s,ops=receive_owner_operations(int(sys.argv[-1]),expected_scope='everyday-program',"
                     "expected_producer=sys.argv[5],expected_recipient=sys.argv[6]); "
-                    "assert (ops is not None and 'approval-disposition' in ops)==(sys.argv[4]=='lookup'); "
+                    "assert (ops is not None and 'approval-disposition' in ops)==(sys.argv[4]!='legacy'); "
+                    "assert (ops is not None and 'approval-disposition-v2' in ops)==(sys.argv[4]=='lookup-v2'); "
                     "write_frame(s,sys.argv[1].encode(),bound=65536); "
                     "\nif sys.argv[3]=='drop':\n s.close(); sys.exit(0)"
                     "\ntry:\n r=json.loads(read_frame(s,bound=1048576,timeout=10))['result']"
@@ -1141,6 +1179,7 @@ print("Done")
                     *,
                     drop: bool = False,
                     lookup: bool = False,
+                    disposition_v2: bool = False,
                     producer: str = "fixture-producer",
                     recipient: str = "fixture-backend",
                 ) -> tuple[LaunchedOwner, Path]:
@@ -1157,7 +1196,7 @@ print("Done")
                             json.dumps(request),
                             str(result_path),
                             "drop" if drop else "read",
-                            "lookup" if lookup else "legacy",
+                            "lookup-v2" if disposition_v2 else "lookup" if lookup else "legacy",
                             producer,
                             recipient,
                         ],
@@ -1165,8 +1204,9 @@ print("Done")
                         scope="everyday-program",
                         producer=producer,
                         recipient=recipient,
-                        version=2 if lookup else 1,
-                        verified_approval_history=lookup,
+                        version=2 if lookup or disposition_v2 else 1,
+                        verified_approval_history=lookup or disposition_v2,
+                        approval_disposition_v2=disposition_v2,
                     )
                     owners.callback(cleanup, launched)
                     return launched, result_path
@@ -1202,13 +1242,23 @@ print("Done")
                     "scope_digest": digest(encode(app.approval_scope(proposal))),
                 }
                 if exercise == "served-host-process-create":
-                    assert crash_host_boundary in {"receipt", "intent"}
-                if exercise == "served-host-process-create" and crash_host_boundary in {"receipt", "intent"}:
+                    assert crash_host_boundary in {
+                        "receipt",
+                        "intent",
+                        "refusal-before-write",
+                        "refusal-uncommitted",
+                        "refusal-committed",
+                    }
+                    refusal = crash_host_boundary.startswith("refusal-")
+                    if refusal:
+                        winner, path = spawn({**approval_request, "command_id": "winner", "decision_id": "winner"})
+                        assert finish(winner, path)["status"] == "approved"
                     approval_id = command_prefix("everyday-program") + digest(encode(["owner", "host-approval"]))
 
-                    def crash_at_boundary() -> None:
+                    def save_recovery_fixture() -> None:
                         receipt_bytes = store.find_artifact(approval_id, "receipt")
-                        assert (receipt_bytes is None) == (crash_host_boundary == "intent")
+                        assert (receipt_bytes is not None) == (crash_host_boundary == "receipt")
+                        identity = (root / "state.db").stat()
                         (root / "host-replay.json").write_text(
                             json.dumps(
                                 {
@@ -1218,13 +1268,13 @@ print("Done")
                                     "history": repr(store.history("everyday-program")),
                                     "operations": repr(store.operations()),
                                     "boundary": crash_host_boundary,
+                                    "db_identity": [identity.st_dev, identity.st_ino],
                                 }
                             )
                         )
                         (root / "first-producer.pid").write_text(str(os.getpid()))
-                        os._exit(0)
 
-                    interrupted, _ = spawn(approval_request, drop=True, lookup=True)
+                    interrupted, _ = spawn(approval_request, drop=True, disposition_v2=True)
                     assert interrupted.process.wait(timeout=10) == 0
                     assert select.select([interrupted.channel.fileno()], [], [], 10)[0]
                     if crash_host_boundary == "receipt":
@@ -1235,10 +1285,29 @@ print("Done")
                         ) -> str:
                             result = finalize(target, operation_id, name, data)
                             if operation_id == approval_id and name == "receipt":
-                                crash_at_boundary()
+                                save_recovery_fixture()
+                                os._exit(0)
                             return result
 
                         with patch.object(SQLiteProgramStore, "finalize_artifact", crash_after_receipt):
+                            interrupted.channel.serve_once()
+                    elif crash_host_boundary == "refusal-uncommitted":
+                        save_recovery_fixture()
+                        insert = SQLiteProgramStore._insert_intent  # pyright: ignore[reportPrivateUsage]
+
+                        def crash_after_insert(
+                            target: SQLiteProgramStore,
+                            operation_id: str,
+                            effect_key: str,
+                            request: dict[str, object],
+                            *,
+                            allow_existing: bool = True,
+                        ) -> None:
+                            insert(target, operation_id, effect_key, request, allow_existing=allow_existing)
+                            assert operation_id == approval_id and target.operation(operation_id).attempts == 0
+                            os._exit(0)
+
+                        with patch.object(SQLiteProgramStore, "_insert_intent", crash_after_insert):
                             interrupted.channel.serve_once()
                     else:
                         intent = SQLiteProgramStore.intent
@@ -1246,10 +1315,11 @@ print("Done")
                         def crash_after_intent(
                             target: SQLiteProgramStore, operation_id: str, effect_key: str, request: dict[str, object]
                         ) -> OperationRecord:
-                            result = intent(target, operation_id, effect_key, request)
-                            if operation_id == approval_id:
-                                crash_at_boundary()
-                            return result
+                            assert operation_id == approval_id
+                            if crash_host_boundary != "refusal-before-write":
+                                intent(target, operation_id, effect_key, request)
+                            save_recovery_fixture()
+                            os._exit(0)
 
                         with patch.object(SQLiteProgramStore, "intent", crash_after_intent):
                             interrupted.channel.serve_once()
@@ -1261,7 +1331,16 @@ print("Done")
                     store.find_operation(command_prefix("everyday-program") + digest(encode(["owner", "pre-intent"])))
                     is None
                 )
-                lost, _ = spawn(approval_request, drop=True, lookup=True)
+                # A future revision mismatch is also terminal, even once that revision is reached.
+                future = {
+                    **approval_request,
+                    "command_id": "future-revision",
+                    "decision_id": "future",
+                    "expected_revision": 0,
+                }
+                refused, path = spawn(future, disposition_v2=True)
+                assert finish(refused, path, refused=True) == {"error": True}
+                lost, _ = spawn(approval_request, drop=True, disposition_v2=True)
                 try:
                     assert lost.process.wait(timeout=10) == 0
                     assert select.select([lost.channel.fileno()], [], [], 10)[0]
@@ -1279,6 +1358,39 @@ print("Done")
                 approval_id = command_prefix("everyday-program") + digest(encode(["owner", "host-approval"]))
                 receipt_bytes = store.artifact(approval_id, "receipt")
                 recorded_approval = store.artifact("ordinary-program:approval:host-decision", "record")
+                stale = {**approval_request, "command_id": "lost-stale", "decision_id": "competing-decision"}
+                refused, _ = spawn(stale, drop=True, disposition_v2=True)
+                changes, data_version = store.served_change_token()
+                try:
+                    assert refused.process.wait(timeout=10) == 0
+                    assert select.select([refused.channel.fileno()], [], [], 10)[0]
+                    with patch.object(OrdinaryProgram, "approve", side_effect=AssertionError("stale invoked approval")):
+                        try:
+                            refused.channel.serve_once()
+                        except LocalChannelRefused as error:
+                            assert "expected revision is stale" in str(error.__cause__)
+                        else:
+                            raise AssertionError("competing approval was not refused")
+                finally:
+                    refused.close()
+                assert store.served_change_token() == (changes + 2, data_version)  # Journal key and outbox only.
+                assert store.load("everyday-program").revision == future["expected_revision"]
+                with patch.object(
+                    OrdinaryProgram, "approve", side_effect=AssertionError("terminal key invoked approval")
+                ):
+                    for request in (future, stale, {**stale, "expected_revision": 0}):
+                        refused, path = spawn(request)
+                        assert finish(refused, path, refused=True) == {"error": True}
+                assert store.find_artifact("ordinary-program:approval:future", "record") is None
+                assert store.find_artifact("ordinary-program:approval:competing-decision", "record") is None
+                token = store.served_change_token()
+                refused_id = command_prefix("everyday-program") + digest(encode(["owner", "lost-stale"]))
+                try:
+                    store.claim(refused_id, now=int(time.time()), lease_seconds=30)
+                except OperationConflict as error:
+                    assert "terminal approval refusal" in str(error)
+                else:
+                    raise AssertionError("terminal approval refusal entered the outbox dispatch path")
                 before_lookup = (
                     store.history("everyday-program"),
                     store.operations(),
@@ -1286,6 +1398,30 @@ print("Done")
                 )
                 lookup_request = _approval_disposition_request(approval_request)
                 with patch.object(LocalOwnerChannel, "_approve", side_effect=AssertionError("lookup invoked approve")):
+                    terminal = _approval_disposition_request(stale, v2=True)
+                    for _ in range(2):
+                        recovered, path = spawn(terminal, disposition_v2=True)
+                        assert finish(recovered, path) == {
+                            "version": 2,
+                            "status": "terminal-refusal",
+                            "receipt": None,
+                            "reason": "stale-revision",
+                        }
+                    recovered, path = spawn(_approval_disposition_request(stale), lookup=True)
+                    assert finish(recovered, path) == {"version": 1, "status": "unknown", "receipt": None}
+                    unsupported, path = spawn(terminal, lookup=True)
+                    assert finish(unsupported, path, refused=True) == {"error": True}
+                    for request in (refused_request, {**stale, "command_id": "never-received"}):
+                        recovered, path = spawn(_approval_disposition_request(request, v2=True), disposition_v2=True)
+                        assert finish(recovered, path) == {"version": 2, "status": "unknown", "receipt": None}
+                    for invalid, pairing in (
+                        ({**terminal, "original": {**stale, "expires_at": 1}}, "fixture-producer"),
+                        ({**terminal, "actor_digest": digest(encode("another-owner"))}, "fixture-producer"),
+                        ({**terminal, "program_digest": digest(encode("other-program"))}, "fixture-producer"),
+                        ({**terminal, "producer": "other-producer"}, "other-producer"),
+                    ):
+                        rejected, path = spawn(invalid, disposition_v2=True, producer=pairing)
+                        assert finish(rejected, path, refused=True) == {"error": True}
                     for _ in range(2):
                         recovered, path = spawn(lookup_request, lookup=True)
                         assert finish(recovered, path) == {
@@ -1347,6 +1483,7 @@ print("Done")
                     store.operations(),
                     store.work_budget_status("everyday-program"),
                 ) == before_lookup
+                assert store.served_change_token() == token
                 assert store.artifact("ordinary-program:approval:host-decision", "record") == recorded_approval
                 first, first_path = spawn(approval_request)
                 second, second_path = spawn(approval_request)

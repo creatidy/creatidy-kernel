@@ -12,6 +12,7 @@ from typing import cast
 
 from creatidy_kernel.adapters.served_local import (
     APPROVAL_DISPOSITION,
+    APPROVAL_DISPOSITION_V2,
     APPROVAL_OPERATIONS,
     OWNER_READS,
     PROPOSAL_READS,
@@ -25,7 +26,7 @@ from creatidy_kernel.adapters.served_local import (
 
 PROVISIONING = "creatidy-kernel-owner-descriptor-v1"
 PROVISIONING_V2 = "creatidy-kernel-owner-descriptor-v2"
-_OWNER_OPERATIONS = OWNER_READS | PROPOSAL_READS | APPROVAL_OPERATIONS | {APPROVAL_DISPOSITION}
+_OWNER_OPERATIONS = OWNER_READS | PROPOSAL_READS | APPROVAL_OPERATIONS | {APPROVAL_DISPOSITION, APPROVAL_DISPOSITION_V2}
 
 
 def _valid_binding(value: object) -> bool:
@@ -66,6 +67,7 @@ def launch_owner(
     recipient: str,
     version: int = 1,
     verified_approval_history: bool = False,
+    approval_disposition_v2: bool = False,
 ) -> LaunchedOwner:
     """Launch the trusted backend, appending its descriptor as the final argv element.
 
@@ -73,6 +75,7 @@ def launch_owner(
     supplying an environment containing only values appropriate for the child.
     Opt in to approval disposition only for a compatible v2 backend when the host has
     verified custody of the original authoritative journal for this producer binding.
+    Opt in to disposition v2 separately for a backend that understands terminal refusals.
     """
     if (
         sys.platform != "linux"
@@ -80,6 +83,8 @@ def launch_owner(
         or version not in (1, 2)
         or type(verified_approval_history) is not bool
         or (verified_approval_history and version != 2)
+        or type(approval_disposition_v2) is not bool
+        or (approval_disposition_v2 and not verified_approval_history)
         or not argv
         or not os.path.isabs(argv[0])
         or not scope
@@ -93,7 +98,9 @@ def launch_owner(
     channel: LocalOwnerChannel | None = None
     try:
         channel = session.attach(
-            server, approval_history_binding=(producer, recipient) if verified_approval_history else None
+            server,
+            approval_history_binding=(producer, recipient) if verified_approval_history else None,
+            approval_disposition_v2=approval_disposition_v2,
         )
         greeting: dict[str, object] = {
             "contract": PROVISIONING if version == 1 else PROVISIONING_V2,
@@ -218,6 +225,7 @@ def _parse_operations(value: object) -> frozenset[str]:
         or not OWNER_READS <= operations
         or (operations & PROPOSAL_READS and not PROPOSAL_READS <= operations)
         or (operations & APPROVAL_OPERATIONS and not (PROPOSAL_READS | APPROVAL_OPERATIONS) <= operations)
+        or (APPROVAL_DISPOSITION_V2 in operations and APPROVAL_DISPOSITION not in operations)
     ):
         raise LocalChannelRefused("inconsistent owner operation declaration")
     return operations
