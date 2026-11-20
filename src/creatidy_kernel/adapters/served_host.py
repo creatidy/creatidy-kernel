@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from typing import cast
 
 from creatidy_kernel.adapters.served_local import (
+    APPROVAL_DISPOSITION,
     APPROVAL_OPERATIONS,
     OWNER_READS,
     PROPOSAL_READS,
@@ -24,7 +25,7 @@ from creatidy_kernel.adapters.served_local import (
 
 PROVISIONING = "creatidy-kernel-owner-descriptor-v1"
 PROVISIONING_V2 = "creatidy-kernel-owner-descriptor-v2"
-_OWNER_OPERATIONS = OWNER_READS | PROPOSAL_READS | APPROVAL_OPERATIONS
+_OWNER_OPERATIONS = OWNER_READS | PROPOSAL_READS | APPROVAL_OPERATIONS | {APPROVAL_DISPOSITION}
 
 
 def _valid_binding(value: object) -> bool:
@@ -64,16 +65,21 @@ def launch_owner(
     producer: str,
     recipient: str,
     version: int = 1,
+    verified_approval_history: bool = False,
 ) -> LaunchedOwner:
     """Launch the trusted backend, appending its descriptor as the final argv element.
 
     The caller is responsible for authenticating the executable, binding the session and
     supplying an environment containing only values appropriate for the child.
+    Opt in to approval disposition only for a compatible v2 backend when the host has
+    verified custody of the original authoritative journal for this producer binding.
     """
     if (
         sys.platform != "linux"
         or type(version) is not int
         or version not in (1, 2)
+        or type(verified_approval_history) is not bool
+        or (verified_approval_history and version != 2)
         or not argv
         or not os.path.isabs(argv[0])
         or not scope
@@ -86,7 +92,9 @@ def launch_owner(
     server, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     channel: LocalOwnerChannel | None = None
     try:
-        channel = session.attach(server)
+        channel = session.attach(
+            server, approval_history_binding=(producer, recipient) if verified_approval_history else None
+        )
         greeting: dict[str, object] = {
             "contract": PROVISIONING if version == 1 else PROVISIONING_V2,
             "wire_version": 1,  # Only the provisioning greeting changes.

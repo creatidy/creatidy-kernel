@@ -95,7 +95,13 @@ from creatidy_kernel.core.verification import Evidence, EvidenceSubject, Verific
 from creatidy_kernel.core.work_budget import WorkBudgetPolicy, WorkKind
 from creatidy_kernel.ports.application import Collection
 from creatidy_kernel.ports.intake import OrdinaryIntake
-from creatidy_kernel.ports.ordinary import DependencyReader, OrdinaryApproval, OrdinaryHandoff, OrdinaryProgram
+from creatidy_kernel.ports.ordinary import (
+    DependencyReader,
+    OrdinaryApproval,
+    OrdinaryHandoff,
+    OrdinaryProgram,
+    proposal_from,
+)
 from creatidy_kernel.ports.outcome_export import PRIVATE_METADATA, export_private_outcome
 from creatidy_kernel.ports.ownership import WorkOwnership
 from creatidy_kernel.ports.program_store import OperationRecord
@@ -295,6 +301,18 @@ def forge_service(
         thread.join()
 
 
+def _approval_disposition_request(original: object) -> dict[str, object]:
+    return {
+        "version": 1,
+        "action": "approval-disposition",
+        "producer": "fixture-producer",
+        "recipient": "fixture-backend",
+        "program_digest": digest(encode("everyday-program")),
+        "actor_digest": digest(encode("owner")),
+        "original": original,
+    }
+
+
 def replay_host_after_process_restart(root: Path) -> None:
     """Reconstruct the synthetic host configuration, not the previous process objects."""
     saved = cast(dict[str, object], json.loads((root / "host-replay.json").read_text()))
@@ -315,90 +333,138 @@ def replay_host_after_process_restart(root: Path) -> None:
         project_budget=budget,
     )
     script = (
-        "import json,pathlib,sys; from creatidy_kernel.adapters.served_host import receive_owner; "
+        "import pathlib,sys; from creatidy_kernel.adapters.served_host import receive_owner_operations; "
         "from creatidy_kernel.adapters.served_local import write_frame,read_frame; "
-        "s=receive_owner(int(sys.argv[-1]),expected_scope='everyday-program',"
+        "s,ops=receive_owner_operations(int(sys.argv[-1]),expected_scope='everyday-program',"
         "expected_producer='fixture-producer',expected_recipient='fixture-backend'); "
+        "assert (ops is None) == (sys.argv[3]=='replay'); "
+        "assert ops is None or ('approval-disposition' in ops)==(sys.argv[3] in ('verified','mutation')); "
+        "assert ops is None or ops <= {'snapshot','record','events','approval-disposition'}; "
         "write_frame(s,sys.argv[1].encode(),bound=65536); "
-        "pathlib.Path(sys.argv[2]).write_bytes(read_frame(s,bound=1048576)); s.close()"
+        "\ntry:\n raw=read_frame(s,bound=1048576)"
+        "\nexcept (ValueError,OSError):\n raw=b''"
+        "\npathlib.Path(sys.argv[2]).write_bytes(raw); s.close()"
     )
-    with SQLiteProgramStore(root / "state.db") as store:
+    with SQLiteProgramStore(root / "state.db") as store, ExitStack() as read_guard:
         assert repr(store.history("everyday-program")) == saved["history"]
         assert repr(store.operations()) == saved["operations"]
         approval_id = command_prefix("everyday-program") + digest(encode(["owner", "host-approval"]))
-        unknown_id = command_prefix("everyday-program") + digest(encode(["owner", "uncertain-approval"]))
-        receipt_bytes = store.artifact(approval_id, "receipt")
-        assert receipt_bytes.hex() == saved["receipt_hex"]
-        receipt = object_from(receipt_bytes)
-        assert receipt["status"] == "approved" and receipt["decision_id"] == "host-decision"
+        original = cast(dict[str, object], saved["request"])
+        receipt_bytes = store.find_artifact(approval_id, "receipt")
+        assert (None if receipt_bytes is None else receipt_bytes.hex()) == saved["receipt_hex"]
+        receipt = None if receipt_bytes is None else object_from(receipt_bytes)
+        committed = saved["boundary"] == "receipt"
+        if committed:
+            assert receipt is not None and receipt["status"] == "approved" and receipt["decision_id"] == "host-decision"
+        else:
+            assert receipt is None and store.find_program("everyday-program") is None
+            assert store.find_artifact("ordinary-program:approval:host-decision", "record") is None
         assert object_from(store.operation(approval_id).request_json.encode())["request"] == {
-            **cast(dict[str, object], saved["request"]),
+            **original,
             "scope": "everyday-program",
             "actor": "owner",
-            "proposal": object_from(store.artifact("ordinary-program:approval:host-decision", "record"))["proposal"],
+            "proposal": original["proposal_digest"],
+            "approval_history_pairing": ["fixture-producer", "fixture-backend"],
         }
-        if saved["boundary"] == "intent":
-            unknown = store.operation(unknown_id)
-            assert object_from(unknown.request_json.encode())["request"] == {
-                **cast(dict[str, object], saved["unknown"]),
-                "scope": "everyday-program",
-                "actor": "owner",
-                "proposal": object_from(store.artifact("ordinary-program:approval:host-decision", "record"))[
-                    "proposal"
-                ],
-            }
-            assert store.find_artifact(unknown_id, "receipt") is None
-            assert store.find_artifact("ordinary-program:approval:interrupted-decision", "record") is None
-        else:
-            assert store.find_operation(unknown_id) is None
-        app = OrdinaryProgram(
-            store,
-            cast(OrdinaryIntake, None),
-            cast(DependencyReader, None),
-            Principal("owner", "owner"),
-            policy,
-            VerificationPolicy(policy_ref, ("paths", "structural", "commands")),
-            lambda: int(time.time()),
-            execution_profile=encode(
-                {
-                    "harness": "kilo-pull+codex",
-                    "provider": "fixture-provider",
-                    "model": "fixture-model",
-                    "effort": None,
-                    "trust": "trusted_development",
-                }
-            ),
+        before = (store.history("everyday-program"), store.operations(), store.work_budget_status("everyday-program"))
+        token = store.served_change_token()
+        for method in ("intent", "finalize_artifact"):
+            read_guard.enter_context(patch.object(SQLiteProgramStore, method, side_effect=AssertionError(method)))
+        read_guard.enter_context(
+            patch.object(OrdinaryProgram, "__init__", side_effect=AssertionError("cold recovery needs no application"))
         )
-        approved = app.recover("host-decision")
-        session = LocalOwnerSession(
-            OwnerProjection(store, "everyday-program"), app, approved, proposal=approved.proposal
-        )
-        before = (store.history("everyday-program"), store.operations())
-        keys = ("request", "unknown") if saved["boundary"] == "intent" else ("request",)
-        for index, key in enumerate(keys):
+        projection = OwnerProjection(store, "everyday-program")
+        actor = Principal("owner", "owner")
+        session = LocalOwnerSession(projection, None, None, history_owner=actor)
+        for index, mode in enumerate(("verified", "unverified", "mutation", "replay")):
             path = root / f"restart-result-{index}.json"
+            request = original if mode in {"replay", "mutation"} else _approval_disposition_request(original)
+            target = session
+            if mode == "replay":
+                assert store.served_change_token() == token
+                read_guard.close()
+                app = OrdinaryProgram(
+                    store,
+                    cast(OrdinaryIntake, None),
+                    cast(DependencyReader, None),
+                    actor,
+                    policy,
+                    VerificationPolicy(policy_ref, ("paths", "structural", "commands")),
+                    lambda: int(time.time()),
+                    execution_profile=encode(
+                        {
+                            "harness": "kilo-pull+codex",
+                            "provider": "fixture-provider",
+                            "model": "fixture-model",
+                            "effort": None,
+                            "trust": "trusted_development",
+                        }
+                    ),
+                )
+                proposal = proposal_from(
+                    store.artifact(f"ordinary-program:proposal:{original['proposal_digest']}", "record")
+                )
+                target = LocalOwnerSession(projection, app, None, proposal=proposal)
             launched = launch_owner(
-                session,
-                [sys.executable, "-I", "-c", script, json.dumps(saved[key]), str(path)],
+                target,
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    script,
+                    json.dumps(request),
+                    str(path),
+                    mode,
+                ],
                 environment={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
                 scope="everyday-program",
                 producer="fixture-producer",
                 recipient="fixture-backend",
+                version=1 if mode == "replay" else 2,
+                verified_approval_history=mode in {"verified", "mutation"},
             )
             try:
                 assert select.select([launched.channel.fileno()], [], [], 10)[0]
-                launched.serve_once()
+                if mode == "replay":
+                    launched.serve_once()
+                else:
+                    with patch.object(
+                        LocalOwnerChannel, "_approve", side_effect=AssertionError("lookup invoked approve")
+                    ):
+                        if mode == "verified":
+                            launched.serve_once()
+                        else:
+                            try:
+                                launched.serve_once()
+                            except LocalChannelRefused:
+                                pass
+                            else:
+                                raise AssertionError("unverified history or mutation accepted")
                 assert launched.process.wait(timeout=10) == 0
-                result = json.loads(path.read_text())["result"]
-                assert result == (receipt if key == "request" else {"status": "unknown", "settlement": "unknown"})
+                if mode == "replay":
+                    assert json.loads(path.read_text())["result"] == (
+                        receipt if committed else {"status": "unknown", "settlement": "unknown"}
+                    )
+                elif mode == "verified":
+                    result = json.loads(path.read_text())["result"]
+                    assert result == (
+                        {"version": 1, "status": "historical-receipt", "receipt": receipt}
+                        if committed
+                        else {"version": 1, "status": "intent-recorded", "receipt": None}
+                    )
+                else:
+                    assert path.read_bytes() == b""
             finally:
                 launched.close()
                 if launched.process.poll() is None:
                     launched.process.kill()
                 launched.process.wait(timeout=10)
-        assert (store.history("everyday-program"), store.operations()) == before
-        assert store.artifact(approval_id, "receipt") == receipt_bytes
-        assert store.find_artifact(unknown_id, "receipt") is None
+        assert (
+            store.history("everyday-program"),
+            store.operations(),
+            store.work_budget_status("everyday-program"),
+        ) == before
+        assert store.find_artifact(approval_id, "receipt") == receipt_bytes
 
 
 def run_ordinary_flow(
@@ -1049,10 +1115,11 @@ print("Done")
                 binding = LocalOwnerSession(OwnerProjection(store, "everyday-program"), app, None, proposal=proposal)
                 script = (
                     "import json,pathlib,sys; "
-                    "from creatidy_kernel.adapters.served_host import receive_owner; "
+                    "from creatidy_kernel.adapters.served_host import receive_owner_operations; "
                     "from creatidy_kernel.adapters.served_local import write_frame,read_frame; "
-                    "s=receive_owner(int(sys.argv[-1]),expected_scope='everyday-program',"
-                    "expected_producer='fixture-producer',expected_recipient='fixture-backend'); "
+                    "s,ops=receive_owner_operations(int(sys.argv[-1]),expected_scope='everyday-program',"
+                    "expected_producer=sys.argv[5],expected_recipient=sys.argv[6]); "
+                    "assert (ops is not None and 'approval-disposition' in ops)==(sys.argv[4]=='lookup'); "
                     "write_frame(s,sys.argv[1].encode(),bound=65536); "
                     "\nif sys.argv[3]=='drop':\n s.close(); sys.exit(0)"
                     "\ntry:\n r=json.loads(read_frame(s,bound=1048576,timeout=10))['result']"
@@ -1069,7 +1136,14 @@ print("Done")
                             launched.process.kill()
                         launched.process.wait(timeout=10)
 
-                def spawn(request: dict[str, object], *, drop: bool = False) -> tuple[LaunchedOwner, Path]:
+                def spawn(
+                    request: dict[str, object],
+                    *,
+                    drop: bool = False,
+                    lookup: bool = False,
+                    producer: str = "fixture-producer",
+                    recipient: str = "fixture-backend",
+                ) -> tuple[LaunchedOwner, Path]:
                     nonlocal serial
                     serial += 1
                     result_path = root / f"host-result-{serial}.json"
@@ -1083,11 +1157,16 @@ print("Done")
                             json.dumps(request),
                             str(result_path),
                             "drop" if drop else "read",
+                            "lookup" if lookup else "legacy",
+                            producer,
+                            recipient,
                         ],
                         environment={"HOME": str(root), "PATH": os.defpath, "LANG": "C.UTF-8"},
                         scope="everyday-program",
-                        producer="fixture-producer",
-                        recipient="fixture-backend",
+                        producer=producer,
+                        recipient=recipient,
+                        version=2 if lookup else 1,
+                        verified_approval_history=lookup,
                     )
                     owners.callback(cleanup, launched)
                     return launched, result_path
@@ -1126,33 +1205,16 @@ print("Done")
                     assert crash_host_boundary in {"receipt", "intent"}
                 if exercise == "served-host-process-create" and crash_host_boundary in {"receipt", "intent"}:
                     approval_id = command_prefix("everyday-program") + digest(encode(["owner", "host-approval"]))
-                    unknown_id = command_prefix("everyday-program") + digest(encode(["owner", "uncertain-approval"]))
-                    boundary_request: dict[str, object] | None = None
-                    if crash_host_boundary == "intent":
-                        first, path = spawn(approval_request)
-                        assert finish(first, path)["status"] == "approved"
-                        boundary_request = {
-                            "version": 1,
-                            "action": "approve",
-                            "command_id": "uncertain-approval",
-                            "expected_revision": store.load("everyday-program").revision,
-                            "decision_id": "interrupted-decision",
-                            "expires_at": approval_request["expires_at"],
-                            "proposal_digest": proposal.digest,
-                            "scope_digest": digest(encode(app.approval_scope(proposal))),
-                        }
 
                     def crash_at_boundary() -> None:
-                        receipt_bytes = store.artifact(approval_id, "receipt")
-                        missing = store.find_artifact(unknown_id, "receipt")
-                        assert missing is None
+                        receipt_bytes = store.find_artifact(approval_id, "receipt")
+                        assert (receipt_bytes is None) == (crash_host_boundary == "intent")
                         (root / "host-replay.json").write_text(
                             json.dumps(
                                 {
                                     "request": approval_request,
-                                    "unknown": boundary_request,
                                     "reader_producer": reader.producer,
-                                    "receipt_hex": receipt_bytes.hex(),
+                                    "receipt_hex": None if receipt_bytes is None else receipt_bytes.hex(),
                                     "history": repr(store.history("everyday-program")),
                                     "operations": repr(store.operations()),
                                     "boundary": crash_host_boundary,
@@ -1162,9 +1224,7 @@ print("Done")
                         (root / "first-producer.pid").write_text(str(os.getpid()))
                         os._exit(0)
 
-                    interrupted, _ = spawn(
-                        approval_request if boundary_request is None else boundary_request, drop=True
-                    )
+                    interrupted, _ = spawn(approval_request, drop=True, lookup=True)
                     assert interrupted.process.wait(timeout=10) == 0
                     assert select.select([interrupted.channel.fileno()], [], [], 10)[0]
                     if crash_host_boundary == "receipt":
@@ -1187,14 +1247,21 @@ print("Done")
                             target: SQLiteProgramStore, operation_id: str, effect_key: str, request: dict[str, object]
                         ) -> OperationRecord:
                             result = intent(target, operation_id, effect_key, request)
-                            if operation_id == unknown_id:
+                            if operation_id == approval_id:
                                 crash_at_boundary()
                             return result
 
                         with patch.object(SQLiteProgramStore, "intent", crash_after_intent):
                             interrupted.channel.serve_once()
                     raise AssertionError("producer did not exit at the requested durable boundary")
-                lost, _ = spawn(approval_request, drop=True)
+                refused_request = {**approval_request, "command_id": "pre-intent", "expected_revision": 0}
+                refused, path = spawn(refused_request, lookup=True)
+                assert finish(refused, path, refused=True) == {"error": True}
+                assert (
+                    store.find_operation(command_prefix("everyday-program") + digest(encode(["owner", "pre-intent"])))
+                    is None
+                )
+                lost, _ = spawn(approval_request, drop=True, lookup=True)
                 try:
                     assert lost.process.wait(timeout=10) == 0
                     assert select.select([lost.channel.fileno()], [], [], 10)[0]
@@ -1209,6 +1276,78 @@ print("Done")
                     if lost.process.poll() is None:
                         lost.process.kill()
                         lost.process.wait(timeout=10)
+                approval_id = command_prefix("everyday-program") + digest(encode(["owner", "host-approval"]))
+                receipt_bytes = store.artifact(approval_id, "receipt")
+                recorded_approval = store.artifact("ordinary-program:approval:host-decision", "record")
+                before_lookup = (
+                    store.history("everyday-program"),
+                    store.operations(),
+                    store.work_budget_status("everyday-program"),
+                )
+                lookup_request = _approval_disposition_request(approval_request)
+                with patch.object(LocalOwnerChannel, "_approve", side_effect=AssertionError("lookup invoked approve")):
+                    for _ in range(2):
+                        recovered, path = spawn(lookup_request, lookup=True)
+                        assert finish(recovered, path) == {
+                            "version": 1,
+                            "status": "historical-receipt",
+                            "receipt": object_from(receipt_bytes),
+                        }
+                    for unresolved in (refused_request, {**approval_request, "command_id": "not-the-original"}):
+                        recovered, path = spawn(_approval_disposition_request(unresolved), lookup=True)
+                        assert finish(recovered, path) == {"version": 1, "status": "unknown", "receipt": None}
+                    for invalid in (
+                        {**lookup_request, "version": 2},
+                        {**lookup_request, "actor_digest": digest(encode("another-owner"))},
+                        {**lookup_request, "program_digest": digest(encode("other-program"))},
+                        {**lookup_request, "producer": "other-producer"},
+                        {**lookup_request, "recipient": "other-backend"},
+                        _approval_disposition_request({**approval_request, "version": True}),
+                        _approval_disposition_request({**approval_request, "decision_id": "changed"}),
+                        _approval_disposition_request({**approval_request, "scope_digest": "0" * 64}),
+                    ):
+                        rejected, path = spawn(invalid, lookup=True)
+                        assert finish(rejected, path, refused=True) == {"error": True}
+                    rejected, path = spawn(
+                        {**lookup_request, "recipient": "other-backend"}, lookup=True, recipient="other-backend"
+                    )
+                    assert finish(rejected, path, refused=True) == {"error": True}
+                    rejected, path = spawn(
+                        {**lookup_request, "producer": "other-producer"}, lookup=True, producer="other-producer"
+                    )
+                    assert finish(rejected, path, refused=True) == {"error": True}
+                    find_artifact = SQLiteProgramStore.find_artifact
+
+                    def inconsistent_receipt(target: SQLiteProgramStore, operation_id: str, name: str) -> bytes | None:
+                        if (operation_id, name) == (approval_id, "receipt"):
+                            return encode({**object_from(receipt_bytes), "spec_digest": "0" * 64})
+                        return find_artifact(target, operation_id, name)
+
+                    rejected, path = spawn(lookup_request, lookup=True)
+                    with patch.object(SQLiteProgramStore, "find_artifact", inconsistent_receipt):
+                        assert finish(rejected, path, refused=True) == {"error": True}
+
+                    def malformed_approval(target: SQLiteProgramStore, operation_id: str, name: str) -> bytes | None:
+                        if (operation_id, name) == ("ordinary-program:approval:host-decision", "record"):
+                            record = object_from(recorded_approval)
+                            del record["execution"]
+                            return encode(record)
+                        return find_artifact(target, operation_id, name)
+
+                    rejected, path = spawn(lookup_request, lookup=True)
+                    with patch.object(SQLiteProgramStore, "find_artifact", malformed_approval):
+                        assert finish(rejected, path, refused=True) == {"error": True}
+                    revoked, path = spawn(lookup_request, lookup=True)
+                    assert select.select([revoked.channel.fileno()], [], [], 10)[0]
+                    revoked.close()
+                    assert revoked.process.wait(timeout=10) == 0
+                    assert json.loads(path.read_text()) == {"error": True}
+                assert (
+                    store.history("everyday-program"),
+                    store.operations(),
+                    store.work_budget_status("everyday-program"),
+                ) == before_lookup
+                assert store.artifact("ordinary-program:approval:host-decision", "record") == recorded_approval
                 first, first_path = spawn(approval_request)
                 second, second_path = spawn(approval_request)
                 mismatched, mismatch_path = spawn({**approval_request, "decision_id": "different"})
@@ -1233,6 +1372,8 @@ print("Done")
                 interrupted, path = spawn(unknown_request)
                 with patch.object(OrdinaryProgram, "approve", side_effect=OSError("synthetic interruption")):
                     assert finish(interrupted, path, refused=True) == {"error": True}
+                legacy_lookup, path = spawn(_approval_disposition_request(unknown_request), lookup=True)
+                assert finish(legacy_lookup, path) == {"version": 1, "status": "unknown", "receipt": None}
                 replay, path = spawn(unknown_request)
                 assert finish(replay, path) == {"status": "unknown", "settlement": "unknown"}
                 assert store.load("everyday-program").revision == revision
