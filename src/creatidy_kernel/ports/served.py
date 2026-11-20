@@ -2,6 +2,7 @@
 """Owner-thread state projections; no remote authentication or transport is implied."""
 
 from dataclasses import dataclass
+from re import fullmatch
 from typing import Protocol, cast
 from uuid import uuid4
 
@@ -73,6 +74,60 @@ class OwnerProjection:
     def uses_store(self, store: object) -> bool:
         """Check the live host composition, not durable producer identity."""
         return self._store is store
+
+    def approval_disposition(self, actor: str, original: dict[str, object]) -> dict[str, object]:
+        """Read evidence for one validated approval on a supervisor-verified journal."""
+        command_id = original["command_id"]
+        decision_id = original["decision_id"]
+        operation_id = command_prefix(self._scope) + digest(encode([actor, command_id]))
+        operation = self._store.find_operation(operation_id)
+        if operation is None:
+            return {"version": 1, "status": "unknown", "receipt": None}
+        expected = encode(
+            {
+                "version": 1,
+                "request": {**original, "scope": self._scope, "actor": actor, "proposal": original["proposal_digest"]},
+            }
+        )
+        if (
+            operation.operation_id != operation_id
+            or operation.effect_key != operation_id
+            or operation.request_digest != digest(expected)
+            or operation.request_json.encode() != expected
+        ):
+            raise ValueError("recorded command identity or input differs")
+        raw = self._store.find_artifact(operation_id, "receipt")
+        if raw is None:
+            return {"version": 1, "status": "intent-recorded", "receipt": None}
+        receipt = object_from(raw)
+        spec, expiry = receipt.get("spec_digest"), receipt.get("expires_at")
+        if (
+            set(receipt) != {"version", "status", "decision_id", "spec_digest", "expires_at", "authority"}
+            or type(receipt["version"]) is not int
+            or receipt["version"] != 1
+            or receipt["status"] != "approved"
+            or receipt["decision_id"] != decision_id
+            or receipt["authority"] != "historical-only"
+            or type(spec) is not str
+            or fullmatch(r"[0-9a-f]{64}", spec) is None
+            or type(expiry) is not int
+            or not 0 < expiry <= cast(int, original["expires_at"])
+            or encode(receipt) != raw
+        ):
+            raise ValueError("recorded approval receipt is invalid")
+        record = self._store.find_artifact(f"ordinary-program:approval:{decision_id}", "record")
+        if record is None:
+            raise ValueError("receipt lacks its recorded approval")
+        approval = object_from(record)
+        if (
+            approval.get("proposal") != original["proposal_digest"]
+            or approval.get("issuer") != actor
+            or approval.get("spec") != spec
+            or type(approval.get("expires_at")) is not int
+            or approval["expires_at"] != expiry
+        ):
+            raise ValueError("receipt differs from the recorded approval")
+        return {"version": 1, "status": "historical-receipt", "receipt": receipt}
 
     def snapshot(self, *, page: int = 0) -> ServedSnapshot:
         if type(page) is not int or page < 0 or page > 1_000_000:
